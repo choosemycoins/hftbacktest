@@ -1,11 +1,7 @@
 use algo::gridtrading;
 use hftbacktest::{
     live::{
-        Instrument,
-        LiveBot,
-        LiveBotBuilder,
-        LoggingRecorder,
-        ipc::iceoryx::IceoryxUnifiedChannel,
+        Instrument, LiveBot, LiveBotBuilder, LoggingRecorder, ipc::iceoryx::IceoryxUnifiedChannel,
     },
     prelude::{Bot, ErrorKind, HashMapMarketDepth},
 };
@@ -18,11 +14,11 @@ const ORDER_PREFIX: &str = "prefix";
 fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
     let mut hbt = LiveBotBuilder::new()
         .register(Instrument::new(
-            "bybit-futures",
-            "BTCUSDT",
-            0.1,
-            0.001,
-            HashMapMarketDepth::new(0.000001, 1.0),
+            "bybit",
+            "ETHUSDT",
+            0.01,
+            0.01,
+            HashMapMarketDepth::new(0.01, 0.01),
             0,
         ))
         .error_handler(|error| {
@@ -46,7 +42,7 @@ fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
         .build()
         .unwrap();
 
-    hbt.run().unwrap();
+    // hbt.run().unwrap();
     hbt
 }
 
@@ -55,12 +51,12 @@ fn main() {
 
     let mut hbt = prepare_live();
 
-    let relative_half_spread = 0.0001;
-    let relative_grid_interval = 0.0001;
+    let relative_half_spread = 0.001;
+    let relative_grid_interval = 0.001;
     let grid_num = 2;
-    let min_grid_step = 0.1; // tick size
+    let min_grid_step = 0.01; // tick size
     let skew = relative_half_spread / grid_num as f64;
-    let order_qty = 0.001;
+    let order_qty = 0.01;
     let max_position = grid_num as f64 * order_qty;
 
     let mut recorder = LoggingRecorder::new();
