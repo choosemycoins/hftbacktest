@@ -3,8 +3,15 @@ use std::time::Duration;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use hftbacktest::prelude::{
-    Event, LOCAL_ASK_DEPTH_BBO_EVENT, LOCAL_ASK_DEPTH_EVENT, LOCAL_BID_DEPTH_BBO_EVENT,
-    LOCAL_BID_DEPTH_EVENT, LOCAL_BUY_TRADE_EVENT, LOCAL_SELL_TRADE_EVENT, LiveEvent, Side,
+    Event,
+    LOCAL_ASK_DEPTH_BBO_EVENT,
+    LOCAL_ASK_DEPTH_EVENT,
+    LOCAL_BID_DEPTH_BBO_EVENT,
+    LOCAL_BID_DEPTH_EVENT,
+    LOCAL_BUY_TRADE_EVENT,
+    LOCAL_SELL_TRADE_EVENT,
+    LiveEvent,
+    Side,
 };
 use tokio::{
     select,
@@ -22,7 +29,8 @@ use tracing::{debug, error};
 
 use crate::{
     bybit::{
-        BybitError, msg,
+        BybitError,
+        msg,
         msg::{Op, OrderBook, PublicStreamMsg},
     },
     connector::PublishEvent,
@@ -176,7 +184,7 @@ impl PublicStream {
                 }
                 msg = self.symbol_rx.recv() => match msg {
                     Ok(symbol) => {
-                        // Subscribes to the orderbook.1, orderbook.50 and orderbook.500 topics to
+                        // Subscribes to the orderbook.1, orderbook.50 and orderbook.200 topics to
                         // obtain a wider range of depth and the most frequent updates.
                         // The different updates are handled by data fusion.
                         // Please see: `<https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook>`
@@ -184,6 +192,7 @@ impl PublicStream {
                             format!("orderbook.1.{symbol}"),
                             format!("orderbook.50.{symbol}"),
                             format!("orderbook.200.{symbol}"),
+                            format!("orderbook.1000.{symbol}"),
                             format!("publicTrade.{symbol}")
                         ];
                         let op = Op {
