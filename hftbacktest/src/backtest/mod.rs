@@ -927,6 +927,7 @@ where
         time_in_force: TimeInForce,
         order_type: OrdType,
         wait: bool,
+        order_link_id: Option<String>,
     ) -> Result<ElapseResult, Self::Error> {
         let local = self.local.get_mut(asset_no).unwrap();
         local.submit_order(
@@ -958,6 +959,7 @@ where
         time_in_force: TimeInForce,
         order_type: OrdType,
         wait: bool,
+        order_link_id: Option<String>,
     ) -> Result<ElapseResult, Self::Error> {
         let local = self.local.get_mut(asset_no).unwrap();
         local.submit_order(

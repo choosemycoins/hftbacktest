@@ -105,6 +105,7 @@ where
             side,
             order_type,
             time_in_force,
+            None,
         );
         order.req = Status::New;
         order.local_timestamp = current_timestamp;

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::{convert::identity, sync::{Arc, Mutex}};
 
 use hashbrown::HashMap;
 use hftbacktest::{
@@ -99,7 +99,10 @@ impl OrderManager {
         order: Order,
     ) -> Result<BybitOrder, BybitError> {
         let price_prec = get_precision(order.tick_size);
-        let order_link_id = format!("{}{}", self.prefix, generate_rand_string(16));
+        let order_link_id = order.order_link_id
+            .or(Some(generate_rand_string(16)))
+            .map(|id| format!("{}{}", self.prefix, id))
+            .unwrap();
         let bybit_order = BybitOrder {
             symbol: symbol.to_string(),
             side: Some({

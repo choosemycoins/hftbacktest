@@ -679,6 +679,7 @@ where
             req: Status::None,
             status: Status::None,
             time_in_force: TimeInForce::GTC,
+            order_link_id: None,
         });
 
         match self.mkt_feed_orders.entry(order_id) {
