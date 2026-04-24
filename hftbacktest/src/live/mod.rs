@@ -24,6 +24,11 @@ pub struct Instrument<MD> {
     last_feed_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
     state: StateValues,
+    /// Set to `true` after the connector delivers `LiveEvent::SnapshotComplete` for this
+    /// instrument. Starts as `false` at construction, which means a freshly built bot will not
+    /// report the snapshot as ready until the first marker arrives — this is the signal myhft
+    /// uses to safely begin placing orders after startup/restart.
+    snapshot_ready: bool,
 }
 
 impl<MD> Instrument<MD> {
@@ -53,6 +58,7 @@ impl<MD> Instrument<MD> {
             last_feed_latency: None,
             last_order_latency: None,
             state: Default::default(),
+            snapshot_ready: false,
         }
     }
 }

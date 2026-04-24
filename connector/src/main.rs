@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::Utc;
 use clap::Parser;
 use hftbacktest::{
     live::ipc::{
@@ -162,7 +163,7 @@ async fn run_publish_task(
                             )?;
                         }
 
-                        match depth.entry(symbol) {
+                        match depth.entry(symbol.clone()) {
                             Entry::Occupied(mut entry) => {
                                 let depth_: &mut FusedHashMapMarketDepth = entry.get_mut();
                                 let snapshot = depth_.snapshot();
@@ -182,6 +183,17 @@ async fn run_publish_task(
                         }
 
                         bot_tx.send(id, &LiveEvent::BatchEnd)?;
+
+                        // Mark the end of the initial state snapshot for this asset. After this
+                        // the bot is free to submit/cancel orders based on orders/position.
+                        // See `LiveEvent::SnapshotComplete` docs for the exact contract.
+                        bot_tx.send(
+                            id,
+                            &LiveEvent::SnapshotComplete {
+                                symbol,
+                                snapshot_time_ns: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                            },
+                        )?;
                     }
                     PublishEvent::LiveEvent(ev) => {
                         // The live event will only be published if the result is true.

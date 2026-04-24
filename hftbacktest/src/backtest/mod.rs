@@ -885,6 +885,12 @@ where
     }
 
     #[inline]
+    fn snapshot_ready(&self, _asset_no: usize) -> bool {
+        // Backtest starts fully initialized; there is no registration-time snapshot phase.
+        true
+    }
+
+    #[inline]
     fn state_values(&self, asset_no: usize) -> &StateValues {
         self.local.get(asset_no).unwrap().state_values()
     }

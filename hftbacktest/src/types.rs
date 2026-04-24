@@ -142,6 +142,23 @@ pub enum LiveEvent {
         exch_ts: i64,
     },
     Error(LiveError),
+    /// Marks the end of the initial state snapshot for an instrument.
+    ///
+    /// Emitted by the connector after `RegisterInstrument` and after all existing `Order`,
+    /// `Position`, and market-depth snapshot events for the asset have been sent. Receipt of this
+    /// event for `symbol` means that, at `snapshot_time_ns`, the bot's view of orders and position
+    /// for that asset mirrors the connector's cached view of the exchange. Callers may start
+    /// making submit/cancel decisions based on `position(asset_no)` / `orders(asset_no)` after
+    /// this event.
+    ///
+    /// Note: the guarantee is only as strong as the connector's own state-tracking. If the
+    /// connector has not pulled initial state from the exchange (e.g. via REST) since its own
+    /// start, the snapshot reflects whatever the connector has observed on the private stream —
+    /// not a fresh exchange pull.
+    SnapshotComplete {
+        symbol: String,
+        snapshot_time_ns: i64,
+    },
 }
 
 /// Indicates a buy, with specific meaning that can vary depending on the situation. For example,
@@ -792,6 +809,18 @@ where
     ///
     /// * `asset_no` - Asset number from which the position will be retrieved.
     fn position(&self, asset_no: usize) -> f64;
+
+    /// Returns whether the initial state snapshot has been received for this asset.
+    ///
+    /// In live mode, this is `false` until the connector sends a
+    /// [`LiveEvent::SnapshotComplete`] for the asset's symbol following registration. After that,
+    /// [`position`](Self::position) and [`orders`](Self::orders) reflect the connector's cached
+    /// exchange view at some timestamp `T` and may be used to make submit/cancel decisions.
+    ///
+    /// In backtest mode this always returns `true` (snapshot is trivial).
+    ///
+    /// * `asset_no` - Asset number to query.
+    fn snapshot_ready(&self, asset_no: usize) -> bool;
 
     /// Returns the state's values such as balance, fee, and so on.
     fn state_values(&self, asset_no: usize) -> &StateValues;

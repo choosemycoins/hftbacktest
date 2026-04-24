@@ -280,6 +280,9 @@ where
                     handler(error)?;
                 }
             }
+            LiveEvent::SnapshotComplete { .. } => {
+                unsafe { self.instruments.get_unchecked_mut(inst_no) }.snapshot_ready = true;
+            }
             LiveEvent::BatchStart | LiveEvent::BatchEnd => {
                 unreachable!();
             }
@@ -430,6 +433,14 @@ where
     #[inline]
     fn position(&self, asset_no: usize) -> f64 {
         self.state_values(asset_no).position
+    }
+
+    #[inline]
+    fn snapshot_ready(&self, asset_no: usize) -> bool {
+        self.instruments
+            .get(asset_no)
+            .map(|i| i.snapshot_ready)
+            .unwrap_or(false)
     }
 
     #[inline]
@@ -652,5 +663,186 @@ where
 
     fn order_latency(&self, asset_no: usize) -> Option<(i64, i64, i64)> {
         self.instruments.get(asset_no).unwrap().last_order_latency
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, time::Duration};
+
+    use super::*;
+    use crate::{
+        depth::HashMapMarketDepth,
+        live::{Instrument, ipc::Channel},
+        types::{BuildError, LiveEvent, LiveRequest, OrdType, Order, Side, Status, TimeInForce},
+    };
+
+    /// In-memory `Channel` for unit testing. `recv_timeout` drains a pre-seeded queue of events;
+    /// once drained it returns `Timeout`, which lets `elapse_` terminate deterministically. `send`
+    /// just records requests.
+    struct MockChannel {
+        incoming: VecDeque<(usize, LiveEvent)>,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl MockChannel {
+        fn with(events: Vec<(usize, LiveEvent)>) -> Self {
+            Self {
+                incoming: events.into(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Channel for MockChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                incoming: VecDeque::new(),
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            match self.incoming.pop_front() {
+                Some(ev) => Ok(ev),
+                None => Err(BotError::Timeout),
+            }
+        }
+
+        fn send(
+            &mut self,
+            id: u64,
+            inst_no: usize,
+            request: LiveRequest,
+        ) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    fn make_bot(
+        symbols: &[&str],
+        events: Vec<(usize, LiveEvent)>,
+    ) -> LiveBot<MockChannel, HashMapMarketDepth> {
+        let instruments = symbols
+            .iter()
+            .map(|s| {
+                Instrument::new(
+                    "mock",
+                    s,
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                )
+            })
+            .collect();
+        LiveBot {
+            id: 42,
+            channel: MockChannel::with(events),
+            instruments,
+            error_handler: None,
+            order_hook: None,
+        }
+    }
+
+    fn snapshot_complete(symbol: &str) -> LiveEvent {
+        LiveEvent::SnapshotComplete {
+            symbol: symbol.into(),
+            snapshot_time_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    fn order_event(symbol: &str, order_id: u64, price: f64) -> LiveEvent {
+        let mut order = Order::new(
+            order_id,
+            (price / 0.01).round() as i64,
+            0.01,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        order.req = Status::New;
+        LiveEvent::Order {
+            symbol: symbol.into(),
+            order,
+        }
+    }
+
+    #[test]
+    fn snapshot_ready_starts_false() {
+        let bot = make_bot(&["BTCUSDT"], vec![]);
+        assert!(!bot.snapshot_ready(0));
+    }
+
+    #[test]
+    fn snapshot_complete_flips_ready() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![(0, snapshot_complete("BTCUSDT"))]);
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.snapshot_ready(0));
+    }
+
+    #[test]
+    fn snapshot_complete_is_per_asset() {
+        let mut bot = make_bot(
+            &["BTCUSDT", "ETHUSDT"],
+            vec![(0, snapshot_complete("BTCUSDT"))],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.snapshot_ready(0));
+        assert!(!bot.snapshot_ready(1));
+    }
+
+    #[test]
+    fn orders_without_complete_leave_ready_false() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, order_event("BTCUSDT", 1, 100.0)),
+                (0, order_event("BTCUSDT", 2, 101.0)),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(!bot.snapshot_ready(0));
+        assert_eq!(bot.orders(0).len(), 2);
+    }
+
+    #[test]
+    fn orders_then_complete_exposes_all_orders_at_ready_time() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, order_event("BTCUSDT", 1, 100.0)),
+                (0, order_event("BTCUSDT", 2, 101.0)),
+                (0, snapshot_complete("BTCUSDT")),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.snapshot_ready(0));
+        assert_eq!(bot.orders(0).len(), 2);
+    }
+
+    #[test]
+    fn empty_snapshot_still_signals_ready() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![(0, snapshot_complete("BTCUSDT"))]);
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.snapshot_ready(0));
+        assert_eq!(bot.orders(0).len(), 0);
+    }
+
+    #[test]
+    fn timeout_without_complete_keeps_ready_false() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+        bot.elapse(1_000).unwrap();
+        assert!(!bot.snapshot_ready(0));
     }
 }
