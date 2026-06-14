@@ -104,8 +104,14 @@ fn run_receive_task(
                             // instrument.
                             connector.register(symbol);
                         }
-                        LiveRequest::Reconcile { .. } => {
-                            // TODO(R-M1a Worker C): connector.reconcile(symbol, request_id, scope, tx.clone())
+                        LiveRequest::Reconcile {
+                            symbol,
+                            request_id,
+                            scope,
+                        } => {
+                            // On-demand REST reconcile (R-M1a). The connector spawns the work and
+                            // streams framed results back targeted to this bot (`id`).
+                            connector.reconcile(id, symbol, request_id, scope, tx.clone());
                         }
                     }
                 }
@@ -203,6 +209,11 @@ async fn run_publish_task(
                         for ev in handle_ev(ev, &mut depth, &mut position) {
                             bot_tx.send(TO_ALL, &ev)?;
                         }
+                    }
+                    PublishEvent::LiveEventTo { id, event } => {
+                        // Targeted delivery to a single bot (R-M1a reconcile frames, §0 D-a). Bypasses
+                        // `handle_ev`/depth-fusion: reconcile frames are not market data.
+                        bot_tx.send(id, &event)?;
                     }
                     PublishEvent::BatchStart(id) => {
                         bot_tx.send(id, &LiveEvent::BatchStart)?;

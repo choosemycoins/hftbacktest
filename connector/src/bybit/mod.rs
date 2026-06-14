@@ -4,7 +4,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use hftbacktest::types::{ErrorKind, LiveError, LiveEvent, Order, Value};
+use chrono::Utc;
+use hftbacktest::types::{
+    ErrorKind,
+    LiveError,
+    LiveEvent,
+    Order,
+    ReconcileEndpoint,
+    ReconcileFrame,
+    ReconcileScope,
+    Value,
+};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender};
@@ -14,6 +24,7 @@ use crate::{
     bybit::{
         ordermanager::{OrderManager, SharedOrderManager},
         public_stream::PublicStream,
+        reconcile::{frame_from_account, frames_from_orders, frames_from_positions, frames_from_wallet, truncate_ret_msg},
         rest::BybitClient,
         trade_stream::OrderOp,
     },
@@ -26,6 +37,7 @@ mod msg;
 mod ordermanager;
 mod private_stream;
 mod public_stream;
+mod reconcile;
 mod rest;
 mod trade_stream;
 
@@ -63,6 +75,14 @@ pub enum BybitError {
     ConnectionInterrupted,
     #[error("OpError: {0}")]
     OpError(String),
+    /// A Bybit REST envelope returned a non-zero `retCode`. Carries the RAW code/msg so the
+    /// reconcile path can preserve them in `ReconcileFrame::End` (classification is R-M1b's job).
+    #[error("OpError: {code} - {msg}")]
+    OpErrorCode { code: i64, msg: String },
+    /// Open-order pagination hit the hard cap with a non-empty cursor (R-M1a §Q6). Fail-closed:
+    /// the caller must NOT present a truncated order set as a complete reconcile.
+    #[error("order pagination cap exceeded")]
+    PaginationCapExceeded,
     #[error("Config: {0:?}")]
     Config(#[from] toml::de::Error),
 }
@@ -95,6 +115,13 @@ impl BybitError {
             BybitError::ConnectionAbort(_) => Value::String(self.to_string()),
             BybitError::ConnectionInterrupted => Value::String(self.to_string()),
             BybitError::OpError(_) => Value::String(self.to_string()),
+            BybitError::OpErrorCode { code, msg } => Value::Map({
+                let mut map = HashMap::new();
+                map.insert("code".to_string(), Value::Int(*code));
+                map.insert("msg".to_string(), Value::String(msg.clone()));
+                map
+            }),
+            BybitError::PaginationCapExceeded => Value::String(self.to_string()),
             BybitError::Reqwest(_) => Value::String(self.to_string()),
             BybitError::Config(_) => Value::String(self.to_string()),
         }
@@ -350,4 +377,211 @@ impl Connector for Bybit {
             }
         }
     }
+
+    fn reconcile(
+        &self,
+        bot_id: u64,
+        symbol: String,
+        request_id: u64,
+        scope: ReconcileScope,
+        ev_tx: UnboundedSender<PublishEvent>,
+    ) {
+        // Spawn so the synchronous dispatch loop is never blocked (mirrors private_stream spawn).
+        let client = self.client.clone();
+        let category = self.config.category.clone();
+
+        tokio::spawn(async move {
+            // 1. Fetch all requested REST endpoints into memory FIRST (every `.await` happens here,
+            //    BEFORE any frame is emitted), so the frame burst below contains no yield points and
+            //    cannot be interleaved with live Feed/Order events (atomicity invariant, §5e).
+            let want_position =
+                matches!(scope, ReconcileScope::All | ReconcileScope::Position);
+            let want_orders =
+                matches!(scope, ReconcileScope::All | ReconcileScope::OpenOrders);
+            let want_wallet =
+                matches!(scope, ReconcileScope::All | ReconcileScope::Wallet);
+
+            // Each fetch yields either rows (collected as frames) or a fail-closed reason: the raw
+            // (endpoint, BybitError). The FIRST failure aborts the reconcile (fail-closed End).
+            let mut body: Vec<ReconcileFrame> = Vec::new();
+            let mut account_frame: Option<ReconcileFrame> = None;
+            let mut failure: Option<(ReconcileEndpoint, BybitError)> = None;
+
+            if want_position && failure.is_none() {
+                match client.get_positions_for_reconcile(&category).await {
+                    Ok(positions) => match frames_from_positions(&positions) {
+                        Ok(frames) => body.extend(frames),
+                        Err(e) => failure = Some((ReconcileEndpoint::Position, e)),
+                    },
+                    Err(e) => failure = Some((ReconcileEndpoint::Position, e)),
+                }
+            }
+
+            if want_orders && failure.is_none() {
+                match client.get_open_orders(&category).await {
+                    Ok(orders) => body.extend(frames_from_orders(&orders)),
+                    Err(e) => failure = Some((ReconcileEndpoint::OpenOrders, e)),
+                }
+            }
+
+            if want_wallet && failure.is_none() {
+                match client.get_wallet_balance().await {
+                    Ok(resp) => {
+                        if resp.ret_code != 0 {
+                            failure = Some((
+                                ReconcileEndpoint::WalletBalance,
+                                BybitError::OpErrorCode {
+                                    code: resp.ret_code,
+                                    msg: resp.ret_msg,
+                                },
+                            ));
+                        } else {
+                            match resp.result.list {
+                                // Guard `null`/empty list — never `.unwrap()` (regression vs the
+                                // panic that `exit(1)`s the connector on a transient hiccup).
+                                Some(list) if !list.is_empty() => {
+                                    let acct = &list[0];
+                                    match frame_from_account(acct) {
+                                        Ok(f) => {
+                                            account_frame = Some(f);
+                                            match frames_from_wallet(acct) {
+                                                Ok(coins) => body.extend(coins),
+                                                Err(e) => {
+                                                    failure =
+                                                        Some((ReconcileEndpoint::WalletBalance, e))
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            failure = Some((ReconcileEndpoint::WalletBalance, e))
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Empty/null wallet list on a zero-retCode response is unexpected
+                                    // → fail-closed (do not present an empty wallet as authoritative).
+                                    failure = Some((
+                                        ReconcileEndpoint::WalletBalance,
+                                        BybitError::OpError("empty wallet-balance list".to_string()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => failure = Some((ReconcileEndpoint::WalletBalance, e)),
+                }
+            }
+
+            let snapshot_ts_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+            // 2. Emit the frame burst contiguously (no `.await` between sends; the unbounded mpsc
+            //    `send` never yields). Any send failure aborts — but the channel is closed only on
+            //    shutdown, so we log and stop rather than spin.
+            let result: Result<(), ()> = (|| {
+                send_frame(&ev_tx, PublishEvent::BatchStart(bot_id))?;
+                send_reconcile(
+                    &ev_tx,
+                    bot_id,
+                    &symbol,
+                    ReconcileFrame::Begin {
+                        request_id,
+                        snapshot_ts_ns,
+                    },
+                )?;
+
+                if let Some((endpoint, err)) = failure {
+                    // Fail-closed terminator with RAW retCode/retMsg preserved (R-M1b classifies).
+                    let (ret_code, ret_msg) = raw_code_msg(&err);
+                    send_reconcile(
+                        &ev_tx,
+                        bot_id,
+                        &symbol,
+                        ReconcileFrame::End {
+                            request_id,
+                            ok: false,
+                            endpoint,
+                            ret_code,
+                            ret_msg: truncate_ret_msg(&ret_msg),
+                            http_status: 200,
+                        },
+                    )?;
+                    send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                    // Out-of-band fatal signal IN ADDITION to End{ok:false} (§4 failure-surfacing).
+                    send_frame(
+                        &ev_tx,
+                        PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                            ErrorKind::Custom(ret_code.unwrap_or(-1)),
+                            err.to_value(),
+                        ))),
+                    )?;
+                    return Ok(());
+                }
+
+                if let Some(acct) = account_frame {
+                    send_reconcile(&ev_tx, bot_id, &symbol, acct)?;
+                }
+                for frame in body {
+                    send_reconcile(&ev_tx, bot_id, &symbol, frame)?;
+                }
+                send_reconcile(
+                    &ev_tx,
+                    bot_id,
+                    &symbol,
+                    ReconcileFrame::End {
+                        request_id,
+                        ok: true,
+                        endpoint: ReconcileEndpoint::None,
+                        ret_code: None,
+                        ret_msg: String::new(),
+                        http_status: 200,
+                    },
+                )?;
+                send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                Ok(())
+            })();
+
+            if result.is_err() {
+                error!(
+                    request_id,
+                    "Reconcile reply send failed (channel closed); reconcile aborted."
+                );
+            }
+        });
+    }
+}
+
+/// Extracts raw `(ret_code, ret_msg)` from a reconcile [`BybitError`], preserving Bybit's original
+/// code/message verbatim (no classification — that is R-M1b's responsibility).
+fn raw_code_msg(err: &BybitError) -> (Option<i64>, String) {
+    match err {
+        BybitError::OpErrorCode { code, msg } => (Some(*code), msg.clone()),
+        BybitError::PaginationCapExceeded => (None, "order pagination cap exceeded".to_string()),
+        other => (None, other.to_string()),
+    }
+}
+
+#[inline]
+fn send_frame(
+    ev_tx: &UnboundedSender<PublishEvent>,
+    ev: PublishEvent,
+) -> Result<(), ()> {
+    ev_tx.send(ev).map_err(|_| ())
+}
+
+#[inline]
+fn send_reconcile(
+    ev_tx: &UnboundedSender<PublishEvent>,
+    bot_id: u64,
+    symbol: &str,
+    frame: ReconcileFrame,
+) -> Result<(), ()> {
+    ev_tx
+        .send(PublishEvent::LiveEventTo {
+            id: bot_id,
+            event: LiveEvent::Reconcile {
+                symbol: symbol.to_string(),
+                frame,
+            },
+        })
+        .map_err(|_| ())
 }

@@ -581,7 +581,10 @@ pub struct RestResult {
     pub list: Option<serde_json::Value>,
     #[serde(default)]
     pub success: String,
-    #[serde(rename = "next_page_cursor")]
+    // Bybit V5 REST returns `nextPageCursor` (camelCase, verified against docs 2026-06-14). The
+    // original `next_page_cursor` rename never matched the wire — `alias` is additive (both keys
+    // accepted) so existing single-page callers are unaffected while reconcile pagination works.
+    #[serde(rename = "next_page_cursor", alias = "nextPageCursor")]
     #[serde(default)]
     pub next_page_cursor: String,
     #[serde(default)]
@@ -598,4 +601,88 @@ pub struct RestResponse {
     #[serde(rename = "retExtInfo")]
     pub ret_ext_info: serde_json::Value,
     pub time: i64,
+}
+
+// --- Wallet balance (R-M1a reconcile) ---------------------------------------------------------
+//
+// `/v5/account/wallet-balance?accountType=UNIFIED` returns a NESTED `result.list[0].coin[]` shape
+// that the flat `RestResult` (`list: Option<Value>`) cannot deserialize. Schema verified against
+// Bybit V5 docs (design-note §5d, 2026-06-14): per-coin numerics are JSON STRINGS (parsed
+// string→f64 on the connector); `collateralSwitch`/`marginCollateral` are Bybit BOOLEANS.
+//
+// All fields are `#[serde(default)]` so a missing field is fail-soft (empty string → 0.0 later)
+// rather than a hard deserialize failure. The outer envelope (`retCode`/`retMsg`) is still the
+// `RestResponse` shape — only `result` differs, hence a dedicated response struct.
+
+#[derive(Deserialize, Debug)]
+pub struct WalletBalanceResponse {
+    #[serde(rename = "retCode")]
+    pub ret_code: i64,
+    #[serde(rename = "retMsg")]
+    pub ret_msg: String,
+    #[serde(default)]
+    pub result: WalletBalanceResult,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletBalanceResult {
+    /// `null` on error envelopes → guarded `Option` (never `.unwrap()`).
+    #[serde(default)]
+    pub list: Option<Vec<AccountBalance>>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountBalance {
+    // Account-level totals (D-d) — numeric JSON strings; emitted as one `Account` frame.
+    // Acronym fields keep Bybit's verbatim casing via explicit `rename` (camelCase would yield
+    // `totalPerpUpl`/`accountImRate`/`accountMmRate`, which do NOT match the wire — verified
+    // against Bybit V5 docs 2026-06-14).
+    #[serde(default)]
+    pub total_equity: String,
+    #[serde(default)]
+    pub total_wallet_balance: String,
+    #[serde(default)]
+    pub total_margin_balance: String,
+    #[serde(default)]
+    pub total_available_balance: String,
+    #[serde(default, rename = "totalPerpUPL")]
+    pub total_perp_upl: String,
+    #[serde(default)]
+    pub total_initial_margin: String,
+    #[serde(default)]
+    pub total_maintenance_margin: String,
+    #[serde(default, rename = "accountIMRate")]
+    pub account_im_rate: String,
+    #[serde(default, rename = "accountMMRate")]
+    pub account_mm_rate: String,
+    #[serde(default)]
+    pub account_type: String,
+    #[serde(default)]
+    pub coin: Vec<CoinBalance>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoinBalance {
+    #[serde(default)]
+    pub coin: String,
+    // Numeric JSON strings (parsed string→f64 on the connector; "" → 0.0).
+    #[serde(default)]
+    pub wallet_balance: String,
+    #[serde(default)]
+    pub equity: String,
+    #[serde(default)]
+    pub usd_value: String,
+    /// PM-only; `""` on Cross-margin → 0.0.
+    #[serde(default)]
+    pub spot_hedging_qty: String,
+    #[serde(default)]
+    pub borrow_amount: String,
+    // Bybit BOOLEANS (not amounts).
+    #[serde(default)]
+    pub collateral_switch: bool,
+    #[serde(default)]
+    pub margin_collateral: bool,
 }

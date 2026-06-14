@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use hftbacktest::types::{LiveEvent, Order};
+use hftbacktest::types::{LiveEvent, Order, ReconcileScope};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A message will be received by the publisher thread and then published to the bots.
@@ -11,6 +11,15 @@ pub enum PublishEvent {
     BatchStart(u64),
     BatchEnd(u64),
     LiveEvent(LiveEvent),
+    /// Targeted live event delivered only to the bot identified by `id` (R-M1a §0 D-a).
+    ///
+    /// Unlike [`PublishEvent::LiveEvent`] (which broadcasts `TO_ALL`), reconcile frames must be
+    /// routed back to the single requesting bot so per-`id` `BatchStart`/`BatchEnd` brackets stay
+    /// consistent. The publisher arm sends `bot_tx.send(id, &event)`.
+    LiveEventTo {
+        id: u64,
+        event: LiveEvent,
+    },
     RegisterInstrument {
         id: u64,
         symbol: String,
@@ -51,6 +60,30 @@ pub trait Connector {
     /// through the channel using [`PublishEvent`]. The returned error should not be related to the
     /// exchange; instead, it should indicate a connector internal error.
     fn cancel(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>);
+
+    /// Pulls a fresh REST snapshot of account state (R-M1a) and streams it back to the requesting
+    /// bot as a `BatchStart`-bracketed group of [`LiveEvent::Reconcile`] frames, delivered targeted
+    /// to that bot via [`PublishEvent::LiveEventTo`].
+    ///
+    /// * `bot_id` — the routing id of the requesting bot (from the dispatch loop), used for the
+    ///   `BatchStart`/`BatchEnd` brackets and `LiveEventTo` so the reply reaches only that bot.
+    /// * `request_id` — the bot-chosen reconcile id, echoed in `Begin`/`End` for completeness
+    ///   matching (distinct from `bot_id`).
+    ///
+    /// This method must NOT block the synchronous dispatch loop; connectors should spawn the work.
+    /// Results — including fail-closed `End { ok: false, .. }` terminators on any error — are
+    /// returned through the channel. The default implementation is a no-op for connectors that do
+    /// not yet support reconcile.
+    fn reconcile(
+        &self,
+        _bot_id: u64,
+        _symbol: String,
+        _request_id: u64,
+        _scope: ReconcileScope,
+        _tx: UnboundedSender<PublishEvent>,
+    ) {
+        // Default: no-op. Non-Bybit connectors do not implement reconcile yet.
+    }
 }
 
 /// Provides `orders` method to get the current working orders.
