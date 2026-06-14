@@ -5,7 +5,15 @@ pub use recorder::LoggingRecorder;
 
 use crate::{
     prelude::StateValues,
-    types::{Event, Order, OrderId, ReconcileOutcome},
+    types::{
+        AccountTotals,
+        Event,
+        Order,
+        OrderId,
+        ReconcileEndpoint,
+        ReconcileOutcome,
+        ReconcileWalletCoin,
+    },
 };
 
 mod bot;
@@ -33,6 +41,87 @@ pub struct Instrument<MD> {
     /// reconcile stream arrives — fail-closed default, so an interrupted reconcile is never
     /// treated as authoritative. Held separately from `orders`/`state` (the WS-cached view).
     last_reconcile: Option<ReconcileOutcome>,
+    /// In-flight reconcile rows accumulated between `Begin` and `End` (R-M1a, §4). `Some` only
+    /// while a reconcile stream is open; finalized into `last_reconcile` on a matching `End` and
+    /// dropped otherwise (fail-closed). Never starts populated.
+    reconcile_accum: Option<ReconcileAccum>,
+}
+
+/// Per-instrument accumulator for the rows of an in-flight reconcile stream (R-M1a, §4). A fresh
+/// instance is created on `ReconcileFrame::Begin`; rows are pushed as `Account`/`Position`/
+/// `OpenOrder`/`WalletCoin` frames arrive; `finish` consumes it on `End` into a [`ReconcileOutcome`].
+/// Kept bot-side only (not IPC-encoded).
+pub(crate) struct ReconcileAccum {
+    request_id: u64,
+    snapshot_ts_ns: i64,
+    account: Option<AccountTotals>,
+    positions: Vec<f64>,
+    open_orders: Vec<Order>,
+    wallet_coins: Vec<ReconcileWalletCoin>,
+}
+
+impl ReconcileAccum {
+    /// Opens a fresh accumulator for the given reconcile request (from a `Begin` frame).
+    pub(crate) fn new(request_id: u64, snapshot_ts_ns: i64) -> Self {
+        Self {
+            request_id,
+            snapshot_ts_ns,
+            account: None,
+            positions: Vec::new(),
+            open_orders: Vec::new(),
+            wallet_coins: Vec::new(),
+        }
+    }
+
+    /// `request_id` from the opening `Begin`, matched against the terminating `End`.
+    pub(crate) fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Records the single account-level totals frame (`Account`).
+    pub(crate) fn set_account(&mut self, account: AccountTotals) {
+        self.account = Some(account);
+    }
+
+    /// Pushes a signed position quantity (`Position`).
+    pub(crate) fn push_position(&mut self, qty: f64) {
+        self.positions.push(qty);
+    }
+
+    /// Pushes one open order (`OpenOrder`).
+    pub(crate) fn push_open_order(&mut self, order: Order) {
+        self.open_orders.push(order);
+    }
+
+    /// Pushes one per-coin wallet balance (`WalletCoin`).
+    pub(crate) fn push_wallet_coin(&mut self, coin: ReconcileWalletCoin) {
+        self.wallet_coins.push(coin);
+    }
+
+    /// Consumes the accumulated rows plus the terminating `End` fields into a [`ReconcileOutcome`].
+    /// Caller has already verified `request_id` matches `Begin` (fail-closed completeness, §4).
+    pub(crate) fn finish(
+        self,
+        ok: bool,
+        ret_code: Option<i64>,
+        ret_msg: String,
+        endpoint: ReconcileEndpoint,
+        http_status: u16,
+    ) -> ReconcileOutcome {
+        ReconcileOutcome {
+            request_id: self.request_id,
+            snapshot_ts_ns: self.snapshot_ts_ns,
+            account: self.account,
+            positions: self.positions,
+            open_orders: self.open_orders,
+            wallet_coins: self.wallet_coins,
+            ok,
+            ret_code,
+            ret_msg,
+            endpoint,
+            http_status,
+        }
+    }
 }
 
 impl<MD> Instrument<MD> {
@@ -64,6 +153,7 @@ impl<MD> Instrument<MD> {
             state: Default::default(),
             snapshot_ready: false,
             last_reconcile: None,
+            reconcile_accum: None,
         }
     }
 }

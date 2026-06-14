@@ -10,8 +10,9 @@ use tracing::{debug, error, info};
 
 use crate::{
     depth::{L2MarketDepth, MarketDepth},
-    live::{Instrument, ipc::Channel},
+    live::{Instrument, ReconcileAccum, ipc::Channel},
     types::{
+        AccountTotals,
         Bot,
         BuildError,
         ElapseResult,
@@ -27,7 +28,10 @@ use crate::{
         Order,
         OrderId,
         OrderRequest,
+        ReconcileFrame,
         ReconcileOutcome,
+        ReconcileScope,
+        ReconcileWalletCoin,
         Side,
         StateValues,
         Status,
@@ -285,9 +289,96 @@ where
                 unsafe { self.instruments.get_unchecked_mut(inst_no) }.snapshot_ready = true;
             }
             LiveEvent::Reconcile { frame, .. } => {
-                // TODO(R-M1a Worker L): accumulate frames into reconcile_accum
-                let _ = frame;
-                // Falls through to Ok(ElapseResult::Ok) (polling consumer API, §4).
+                // Accumulate reconcile rows between Begin and End into `reconcile_accum`, then
+                // finalize into the separate `last_reconcile` on a matching `End` (§4). The fresh
+                // REST truth is kept apart from `orders`/`state` (the WS-cached view) so R-M1b can
+                // compare the two. Falls through to Ok(ElapseResult::Ok) (polling consumer API).
+                let inst = unsafe { self.instruments.get_unchecked_mut(inst_no) };
+                match frame {
+                    ReconcileFrame::Begin {
+                        request_id,
+                        snapshot_ts_ns,
+                    } => {
+                        inst.reconcile_accum =
+                            Some(ReconcileAccum::new(request_id, snapshot_ts_ns));
+                    }
+                    ReconcileFrame::Account {
+                        total_equity,
+                        total_wallet_balance,
+                        total_margin_balance,
+                        total_available_balance,
+                        total_perp_upl,
+                        total_initial_margin,
+                        total_maintenance_margin,
+                        account_im_rate,
+                        account_mm_rate,
+                    } => {
+                        if let Some(accum) = inst.reconcile_accum.as_mut() {
+                            accum.set_account(AccountTotals {
+                                total_equity,
+                                total_wallet_balance,
+                                total_margin_balance,
+                                total_available_balance,
+                                total_perp_upl,
+                                total_initial_margin,
+                                total_maintenance_margin,
+                                account_im_rate,
+                                account_mm_rate,
+                            });
+                        }
+                    }
+                    ReconcileFrame::Position { qty } => {
+                        if let Some(accum) = inst.reconcile_accum.as_mut() {
+                            accum.push_position(qty);
+                        }
+                    }
+                    ReconcileFrame::OpenOrder { order } => {
+                        if let Some(accum) = inst.reconcile_accum.as_mut() {
+                            accum.push_open_order(order);
+                        }
+                    }
+                    ReconcileFrame::WalletCoin {
+                        coin,
+                        wallet_balance,
+                        equity,
+                        usd_value,
+                        spot_hedging_qty,
+                        borrow_amount,
+                        collateral_switch,
+                        margin_collateral,
+                    } => {
+                        if let Some(accum) = inst.reconcile_accum.as_mut() {
+                            accum.push_wallet_coin(ReconcileWalletCoin {
+                                coin,
+                                wallet_balance,
+                                equity,
+                                usd_value,
+                                spot_hedging_qty,
+                                borrow_amount,
+                                collateral_switch,
+                                margin_collateral,
+                            });
+                        }
+                    }
+                    ReconcileFrame::End {
+                        request_id,
+                        ok,
+                        endpoint,
+                        ret_code,
+                        ret_msg,
+                        http_status,
+                    } => {
+                        // `take()` always drops the in-flight accum. Only a matching `request_id`
+                        // finalizes it into `last_reconcile`; a mismatched id (or a `Begin` with
+                        // no matching `End`) leaves `last_reconcile` unchanged (fail-closed).
+                        if let Some(accum) = inst.reconcile_accum.take()
+                            && accum.request_id() == request_id
+                        {
+                            inst.last_reconcile =
+                                Some(accum.finish(ok, ret_code, ret_msg, endpoint, http_status));
+                        }
+                    }
+                }
             }
             LiveEvent::BatchStart | LiveEvent::BatchEnd => {
                 unreachable!();
@@ -416,6 +507,33 @@ where
             return self.wait_order_response(asset_no, order_id, 60_000_000_000);
         }
         Ok(ElapseResult::Ok)
+    }
+
+    /// Requests an on-demand REST reconcile of account state for `asset_no` (R-M1a, §4). Mirrors
+    /// `submit_order`/`cancel`: resolves the instrument's `symbol` and sends a
+    /// [`LiveRequest::Reconcile`] over the channel. The connector replies asynchronously with a
+    /// `BatchStart`-bracketed group of [`LiveEvent::Reconcile`] frames keyed by `request_id`; the
+    /// result is polled via [`Bot::last_reconcile`]. Non-blocking — does not wait for the reply.
+    pub fn request_reconcile(
+        &mut self,
+        asset_no: usize,
+        request_id: u64,
+        scope: ReconcileScope,
+    ) -> Result<(), BotError> {
+        let instrument = self
+            .instruments
+            .get(asset_no)
+            .ok_or(BotError::InstrumentNotFound)?;
+        let symbol = instrument.symbol.clone();
+        self.channel.send(
+            self.id,
+            asset_no,
+            LiveRequest::Reconcile {
+                symbol,
+                request_id,
+                scope,
+            },
+        )
     }
 }
 
@@ -687,7 +805,19 @@ mod tests {
     use crate::{
         depth::HashMapMarketDepth,
         live::{Instrument, ipc::Channel},
-        types::{BuildError, LiveEvent, LiveRequest, OrdType, Order, Side, Status, TimeInForce},
+        types::{
+            BuildError,
+            LiveEvent,
+            LiveRequest,
+            OrdType,
+            Order,
+            ReconcileEndpoint,
+            ReconcileFrame,
+            ReconcileScope,
+            Side,
+            Status,
+            TimeInForce,
+        },
     };
 
     /// In-memory `Channel` for unit testing. `recv_timeout` drains a pre-seeded queue of events;
@@ -857,5 +987,285 @@ mod tests {
         let mut bot = make_bot(&["BTCUSDT"], vec![]);
         bot.elapse(1_000).unwrap();
         assert!(!bot.snapshot_ready(0));
+    }
+
+    // ----- Reconcile RPC (R-M1a Worker L) frame-accumulation tests (§6 #1-9) -----
+
+    /// Wraps a `ReconcileFrame` into the routable outer `LiveEvent::Reconcile`.
+    fn reconcile(symbol: &str, frame: ReconcileFrame) -> LiveEvent {
+        LiveEvent::Reconcile {
+            symbol: symbol.into(),
+            frame,
+        }
+    }
+
+    fn reconcile_begin(request_id: u64) -> ReconcileFrame {
+        ReconcileFrame::Begin {
+            request_id,
+            snapshot_ts_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    fn reconcile_account() -> ReconcileFrame {
+        ReconcileFrame::Account {
+            total_equity: 1000.0,
+            total_wallet_balance: 900.0,
+            total_margin_balance: 950.0,
+            total_available_balance: 800.0,
+            total_perp_upl: 50.0,
+            total_initial_margin: 100.0,
+            total_maintenance_margin: 40.0,
+            account_im_rate: 0.1,
+            account_mm_rate: 0.04,
+        }
+    }
+
+    fn reconcile_wallet_coin(coin: &str) -> ReconcileFrame {
+        ReconcileFrame::WalletCoin {
+            coin: coin.into(),
+            wallet_balance: 900.0,
+            equity: 950.0,
+            usd_value: 950.0,
+            spot_hedging_qty: 0.0,
+            borrow_amount: 0.0,
+            collateral_switch: true,
+            margin_collateral: true,
+        }
+    }
+
+    fn reconcile_open_order(order_id: u64, price: f64) -> ReconcileFrame {
+        let mut order = Order::new(
+            order_id,
+            (price / 0.01).round() as i64,
+            0.01,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        ReconcileFrame::OpenOrder { order }
+    }
+
+    fn reconcile_end_ok(request_id: u64) -> ReconcileFrame {
+        ReconcileFrame::End {
+            request_id,
+            ok: true,
+            endpoint: ReconcileEndpoint::None,
+            ret_code: None,
+            ret_msg: String::new(),
+            http_status: 200,
+        }
+    }
+
+    /// #1 — fail-closed default (mirror of `snapshot_ready_starts_false`).
+    #[test]
+    fn last_reconcile_starts_none() {
+        let bot = make_bot(&["BTCUSDT"], vec![]);
+        assert!(bot.last_reconcile(0).is_none());
+    }
+
+    /// #2 — `request_reconcile` records a `LiveRequest::Reconcile{symbol,request_id,scope}`.
+    #[test]
+    fn request_reconcile_sends_liverequest() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+        bot.request_reconcile(0, 42, ReconcileScope::All).unwrap();
+        assert_eq!(bot.channel.sent.len(), 1);
+        let (id, inst_no, request) = &bot.channel.sent[0];
+        assert_eq!(*id, 42);
+        assert_eq!(*inst_no, 0);
+        match request {
+            LiveRequest::Reconcile {
+                symbol,
+                request_id,
+                scope,
+            } => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert_eq!(*request_id, 42);
+                assert!(matches!(scope, ReconcileScope::All));
+            }
+            other => panic!("expected LiveRequest::Reconcile, got {other:?}"),
+        }
+    }
+
+    /// #3 — full round-trip populates the outcome with all rows AND account totals (D-d).
+    #[test]
+    fn reconcile_roundtrip_populates_outcome() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, reconcile("BTCUSDT", reconcile_begin(7))),
+                (0, reconcile("BTCUSDT", reconcile_account())),
+                (0, reconcile("BTCUSDT", ReconcileFrame::Position { qty: 1.5 })),
+                (0, reconcile("BTCUSDT", reconcile_open_order(11, 100.0))),
+                (0, reconcile("BTCUSDT", reconcile_wallet_coin("USDT"))),
+                (0, reconcile("BTCUSDT", reconcile_end_ok(7))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        let outcome = bot.last_reconcile(0).expect("reconcile outcome present");
+        assert_eq!(outcome.request_id, 7);
+        assert!(outcome.ok);
+        assert_eq!(outcome.positions, vec![1.5]);
+        assert_eq!(outcome.open_orders.len(), 1);
+        assert_eq!(outcome.open_orders[0].order_id, 11);
+        assert_eq!(outcome.wallet_coins.len(), 1);
+        assert_eq!(outcome.wallet_coins[0].coin, "USDT");
+        let account = outcome.account.as_ref().expect("account totals present");
+        assert_eq!(account.total_equity, 1000.0);
+        assert_eq!(account.total_margin_balance, 950.0);
+        assert_eq!(account.account_mm_rate, 0.04);
+    }
+
+    /// #4 — reconcile must NOT overwrite the WS-cached `orders`/`position` view.
+    #[test]
+    fn reconcile_does_not_overwrite_cached_orders() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                // Establish a cached order + position via the normal live paths first.
+                (0, order_event("BTCUSDT", 1, 100.0)),
+                (
+                    0,
+                    LiveEvent::Position {
+                        symbol: "BTCUSDT".into(),
+                        qty: 3.0,
+                        exch_ts: 0,
+                    },
+                ),
+                // Then run a reconcile carrying DIFFERENT REST truth.
+                (0, LiveEvent::BatchStart),
+                (0, reconcile("BTCUSDT", reconcile_begin(1))),
+                (
+                    0,
+                    reconcile("BTCUSDT", ReconcileFrame::Position { qty: 99.0 }),
+                ),
+                (0, reconcile("BTCUSDT", reconcile_open_order(555, 200.0))),
+                (0, reconcile("BTCUSDT", reconcile_end_ok(1))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        // Cached view untouched: still the single WS-cached order id 1 and position 3.0.
+        assert_eq!(bot.orders(0).len(), 1);
+        assert!(bot.orders(0).contains_key(&1));
+        assert!(!bot.orders(0).contains_key(&555));
+        assert_eq!(bot.position(0), 3.0);
+        // Reconcile truth stored separately.
+        let outcome = bot.last_reconcile(0).expect("reconcile outcome present");
+        assert_eq!(outcome.positions, vec![99.0]);
+        assert_eq!(outcome.open_orders[0].order_id, 555);
+    }
+
+    /// #5 — a `Begin` with no matching `End` (interrupted) leaves `last_reconcile` None (fail-closed).
+    #[test]
+    fn reconcile_begin_without_end_stays_none() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, reconcile("BTCUSDT", reconcile_begin(5))),
+                (0, reconcile("BTCUSDT", ReconcileFrame::Position { qty: 2.0 })),
+                // no End, no BatchEnd
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_reconcile(0).is_none());
+    }
+
+    /// #6 — `End{request_id:99}` for `Begin{request_id:42}` is dropped (fail-closed completeness).
+    #[test]
+    fn reconcile_mismatched_request_id_ignored() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, reconcile("BTCUSDT", reconcile_begin(42))),
+                (0, reconcile("BTCUSDT", ReconcileFrame::Position { qty: 1.0 })),
+                (0, reconcile("BTCUSDT", reconcile_end_ok(99))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_reconcile(0).is_none());
+    }
+
+    /// #7 — per-inst_no isolation: reconcile asset 1 leaves asset 0 None.
+    #[test]
+    fn reconcile_per_asset_isolation() {
+        let mut bot = make_bot(
+            &["BTCUSDT", "ETHUSDT"],
+            vec![
+                (1, LiveEvent::BatchStart),
+                (1, reconcile("ETHUSDT", reconcile_begin(3))),
+                (1, reconcile("ETHUSDT", ReconcileFrame::Position { qty: 7.0 })),
+                (1, reconcile("ETHUSDT", reconcile_end_ok(3))),
+                (1, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_reconcile(0).is_none());
+        let outcome = bot.last_reconcile(1).expect("asset 1 reconcile present");
+        assert_eq!(outcome.request_id, 3);
+        assert_eq!(outcome.positions, vec![7.0]);
+    }
+
+    /// #8 — a genuinely empty reconcile (`Begin → End{ok:true}`, 0 rows) still completes as Some.
+    #[test]
+    fn reconcile_empty_still_completes() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, reconcile("BTCUSDT", reconcile_begin(8))),
+                (0, reconcile("BTCUSDT", reconcile_end_ok(8))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_reconcile(0).expect("empty reconcile still present");
+        assert!(outcome.ok);
+        assert!(outcome.positions.is_empty());
+        assert!(outcome.open_orders.is_empty());
+        assert!(outcome.wallet_coins.is_empty());
+        assert!(outcome.account.is_none());
+    }
+
+    /// #9 — `End{ok:false}` preserves the raw retCode/retMsg (not collapsed to a bool).
+    #[test]
+    fn reconcile_end_not_ok_preserves_retcode() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, reconcile("BTCUSDT", reconcile_begin(9))),
+                (
+                    0,
+                    reconcile(
+                        "BTCUSDT",
+                        ReconcileFrame::End {
+                            request_id: 9,
+                            ok: false,
+                            endpoint: ReconcileEndpoint::WalletBalance,
+                            ret_code: Some(10006),
+                            ret_msg: "Too many visits".into(),
+                            http_status: 403,
+                        },
+                    ),
+                ),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_reconcile(0).expect("failed reconcile still recorded");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.ret_code, Some(10006));
+        assert_eq!(outcome.ret_msg, "Too many visits");
+        assert_eq!(outcome.http_status, 403);
+        assert!(matches!(outcome.endpoint, ReconcileEndpoint::WalletBalance));
     }
 }
