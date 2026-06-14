@@ -104,6 +104,9 @@ fn run_receive_task(
                             // instrument.
                             connector.register(symbol);
                         }
+                        LiveRequest::Reconcile { .. } => {
+                            // TODO(R-M1a Worker C): connector.reconcile(symbol, request_id, scope, tx.clone())
+                        }
                     }
                 }
             }

@@ -5,7 +5,7 @@ pub use recorder::LoggingRecorder;
 
 use crate::{
     prelude::StateValues,
-    types::{Event, Order, OrderId},
+    types::{Event, Order, OrderId, ReconcileOutcome},
 };
 
 mod bot;
@@ -29,6 +29,10 @@ pub struct Instrument<MD> {
     /// report the snapshot as ready until the first marker arrives — this is the signal myhft
     /// uses to safely begin placing orders after startup/restart.
     snapshot_ready: bool,
+    /// Most recent completed reconcile outcome (R-M1a). `None` until a matching `Begin`/`End`
+    /// reconcile stream arrives — fail-closed default, so an interrupted reconcile is never
+    /// treated as authoritative. Held separately from `orders`/`state` (the WS-cached view).
+    last_reconcile: Option<ReconcileOutcome>,
 }
 
 impl<MD> Instrument<MD> {
@@ -59,6 +63,7 @@ impl<MD> Instrument<MD> {
             last_order_latency: None,
             state: Default::default(),
             snapshot_ready: false,
+            last_reconcile: None,
         }
     }
 }

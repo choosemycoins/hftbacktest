@@ -30,6 +30,7 @@ use crate::{
         Order,
         OrderId,
         OrderRequest,
+        ReconcileOutcome,
         Side,
         StateValues,
         TimeInForce,
@@ -888,6 +889,12 @@ where
     fn snapshot_ready(&self, _asset_no: usize) -> bool {
         // Backtest starts fully initialized; there is no registration-time snapshot phase.
         true
+    }
+
+    #[inline]
+    fn last_reconcile(&self, _asset_no: usize) -> Option<&ReconcileOutcome> {
+        // Backtest has no live reconcile phase; fail-closed.
+        None
     }
 
     #[inline]

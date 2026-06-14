@@ -27,6 +27,7 @@ use crate::{
         Order,
         OrderId,
         OrderRequest,
+        ReconcileOutcome,
         Side,
         StateValues,
         Status,
@@ -283,6 +284,11 @@ where
             LiveEvent::SnapshotComplete { .. } => {
                 unsafe { self.instruments.get_unchecked_mut(inst_no) }.snapshot_ready = true;
             }
+            LiveEvent::Reconcile { frame, .. } => {
+                // TODO(R-M1a Worker L): accumulate frames into reconcile_accum
+                let _ = frame;
+                // Falls through to Ok(ElapseResult::Ok) (polling consumer API, §4).
+            }
             LiveEvent::BatchStart | LiveEvent::BatchEnd => {
                 unreachable!();
             }
@@ -441,6 +447,13 @@ where
             .get(asset_no)
             .map(|i| i.snapshot_ready)
             .unwrap_or(false)
+    }
+
+    #[inline]
+    fn last_reconcile(&self, asset_no: usize) -> Option<&ReconcileOutcome> {
+        self.instruments
+            .get(asset_no)
+            .and_then(|i| i.last_reconcile.as_ref())
     }
 
     #[inline]

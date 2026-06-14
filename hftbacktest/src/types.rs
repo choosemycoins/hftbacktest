@@ -159,6 +159,117 @@ pub enum LiveEvent {
         symbol: String,
         snapshot_time_ns: i64,
     },
+    /// On-demand reconcile reply frame (R-M1a). Tail-appended after `SnapshotComplete`.
+    ///
+    /// Streamed as `Begin → Account? → Position* → OpenOrder* → WalletCoin* → End`, bracketed by
+    /// `BatchStart`/`BatchEnd` on the connector. Carries `symbol` so the outer `LiveEvent` routes
+    /// through `symbol_to_inst_no` exactly like `Feed`/`Order`/`Position`/`SnapshotComplete`; all
+    /// sub-frames travel under one routing arm.
+    Reconcile {
+        symbol: String,
+        frame: ReconcileFrame,
+    },
+}
+
+/// A single frame of a reconcile reply stream (R-M1a, §2). Derives mirror [`LiveEvent`] so it is
+/// bincode-encodable as IPC payload. Variant order is wire-significant — append only.
+#[derive(Clone, Debug, Decode, Encode)]
+pub enum ReconcileFrame {
+    /// Opens a reconcile stream; matched against `End` by `request_id` (fail-closed completeness).
+    Begin { request_id: u64, snapshot_ts_ns: i64 },
+    /// Account-level totals (D-d); one frame per reconcile, emitted right after `Begin`.
+    /// `total_margin_balance` = wallet + UPL.
+    Account {
+        total_equity: f64,
+        total_wallet_balance: f64,
+        total_margin_balance: f64,
+        total_available_balance: f64,
+        total_perp_upl: f64,
+        total_initial_margin: f64,
+        total_maintenance_margin: f64,
+        account_im_rate: f64,
+        account_mm_rate: f64,
+    },
+    /// Signed position quantity; symbol lives on the outer `Reconcile`.
+    Position { qty: f64 },
+    /// A single open order; reuses `Order`'s hand-written `Encode`/`Decode`.
+    OpenOrder { order: Order },
+    /// Per-coin wallet balance. Bybit returns numerics as JSON strings (connector parses
+    /// string→f64); `collateral_switch`/`margin_collateral` are Bybit booleans.
+    WalletCoin {
+        coin: String,
+        wallet_balance: f64,
+        equity: f64,
+        usd_value: f64,
+        spot_hedging_qty: f64,
+        borrow_amount: f64,
+        collateral_switch: bool,
+        margin_collateral: bool,
+    },
+    /// Terminates a reconcile stream. `ok=false` (with raw `ret_code`/`ret_msg`) signals a
+    /// fail-closed incomplete reconcile that the bot must NOT treat as authoritative.
+    End {
+        request_id: u64,
+        ok: bool,
+        endpoint: ReconcileEndpoint,
+        ret_code: Option<i64>,
+        ret_msg: String,
+        http_status: u16,
+    },
+}
+
+/// Which REST endpoint a [`ReconcileFrame::End`] pertains to (§0 D-b). IPC-encoded → append only.
+#[derive(Clone, Copy, Debug, Decode, Encode)]
+pub enum ReconcileEndpoint {
+    Position,
+    OpenOrders,
+    WalletBalance,
+    None,
+}
+
+/// Account-level totals from a reconcile (consumer-side; not IPC-encoded).
+#[derive(Clone, Debug, Default)]
+pub struct AccountTotals {
+    pub total_equity: f64,
+    pub total_wallet_balance: f64,
+    pub total_margin_balance: f64,
+    pub total_available_balance: f64,
+    pub total_perp_upl: f64,
+    pub total_initial_margin: f64,
+    pub total_maintenance_margin: f64,
+    pub account_im_rate: f64,
+    pub account_mm_rate: f64,
+}
+
+/// Per-coin wallet balance from a reconcile (consumer-side; not IPC-encoded).
+#[derive(Clone, Debug)]
+pub struct ReconcileWalletCoin {
+    pub coin: String,
+    pub wallet_balance: f64,
+    pub equity: f64,
+    pub usd_value: f64,
+    pub spot_hedging_qty: f64,
+    pub borrow_amount: f64,
+    pub collateral_switch: bool,
+    pub margin_collateral: bool,
+}
+
+/// The completed result of a reconcile, accumulated bot-side from frames between `Begin` and `End`
+/// (consumer-side; not IPC-encoded). Stored separately from `instrument.orders`/`state.position`
+/// (the WS-cached view) so R-M1b can compare fresh REST truth against the cached view.
+#[derive(Clone, Debug)]
+pub struct ReconcileOutcome {
+    pub request_id: u64,
+    pub snapshot_ts_ns: i64,
+    pub account: Option<AccountTotals>,
+    pub positions: Vec<f64>,
+    pub open_orders: Vec<Order>,
+    pub wallet_coins: Vec<ReconcileWalletCoin>,
+    pub ok: bool,
+    pub ret_code: Option<i64>,
+    pub ret_msg: String,
+    pub endpoint: ReconcileEndpoint,
+    pub http_status: u16,
 }
 
 /// Indicates a buy, with specific meaning that can vary depending on the situation. For example,
@@ -741,6 +852,25 @@ pub enum LiveRequest {
         tick_size: f64,
         lot_size: f64,
     },
+    /// On-demand request for a fresh REST reconcile snapshot of account state (R-M1a).
+    ///
+    /// Tail-appended after `RegisterInstrument` — bincode encodes by discriminant index, so new
+    /// variants MUST be appended, never inserted mid-enum. The connector replies by streaming a
+    /// `BatchStart`-bracketed group of [`LiveEvent::Reconcile`] frames keyed by `request_id`.
+    Reconcile {
+        symbol: String,
+        request_id: u64,
+        scope: ReconcileScope,
+    },
+}
+
+/// Scope of a [`LiveRequest::Reconcile`] — which account-state endpoints to pull (R-M1a, §0 D-b).
+#[derive(Clone, Copy, Debug, Encode, Decode)]
+pub enum ReconcileScope {
+    All,
+    Position,
+    OpenOrders,
+    Wallet,
 }
 
 /// Provides state values.
@@ -821,6 +951,19 @@ where
     ///
     /// * `asset_no` - Asset number to query.
     fn snapshot_ready(&self, asset_no: usize) -> bool;
+
+    /// Returns the most recent completed reconcile outcome for this asset, if any (R-M1a).
+    ///
+    /// In live mode this is `None` until the connector delivers a complete reconcile stream
+    /// (matching `Begin`/`End`) for the asset — a fail-closed default: a `Begin` without a matching
+    /// `End` leaves this `None`, so an interrupted reconcile is never treated as authoritative.
+    /// The returned outcome is freshly REST-pulled truth, stored separately from
+    /// [`position`](Self::position)/[`orders`](Self::orders) (the connector's cached view).
+    ///
+    /// In backtest mode this always returns `None` (no live reconcile phase).
+    ///
+    /// * `asset_no` - Asset number to query.
+    fn last_reconcile(&self, asset_no: usize) -> Option<&ReconcileOutcome>;
 
     /// Returns the state's values such as balance, fee, and so on.
     fn state_values(&self, asset_no: usize) -> &StateValues;
