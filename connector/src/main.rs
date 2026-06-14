@@ -101,8 +101,9 @@ fn run_receive_task(
                             })
                             .unwrap();
                             // Requests to the Connector subscribe to the necessary feeds for the
-                            // instrument.
-                            connector.register(symbol);
+                            // instrument. tick_size/lot_size are threaded through so read-only
+                            // paths (reconcile) can encode prices the same way the bot caches them.
+                            connector.register(symbol, tick_size, lot_size);
                         }
                         LiveRequest::Reconcile {
                             symbol,

@@ -141,12 +141,17 @@ pub struct Config {
 }
 
 type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
+/// Per-symbol `tick_size`, captured at `register` from the bot's `RegisterInstrument`. Read by the
+/// reconcile path so the REST snapshot encodes `price_tick = round(price / tick_size)` exactly the
+/// way the bot caches it (R-M1a interop fix). Shared so the spawned reconcile task can look it up.
+type SharedTickSizes = Arc<Mutex<HashMap<String, f64>>>;
 
 pub struct Bybit {
     config: Config,
     order_tx: Sender<OrderOp>,
     order_manager: SharedOrderManager,
     symbols: SharedSymbolSet,
+    instrument_tick_size: SharedTickSizes,
     client: BybitClient,
     symbol_tx: Sender<String>,
 }
@@ -303,13 +308,20 @@ impl ConnectorBuilder for Bybit {
             order_manager,
             client,
             symbols: Default::default(),
+            instrument_tick_size: Default::default(),
             symbol_tx,
         })
     }
 }
 
 impl Connector for Bybit {
-    fn register(&mut self, symbol: String) {
+    fn register(&mut self, symbol: String, tick_size: f64, _lot_size: f64) {
+        // Capture the per-symbol tick_size so the reconcile path encodes prices faithfully
+        // (price_tick = round(price / tick_size)) matching the bot's cached encoding.
+        self.instrument_tick_size
+            .lock()
+            .unwrap()
+            .insert(symbol.clone(), tick_size);
         let mut symbols = self.symbols.lock().unwrap();
         if !symbols.contains(&symbol) {
             symbols.insert(symbol.clone());
@@ -389,8 +401,55 @@ impl Connector for Bybit {
         // Spawn so the synchronous dispatch loop is never blocked (mirrors private_stream spawn).
         let client = self.client.clone();
         let category = self.config.category.clone();
+        // Look up the per-symbol tick_size captured at register. Fail-closed if absent: encoding a
+        // truncated/wrong price would make R-M1b flag drift on every order (R-M1a interop fix). The
+        // bot always registers before requesting a reconcile, so a miss is a contract violation.
+        let tick_size = self
+            .instrument_tick_size
+            .lock()
+            .unwrap()
+            .get(&symbol)
+            .copied();
 
         tokio::spawn(async move {
+            let Some(tick_size) = tick_size else {
+                // No registered tick_size → cannot encode prices faithfully. Emit a fail-closed
+                // End so R-M1b sees an explicit failure rather than silently-wrong order frames.
+                let result: Result<(), ()> = (|| {
+                    send_frame(&ev_tx, PublishEvent::BatchStart(bot_id))?;
+                    send_reconcile(
+                        &ev_tx,
+                        bot_id,
+                        &symbol,
+                        ReconcileFrame::Begin {
+                            request_id,
+                            snapshot_ts_ns: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        },
+                    )?;
+                    send_reconcile(
+                        &ev_tx,
+                        bot_id,
+                        &symbol,
+                        ReconcileFrame::End {
+                            request_id,
+                            ok: false,
+                            endpoint: ReconcileEndpoint::OpenOrders,
+                            ret_code: None,
+                            ret_msg: "no tick_size for symbol (not registered)".to_string(),
+                            http_status: 200,
+                        },
+                    )?;
+                    send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    error!(
+                        request_id,
+                        "Reconcile reply send failed (channel closed); reconcile aborted."
+                    );
+                }
+                return;
+            };
             // 1. Fetch all requested REST endpoints into memory FIRST (every `.await` happens here,
             //    BEFORE any frame is emitted), so the frame burst below contains no yield points and
             //    cannot be interleaved with live Feed/Order events (atomicity invariant, §5e).
@@ -419,7 +478,7 @@ impl Connector for Bybit {
 
             if want_orders && failure.is_none() {
                 match client.get_open_orders(&category).await {
-                    Ok(orders) => body.extend(frames_from_orders(&orders)),
+                    Ok(orders) => body.extend(frames_from_orders(&orders, tick_size)),
                     Err(e) => failure = Some((ReconcileEndpoint::OpenOrders, e)),
                 }
             }

@@ -95,34 +95,40 @@ pub fn frames_from_positions(positions: &[Position]) -> Result<Vec<ReconcileFram
         .collect()
 }
 
-/// Builds one `OpenOrder` frame per open order.
+/// Builds one `OpenOrder` frame per open order, encoding price against the per-symbol `tick_size`.
 ///
 /// **PrivateOrder → inner-lib `Order` mapping (deviation, see report):** Bybit's `orderId` is a
 /// UUID-like string and the bot's own `u64` `order_id` lives only in the connector's in-memory
 /// `order_id_map` (not recoverable from a fresh REST pull). So `order_id` is set to `0` here — the
 /// frame carries the authoritative REST `price`/`qty`/`side`/`status`, which is what R-M1b compares
-/// against the cached view. `price_tick` is encoded with `tick_size = 1.0` so `price_tick == price`
-/// losslessly carries the REST price (the connector does not know the per-symbol tick size in this
-/// read-only path; R-M1b reads `order.price()` = `price_tick * tick_size`).
-pub fn frames_from_orders(orders: &[PrivateOrder]) -> Vec<ReconcileFrame> {
-    orders.iter().map(build_order_frame).collect()
+/// against the cached view. `price_tick` is encoded as `round(price / tick_size)` using the REAL
+/// per-symbol tick_size (threaded in from `register`, R-M1a interop fix), so it matches the bot's
+/// cached `price_tick = round(price / tick_size)` (myhft lib.rs:654) EXACTLY — R-M1b can then
+/// compare order sets by `(price_tick, side)` without false drift. `order.price()` recovers the
+/// REST price within tick precision.
+pub fn frames_from_orders(orders: &[PrivateOrder], tick_size: f64) -> Vec<ReconcileFrame> {
+    orders
+        .iter()
+        .map(|po| build_order_frame(po, tick_size))
+        .collect()
 }
 
-fn build_order_frame(po: &PrivateOrder) -> ReconcileFrame {
+fn build_order_frame(po: &PrivateOrder, tick_size: f64) -> ReconcileFrame {
     ReconcileFrame::OpenOrder {
-        order: build_order(po),
+        order: build_order(po, tick_size),
     }
 }
 
 /// Maps a REST `PrivateOrder` to an inner-lib `Order` carrying the REST truth. See
 /// [`frames_from_orders`] for the `order_id`/`price_tick` rationale.
-pub fn build_order(po: &PrivateOrder) -> Order {
+pub fn build_order(po: &PrivateOrder, tick_size: f64) -> Order {
     let mut order = Order::new(
         // No recoverable inner-lib u64 id from a fresh REST pull (see module docs).
         0,
-        // tick_size = 1.0 below → price_tick carries the raw price.
-        po.price as i64,
-        1.0,
+        // Encode price_tick the same way the bot caches it: round(price / tick_size). Combined with
+        // the real tick_size below, order.price() ≈ po.price within tick precision.
+        (po.price / tick_size).round() as i64,
+        tick_size,
         po.qty,
         po.side,
         po.order_type,
@@ -245,19 +251,22 @@ mod tests {
 
     // --- Test #11: orders_pagination_0_1_50_over50 --------------------------------------------
 
+    /// BTCUSDT tick_size used by the order fixtures (price "60000.5").
+    const TICK: f64 = 0.5;
+
     #[test]
     fn orders_pagination_frame_counts() {
         // 0 orders → 0 frames.
         let (o0, _) = parse_orders_page(&orders_fixture(0, ""));
-        assert_eq!(frames_from_orders(&o0).len(), 0);
+        assert_eq!(frames_from_orders(&o0, TICK).len(), 0);
 
         // 1 order → 1 frame.
         let (o1, _) = parse_orders_page(&orders_fixture(1, ""));
-        assert_eq!(frames_from_orders(&o1).len(), 1);
+        assert_eq!(frames_from_orders(&o1, TICK).len(), 1);
 
         // 50 orders, empty cursor → 50 frames, no further fetch.
         let (o50, cur50) = parse_orders_page(&orders_fixture(50, ""));
-        assert_eq!(frames_from_orders(&o50).len(), 50);
+        assert_eq!(frames_from_orders(&o50, TICK).len(), 50);
         assert!(cur50.is_empty(), "no 2nd page expected for a drained cursor");
     }
 
@@ -276,7 +285,7 @@ mod tests {
 
         let mut all = page1;
         all.extend(page2);
-        assert_eq!(frames_from_orders(&all).len(), 51);
+        assert_eq!(frames_from_orders(&all, TICK).len(), 51);
     }
 
     #[test]
@@ -514,17 +523,71 @@ mod tests {
     #[test]
     fn order_mapping_carries_rest_truth() {
         let (orders, _) = parse_orders_page(&orders_fixture(1, ""));
-        let frames = frames_from_orders(&orders);
+        let frames = frames_from_orders(&orders, TICK);
         match &frames[0] {
             ReconcileFrame::OpenOrder { order } => {
                 assert_eq!(order.qty, 0.01);
                 assert_eq!(order.leaves_qty, 0.01);
                 assert_eq!(order.side, Side::Buy);
                 assert_eq!(order.status, Status::New);
-                // price_tick carries the raw price (tick_size = 1.0).
-                assert_eq!(order.price(), 60000.0);
+                // Encoded with the REAL tick_size (0.5): price_tick = round(60000.5 / 0.5).
+                assert_eq!(order.tick_size, TICK);
+                assert_eq!(order.price_tick, (60000.5_f64 / TICK).round() as i64);
+                // order.price() recovers the REST price within tick precision.
+                assert!((order.price() - 60000.5).abs() < TICK);
             }
             f => panic!("expected OpenOrder, got {f:?}"),
         }
+    }
+
+    /// REGRESSION GUARD (R-M1a interop bug, design-note §0-BLOCKER): the REST frame's `price_tick`
+    /// MUST equal what the bot's cached encoding produces for the same price —
+    /// `(price / tick_size).round() as u64` (myhft lib.rs:654). Before the fix, `build_order`
+    /// truncated to `price as i64` with `tick_size = 1.0`, so for ETHUSDT (tick 0.01, price 3000.45)
+    /// the REST `price_tick` was 3000 while the cached one was 300045 — they could NEVER match and
+    /// R-M1b would false-flag `order_keyset_mismatch` on every order → false-EmergencyStop.
+    #[test]
+    fn rest_price_tick_matches_bot_cached_encoding() {
+        // ETHUSDT: tick_size 0.01.
+        for (tick_size, price) in [(0.01_f64, 3000.45_f64), (0.01_f64, 60000.01_f64)] {
+            let po = order_with_price(price);
+            let order = build_order(&po, tick_size);
+
+            // The exact integer the bot caches: `(price / tick_size).round() as u64` (lib.rs:654).
+            let bot_cached_price_tick = (price / tick_size).round() as i64;
+            assert_eq!(
+                order.price_tick, bot_cached_price_tick,
+                "REST price_tick must equal the bot's cached encoding for price {price} \
+                 (tick {tick_size})"
+            );
+
+            // tick_size must be the real one (not 1.0), so order.price() recovers the REST price.
+            assert_eq!(order.tick_size, tick_size);
+            assert!(
+                (order.price() - price).abs() < tick_size,
+                "order.price() {} must recover REST price {price} within tick precision",
+                order.price()
+            );
+        }
+    }
+
+    /// Builds a minimal `PrivateOrder` at a given price for encoding tests.
+    fn order_with_price(price: f64) -> PrivateOrder {
+        let json = format!(
+            r#"{{
+                "symbol":"ETHUSDT","orderId":"abc","side":"Buy","orderType":"Limit",
+                "cancelType":"UNKNOWN","price":"{price}","qty":"0.1","orderIv":"",
+                "timeInForce":"GTC","orderStatus":"New","orderLinkId":"t0",
+                "lastPriceOnCreated":"","reduceOnly":false,"leavesQty":"0.1","leavesValue":"300",
+                "cumExecQty":"0","cumExecValue":"0","avgPrice":"","blockTradeId":"",
+                "positionIdx":0,"cumExecFee":"0","createdTime":"1","updatedTime":"2",
+                "rejectReason":"EC_NoError","stopOrderType":"","tpslMode":"","triggerPrice":"",
+                "takeProfit":"","stopLoss":"","tpTriggerBy":"","slTriggerBy":"","tpLimitPrice":"",
+                "slLimitPrice":"","triggerDirection":0,"triggerBy":"","closeOnTrigger":false,
+                "category":"linear","placeType":"","smpType":"None","smpGroup":0,"smpOrderId":"",
+                "feeCurrency":""
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
     }
 }

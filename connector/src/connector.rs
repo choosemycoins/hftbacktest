@@ -40,7 +40,12 @@ pub trait ConnectorBuilder {
 /// Provides an interface for connecting with an exchange or broker for a live bot.
 pub trait Connector {
     /// Registers an instrument to be traded through this connector.
-    fn register(&mut self, symbol: String);
+    ///
+    /// `tick_size`/`lot_size` come from the bot's `LiveRequest::RegisterInstrument` and let the
+    /// connector encode prices/quantities faithfully in read-only paths (e.g. the reconcile
+    /// REST snapshot must produce the same `price_tick = round(price / tick_size)` the bot caches,
+    /// R-M1a interop fix). Connectors that do not need them may ignore the parameters.
+    fn register(&mut self, symbol: String, tick_size: f64, lot_size: f64);
 
     /// Returns an [`OrderManager`].
     fn order_manager(&self) -> Arc<Mutex<dyn GetOrders + Send + 'static>>;
