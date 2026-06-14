@@ -21,12 +21,25 @@ pub const RET_MSG_CAP: usize = 256;
 /// Parses a Bybit numeric JSON string into `f64`. Bybit encodes numerics as strings; an EMPTY
 /// string (e.g. `spotHedgingQty` on Cross margin) is a legitimate "not applicable" sentinel → 0.0.
 /// Any other non-numeric value is a hard error (fail-closed — never silently coerce to 0.0).
+///
+/// Non-finite guard (risk fail-open root): `f64::from_str` ACCEPTS "NaN"/"inf"/"-inf"/"Infinity"
+/// as `Ok`. A NaN/inf field that reaches the risk consumer poisons every EmergencyStop comparison
+/// (`NaN > x` and `NaN < x` are both false), so margin/drawdown kill silently never fires. We reject
+/// non-finite at the source as `InvalidPxQty` so the whole reconcile becomes `End { ok: false }`.
 pub fn parse_f64(s: &str) -> Result<f64, BybitError> {
     let t = s.trim();
     if t.is_empty() {
         Ok(0.0)
     } else {
-        t.parse::<f64>().map_err(BybitError::InvalidPxQty)
+        let v = t.parse::<f64>().map_err(BybitError::InvalidPxQty)?;
+        if !v.is_finite() {
+            // Reuse `InvalidPxQty` (carries a `ParseFloatError`, which has no public ctor) by
+            // forcing a fresh parse error — non-finite is a parse failure for our purposes.
+            return Err(BybitError::InvalidPxQty(
+                "non-finite".parse::<f64>().unwrap_err(),
+            ));
+        }
+        Ok(v)
     }
 }
 
@@ -479,6 +492,24 @@ mod tests {
         assert_eq!(parse_f64("  ").unwrap(), 0.0);
         assert_eq!(parse_f64("12.5").unwrap(), 12.5);
         assert_eq!(parse_f64("-3").unwrap(), -3.0);
+        assert!(parse_f64("abc").is_err());
+    }
+
+    /// Risk fail-open root: `f64::from_str` ACCEPTS "NaN"/"inf"/"-inf"/"Infinity", and a NaN that
+    /// reaches the risk consumer makes every `NaN > x` / `NaN < x` EmergencyStop comparison return
+    /// false → margin/drawdown kill silently never fires. `parse_f64` must reject non-finite at the
+    /// source so the whole reconcile becomes `End { ok: false }` (fail-closed), never silently-NaN.
+    #[test]
+    fn parse_f64_rejects_non_finite() {
+        assert!(parse_f64("NaN").is_err());
+        assert!(parse_f64("nan").is_err());
+        assert!(parse_f64("inf").is_err());
+        assert!(parse_f64("-inf").is_err());
+        assert!(parse_f64("Infinity").is_err());
+        assert!(parse_f64("  inf  ").is_err()); // trimmed-then-rejected
+        // Finite values and the empty sentinel remain unchanged.
+        assert_eq!(parse_f64("12.5").unwrap(), 12.5);
+        assert_eq!(parse_f64("").unwrap(), 0.0);
         assert!(parse_f64("abc").is_err());
     }
 
