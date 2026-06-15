@@ -181,6 +181,20 @@ pub enum LiveEvent {
         symbol: String,
         frame: SpotOrderFrame,
     },
+    /// On-demand quotes reply frame (B-M1b). Tail-appended after `SpotOrderReply`.
+    ///
+    /// Mirrors `Reconcile`/`SpotOrderReply`'s framing: streamed as
+    /// `Begin → PerpQuote → SpotQuote → FundingRow* → End`, bracketed by `BatchStart`/`BatchEnd` on
+    /// the connector and delivered targeted to the requesting bot. Carries `symbol` so the outer
+    /// `LiveEvent` routes through `symbol_to_inst_no` exactly like `Feed`/`Order`/`Position`/
+    /// `Reconcile`/`SpotOrderReply`; all sub-frames travel under one routing arm. Carries perp
+    /// funding + perp/spot ticker (+ optional capped funding history) for a carry decision tick,
+    /// pulled from UNSIGNED public Bybit GETs (no auth/clock-skew — public market data must not
+    /// fail-open on clock skew, §0 D-d).
+    QuotesReply {
+        symbol: String,
+        frame: QuotesFrame,
+    },
 }
 
 /// A single frame of a reconcile reply stream (R-M1a, §2). Derives mirror [`LiveEvent`] so it is
@@ -283,6 +297,56 @@ pub enum SpotOrderStatus {
     Other,
 }
 
+/// A single frame of a quotes reply stream (B-M1b). Derives mirror [`ReconcileFrame`]/
+/// [`SpotOrderFrame`] so it is bincode-encodable as IPC payload. Variant order is wire-significant —
+/// append only.
+///
+/// Frame sequencing (mirrors reconcile's `Begin`/content/`End`):
+/// * `Begin` + `PerpQuote` + `SpotQuote` + `FundingRow`×(0..N, only if `include_funding_history`) + `End`
+///
+/// `server_ts_ms` is carried per quote so the CONSUMER (B-M2) owns max-age/max-skew policy (R-M1a §0
+/// D-c: the fork delivers, freshness is the consumer's policy). The connector does NOT enforce
+/// freshness. `funding_interval_min` comes from instruments-info — the real interval is carried (do
+/// NOT assume 480/8h). On any REST/build/send failure the stream terminates with
+/// `End { ok: false, .. }` (raw `ret_code`/`ret_msg` preserved, fail-closed).
+#[derive(Clone, Debug, Decode, Encode)]
+pub enum QuotesFrame {
+    /// Opens a quotes stream; matched against `End` by `request_id` (fail-closed completeness).
+    Begin { request_id: u64, snapshot_ts_ns: i64 },
+    /// Perp (linear) ticker + current funding. `funding_rate` is the predicted/last funding rate for
+    /// the symbol; `funding_interval_min` is the funding interval in MINUTES from instruments-info.
+    /// Numerics are parsed string→f64 on the connector (fail-closed on non-finite).
+    PerpQuote {
+        server_ts_ms: i64,
+        bid: f64,
+        ask: f64,
+        last: f64,
+        funding_rate: f64,
+        next_funding_time_ms: i64,
+        funding_interval_min: i64,
+    },
+    /// Spot ticker. Numerics are parsed string→f64 on the connector (fail-closed on non-finite).
+    SpotQuote {
+        server_ts_ms: i64,
+        bid: f64,
+        ask: f64,
+        last: f64,
+    },
+    /// One historical funding row (newest-first; capped — see `FUNDING_HISTORY_CAP` in the
+    /// connector). Emitted 0..N times, only when `include_funding_history` was requested.
+    FundingRow { funding_time_ms: i64, funding_rate: f64 },
+    /// Terminates a quotes stream. Bybit always replies HTTP 200, so correctness relies on
+    /// `ret_code` — a non-zero/absent `retCode` ⇒ `ok = false` (fail-closed). Raw `ret_code`/`ret_msg`
+    /// are preserved (no classification — that is the consumer's job).
+    End {
+        request_id: u64,
+        ok: bool,
+        ret_code: Option<i64>,
+        ret_msg: String,
+        http_status: u16,
+    },
+}
+
 /// The completed result of a spot-order op, accumulated bot-side from frames between `Begin` and
 /// `End` (consumer-side; not IPC-encoded). Mirrors [`ReconcileOutcome`]: stored separately so the
 /// strategy FSM polls a freshly REST-pulled spot-order truth keyed by `request_id`. `ack` is `None`
@@ -305,6 +369,58 @@ pub struct SpotOrderAck {
     pub cum_exec_qty: f64,
     pub avg_price: f64,
     pub status: SpotOrderStatus,
+}
+
+/// The completed result of a quotes op, accumulated bot-side from frames between `Begin` and `End`
+/// (consumer-side; not IPC-encoded). Mirrors [`SpotOrderOutcome`]: stored separately so the strategy
+/// FSM polls a freshly REST-pulled quotes truth keyed by `request_id`. `perp`/`spot` are `None` if
+/// the corresponding quote frame was absent (e.g. a fail-closed `End` before the quote arrived); the
+/// result is then read from `ok`/`ret_code`. `server_ts_ms` is carried per quote so the consumer can
+/// age it (max-age/max-skew is consumer policy, §0 D-c).
+#[derive(Clone, Debug)]
+pub struct QuotesOutcome {
+    pub request_id: u64,
+    pub snapshot_ts_ns: i64,
+    pub perp: Option<PerpQuote>,
+    pub spot: Option<SpotQuote>,
+    pub funding_history: Vec<FundingRow>,
+    pub ok: bool,
+    pub ret_code: Option<i64>,
+    pub ret_msg: String,
+    pub http_status: u16,
+}
+
+/// The perp (linear) quote payload of a quotes op (consumer-side; not IPC-encoded). See
+/// [`QuotesFrame::PerpQuote`]. `funding_interval_min` is the real funding interval in MINUTES
+/// (carried from instruments-info; not assumed 8h/480).
+#[derive(Clone, Copy, Debug)]
+pub struct PerpQuote {
+    pub server_ts_ms: i64,
+    pub bid: f64,
+    pub ask: f64,
+    pub last: f64,
+    pub funding_rate: f64,
+    pub next_funding_time_ms: i64,
+    pub funding_interval_min: i64,
+}
+
+/// The spot quote payload of a quotes op (consumer-side; not IPC-encoded). See
+/// [`QuotesFrame::SpotQuote`].
+#[derive(Clone, Copy, Debug)]
+pub struct SpotQuote {
+    pub server_ts_ms: i64,
+    pub bid: f64,
+    pub ask: f64,
+    pub last: f64,
+}
+
+/// One historical funding row of a quotes op (consumer-side; not IPC-encoded). See
+/// [`QuotesFrame::FundingRow`]. Newest-first ordering (capped to the connector's
+/// `FUNDING_HISTORY_CAP`, keeping the newest rows — SF-4).
+#[derive(Clone, Copy, Debug)]
+pub struct FundingRow {
+    pub funding_time_ms: i64,
+    pub funding_rate: f64,
 }
 
 /// Account-level totals from a reconcile (consumer-side; not IPC-encoded).
@@ -953,6 +1069,19 @@ pub enum LiveRequest {
         request_id: u64,
         action: SpotOrderAction,
     },
+    /// On-demand combined quotes pull (perp funding + perp/spot ticker + optional funding history)
+    /// for a Bybit carry decision tick (B-M1b).
+    ///
+    /// Tail-appended after `SpotOrder` — bincode encodes by discriminant index, so new variants
+    /// MUST be appended, never inserted mid-enum. The connector replies by streaming a
+    /// `BatchStart`-bracketed group of [`LiveEvent::QuotesReply`] frames keyed by `request_id`,
+    /// pulled from UNSIGNED public GETs. `include_funding_history` toggles the `FundingRow` frames
+    /// (the carry signal does not always need history).
+    Quotes {
+        symbol: String,
+        request_id: u64,
+        include_funding_history: bool,
+    },
 }
 
 /// Scope of a [`LiveRequest::Reconcile`] — which account-state endpoints to pull (R-M1a, §0 D-b).
@@ -1105,6 +1234,20 @@ where
     ///
     /// * `asset_no` - Asset number to query.
     fn last_spot_order(&self, asset_no: usize) -> Option<&SpotOrderOutcome>;
+
+    /// Returns the most recent completed quotes outcome for this asset, if any (B-M1b).
+    ///
+    /// In live mode this is `None` until the connector delivers a complete quotes stream (matching
+    /// `Begin`/`End`) for the asset — a fail-closed default: a `Begin` without a matching `End`
+    /// leaves this `None`, so an interrupted quotes pull is never treated as authoritative. Mirrors
+    /// [`last_spot_order`](Self::last_spot_order); the strategy FSM polls it after issuing a
+    /// `request_quotes`, keyed by `request_id`. The per-quote `server_ts_ms` lets the consumer apply
+    /// its own max-age/max-skew policy (§0 D-c).
+    ///
+    /// In backtest mode this always returns `None` (no live quotes phase).
+    ///
+    /// * `asset_no` - Asset number to query.
+    fn last_quotes(&self, asset_no: usize) -> Option<&QuotesOutcome>;
 
     /// Returns the state's values such as balance, fee, and so on.
     fn state_values(&self, asset_no: usize) -> &StateValues;

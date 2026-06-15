@@ -10,6 +10,7 @@ use hftbacktest::types::{
     LiveError,
     LiveEvent,
     Order,
+    QuotesFrame,
     ReconcileEndpoint,
     ReconcileFrame,
     ReconcileScope,
@@ -26,6 +27,13 @@ use crate::{
     bybit::{
         ordermanager::{OrderManager, SharedOrderManager},
         public_stream::PublicStream,
+        quotes::{
+            FUNDING_HISTORY_CAP,
+            funding_interval_min,
+            funding_row_frames,
+            perp_quote_frame,
+            spot_quote_frame,
+        },
         reconcile::{frame_from_account, frames_from_orders, frames_from_positions, frames_from_wallet, truncate_ret_msg},
         rest::BybitClient,
         spot_order::{ack_from_create, ack_from_spot_item, build_cancel_body, build_create_body},
@@ -40,6 +48,7 @@ mod msg;
 mod ordermanager;
 mod private_stream;
 mod public_stream;
+mod quotes;
 mod reconcile;
 mod rest;
 mod spot_order;
@@ -778,6 +787,212 @@ impl Connector for Bybit {
             }
         });
     }
+
+    fn quotes(
+        &self,
+        bot_id: u64,
+        symbol: String,
+        request_id: u64,
+        include_funding_history: bool,
+        ev_tx: UnboundedSender<PublishEvent>,
+    ) {
+        // Spawn so the synchronous dispatch loop is never blocked (mirrors the reconcile spawn).
+        // These are UNSIGNED public GETs (no auth/clock-skew, §0 D-d) — `category` is hardcoded
+        // per-endpoint (linear for perp/funding/instruments, spot for the spot ticker).
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            // 1. Fetch ALL public REST endpoints into memory FIRST (every `.await` happens here,
+            //    BEFORE any frame is emitted), so the frame burst below contains no yield points and
+            //    cannot be interleaved with live Feed/Order events (atomicity invariant, mirrors
+            //    reconcile). The FIRST failure aborts the pull (fail-closed End).
+            //
+            //    Build the perp + spot quote frames and the (optional, capped) funding rows. On any
+            //    error, `failure` carries the raw BybitError → fail-closed `End { ok:false }`.
+            let mut perp_frame: Option<QuotesFrame> = None;
+            let mut spot_frame: Option<QuotesFrame> = None;
+            let mut funding_frames: Vec<QuotesFrame> = Vec::new();
+            let mut failure: Option<BybitError> = None;
+
+            // funding_interval comes from instruments-info (real interval in MINUTES, not 8h/480).
+            let mut interval_min: i64 = 0;
+            if failure.is_none() {
+                match client.get_instruments_info(&symbol).await {
+                    Ok(resp) if resp.ret_code == 0 => {
+                        interval_min =
+                            funding_interval_min(&resp.result.list.unwrap_or_default());
+                    }
+                    Ok(resp) => {
+                        failure = Some(BybitError::OpErrorCode {
+                            code: resp.ret_code,
+                            msg: resp.ret_msg,
+                        })
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+
+            // Perp (linear) ticker + funding.
+            if failure.is_none() {
+                match client.get_tickers("linear", &symbol).await {
+                    Ok(resp) if resp.ret_code == 0 => {
+                        match resp.result.list.and_then(|mut l| {
+                            if l.is_empty() { None } else { Some(l.remove(0)) }
+                        }) {
+                            Some(item) => match perp_quote_frame(&item, resp.time, interval_min) {
+                                Ok(f) => perp_frame = Some(f),
+                                Err(e) => failure = Some(e),
+                            },
+                            None => {
+                                failure = Some(BybitError::OpError(
+                                    "empty linear tickers list".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        failure = Some(BybitError::OpErrorCode {
+                            code: resp.ret_code,
+                            msg: resp.ret_msg,
+                        })
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+
+            // Spot ticker.
+            if failure.is_none() {
+                match client.get_tickers("spot", &symbol).await {
+                    Ok(resp) if resp.ret_code == 0 => {
+                        match resp.result.list.and_then(|mut l| {
+                            if l.is_empty() { None } else { Some(l.remove(0)) }
+                        }) {
+                            Some(item) => match spot_quote_frame(&item, resp.time) {
+                                Ok(f) => spot_frame = Some(f),
+                                Err(e) => failure = Some(e),
+                            },
+                            None => {
+                                failure = Some(BybitError::OpError(
+                                    "empty spot tickers list".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        failure = Some(BybitError::OpErrorCode {
+                            code: resp.ret_code,
+                            msg: resp.ret_msg,
+                        })
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+
+            // Funding history (optional). Bybit returns NEWEST-FIRST; cap keeps the newest (SF-4).
+            if include_funding_history && failure.is_none() {
+                match client.get_funding_history(&symbol, FUNDING_HISTORY_CAP).await {
+                    Ok(resp) if resp.ret_code == 0 => {
+                        match funding_row_frames(&resp.result.list.unwrap_or_default()) {
+                            Ok((frames, truncated)) => {
+                                if truncated {
+                                    error!(
+                                        request_id,
+                                        cap = FUNDING_HISTORY_CAP,
+                                        "Funding history truncated to cap (kept newest)."
+                                    );
+                                }
+                                funding_frames = frames;
+                            }
+                            Err(e) => failure = Some(e),
+                        }
+                    }
+                    Ok(resp) => {
+                        failure = Some(BybitError::OpErrorCode {
+                            code: resp.ret_code,
+                            msg: resp.ret_msg,
+                        })
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+
+            let snapshot_ts_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+            // 2. Emit the frame burst contiguously (no `.await` between sends; the unbounded mpsc
+            //    `send` never yields). Mirrors the reconcile/spot-order emit exactly.
+            let result: Result<(), ()> = (|| {
+                send_frame(&ev_tx, PublishEvent::BatchStart(bot_id))?;
+                send_quotes(
+                    &ev_tx,
+                    bot_id,
+                    &symbol,
+                    QuotesFrame::Begin {
+                        request_id,
+                        snapshot_ts_ns,
+                    },
+                )?;
+
+                if let Some(err) = failure {
+                    // Fail-closed terminator with RAW retCode/retMsg preserved (consumer classifies).
+                    // Bybit is always HTTP 200, so http_status=200.
+                    let (ret_code, ret_msg) = raw_code_msg(&err);
+                    send_quotes(
+                        &ev_tx,
+                        bot_id,
+                        &symbol,
+                        QuotesFrame::End {
+                            request_id,
+                            ok: false,
+                            ret_code,
+                            ret_msg: truncate_ret_msg(&ret_msg),
+                            http_status: 200,
+                        },
+                    )?;
+                    send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                    // Out-of-band fatal signal IN ADDITION to End{ok:false} (mirrors reconcile/spot).
+                    send_frame(
+                        &ev_tx,
+                        PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                            ErrorKind::Custom(ret_code.unwrap_or(-1)),
+                            err.to_value(),
+                        ))),
+                    )?;
+                    return Ok(());
+                }
+
+                if let Some(perp) = perp_frame {
+                    send_quotes(&ev_tx, bot_id, &symbol, perp)?;
+                }
+                if let Some(spot) = spot_frame {
+                    send_quotes(&ev_tx, bot_id, &symbol, spot)?;
+                }
+                for frame in funding_frames {
+                    send_quotes(&ev_tx, bot_id, &symbol, frame)?;
+                }
+                send_quotes(
+                    &ev_tx,
+                    bot_id,
+                    &symbol,
+                    QuotesFrame::End {
+                        request_id,
+                        ok: true,
+                        ret_code: Some(0),
+                        ret_msg: String::new(),
+                        http_status: 200,
+                    },
+                )?;
+                send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                Ok(())
+            })();
+
+            if result.is_err() {
+                error!(
+                    request_id,
+                    "Quotes reply send failed (channel closed); quotes aborted."
+                );
+            }
+        });
+    }
 }
 
 /// Extracts raw `(ret_code, ret_msg)` from a reconcile [`BybitError`], preserving Bybit's original
@@ -827,6 +1042,24 @@ fn send_spot_order(
         .send(PublishEvent::LiveEventTo {
             id: bot_id,
             event: LiveEvent::SpotOrderReply {
+                symbol: symbol.to_string(),
+                frame,
+            },
+        })
+        .map_err(|_| ())
+}
+
+#[inline]
+fn send_quotes(
+    ev_tx: &UnboundedSender<PublishEvent>,
+    bot_id: u64,
+    symbol: &str,
+    frame: QuotesFrame,
+) -> Result<(), ()> {
+    ev_tx
+        .send(PublishEvent::LiveEventTo {
+            id: bot_id,
+            event: LiveEvent::QuotesReply {
                 symbol: symbol.to_string(),
                 frame,
             },

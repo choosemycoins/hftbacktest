@@ -30,6 +30,7 @@ use crate::{
         Order,
         OrderId,
         OrderRequest,
+        QuotesOutcome,
         ReconcileOutcome,
         Side,
         SpotOrderOutcome,
@@ -901,6 +902,12 @@ where
     #[inline]
     fn last_spot_order(&self, _asset_no: usize) -> Option<&SpotOrderOutcome> {
         // Backtest has no live spot-order phase; fail-closed.
+        None
+    }
+
+    #[inline]
+    fn last_quotes(&self, _asset_no: usize) -> Option<&QuotesOutcome> {
+        // Backtest has no live quotes phase; fail-closed.
         None
     }
 

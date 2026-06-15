@@ -124,6 +124,23 @@ fn run_receive_task(
                             // bot (`id`).
                             connector.spot_order(id, symbol, request_id, action, tx.clone());
                         }
+                        LiveRequest::Quotes {
+                            symbol,
+                            request_id,
+                            include_funding_history,
+                        } => {
+                            // On-demand combined quotes pull (perp funding + perp/spot ticker +
+                            // optional funding history, B-M1b). The connector spawns the UNSIGNED
+                            // public REST work and streams framed results back targeted to this
+                            // bot (`id`).
+                            connector.quotes(
+                                id,
+                                symbol,
+                                request_id,
+                                include_funding_history,
+                                tx.clone(),
+                            );
+                        }
                     }
                 }
             }

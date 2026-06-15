@@ -10,13 +10,14 @@ use tracing::{debug, error, info};
 
 use crate::{
     depth::{L2MarketDepth, MarketDepth},
-    live::{Instrument, ReconcileAccum, SpotOrderAccum, ipc::Channel},
+    live::{Instrument, QuotesAccum, ReconcileAccum, SpotOrderAccum, ipc::Channel},
     types::{
         AccountTotals,
         Bot,
         BuildError,
         ElapseResult,
         Event,
+        FundingRow,
         LOCAL_ASK_DEPTH_EVENT,
         LOCAL_BID_DEPTH_EVENT,
         LOCAL_BUY_TRADE_EVENT,
@@ -28,6 +29,9 @@ use crate::{
         Order,
         OrderId,
         OrderRequest,
+        PerpQuote,
+        QuotesFrame,
+        QuotesOutcome,
         ReconcileFrame,
         ReconcileOutcome,
         ReconcileScope,
@@ -37,6 +41,7 @@ use crate::{
         SpotOrderAction,
         SpotOrderFrame,
         SpotOrderOutcome,
+        SpotQuote,
         StateValues,
         Status,
         TimeInForce,
@@ -432,6 +437,85 @@ where
                     }
                 }
             }
+            LiveEvent::QuotesReply { frame, .. } => {
+                // Accumulate the quotes stream (Begin → PerpQuote → SpotQuote → FundingRow* → End)
+                // into `quotes_accum`, then finalize into `last_quotes` on a matching `End` (B-M1b).
+                // Mirrors the spot-order arm: same fail-closed id-matching discipline, falls through
+                // to Ok(ElapseResult::Ok) (polling consumer API).
+                let inst = unsafe { self.instruments.get_unchecked_mut(inst_no) };
+                match frame {
+                    QuotesFrame::Begin {
+                        request_id,
+                        snapshot_ts_ns,
+                    } => {
+                        inst.quotes_accum = Some(QuotesAccum::new(request_id, snapshot_ts_ns));
+                    }
+                    QuotesFrame::PerpQuote {
+                        server_ts_ms,
+                        bid,
+                        ask,
+                        last,
+                        funding_rate,
+                        next_funding_time_ms,
+                        funding_interval_min,
+                    } => {
+                        if let Some(accum) = inst.quotes_accum.as_mut() {
+                            accum.set_perp(PerpQuote {
+                                server_ts_ms,
+                                bid,
+                                ask,
+                                last,
+                                funding_rate,
+                                next_funding_time_ms,
+                                funding_interval_min,
+                            });
+                        }
+                    }
+                    QuotesFrame::SpotQuote {
+                        server_ts_ms,
+                        bid,
+                        ask,
+                        last,
+                    } => {
+                        if let Some(accum) = inst.quotes_accum.as_mut() {
+                            accum.set_spot(SpotQuote {
+                                server_ts_ms,
+                                bid,
+                                ask,
+                                last,
+                            });
+                        }
+                    }
+                    QuotesFrame::FundingRow {
+                        funding_time_ms,
+                        funding_rate,
+                    } => {
+                        if let Some(accum) = inst.quotes_accum.as_mut() {
+                            accum.push_funding_row(FundingRow {
+                                funding_time_ms,
+                                funding_rate,
+                            });
+                        }
+                    }
+                    QuotesFrame::End {
+                        request_id,
+                        ok,
+                        ret_code,
+                        ret_msg,
+                        http_status,
+                    } => {
+                        // `take()` always drops the in-flight accum. Only a matching `request_id`
+                        // finalizes it into `last_quotes`; a mismatched id (or a `Begin` with no
+                        // matching `End`) leaves `last_quotes` unchanged (fail-closed).
+                        if let Some(accum) = inst.quotes_accum.take()
+                            && accum.request_id() == request_id
+                        {
+                            inst.last_quotes =
+                                Some(accum.finish(ok, ret_code, ret_msg, http_status));
+                        }
+                    }
+                }
+            }
             LiveEvent::BatchStart | LiveEvent::BatchEnd => {
                 unreachable!();
             }
@@ -614,6 +698,34 @@ where
             },
         )
     }
+
+    /// Requests an on-demand combined quotes pull (perp funding + perp/spot ticker + optional
+    /// funding history) for `asset_no` (B-M1b). Mirrors `request_spot_order`: resolves the
+    /// instrument's `symbol` and sends a [`LiveRequest::Quotes`] over the channel. The connector
+    /// replies asynchronously with a `BatchStart`-bracketed group of [`LiveEvent::QuotesReply`]
+    /// frames keyed by `request_id`; the result is polled via [`Bot::last_quotes`]. Non-blocking —
+    /// does not wait for the reply.
+    pub fn request_quotes(
+        &mut self,
+        asset_no: usize,
+        request_id: u64,
+        include_funding_history: bool,
+    ) -> Result<(), BotError> {
+        let instrument = self
+            .instruments
+            .get(asset_no)
+            .ok_or(BotError::InstrumentNotFound)?;
+        let symbol = instrument.symbol.clone();
+        self.channel.send(
+            self.id,
+            asset_no,
+            LiveRequest::Quotes {
+                symbol,
+                request_id,
+                include_funding_history,
+            },
+        )
+    }
 }
 
 impl<CH, MD> Bot<MD> for LiveBot<CH, MD>
@@ -658,6 +770,13 @@ where
         self.instruments
             .get(asset_no)
             .and_then(|i| i.last_spot_order.as_ref())
+    }
+
+    #[inline]
+    fn last_quotes(&self, asset_no: usize) -> Option<&QuotesOutcome> {
+        self.instruments
+            .get(asset_no)
+            .and_then(|i| i.last_quotes.as_ref())
     }
 
     #[inline]
@@ -897,6 +1016,7 @@ mod tests {
             LiveRequest,
             OrdType,
             Order,
+            QuotesFrame,
             ReconcileEndpoint,
             ReconcileFrame,
             ReconcileScope,
@@ -1597,5 +1717,267 @@ mod tests {
         assert_eq!(outcome.ret_msg, "Insufficient balance");
         assert_eq!(outcome.http_status, 200);
         assert!(outcome.ack.is_none());
+    }
+
+    // ----- Quotes RPC (B-M1b) frame-accumulation tests — clone of the spot-order tests -----
+
+    /// Wraps a `QuotesFrame` into the routable outer `LiveEvent::QuotesReply`.
+    fn quotes(symbol: &str, frame: QuotesFrame) -> LiveEvent {
+        LiveEvent::QuotesReply {
+            symbol: symbol.into(),
+            frame,
+        }
+    }
+
+    fn quotes_begin(request_id: u64) -> QuotesFrame {
+        QuotesFrame::Begin {
+            request_id,
+            snapshot_ts_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    fn perp_quote() -> QuotesFrame {
+        QuotesFrame::PerpQuote {
+            server_ts_ms: 1_718_000_000_000,
+            bid: 3000.1,
+            ask: 3000.2,
+            last: 3000.15,
+            funding_rate: 0.0001,
+            next_funding_time_ms: 1_718_028_800_000,
+            funding_interval_min: 480,
+        }
+    }
+
+    fn spot_quote() -> QuotesFrame {
+        QuotesFrame::SpotQuote {
+            server_ts_ms: 1_718_000_000_001,
+            bid: 2999.9,
+            ask: 3000.0,
+            last: 2999.95,
+        }
+    }
+
+    fn quotes_end_ok(request_id: u64) -> QuotesFrame {
+        QuotesFrame::End {
+            request_id,
+            ok: true,
+            ret_code: Some(0),
+            ret_msg: String::new(),
+            http_status: 200,
+        }
+    }
+
+    /// `last_quotes` fail-closed default (mirror of `last_spot_order_starts_none`).
+    #[test]
+    fn last_quotes_starts_none() {
+        let bot = make_bot(&["ETHUSDT"], vec![]);
+        assert!(bot.last_quotes(0).is_none());
+    }
+
+    /// `request_quotes` records a `LiveRequest::Quotes{symbol,request_id,include_funding_history}`.
+    #[test]
+    fn request_quotes_sends_liverequest() {
+        let mut bot = make_bot(&["ETHUSDT"], vec![]);
+        bot.request_quotes(0, 42, true).unwrap();
+        assert_eq!(bot.channel.sent.len(), 1);
+        let (id, inst_no, request) = &bot.channel.sent[0];
+        assert_eq!(*id, 42);
+        assert_eq!(*inst_no, 0);
+        match request {
+            LiveRequest::Quotes {
+                symbol,
+                request_id,
+                include_funding_history,
+            } => {
+                assert_eq!(symbol, "ETHUSDT");
+                assert_eq!(*request_id, 42);
+                assert!(*include_funding_history);
+            }
+            other => panic!("expected LiveRequest::Quotes, got {other:?}"),
+        }
+    }
+
+    /// Full round-trip: `Begin → PerpQuote → SpotQuote → FundingRow* → End{ok:true}` populates the
+    /// outcome with both quotes and the funding rows (newest-first).
+    #[test]
+    fn quotes_roundtrip_populates_outcome() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, quotes("ETHUSDT", quotes_begin(7))),
+                (0, quotes("ETHUSDT", perp_quote())),
+                (0, quotes("ETHUSDT", spot_quote())),
+                (
+                    0,
+                    quotes(
+                        "ETHUSDT",
+                        QuotesFrame::FundingRow {
+                            funding_time_ms: 1_718_028_800_000,
+                            funding_rate: 0.0002,
+                        },
+                    ),
+                ),
+                (
+                    0,
+                    quotes(
+                        "ETHUSDT",
+                        QuotesFrame::FundingRow {
+                            funding_time_ms: 1_718_000_000_000,
+                            funding_rate: 0.0001,
+                        },
+                    ),
+                ),
+                (0, quotes("ETHUSDT", quotes_end_ok(7))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        let outcome = bot.last_quotes(0).expect("quotes outcome present");
+        assert_eq!(outcome.request_id, 7);
+        assert!(outcome.ok);
+        let perp = outcome.perp.as_ref().expect("perp quote present");
+        assert_eq!(perp.bid, 3000.1);
+        assert_eq!(perp.ask, 3000.2);
+        assert_eq!(perp.funding_rate, 0.0001);
+        assert_eq!(perp.funding_interval_min, 480);
+        assert_eq!(perp.next_funding_time_ms, 1_718_028_800_000);
+        let spot = outcome.spot.as_ref().expect("spot quote present");
+        assert_eq!(spot.bid, 2999.9);
+        assert_eq!(spot.ask, 3000.0);
+        assert_eq!(outcome.funding_history.len(), 2);
+        // Newest-first ordering preserved (first row carries the most recent funding_time_ms).
+        assert_eq!(outcome.funding_history[0].funding_time_ms, 1_718_028_800_000);
+        assert_eq!(outcome.funding_history[1].funding_time_ms, 1_718_000_000_000);
+    }
+
+    /// A quotes pull WITHOUT funding history: `Begin → PerpQuote → SpotQuote → End` → empty history.
+    #[test]
+    fn quotes_no_funding_history_still_completes() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, quotes("ETHUSDT", quotes_begin(8))),
+                (0, quotes("ETHUSDT", perp_quote())),
+                (0, quotes("ETHUSDT", spot_quote())),
+                (0, quotes("ETHUSDT", quotes_end_ok(8))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_quotes(0).expect("quotes outcome present");
+        assert!(outcome.ok);
+        assert!(outcome.perp.is_some());
+        assert!(outcome.spot.is_some());
+        assert!(outcome.funding_history.is_empty());
+    }
+
+    /// The consumer can age a quote off the carried `server_ts_ms` (B-M1b §0 D-c).
+    #[test]
+    fn quotes_timestamp_carried() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, quotes("ETHUSDT", quotes_begin(3))),
+                (0, quotes("ETHUSDT", perp_quote())),
+                (0, quotes("ETHUSDT", spot_quote())),
+                (0, quotes("ETHUSDT", quotes_end_ok(3))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_quotes(0).expect("quotes outcome present");
+        assert_eq!(outcome.perp.unwrap().server_ts_ms, 1_718_000_000_000);
+        assert_eq!(outcome.spot.unwrap().server_ts_ms, 1_718_000_000_001);
+    }
+
+    /// A `Begin` with no matching `End` (interrupted) leaves `last_quotes` None (fail-closed).
+    #[test]
+    fn quotes_begin_without_end_stays_none() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, quotes("ETHUSDT", quotes_begin(5))),
+                (0, quotes("ETHUSDT", perp_quote())),
+                // no End, no BatchEnd
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_quotes(0).is_none());
+    }
+
+    /// `End{request_id:99}` for `Begin{request_id:42}` is dropped (fail-closed completeness).
+    #[test]
+    fn quotes_mismatched_request_id_ignored() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, quotes("ETHUSDT", quotes_begin(42))),
+                (0, quotes("ETHUSDT", perp_quote())),
+                (0, quotes("ETHUSDT", quotes_end_ok(99))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_quotes(0).is_none());
+    }
+
+    /// Per-inst_no isolation: a quotes pull on asset 1 leaves asset 0 None.
+    #[test]
+    fn quotes_per_asset_isolation() {
+        let mut bot = make_bot(
+            &["ETHUSDT", "BTCUSDT"],
+            vec![
+                (1, LiveEvent::BatchStart),
+                (1, quotes("BTCUSDT", quotes_begin(3))),
+                (1, quotes("BTCUSDT", perp_quote())),
+                (1, quotes("BTCUSDT", quotes_end_ok(3))),
+                (1, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_quotes(0).is_none());
+        let outcome = bot.last_quotes(1).expect("asset 1 quotes present");
+        assert_eq!(outcome.request_id, 3);
+    }
+
+    /// `End{ok:false}` preserves the raw retCode/retMsg (not collapsed to a bool) — e.g. a
+    /// rate-limit / bad-symbol reject (B-M1b fail-closed retCode).
+    #[test]
+    fn quotes_end_not_ok_preserves_retcode() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, quotes("ETHUSDT", quotes_begin(9))),
+                (
+                    0,
+                    quotes(
+                        "ETHUSDT",
+                        QuotesFrame::End {
+                            request_id: 9,
+                            ok: false,
+                            ret_code: Some(10001),
+                            ret_msg: "params error".into(),
+                            http_status: 200,
+                        },
+                    ),
+                ),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_quotes(0).expect("failed quotes still recorded");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.ret_code, Some(10001));
+        assert_eq!(outcome.ret_msg, "params error");
+        assert_eq!(outcome.http_status, 200);
+        assert!(outcome.perp.is_none());
+        assert!(outcome.spot.is_none());
     }
 }

@@ -115,6 +115,32 @@ pub trait Connector {
     ) {
         // Default: no-op. Non-Bybit connectors do not implement spot orders yet.
     }
+
+    /// Pulls a combined quotes snapshot (perp funding + perp/spot ticker + optional funding history,
+    /// B-M1b) via UNSIGNED public REST and streams the result back to the requesting bot as a
+    /// `BatchStart`-bracketed group of [`LiveEvent::QuotesReply`] frames, delivered targeted via
+    /// [`PublishEvent::LiveEventTo`]. Clones the [`reconcile`](Self::reconcile) contract.
+    ///
+    /// * `bot_id` — the routing id of the requesting bot (from the dispatch loop), used for the
+    ///   `BatchStart`/`BatchEnd` brackets and `LiveEventTo` so the reply reaches only that bot.
+    /// * `request_id` — the bot-chosen op id, echoed in `Begin`/`End` for completeness matching
+    ///   (distinct from `bot_id`).
+    /// * `include_funding_history` — whether to also emit `FundingRow` frames (capped, newest-first).
+    ///
+    /// This method must NOT block the synchronous dispatch loop; connectors should spawn the work.
+    /// Results — including fail-closed `End { ok: false, .. }` terminators on any error — are
+    /// returned through the channel. The default implementation is a no-op for connectors that do
+    /// not yet support quotes.
+    fn quotes(
+        &self,
+        _bot_id: u64,
+        _symbol: String,
+        _request_id: u64,
+        _include_funding_history: bool,
+        _tx: UnboundedSender<PublishEvent>,
+    ) {
+        // Default: no-op. Non-Bybit connectors do not implement quotes yet.
+    }
 }
 
 /// Provides `orders` method to get the current working orders.

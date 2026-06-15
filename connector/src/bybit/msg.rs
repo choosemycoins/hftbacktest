@@ -569,6 +569,119 @@ pub struct SpotOrderItem {
     pub avg_price: String,
 }
 
+// --- Quotes (B-M1b: tickers / funding-history / instruments-info) -----------------------------
+//
+// All three are UNSIGNED public `/v5/market/*` GETs. Their envelope is the standard
+// `{retCode, retMsg, result:{...}, time}` shape, but each `result` differs, so each gets a
+// dedicated response struct (precedent: `WalletBalanceResponse`). Per-symbol numerics are JSON
+// STRINGS (parsed string→f64 on the connector, fail-closed on non-finite via `parse_f64`). Every
+// field is `#[serde(default)]` so a missing field is fail-soft (empty string → 0.0 later) rather
+// than a hard deserialize failure; correctness is keyed on `retCode`.
+//
+// [verify — design §E] Bybit `/v5/market/tickers` carries an ENVELOPE-level `time` (ms) — the
+// per-symbol ticker item does NOT carry its own `time`. So `server_ts_ms` is sourced from the
+// envelope `time` here. Confirm on testnet whether a per-symbol `time` exists (would tighten skew).
+
+/// Tickers envelope (`GET /v5/market/tickers?category={linear|spot}&symbol=...`). The same shape is
+/// used for both categories; linear-only fields (`fundingRate`/`nextFundingTime`) are absent on spot
+/// and default to empty strings.
+#[derive(Deserialize, Debug)]
+pub struct TickersResponse {
+    #[serde(rename = "retCode")]
+    pub ret_code: i64,
+    #[serde(rename = "retMsg")]
+    pub ret_msg: String,
+    #[serde(default)]
+    pub result: TickersResult,
+    /// Envelope-level server timestamp (ms). Carried per quote as `server_ts_ms` (see module note).
+    #[serde(default)]
+    pub time: i64,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct TickersResult {
+    /// `null` on error envelopes → guarded `Option` (never `.unwrap()`).
+    #[serde(default)]
+    pub list: Option<Vec<TickerItem>>,
+}
+
+/// One ticker item. Numeric JSON strings (parsed string→f64; "" → 0.0). `funding_rate`/
+/// `next_funding_time` are linear-only (empty on spot → 0.0 / 0). `next_funding_time` is a ms epoch
+/// STRING on Bybit (parsed string→i64 on the connector).
+#[derive(Deserialize, Debug, Default)]
+pub struct TickerItem {
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(rename = "bid1Price", default)]
+    pub bid1_price: String,
+    #[serde(rename = "ask1Price", default)]
+    pub ask1_price: String,
+    #[serde(rename = "lastPrice", default)]
+    pub last_price: String,
+    #[serde(rename = "fundingRate", default)]
+    pub funding_rate: String,
+    #[serde(rename = "nextFundingTime", default)]
+    pub next_funding_time: String,
+}
+
+/// Funding-history envelope (`GET /v5/market/funding/history?category=linear&symbol=...&limit=N`).
+/// Bybit returns rows NEWEST-FIRST.
+#[derive(Deserialize, Debug)]
+pub struct FundingHistoryResponse {
+    #[serde(rename = "retCode")]
+    pub ret_code: i64,
+    #[serde(rename = "retMsg")]
+    pub ret_msg: String,
+    #[serde(default)]
+    pub result: FundingHistoryResult,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct FundingHistoryResult {
+    #[serde(default)]
+    pub list: Option<Vec<FundingHistoryItem>>,
+}
+
+/// One funding-history row. `funding_rate` and `funding_rate_timestamp` are JSON STRINGS (rate→f64,
+/// timestamp ms→i64).
+#[derive(Deserialize, Debug, Default)]
+pub struct FundingHistoryItem {
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(rename = "fundingRate", default)]
+    pub funding_rate: String,
+    #[serde(rename = "fundingRateTimestamp", default)]
+    pub funding_rate_timestamp: String,
+}
+
+/// Instruments-info envelope (`GET /v5/market/instruments-info?category=linear&symbol=...`). Carries
+/// the real `fundingInterval` (MINUTES) so the consumer does NOT assume 8h/480.
+#[derive(Deserialize, Debug)]
+pub struct InstrumentsInfoResponse {
+    #[serde(rename = "retCode")]
+    pub ret_code: i64,
+    #[serde(rename = "retMsg")]
+    pub ret_msg: String,
+    #[serde(default)]
+    pub result: InstrumentsInfoResult,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct InstrumentsInfoResult {
+    #[serde(default)]
+    pub list: Option<Vec<InstrumentInfoItem>>,
+}
+
+/// One instrument-info item. `funding_interval` is the funding interval in MINUTES (a JSON NUMBER on
+/// Bybit, not a string — e.g. `480` for 8h).
+#[derive(Deserialize, Debug, Default)]
+pub struct InstrumentInfoItem {
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(rename = "fundingInterval", default)]
+    pub funding_interval: i64,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct TradeStreamMsg {
     #[serde(rename = "reqId")]

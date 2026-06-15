@@ -4,7 +4,16 @@ use serde::Deserialize;
 use crate::{
     bybit::{
         BybitError,
-        msg::{OrderCreateResponse, Position, PrivateOrder, RestResponse, WalletBalanceResponse},
+        msg::{
+            FundingHistoryResponse,
+            InstrumentsInfoResponse,
+            OrderCreateResponse,
+            Position,
+            PrivateOrder,
+            RestResponse,
+            TickersResponse,
+            WalletBalanceResponse,
+        },
     },
     utils::sign_hmac_sha256,
 };
@@ -50,6 +59,28 @@ impl BybitClient {
             .header("X-BAPI-API-KEY", api_key)
             .header("X-BAPI-TIMESTAMP", time)
             .header("X-BAPI-RECV-WINDOW", "5000")
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(resp)
+    }
+
+    /// UNSIGNED public GET (B-M1b). Bybit `/v5/market/*` endpoints are read-only PUBLIC market data
+    /// and require NO authentication — so this sends NO `X-BAPI` auth headers, NO timestamp, and NO
+    /// recv-window. Crucially, public market data must NOT be gated on clock skew: a signed GET would
+    /// fail-OPEN on the carry signal whenever the local clock drifts, whereas a missing quote should
+    /// fail-CLOSED. (The signed [`Self::get`] always attaches auth headers, so it cannot be reused
+    /// here — §0 D-d.)
+    async fn get_public<T: for<'a> Deserialize<'a>>(
+        &self,
+        path: &str,
+        query: &str,
+    ) -> Result<T, reqwest::Error> {
+        let resp = self
+            .client
+            .get(format!("{}{}?{}", self.url, path, query))
+            .header("Accept", "application/json")
             .send()
             .await?
             .json()
@@ -246,6 +277,55 @@ impl BybitClient {
                 &format!("category=spot&orderLinkId={order_link_id}"),
                 &self.api_key,
                 &self.secret,
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// Quotes (B-M1b): fetches the ticker for `category` ("linear" or "spot") via UNSIGNED public
+    /// `GET /v5/market/tickers`. The caller keys success on `ret_code`.
+    pub async fn get_tickers(
+        &self,
+        category: &str,
+        symbol: &str,
+    ) -> Result<TickersResponse, BybitError> {
+        let resp: TickersResponse = self
+            .get_public(
+                "/v5/market/tickers",
+                &format!("category={category}&symbol={symbol}"),
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// Quotes (B-M1b): fetches the funding-rate history (NEWEST-FIRST) for a linear symbol via
+    /// UNSIGNED public `GET /v5/market/funding/history`. `limit` bounds the rows Bybit returns; the
+    /// caller additionally caps to `FUNDING_HISTORY_CAP` keeping the newest (SF-4).
+    pub async fn get_funding_history(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<FundingHistoryResponse, BybitError> {
+        let resp: FundingHistoryResponse = self
+            .get_public(
+                "/v5/market/funding/history",
+                &format!("category=linear&symbol={symbol}&limit={limit}"),
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// Quotes (B-M1b): fetches instrument info (for the real `fundingInterval`, in MINUTES) for a
+    /// linear symbol via UNSIGNED public `GET /v5/market/instruments-info`. The caller keys success
+    /// on `ret_code`.
+    pub async fn get_instruments_info(
+        &self,
+        symbol: &str,
+    ) -> Result<InstrumentsInfoResponse, BybitError> {
+        let resp: InstrumentsInfoResponse = self
+            .get_public(
+                "/v5/market/instruments-info",
+                &format!("category=linear&symbol={symbol}"),
             )
             .await?;
         Ok(resp)

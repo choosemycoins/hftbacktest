@@ -8,13 +8,17 @@ use crate::{
     types::{
         AccountTotals,
         Event,
+        FundingRow,
         Order,
         OrderId,
+        PerpQuote,
+        QuotesOutcome,
         ReconcileEndpoint,
         ReconcileOutcome,
         ReconcileWalletCoin,
         SpotOrderAck,
         SpotOrderOutcome,
+        SpotQuote,
     },
 };
 
@@ -56,6 +60,15 @@ pub struct Instrument<MD> {
     /// a spot-order stream is open; finalized into `last_spot_order` on a matching `End` and dropped
     /// otherwise (fail-closed). Never starts populated. Mirrors `reconcile_accum`.
     spot_order_accum: Option<SpotOrderAccum>,
+    /// Most recent completed quotes outcome (B-M1b). `None` until a matching `Begin`/`End` quotes
+    /// stream arrives — fail-closed default, so an interrupted pull is never treated as
+    /// authoritative. Held separately from `orders`/`state` (the WS-cached view). Mirrors
+    /// `last_spot_order`.
+    last_quotes: Option<QuotesOutcome>,
+    /// In-flight quotes frames accumulated between `Begin` and `End` (B-M1b). `Some` only while a
+    /// quotes stream is open; finalized into `last_quotes` on a matching `End` and dropped otherwise
+    /// (fail-closed). Never starts populated. Mirrors `spot_order_accum`.
+    quotes_accum: Option<QuotesAccum>,
 }
 
 /// Per-instrument accumulator for the rows of an in-flight reconcile stream (R-M1a, §4). A fresh
@@ -186,6 +199,73 @@ impl SpotOrderAccum {
     }
 }
 
+/// Per-instrument accumulator for an in-flight quotes stream (B-M1b). A fresh instance is created on
+/// `QuotesFrame::Begin`; the optional perp/spot quotes and 0..N funding rows are recorded as they
+/// arrive; `finish` consumes it on `End` into a [`QuotesOutcome`]. Mirrors [`SpotOrderAccum`]
+/// (bot-side only, not IPC-encoded).
+pub(crate) struct QuotesAccum {
+    request_id: u64,
+    snapshot_ts_ns: i64,
+    perp: Option<PerpQuote>,
+    spot: Option<SpotQuote>,
+    funding_history: Vec<FundingRow>,
+}
+
+impl QuotesAccum {
+    /// Opens a fresh accumulator for the given quotes request (from a `Begin` frame).
+    pub(crate) fn new(request_id: u64, snapshot_ts_ns: i64) -> Self {
+        Self {
+            request_id,
+            snapshot_ts_ns,
+            perp: None,
+            spot: None,
+            funding_history: Vec::new(),
+        }
+    }
+
+    /// `request_id` from the opening `Begin`, matched against the terminating `End`.
+    pub(crate) fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Records the single `PerpQuote` frame.
+    pub(crate) fn set_perp(&mut self, perp: PerpQuote) {
+        self.perp = Some(perp);
+    }
+
+    /// Records the single `SpotQuote` frame.
+    pub(crate) fn set_spot(&mut self, spot: SpotQuote) {
+        self.spot = Some(spot);
+    }
+
+    /// Pushes one historical funding row (`FundingRow`), newest-first.
+    pub(crate) fn push_funding_row(&mut self, row: FundingRow) {
+        self.funding_history.push(row);
+    }
+
+    /// Consumes the accumulated quotes plus the terminating `End` fields into a [`QuotesOutcome`].
+    /// Caller has already verified `request_id` matches `Begin` (fail-closed completeness).
+    pub(crate) fn finish(
+        self,
+        ok: bool,
+        ret_code: Option<i64>,
+        ret_msg: String,
+        http_status: u16,
+    ) -> QuotesOutcome {
+        QuotesOutcome {
+            request_id: self.request_id,
+            snapshot_ts_ns: self.snapshot_ts_ns,
+            perp: self.perp,
+            spot: self.spot,
+            funding_history: self.funding_history,
+            ok,
+            ret_code,
+            ret_msg,
+            http_status,
+        }
+    }
+}
+
 impl<MD> Instrument<MD> {
     /// * `connector_name` - Name of the [`Connector`], which is registered by
     ///   [`register()`](`LiveBotBuilder::register()`), through which this asset will be traded.
@@ -218,6 +298,8 @@ impl<MD> Instrument<MD> {
             reconcile_accum: None,
             last_spot_order: None,
             spot_order_accum: None,
+            last_quotes: None,
+            quotes_accum: None,
         }
     }
 }
