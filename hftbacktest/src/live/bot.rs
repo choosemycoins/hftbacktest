@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     depth::{L2MarketDepth, MarketDepth},
-    live::{Instrument, ReconcileAccum, ipc::Channel},
+    live::{Instrument, ReconcileAccum, SpotOrderAccum, ipc::Channel},
     types::{
         AccountTotals,
         Bot,
@@ -33,6 +33,10 @@ use crate::{
         ReconcileScope,
         ReconcileWalletCoin,
         Side,
+        SpotOrderAck,
+        SpotOrderAction,
+        SpotOrderFrame,
+        SpotOrderOutcome,
         StateValues,
         Status,
         TimeInForce,
@@ -380,6 +384,54 @@ where
                     }
                 }
             }
+            LiveEvent::SpotOrderReply { frame, .. } => {
+                // Accumulate the spot-order stream (Begin → Ack? → End) into `spot_order_accum`,
+                // then finalize into `last_spot_order` on a matching `End` (B-M1a). Mirrors the
+                // reconcile arm: same fail-closed id-matching discipline, falls through to
+                // Ok(ElapseResult::Ok) (polling consumer API).
+                let inst = unsafe { self.instruments.get_unchecked_mut(inst_no) };
+                match frame {
+                    SpotOrderFrame::Begin {
+                        request_id,
+                        snapshot_ts_ns,
+                    } => {
+                        inst.spot_order_accum =
+                            Some(SpotOrderAccum::new(request_id, snapshot_ts_ns));
+                    }
+                    SpotOrderFrame::Ack {
+                        order_link_id,
+                        cum_exec_qty,
+                        avg_price,
+                        status,
+                    } => {
+                        if let Some(accum) = inst.spot_order_accum.as_mut() {
+                            accum.set_ack(SpotOrderAck {
+                                order_link_id,
+                                cum_exec_qty,
+                                avg_price,
+                                status,
+                            });
+                        }
+                    }
+                    SpotOrderFrame::End {
+                        request_id,
+                        ok,
+                        ret_code,
+                        ret_msg,
+                        http_status,
+                    } => {
+                        // `take()` always drops the in-flight accum. Only a matching `request_id`
+                        // finalizes it into `last_spot_order`; a mismatched id (or a `Begin` with no
+                        // matching `End`) leaves `last_spot_order` unchanged (fail-closed).
+                        if let Some(accum) = inst.spot_order_accum.take()
+                            && accum.request_id() == request_id
+                        {
+                            inst.last_spot_order =
+                                Some(accum.finish(ok, ret_code, ret_msg, http_status));
+                        }
+                    }
+                }
+            }
             LiveEvent::BatchStart | LiveEvent::BatchEnd => {
                 unreachable!();
             }
@@ -535,6 +587,33 @@ where
             },
         )
     }
+
+    /// Requests an on-demand spot-order op (place/cancel/status) for `asset_no` (B-M1a). Mirrors
+    /// `request_reconcile`: resolves the instrument's `symbol` and sends a
+    /// [`LiveRequest::SpotOrder`] over the channel. The connector replies asynchronously with a
+    /// `BatchStart`-bracketed group of [`LiveEvent::SpotOrderReply`] frames keyed by `request_id`;
+    /// the result is polled via [`Bot::last_spot_order`]. Non-blocking — does not wait for the reply.
+    pub fn request_spot_order(
+        &mut self,
+        asset_no: usize,
+        request_id: u64,
+        action: SpotOrderAction,
+    ) -> Result<(), BotError> {
+        let instrument = self
+            .instruments
+            .get(asset_no)
+            .ok_or(BotError::InstrumentNotFound)?;
+        let symbol = instrument.symbol.clone();
+        self.channel.send(
+            self.id,
+            asset_no,
+            LiveRequest::SpotOrder {
+                symbol,
+                request_id,
+                action,
+            },
+        )
+    }
 }
 
 impl<CH, MD> Bot<MD> for LiveBot<CH, MD>
@@ -572,6 +651,13 @@ where
         self.instruments
             .get(asset_no)
             .and_then(|i| i.last_reconcile.as_ref())
+    }
+
+    #[inline]
+    fn last_spot_order(&self, asset_no: usize) -> Option<&SpotOrderOutcome> {
+        self.instruments
+            .get(asset_no)
+            .and_then(|i| i.last_spot_order.as_ref())
     }
 
     #[inline]
@@ -815,6 +901,11 @@ mod tests {
             ReconcileFrame,
             ReconcileScope,
             Side,
+            SpotMarketUnit,
+            SpotOrdType,
+            SpotOrderAction,
+            SpotOrderFrame,
+            SpotOrderStatus,
             Status,
             TimeInForce,
         },
@@ -1267,5 +1358,244 @@ mod tests {
         assert_eq!(outcome.ret_msg, "Too many visits");
         assert_eq!(outcome.http_status, 403);
         assert!(matches!(outcome.endpoint, ReconcileEndpoint::WalletBalance));
+    }
+
+    // ----- SpotOrder RPC (B-M1a) frame-accumulation tests — clone of the reconcile tests -----
+
+    /// Wraps a `SpotOrderFrame` into the routable outer `LiveEvent::SpotOrderReply`.
+    fn spot(symbol: &str, frame: SpotOrderFrame) -> LiveEvent {
+        LiveEvent::SpotOrderReply {
+            symbol: symbol.into(),
+            frame,
+        }
+    }
+
+    fn spot_begin(request_id: u64) -> SpotOrderFrame {
+        SpotOrderFrame::Begin {
+            request_id,
+            snapshot_ts_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    fn spot_ack(order_link_id: &str, status: SpotOrderStatus) -> SpotOrderFrame {
+        SpotOrderFrame::Ack {
+            order_link_id: order_link_id.into(),
+            cum_exec_qty: 0.0,
+            avg_price: 0.0,
+            status,
+        }
+    }
+
+    fn spot_end_ok(request_id: u64) -> SpotOrderFrame {
+        SpotOrderFrame::End {
+            request_id,
+            ok: true,
+            ret_code: Some(0),
+            ret_msg: String::new(),
+            http_status: 200,
+        }
+    }
+
+    /// `last_spot_order` fail-closed default (mirror of `last_reconcile_starts_none`).
+    #[test]
+    fn last_spot_order_starts_none() {
+        let bot = make_bot(&["ETHUSDT"], vec![]);
+        assert!(bot.last_spot_order(0).is_none());
+    }
+
+    /// `request_spot_order` records a `LiveRequest::SpotOrder{symbol,request_id,action}`.
+    #[test]
+    fn request_spot_order_sends_liverequest() {
+        let mut bot = make_bot(&["ETHUSDT"], vec![]);
+        bot.request_spot_order(
+            0,
+            42,
+            SpotOrderAction::Place {
+                side: Side::Buy,
+                order_type: SpotOrdType::Limit,
+                qty: 0.5,
+                market_unit: SpotMarketUnit::BaseCoin,
+                price: Some(3000.0),
+                order_link_id: "basis-42".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(bot.channel.sent.len(), 1);
+        let (id, inst_no, request) = &bot.channel.sent[0];
+        assert_eq!(*id, 42);
+        assert_eq!(*inst_no, 0);
+        match request {
+            LiveRequest::SpotOrder {
+                symbol,
+                request_id,
+                action,
+            } => {
+                assert_eq!(symbol, "ETHUSDT");
+                assert_eq!(*request_id, 42);
+                match action {
+                    SpotOrderAction::Place {
+                        side,
+                        order_type,
+                        qty,
+                        market_unit,
+                        price,
+                        order_link_id,
+                    } => {
+                        assert_eq!(*side, Side::Buy);
+                        assert_eq!(*order_type, SpotOrdType::Limit);
+                        assert_eq!(*qty, 0.5);
+                        assert_eq!(*market_unit, SpotMarketUnit::BaseCoin);
+                        assert_eq!(*price, Some(3000.0));
+                        assert_eq!(order_link_id, "basis-42");
+                    }
+                    other => panic!("expected SpotOrderAction::Place, got {other:?}"),
+                }
+            }
+            other => panic!("expected LiveRequest::SpotOrder, got {other:?}"),
+        }
+    }
+
+    /// Place/Status round-trip: `Begin → Ack → End{ok:true}` populates the outcome with the Ack.
+    #[test]
+    fn spot_order_place_roundtrip_populates_outcome() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, spot("ETHUSDT", spot_begin(7))),
+                (
+                    0,
+                    spot(
+                        "ETHUSDT",
+                        SpotOrderFrame::Ack {
+                            order_link_id: "basis-7".into(),
+                            cum_exec_qty: 0.25,
+                            avg_price: 3001.5,
+                            status: SpotOrderStatus::PartiallyFilled,
+                        },
+                    ),
+                ),
+                (0, spot("ETHUSDT", spot_end_ok(7))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        let outcome = bot.last_spot_order(0).expect("spot-order outcome present");
+        assert_eq!(outcome.request_id, 7);
+        assert!(outcome.ok);
+        let ack = outcome.ack.as_ref().expect("ack present");
+        assert_eq!(ack.order_link_id, "basis-7");
+        assert_eq!(ack.cum_exec_qty, 0.25);
+        assert_eq!(ack.avg_price, 3001.5);
+        assert_eq!(ack.status, SpotOrderStatus::PartiallyFilled);
+    }
+
+    /// Cancel round-trip: `Begin → End` (no `Ack`) → outcome with `ack: None`, result in `ok`.
+    #[test]
+    fn spot_order_cancel_roundtrip_has_no_ack() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, spot("ETHUSDT", spot_begin(8))),
+                (0, spot("ETHUSDT", spot_end_ok(8))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_spot_order(0).expect("cancel outcome present");
+        assert!(outcome.ok);
+        assert!(outcome.ack.is_none(), "Cancel carries no Ack frame");
+    }
+
+    /// A `Begin` with no matching `End` (interrupted) leaves `last_spot_order` None (fail-closed).
+    #[test]
+    fn spot_order_begin_without_end_stays_none() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, spot("ETHUSDT", spot_begin(5))),
+                (0, spot("ETHUSDT", spot_ack("basis-5", SpotOrderStatus::New))),
+                // no End, no BatchEnd
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_spot_order(0).is_none());
+    }
+
+    /// `End{request_id:99}` for `Begin{request_id:42}` is dropped (fail-closed completeness).
+    #[test]
+    fn spot_order_mismatched_request_id_ignored() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, spot("ETHUSDT", spot_begin(42))),
+                (0, spot("ETHUSDT", spot_ack("basis-42", SpotOrderStatus::New))),
+                (0, spot("ETHUSDT", spot_end_ok(99))),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_spot_order(0).is_none());
+    }
+
+    /// Per-inst_no isolation: a spot-order on asset 1 leaves asset 0 None.
+    #[test]
+    fn spot_order_per_asset_isolation() {
+        let mut bot = make_bot(
+            &["ETHUSDT", "BTCUSDT"],
+            vec![
+                (1, LiveEvent::BatchStart),
+                (1, spot("BTCUSDT", spot_begin(3))),
+                (1, spot("BTCUSDT", spot_ack("basis-3", SpotOrderStatus::Filled))),
+                (1, spot("BTCUSDT", spot_end_ok(3))),
+                (1, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.last_spot_order(0).is_none());
+        let outcome = bot.last_spot_order(1).expect("asset 1 spot-order present");
+        assert_eq!(outcome.request_id, 3);
+        assert_eq!(
+            outcome.ack.as_ref().unwrap().status,
+            SpotOrderStatus::Filled
+        );
+    }
+
+    /// `End{ok:false}` preserves the raw retCode/retMsg (not collapsed to a bool) — e.g. a
+    /// min-notional / insufficient-balance reject (B-M1a fail-closed retCode).
+    #[test]
+    fn spot_order_end_not_ok_preserves_retcode() {
+        let mut bot = make_bot(
+            &["ETHUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, spot("ETHUSDT", spot_begin(9))),
+                (
+                    0,
+                    spot(
+                        "ETHUSDT",
+                        SpotOrderFrame::End {
+                            request_id: 9,
+                            ok: false,
+                            ret_code: Some(170131),
+                            ret_msg: "Insufficient balance".into(),
+                            http_status: 200,
+                        },
+                    ),
+                ),
+                (0, LiveEvent::BatchEnd),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        let outcome = bot.last_spot_order(0).expect("failed spot-order still recorded");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.ret_code, Some(170131));
+        assert_eq!(outcome.ret_msg, "Insufficient balance");
+        assert_eq!(outcome.http_status, 200);
+        assert!(outcome.ack.is_none());
     }
 }

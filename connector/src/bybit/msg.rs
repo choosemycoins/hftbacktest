@@ -525,6 +525,50 @@ pub struct OrderResponseData {
     pub order_link_id: String,
 }
 
+// --- Spot order (B-M1a) -----------------------------------------------------------------------
+//
+// Bybit `POST /v5/order/create` and `/v5/order/cancel` return `result: {orderId, orderLinkId}`.
+// `result` is `{}` (empty object) on a non-zero-retCode reject, so all fields are
+// `#[serde(default)]` (fail-soft: an absent field stays empty; correctness is keyed on `retCode`).
+
+#[derive(Deserialize, Debug, Default)]
+pub struct OrderCreateResult {
+    #[serde(rename = "orderId", default)]
+    pub order_id: String,
+    #[serde(rename = "orderLinkId", default)]
+    pub order_link_id: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OrderCreateResponse {
+    #[serde(rename = "retCode")]
+    pub ret_code: i64,
+    #[serde(rename = "retMsg")]
+    pub ret_msg: String,
+    #[serde(default)]
+    pub result: OrderCreateResult,
+}
+
+/// A spot order item from `GET /v5/order/realtime?category=spot`, keeping `orderStatus` as a RAW
+/// string so the spot RPC can map it fail-closed to [`SpotOrderStatus`](hftbacktest::types::SpotOrderStatus)
+/// (`Other` on unknown). Distinct from [`PrivateOrder`] whose `from_str_to_status` deserializer is
+/// lossy (`Rejected`→`Expired`) and HARD-FAILS on an unknown status (B-M1a deviation). Only the
+/// reconcile-relevant fields are deserialized; everything else is ignored. Numerics stay strings
+/// (parsed string→f64 on the connector, fail-closed on non-finite).
+#[derive(Deserialize, Debug, Default)]
+pub struct SpotOrderItem {
+    #[serde(rename = "orderLinkId", default)]
+    pub order_link_id: String,
+    #[serde(rename = "orderId", default)]
+    pub order_id: String,
+    #[serde(rename = "orderStatus", default)]
+    pub order_status: String,
+    #[serde(rename = "cumExecQty", default)]
+    pub cum_exec_qty: String,
+    #[serde(rename = "avgPrice", default)]
+    pub avg_price: String,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct TradeStreamMsg {
     #[serde(rename = "reqId")]

@@ -169,6 +169,18 @@ pub enum LiveEvent {
         symbol: String,
         frame: ReconcileFrame,
     },
+    /// On-demand spot-order reply frame (B-M1a). Tail-appended after `Reconcile`.
+    ///
+    /// Mirrors `Reconcile`'s framing: streamed as `Begin → Ack? → End`, bracketed by
+    /// `BatchStart`/`BatchEnd` on the connector and delivered targeted to the requesting bot.
+    /// Carries `symbol` so the outer `LiveEvent` routes through `symbol_to_inst_no` exactly like
+    /// `Feed`/`Order`/`Position`/`Reconcile`; all sub-frames travel under one routing arm. The op
+    /// is a Bybit **spot** order (place/cancel/status), correlated by `order_link_id` (Bybit
+    /// `orderId` is always 0 for the bot's purposes — B-M1a D-b).
+    SpotOrderReply {
+        symbol: String,
+        frame: SpotOrderFrame,
+    },
 }
 
 /// A single frame of a reconcile reply stream (R-M1a, §2). Derives mirror [`LiveEvent`] so it is
@@ -225,6 +237,74 @@ pub enum ReconcileEndpoint {
     OpenOrders,
     WalletBalance,
     None,
+}
+
+/// A single frame of a spot-order reply stream (B-M1a). Derives mirror [`ReconcileFrame`] so it is
+/// bincode-encodable as IPC payload. Variant order is wire-significant — append only.
+///
+/// Frame sequencing (mirrors reconcile's `Begin`/content/`End`):
+/// * **Place** → `Begin` + `Ack`(post-create state) + `End`
+/// * **Status** → `Begin` + `Ack`(current state) + `End`
+/// * **Cancel** → `Begin` + `End` (the result lives in `End.ok`/`ret_code`)
+#[derive(Clone, Debug, Decode, Encode)]
+pub enum SpotOrderFrame {
+    /// Opens a spot-order stream; matched against `End` by `request_id` (fail-closed completeness).
+    Begin { request_id: u64, snapshot_ts_ns: i64 },
+    /// Post-op order state, correlated by `order_link_id` (Bybit `orderId` is unusable — B-M1a D-b).
+    /// `cum_exec_qty`/`avg_price` are parsed string→f64 on the connector; `status` is mapped from
+    /// Bybit `orderStatus` (fail-closed [`SpotOrderStatus::Other`] on an unknown value).
+    Ack {
+        order_link_id: String,
+        cum_exec_qty: f64,
+        avg_price: f64,
+        status: SpotOrderStatus,
+    },
+    /// Terminates a spot-order stream. Bybit always replies HTTP 200, so correctness relies on
+    /// `ret_code` — a non-zero/absent `retCode` ⇒ `ok = false` (fail-closed). Raw `ret_code`/`ret_msg`
+    /// are preserved (no classification — that is the consumer's job).
+    End {
+        request_id: u64,
+        ok: bool,
+        ret_code: Option<i64>,
+        ret_msg: String,
+        http_status: u16,
+    },
+}
+
+/// Spot-order lifecycle status, mapped from Bybit `orderStatus` (B-M1a). IPC-encoded → append only.
+/// An unrecognized Bybit value maps to [`SpotOrderStatus::Other`] (fail-closed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decode, Encode)]
+pub enum SpotOrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+    Other,
+}
+
+/// The completed result of a spot-order op, accumulated bot-side from frames between `Begin` and
+/// `End` (consumer-side; not IPC-encoded). Mirrors [`ReconcileOutcome`]: stored separately so the
+/// strategy FSM polls a freshly REST-pulled spot-order truth keyed by `request_id`. `ack` is `None`
+/// for a Cancel (which carries no `Ack` frame) — the result is then read from `ok`/`ret_code`.
+#[derive(Clone, Debug)]
+pub struct SpotOrderOutcome {
+    pub request_id: u64,
+    pub snapshot_ts_ns: i64,
+    pub ack: Option<SpotOrderAck>,
+    pub ok: bool,
+    pub ret_code: Option<i64>,
+    pub ret_msg: String,
+    pub http_status: u16,
+}
+
+/// The `Ack` payload of a spot-order op (consumer-side; not IPC-encoded). See [`SpotOrderFrame::Ack`].
+#[derive(Clone, Debug)]
+pub struct SpotOrderAck {
+    pub order_link_id: String,
+    pub cum_exec_qty: f64,
+    pub avg_price: f64,
+    pub status: SpotOrderStatus,
 }
 
 /// Account-level totals from a reconcile (consumer-side; not IPC-encoded).
@@ -862,6 +942,17 @@ pub enum LiveRequest {
         request_id: u64,
         scope: ReconcileScope,
     },
+    /// On-demand spot-order op (place/cancel/status) for a Bybit **spot** instrument (B-M1a).
+    ///
+    /// Tail-appended after `Reconcile` — bincode encodes by discriminant index, so new variants
+    /// MUST be appended, never inserted mid-enum. The connector replies by streaming a
+    /// `BatchStart`-bracketed group of [`LiveEvent::SpotOrderReply`] frames keyed by `request_id`.
+    /// `category="spot"` is hardcoded per-RPC on the connector (B-M1a D-feasible).
+    SpotOrder {
+        symbol: String,
+        request_id: u64,
+        action: SpotOrderAction,
+    },
 }
 
 /// Scope of a [`LiveRequest::Reconcile`] — which account-state endpoints to pull (R-M1a, §0 D-b).
@@ -871,6 +962,43 @@ pub enum ReconcileScope {
     Position,
     OpenOrders,
     Wallet,
+}
+
+/// The spot-order op carried by [`LiveRequest::SpotOrder`] (B-M1a). IPC-encoded → append only.
+/// Correlation is by `order_link_id` (bot-chosen) — Bybit's `orderId` is unusable for the bot
+/// (always 0, D-b).
+#[derive(Clone, Debug, Encode, Decode)]
+pub enum SpotOrderAction {
+    /// Places a new spot order. For a market BUY, Bybit defaults `qty` to QUOTE coin; a base-coin
+    /// order MUST set `market_unit = BaseCoin` (de-risk §34-41) so `qty` is interpreted in base.
+    Place {
+        side: Side,
+        order_type: SpotOrdType,
+        qty: f64,
+        market_unit: SpotMarketUnit,
+        price: Option<f64>,
+        order_link_id: String,
+    },
+    /// Cancels a resting spot order by its `order_link_id`.
+    Cancel { order_link_id: String },
+    /// Queries the current state of a spot order by its `order_link_id`.
+    Status { order_link_id: String },
+}
+
+/// Which coin a spot order's `qty` is denominated in (Bybit `marketUnit`, B-M1a). IPC-encoded →
+/// append only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum SpotMarketUnit {
+    BaseCoin,
+    QuoteCoin,
+}
+
+/// Order type for a spot order (B-M1a). Distinct from [`OrdType`] (which is a Copy enum with a wire
+/// `repr`); kept minimal for the spot RPC. IPC-encoded → append only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum SpotOrdType {
+    Market,
+    Limit,
 }
 
 /// Provides state values.
@@ -964,6 +1092,19 @@ where
     ///
     /// * `asset_no` - Asset number to query.
     fn last_reconcile(&self, asset_no: usize) -> Option<&ReconcileOutcome>;
+
+    /// Returns the most recent completed spot-order outcome for this asset, if any (B-M1a).
+    ///
+    /// In live mode this is `None` until the connector delivers a complete spot-order stream
+    /// (matching `Begin`/`End`) for the asset — a fail-closed default: a `Begin` without a matching
+    /// `End` leaves this `None`, so an interrupted spot-order op is never treated as authoritative.
+    /// Mirrors [`last_reconcile`](Self::last_reconcile); the strategy FSM polls it after issuing a
+    /// `request_spot_order`, keyed by `request_id`.
+    ///
+    /// In backtest mode this always returns `None` (no live spot-order phase).
+    ///
+    /// * `asset_no` - Asset number to query.
+    fn last_spot_order(&self, asset_no: usize) -> Option<&SpotOrderOutcome>;
 
     /// Returns the state's values such as balance, fee, and so on.
     fn state_values(&self, asset_no: usize) -> &StateValues;

@@ -13,6 +13,8 @@ use crate::{
         ReconcileEndpoint,
         ReconcileOutcome,
         ReconcileWalletCoin,
+        SpotOrderAck,
+        SpotOrderOutcome,
     },
 };
 
@@ -45,6 +47,15 @@ pub struct Instrument<MD> {
     /// while a reconcile stream is open; finalized into `last_reconcile` on a matching `End` and
     /// dropped otherwise (fail-closed). Never starts populated.
     reconcile_accum: Option<ReconcileAccum>,
+    /// Most recent completed spot-order outcome (B-M1a). `None` until a matching `Begin`/`End`
+    /// spot-order stream arrives — fail-closed default, so an interrupted op is never treated as
+    /// authoritative. Held separately from `orders`/`state` (the WS-cached view). Mirrors
+    /// `last_reconcile`.
+    last_spot_order: Option<SpotOrderOutcome>,
+    /// In-flight spot-order frame accumulated between `Begin` and `End` (B-M1a). `Some` only while
+    /// a spot-order stream is open; finalized into `last_spot_order` on a matching `End` and dropped
+    /// otherwise (fail-closed). Never starts populated. Mirrors `reconcile_accum`.
+    spot_order_accum: Option<SpotOrderAccum>,
 }
 
 /// Per-instrument accumulator for the rows of an in-flight reconcile stream (R-M1a, §4). A fresh
@@ -124,6 +135,57 @@ impl ReconcileAccum {
     }
 }
 
+/// Per-instrument accumulator for an in-flight spot-order stream (B-M1a). A fresh instance is
+/// created on `SpotOrderFrame::Begin`; the optional `Ack` is recorded as it arrives; `finish`
+/// consumes it on `End` into a [`SpotOrderOutcome`]. Mirrors [`ReconcileAccum`] (bot-side only, not
+/// IPC-encoded).
+pub(crate) struct SpotOrderAccum {
+    request_id: u64,
+    snapshot_ts_ns: i64,
+    ack: Option<SpotOrderAck>,
+}
+
+impl SpotOrderAccum {
+    /// Opens a fresh accumulator for the given spot-order request (from a `Begin` frame).
+    pub(crate) fn new(request_id: u64, snapshot_ts_ns: i64) -> Self {
+        Self {
+            request_id,
+            snapshot_ts_ns,
+            ack: None,
+        }
+    }
+
+    /// `request_id` from the opening `Begin`, matched against the terminating `End`.
+    pub(crate) fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Records the single `Ack` frame (absent for a Cancel op).
+    pub(crate) fn set_ack(&mut self, ack: SpotOrderAck) {
+        self.ack = Some(ack);
+    }
+
+    /// Consumes the accumulated `Ack` plus the terminating `End` fields into a [`SpotOrderOutcome`].
+    /// Caller has already verified `request_id` matches `Begin` (fail-closed completeness).
+    pub(crate) fn finish(
+        self,
+        ok: bool,
+        ret_code: Option<i64>,
+        ret_msg: String,
+        http_status: u16,
+    ) -> SpotOrderOutcome {
+        SpotOrderOutcome {
+            request_id: self.request_id,
+            snapshot_ts_ns: self.snapshot_ts_ns,
+            ack: self.ack,
+            ok,
+            ret_code,
+            ret_msg,
+            http_status,
+        }
+    }
+}
+
 impl<MD> Instrument<MD> {
     /// * `connector_name` - Name of the [`Connector`], which is registered by
     ///   [`register()`](`LiveBotBuilder::register()`), through which this asset will be traded.
@@ -154,6 +216,8 @@ impl<MD> Instrument<MD> {
             snapshot_ready: false,
             last_reconcile: None,
             reconcile_accum: None,
+            last_spot_order: None,
+            spot_order_accum: None,
         }
     }
 }

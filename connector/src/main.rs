@@ -114,6 +114,16 @@ fn run_receive_task(
                             // streams framed results back targeted to this bot (`id`).
                             connector.reconcile(id, symbol, request_id, scope, tx.clone());
                         }
+                        LiveRequest::SpotOrder {
+                            symbol,
+                            request_id,
+                            action,
+                        } => {
+                            // On-demand spot-order op (place/cancel/status, B-M1a). The connector
+                            // spawns the REST work and streams framed results back targeted to this
+                            // bot (`id`).
+                            connector.spot_order(id, symbol, request_id, action, tx.clone());
+                        }
                     }
                 }
             }

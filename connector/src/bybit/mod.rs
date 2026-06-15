@@ -13,6 +13,8 @@ use hftbacktest::types::{
     ReconcileEndpoint,
     ReconcileFrame,
     ReconcileScope,
+    SpotOrderAction,
+    SpotOrderFrame,
     Value,
 };
 use serde::Deserialize;
@@ -26,6 +28,7 @@ use crate::{
         public_stream::PublicStream,
         reconcile::{frame_from_account, frames_from_orders, frames_from_positions, frames_from_wallet, truncate_ret_msg},
         rest::BybitClient,
+        spot_order::{ack_from_create, ack_from_spot_item, build_cancel_body, build_create_body},
         trade_stream::OrderOp,
     },
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
@@ -39,6 +42,7 @@ mod private_stream;
 mod public_stream;
 mod reconcile;
 mod rest;
+mod spot_order;
 mod trade_stream;
 
 #[derive(Error, Debug)]
@@ -607,6 +611,173 @@ impl Connector for Bybit {
             }
         });
     }
+
+    fn spot_order(
+        &self,
+        bot_id: u64,
+        symbol: String,
+        request_id: u64,
+        action: SpotOrderAction,
+        ev_tx: UnboundedSender<PublishEvent>,
+    ) {
+        // Spawn so the synchronous dispatch loop is never blocked (mirrors the reconcile spawn).
+        // `category="spot"` is hardcoded for this RPC (B-M1a D-feasible) — do NOT use self.config
+        // .category (that is the linear-perp category for the WS/order paths).
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            // 1. Perform the REST op into memory FIRST (every `.await` happens here, BEFORE any
+            //    frame is emitted), so the frame burst below contains no yield points and cannot be
+            //    interleaved with live Feed/Order events (atomicity invariant, mirrors reconcile).
+            //    Each op yields either an optional Ack frame + ok, or a fail-closed BybitError.
+            let outcome: Result<Option<SpotOrderFrame>, BybitError> = match action {
+                SpotOrderAction::Place {
+                    side,
+                    order_type,
+                    qty,
+                    market_unit,
+                    price,
+                    order_link_id,
+                } => {
+                    match build_create_body(
+                        &symbol,
+                        side,
+                        order_type,
+                        qty,
+                        market_unit,
+                        price,
+                        &order_link_id,
+                    ) {
+                        Ok(body) => match client.spot_create_order(body).await {
+                            Ok(resp) if resp.ret_code == 0 => {
+                                // Post-create state: accepted-but-resting (zero fill, New). Actual
+                                // fills are observable later via a `Status` poll (D3/BLK-4).
+                                Ok(Some(ack_from_create(&resp.result.order_link_id)))
+                            }
+                            Ok(resp) => Err(BybitError::OpErrorCode {
+                                code: resp.ret_code,
+                                msg: resp.ret_msg,
+                            }),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    }
+                }
+                SpotOrderAction::Cancel { order_link_id } => {
+                    let body = build_cancel_body(&symbol, &order_link_id);
+                    match client.spot_cancel_order(body).await {
+                        // Cancel carries no Ack; the result lives in End.ok/ret_code.
+                        Ok(resp) if resp.ret_code == 0 => Ok(None),
+                        Ok(resp) => Err(BybitError::OpErrorCode {
+                            code: resp.ret_code,
+                            msg: resp.ret_msg,
+                        }),
+                        Err(e) => Err(e),
+                    }
+                }
+                SpotOrderAction::Status { order_link_id } => {
+                    match client.spot_order_status(&order_link_id).await {
+                        Ok(resp) if resp.ret_code == 0 => {
+                            // Guard `result.list` (Bybit returns `null` on errors — never unwrap).
+                            match resp.result.list {
+                                Some(list) => match serde_json::from_value::<
+                                    Vec<crate::bybit::msg::SpotOrderItem>,
+                                >(list)
+                                {
+                                    Ok(items) => match items.first() {
+                                        Some(item) => ack_from_spot_item(item).map(Some),
+                                        // Order not found is a legitimate "no such order" result;
+                                        // report it fail-closed so the FSM treats lost-reply as
+                                        // possibly-live, never as a definitive no-fill (BLK-4).
+                                        None => Err(BybitError::OrderNotFound),
+                                    },
+                                    Err(e) => Err(BybitError::from(e)),
+                                },
+                                None => Err(BybitError::OrderNotFound),
+                            }
+                        }
+                        Ok(resp) => Err(BybitError::OpErrorCode {
+                            code: resp.ret_code,
+                            msg: resp.ret_msg,
+                        }),
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+
+            let snapshot_ts_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+            // 2. Emit the frame burst contiguously (no `.await` between sends; the unbounded mpsc
+            //    `send` never yields). Mirrors the reconcile emit exactly.
+            let result: Result<(), ()> = (|| {
+                send_frame(&ev_tx, PublishEvent::BatchStart(bot_id))?;
+                send_spot_order(
+                    &ev_tx,
+                    bot_id,
+                    &symbol,
+                    SpotOrderFrame::Begin {
+                        request_id,
+                        snapshot_ts_ns,
+                    },
+                )?;
+
+                match outcome {
+                    Ok(ack) => {
+                        if let Some(ack) = ack {
+                            send_spot_order(&ev_tx, bot_id, &symbol, ack)?;
+                        }
+                        send_spot_order(
+                            &ev_tx,
+                            bot_id,
+                            &symbol,
+                            SpotOrderFrame::End {
+                                request_id,
+                                ok: true,
+                                ret_code: Some(0),
+                                ret_msg: String::new(),
+                                http_status: 200,
+                            },
+                        )?;
+                        send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                    }
+                    Err(err) => {
+                        // Fail-closed terminator with RAW retCode/retMsg preserved (consumer
+                        // classifies). Bybit is always HTTP 200, so http_status=200.
+                        let (ret_code, ret_msg) = raw_code_msg(&err);
+                        send_spot_order(
+                            &ev_tx,
+                            bot_id,
+                            &symbol,
+                            SpotOrderFrame::End {
+                                request_id,
+                                ok: false,
+                                ret_code,
+                                ret_msg: truncate_ret_msg(&ret_msg),
+                                http_status: 200,
+                            },
+                        )?;
+                        send_frame(&ev_tx, PublishEvent::BatchEnd(bot_id))?;
+                        // Out-of-band fatal signal IN ADDITION to End{ok:false} (mirrors reconcile).
+                        send_frame(
+                            &ev_tx,
+                            PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                                ErrorKind::Custom(ret_code.unwrap_or(-1)),
+                                err.to_value(),
+                            ))),
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+
+            if result.is_err() {
+                error!(
+                    request_id,
+                    "SpotOrder reply send failed (channel closed); spot order aborted."
+                );
+            }
+        });
+    }
 }
 
 /// Extracts raw `(ret_code, ret_msg)` from a reconcile [`BybitError`], preserving Bybit's original
@@ -638,6 +809,24 @@ fn send_reconcile(
         .send(PublishEvent::LiveEventTo {
             id: bot_id,
             event: LiveEvent::Reconcile {
+                symbol: symbol.to_string(),
+                frame,
+            },
+        })
+        .map_err(|_| ())
+}
+
+#[inline]
+fn send_spot_order(
+    ev_tx: &UnboundedSender<PublishEvent>,
+    bot_id: u64,
+    symbol: &str,
+    frame: SpotOrderFrame,
+) -> Result<(), ()> {
+    ev_tx
+        .send(PublishEvent::LiveEventTo {
+            id: bot_id,
+            event: LiveEvent::SpotOrderReply {
                 symbol: symbol.to_string(),
                 frame,
             },

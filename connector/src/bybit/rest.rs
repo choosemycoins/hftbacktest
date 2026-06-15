@@ -4,7 +4,7 @@ use serde::Deserialize;
 use crate::{
     bybit::{
         BybitError,
-        msg::{Position, PrivateOrder, RestResponse, WalletBalanceResponse},
+        msg::{OrderCreateResponse, Position, PrivateOrder, RestResponse, WalletBalanceResponse},
     },
     utils::sign_hmac_sha256,
 };
@@ -199,6 +199,51 @@ impl BybitClient {
             .get(
                 "/v5/account/wallet-balance",
                 "accountType=UNIFIED",
+                &self.api_key,
+                &self.secret,
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// SpotOrder (B-M1a): places a spot order via `POST /v5/order/create`. `body` is the pre-built
+    /// JSON (category=spot hardcoded, see `spot_order::build_create_body`). Returns the parsed
+    /// [`OrderCreateResponse`]; the caller checks `ret_code` (Bybit always HTTP 200, so a non-zero
+    /// `retCode` is the only failure signal — fail-closed).
+    pub async fn spot_create_order(
+        &self,
+        body: String,
+    ) -> Result<OrderCreateResponse, BybitError> {
+        let resp: OrderCreateResponse = self
+            .post("/v5/order/create", body, &self.api_key, &self.secret)
+            .await?;
+        Ok(resp)
+    }
+
+    /// SpotOrder (B-M1a): cancels a spot order via `POST /v5/order/cancel` (correlated by
+    /// `orderLinkId` inside `body`). Returns the parsed [`OrderCreateResponse`] (same envelope shape;
+    /// `result` carries orderId/orderLinkId). The caller keys success on `ret_code`.
+    pub async fn spot_cancel_order(
+        &self,
+        body: String,
+    ) -> Result<OrderCreateResponse, BybitError> {
+        let resp: OrderCreateResponse = self
+            .post("/v5/order/cancel", body, &self.api_key, &self.secret)
+            .await?;
+        Ok(resp)
+    }
+
+    /// SpotOrder (B-M1a): queries a spot order's current state via
+    /// `GET /v5/order/realtime?category=spot&orderLinkId={...}`. Returns the parsed envelope; the
+    /// caller guards `result.list` against `null` (never `.unwrap()`) and keys on `ret_code`.
+    pub async fn spot_order_status(
+        &self,
+        order_link_id: &str,
+    ) -> Result<RestResponse, BybitError> {
+        let resp: RestResponse = self
+            .get(
+                "/v5/order/realtime",
+                &format!("category=spot&orderLinkId={order_link_id}"),
                 &self.api_key,
                 &self.secret,
             )

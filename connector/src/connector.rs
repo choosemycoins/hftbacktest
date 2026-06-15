@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use hftbacktest::types::{LiveEvent, Order, ReconcileScope};
+use hftbacktest::types::{LiveEvent, Order, ReconcileScope, SpotOrderAction};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A message will be received by the publisher thread and then published to the bots.
@@ -88,6 +88,32 @@ pub trait Connector {
         _tx: UnboundedSender<PublishEvent>,
     ) {
         // Default: no-op. Non-Bybit connectors do not implement reconcile yet.
+    }
+
+    /// Performs a Bybit **spot** order op (place/cancel/status, B-M1a) via REST and streams the
+    /// result back to the requesting bot as a `BatchStart`-bracketed group of
+    /// [`LiveEvent::SpotOrderReply`] frames, delivered targeted via [`PublishEvent::LiveEventTo`].
+    /// Clones the [`reconcile`](Self::reconcile) contract.
+    ///
+    /// * `bot_id` — the routing id of the requesting bot (from the dispatch loop), used for the
+    ///   `BatchStart`/`BatchEnd` brackets and `LiveEventTo` so the reply reaches only that bot.
+    /// * `request_id` — the bot-chosen op id, echoed in `Begin`/`End` for completeness matching
+    ///   (distinct from `bot_id`).
+    /// * `action` — the spot op (place/cancel/status), correlated by `order_link_id` (D-b).
+    ///
+    /// This method must NOT block the synchronous dispatch loop; connectors should spawn the work.
+    /// Results — including fail-closed `End { ok: false, .. }` terminators on any error — are
+    /// returned through the channel. The default implementation is a no-op for connectors that do
+    /// not yet support spot orders.
+    fn spot_order(
+        &self,
+        _bot_id: u64,
+        _symbol: String,
+        _request_id: u64,
+        _action: SpotOrderAction,
+        _tx: UnboundedSender<PublishEvent>,
+    ) {
+        // Default: no-op. Non-Bybit connectors do not implement spot orders yet.
     }
 }
 

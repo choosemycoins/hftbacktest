@@ -32,6 +32,7 @@ use crate::{
         OrderRequest,
         ReconcileOutcome,
         Side,
+        SpotOrderOutcome,
         StateValues,
         TimeInForce,
         UNTIL_END_OF_DATA,
@@ -894,6 +895,12 @@ where
     #[inline]
     fn last_reconcile(&self, _asset_no: usize) -> Option<&ReconcileOutcome> {
         // Backtest has no live reconcile phase; fail-closed.
+        None
+    }
+
+    #[inline]
+    fn last_spot_order(&self, _asset_no: usize) -> Option<&SpotOrderOutcome> {
+        // Backtest has no live spot-order phase; fail-closed.
         None
     }
 

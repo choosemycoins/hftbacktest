@@ -355,7 +355,8 @@ impl Channel for IceoryxUnifiedChannel {
                             | LiveEvent::Order { symbol, .. }
                             | LiveEvent::Position { symbol, .. }
                             | LiveEvent::SnapshotComplete { symbol, .. }
-                            | LiveEvent::Reconcile { symbol, .. } => {
+                            | LiveEvent::Reconcile { symbol, .. }
+                            | LiveEvent::SpotOrderReply { symbol, .. } => {
                                 if let Some(inst_no) = ch.symbol_to_inst_no.get(symbol) {
                                     return Ok((*inst_no, ev));
                                 }
