@@ -25,16 +25,16 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Bytes, Message, client::IntoClientRequest},
 };
+use simd_json::Buffers;
 use tracing::{debug, error};
 
 use crate::{
     bybit::{
         BybitError,
-        msg,
-        msg::{Op, OrderBook, PublicStreamMsg},
+        msg::Op,
+        simd_parse::{PublicFeed, decode_public_feed},
     },
     connector::PublishEvent,
-    utils::parse_depth,
 };
 
 pub struct PublicStream {
@@ -47,117 +47,84 @@ impl PublicStream {
         Self { ev_tx, symbol_rx }
     }
 
-    async fn handle_public_stream(&self, text: &str) -> Result<(), BybitError> {
-        let stream = serde_json::from_str::<PublicStreamMsg>(text)?;
-        match stream {
-            PublicStreamMsg::Op(resp) => {
-                debug!(?resp, "Op");
-            }
-            PublicStreamMsg::Topic(stream) => {
-                if stream.topic.starts_with("orderbook.1") {
-                    let data: OrderBook = serde_json::from_value(stream.data)?;
-                    let (bids, asks) = parse_depth(data.bids, data.asks)?;
+    fn handle_public_stream(
+        &self,
+        scratch: &mut Vec<u8>,
+        buffers: &mut Buffers,
+        text: &str,
+    ) -> Result<(), BybitError> {
+        // Parse the frame once with simd-json and read the fields directly from the resulting DOM,
+        // reusing `scratch` and `buffers` so steady-state decoding allocates nothing.
+        match decode_public_feed(scratch, buffers, text)? {
+            PublicFeed::OrderBook { bbo, update } => {
+                let (bid_ev, ask_ev) = if bbo {
+                    (LOCAL_BID_DEPTH_BBO_EVENT, LOCAL_ASK_DEPTH_BBO_EVENT)
+                } else {
+                    (LOCAL_BID_DEPTH_EVENT, LOCAL_ASK_DEPTH_EVENT)
+                };
+                let exch_ts = update.cts * 1_000_000;
 
-                    for (px, qty) in bids {
-                        self.ev_tx
-                            .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                symbol: data.symbol.clone(),
-                                event: Event {
-                                    ev: LOCAL_BID_DEPTH_BBO_EVENT,
-                                    exch_ts: stream.cts.unwrap() * 1_000_000,
-                                    local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                    order_id: 0,
-                                    px,
-                                    qty,
-                                    ival: 0,
-                                    fval: 0.0,
-                                },
-                            }))
-                            .unwrap();
-                    }
-
-                    for (px, qty) in asks {
-                        self.ev_tx
-                            .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                symbol: data.symbol.clone(),
-                                event: Event {
-                                    ev: LOCAL_ASK_DEPTH_BBO_EVENT,
-                                    exch_ts: stream.cts.unwrap() * 1_000_000,
-                                    local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                    order_id: 0,
-                                    px,
-                                    qty,
-                                    ival: 0,
-                                    fval: 0.0,
-                                },
-                            }))
-                            .unwrap();
-                    }
-                } else if stream.topic.starts_with("orderbook") {
-                    let data: OrderBook = serde_json::from_value(stream.data)?;
-                    let (bids, asks) = parse_depth(data.bids, data.asks)?;
-
-                    for (px, qty) in bids {
-                        self.ev_tx
-                            .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                symbol: data.symbol.clone(),
-                                event: Event {
-                                    ev: LOCAL_BID_DEPTH_EVENT,
-                                    exch_ts: stream.cts.unwrap() * 1_000_000,
-                                    local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                    order_id: 0,
-                                    px,
-                                    qty,
-                                    ival: 0,
-                                    fval: 0.0,
-                                },
-                            }))
-                            .unwrap();
-                    }
-
-                    for (px, qty) in asks {
-                        self.ev_tx
-                            .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                symbol: data.symbol.clone(),
-                                event: Event {
-                                    ev: LOCAL_ASK_DEPTH_EVENT,
-                                    exch_ts: stream.cts.unwrap() * 1_000_000,
-                                    local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                    order_id: 0,
-                                    px,
-                                    qty,
-                                    ival: 0,
-                                    fval: 0.0,
-                                },
-                            }))
-                            .unwrap();
-                    }
-                } else if stream.topic.starts_with("publicTrade") {
-                    let data: Vec<msg::Trade> = serde_json::from_value(stream.data)?;
-                    for item in data {
-                        self.ev_tx
-                            .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                symbol: item.symbol.clone(),
-                                event: Event {
-                                    ev: {
-                                        if item.side == Side::Sell {
-                                            LOCAL_SELL_TRADE_EVENT
-                                        } else {
-                                            LOCAL_BUY_TRADE_EVENT
-                                        }
-                                    },
-                                    exch_ts: item.ts * 1_000_000,
-                                    local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                    order_id: 0,
-                                    px: item.trade_price,
-                                    qty: item.trade_size,
-                                    ival: 0,
-                                    fval: 0.0,
-                                },
-                            }))
-                            .unwrap();
-                    }
+                for (px, qty) in update.bids {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: update.symbol.clone(),
+                            event: Event {
+                                ev: bid_ev,
+                                exch_ts,
+                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                                order_id: 0,
+                                px,
+                                qty,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
                 }
+
+                for (px, qty) in update.asks {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: update.symbol.clone(),
+                            event: Event {
+                                ev: ask_ev,
+                                exch_ts,
+                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                                order_id: 0,
+                                px,
+                                qty,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
+                }
+            }
+            PublicFeed::Trades(trades) => {
+                for item in trades {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: item.symbol,
+                            event: Event {
+                                ev: if item.side == Side::Sell {
+                                    LOCAL_SELL_TRADE_EVENT
+                                } else {
+                                    LOCAL_BUY_TRADE_EVENT
+                                },
+                                exch_ts: item.ts * 1_000_000,
+                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                                order_id: 0,
+                                px: item.price,
+                                qty: item.size,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
+                }
+            }
+            PublicFeed::Other => {
+                debug!(%text, "Op");
             }
         }
         Ok(())
@@ -170,6 +137,11 @@ impl PublicStream {
         let (ws_stream, _) = connect_async(request).await?;
         let (mut write, mut read) = ws_stream.split();
         let mut interval = time::interval(Duration::from_secs(15));
+
+        // Reused across frames so steady-state decoding does not allocate: `scratch` holds the
+        // mutable copy simd-json parses in place, `buffers` holds simd-json's internal buffers.
+        let mut scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut buffers = Buffers::new(64 * 1024);
 
         loop {
             select! {
@@ -213,7 +185,9 @@ impl PublicStream {
                 message = read.next() => {
                     match message {
                         Some(Ok(Message::Text(text))) => {
-                            if let Err(error) = self.handle_public_stream(&text).await {
+                            if let Err(error) =
+                                self.handle_public_stream(&mut scratch, &mut buffers, &text)
+                            {
                                 error!(?error, %text, "Couldn't handle PublicStreamMsg.");
                             }
                         }

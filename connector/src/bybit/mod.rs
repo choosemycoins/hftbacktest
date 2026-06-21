@@ -22,11 +22,12 @@ use crate::{
 };
 
 #[allow(dead_code)]
-mod msg;
+pub mod msg;
 mod ordermanager;
 mod private_stream;
 mod public_stream;
 mod rest;
+pub mod simd_parse;
 mod trade_stream;
 
 #[derive(Error, Debug)]
@@ -53,6 +54,8 @@ pub enum BybitError {
     OrderAlreadyExist,
     #[error("Serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("SimdJson: {0}")]
+    SimdJson(#[from] simd_json::Error),
     #[error("Reqwest: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error("Tungstenite: {0}")]
@@ -91,6 +94,7 @@ impl BybitError {
             BybitError::InvalidArg(_) => Value::String(self.to_string()),
             BybitError::OrderAlreadyExist => Value::String(self.to_string()),
             BybitError::Serde(_) => Value::String(self.to_string()),
+            BybitError::SimdJson(_) => Value::String(self.to_string()),
             BybitError::Tungstenite(_) => Value::String(self.to_string()),
             BybitError::ConnectionAbort(_) => Value::String(self.to_string()),
             BybitError::ConnectionInterrupted => Value::String(self.to_string()),

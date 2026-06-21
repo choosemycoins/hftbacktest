@@ -8,6 +8,7 @@ use serde::{
     de,
     de::{Error, Unexpected, Visitor},
 };
+use serde_json::value::RawValue;
 
 use crate::utils::{from_str_to_f64, from_str_to_f64_opt, from_str_to_i64};
 
@@ -160,18 +161,22 @@ pub struct OpResponse {
     pub ty: Option<String>,
 }
 
+/// A message received on the Bybit public WebSocket stream.
+///
+/// Both topic frames (order book / trade data) and op responses (subscribe acks, pongs) arrive on
+/// the same socket; only topic frames carry `topic`. The `data` payload is captured as a borrowed
+/// [`RawValue`], so it is **not** parsed into an intermediate `serde_json::Value` DOM here. The
+/// caller parses the raw payload directly into the concrete type selected by `topic`
+/// ([`OrderBook`] or `Vec<`[`Trade`]`>`), which avoids materializing and re-walking a DOM.
 #[derive(Deserialize, Debug)]
-#[serde(untagged)]
-pub enum PublicStreamMsg {
-    Topic(PublicStream),
-    Op(OpResponse),
-}
-
-#[derive(Deserialize, Debug)]
-pub struct PublicStream {
-    pub topic: String,
-    pub ts: i64,
-    pub data: serde_json::Value,
+pub struct PublicStream<'a> {
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub ts: Option<i64>,
+    #[serde(borrow, default)]
+    pub data: Option<&'a RawValue>,
+    #[serde(default)]
     pub cts: Option<i64>,
 }
 
@@ -534,8 +539,9 @@ pub struct TradeStreamMsg {
     #[serde(rename = "retMsg")]
     pub ret_msg: String,
     pub op: String,
-    #[serde(default)]
-    pub data: serde_json::Value,
+    // The `data` payload is intentionally not declared: it is never read by the trade-stream
+    // handler, so parsing it into a `serde_json::Value` DOM would be wasted work. serde ignores
+    // the unknown `data` key.
     #[serde(default)]
     pub header: HashMap<String, String>,
     #[serde(rename = "connId")]
@@ -578,7 +584,10 @@ pub struct Order {
 
 #[derive(Deserialize, Debug)]
 pub struct RestResult {
-    pub list: Option<serde_json::Value>,
+    /// Raw `list` payload, captured as a `RawValue` so it is not parsed into an intermediate
+    /// `serde_json::Value` DOM here; the caller parses it once into the concrete element type
+    /// (e.g. `Vec<Position>`), avoiding a second pass.
+    pub list: Option<Box<RawValue>>,
     #[serde(default)]
     pub success: String,
     #[serde(rename = "next_page_cursor")]
@@ -595,7 +604,8 @@ pub struct RestResponse {
     #[serde(rename = "retMsg")]
     pub ret_msg: String,
     pub result: RestResult,
+    // `retExtInfo` is never read; `IgnoredAny` skips it without building a `serde_json::Value`.
     #[serde(rename = "retExtInfo")]
-    pub ret_ext_info: serde_json::Value,
+    pub ret_ext_info: de::IgnoredAny,
     pub time: i64,
 }

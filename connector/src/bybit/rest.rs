@@ -110,7 +110,9 @@ impl BybitClient {
         if resp.ret_code != 0 {
             Err(BybitError::OpError(resp.ret_msg))
         } else {
-            let position: Vec<Position> = serde_json::from_value(resp.result.list.unwrap())?;
+            // Single pass: the `list` payload was captured as a `RawValue`, so parse it directly
+            // into `Vec<Position>` instead of going through a `serde_json::Value` DOM.
+            let position: Vec<Position> = serde_json::from_str(resp.result.list.unwrap().get())?;
             Ok(position)
         }
     }

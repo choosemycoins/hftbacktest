@@ -31,23 +31,12 @@ use tokio::{
 };
 use tracing::error;
 
-use crate::{
+use connector::{
     binancefutures::BinanceFutures,
     binancespot::BinanceSpot,
     bybit::Bybit,
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
 };
-
-#[cfg(feature = "binancefutures")]
-pub mod binancefutures;
-#[cfg(feature = "binancespot")]
-pub mod binancespot;
-#[cfg(feature = "bybit")]
-pub mod bybit;
-
-mod connector;
-//mod fuse;
-mod utils;
 
 struct Position {
     qty: f64,

@@ -82,7 +82,7 @@ async fn main() -> Result<(), anyhow::Error> {
             let topics = [
                 "orderbook.1.$symbol",
                 "orderbook.50.$symbol",
-                "orderbook.500.$symbol",
+                "orderbook.200.$symbol",
                 "publicTrade.$symbol",
             ]
             .iter()
