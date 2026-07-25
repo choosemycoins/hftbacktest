@@ -343,6 +343,54 @@ sudo ./deploy/bootstrap.sh
 Creates the `hftcollector` system user and scaffolds `/opt/hft-collector`.
 Idempotent; run once per host.
 
+### Mounting a separate data volume
+
+Recommended: mount it at **`/opt/hft-collector/data`**. That path is already in
+the unit's `ReadWritePaths`, so no drop-in is needed, and a full data volume
+then cannot take the OS down with it.
+
+Order matters — the filesystem must exist and be mounted *before* ownership is
+set, because mounting over a directory hides whatever was underneath.
+
+```bash
+lsblk                                  # find the device; Nitro shows nvme1n1, not xvdf
+sudo mkfs.ext4 -L hftdata /dev/nvme1n1 # ONLY if the volume is new and empty
+sudo blkid /dev/nvme1n1                # copy the UUID
+
+sudo mkdir -p /opt/hft-collector/data
+echo 'UUID=<uuid> /opt/hft-collector/data ext4 defaults,noatime,nofail 0 2' \
+    | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload           # fstab changed; refresh the mount units
+sudo mount -a
+
+# only now, on the mounted filesystem
+sudo chown hftcollector:hftcollector /opt/hft-collector/data
+sudo chmod 755 /opt/hft-collector/data
+findmnt /opt/hft-collector/data        # confirm before starting anything
+```
+
+`noatime` avoids a metadata write per read on a volume that is append-only in
+practice. `nofail` keeps the host bootable and reachable when the volume is
+missing — and the unit's `RequiresMountsFor=/opt/hft-collector/data` is what
+stops the collector recording in that state.
+
+**That pairing is load-bearing.** Without it, an unmounted volume is worse than
+an outage: `collector-run.sh` would create the data directory on the root
+filesystem, the free-space check would measure the root filesystem and pass,
+recording would look healthy — and everything written would vanish under the
+mount point the moment the volume came back.
+
+To mount somewhere else instead, point `COLLECTOR_DATA_DIR` at it and widen
+both directives:
+
+```bash
+sudo systemctl edit hft-collector@hyperliquid
+# [Unit]
+# RequiresMountsFor=/mnt/marketdata
+# [Service]
+# ReadWritePaths=/mnt/marketdata
+```
+
 ### Build and install
 
 ```bash

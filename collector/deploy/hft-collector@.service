@@ -17,6 +17,20 @@ Wants=network-online.target
 After=time-sync.target
 Wants=time-sync.target
 
+# Refuse to start unless the data directory's mount is up.
+#
+# Without this, a volume that has not mounted yet is silently catastrophic
+# rather than merely inconvenient: collector-run.sh would mkdir the data
+# directory on the ROOT filesystem, the statvfs free-space check would measure
+# the root filesystem and pass, recording would proceed — and the moment the
+# volume does mount, everything written so far disappears underneath it.
+#
+# Pair this with `nofail` in /etc/fstab. The host then still boots and stays
+# reachable when the volume is missing, but the collector declines to record
+# into the wrong place. If COLLECTOR_DATA_DIR points somewhere else, change
+# this path to match via a drop-in.
+RequiresMountsFor=/opt/hft-collector/data
+
 # The start rate limiter belongs to the Unit, not the Service. Placed under
 # [Service] these are silently ignored (StartLimitIntervalSec is not a
 # [Service] key at all), leaving a crash-looping instance unthrottled.
