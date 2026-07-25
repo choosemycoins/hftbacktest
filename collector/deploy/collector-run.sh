@@ -59,8 +59,22 @@ if [[ "${#SYMBOLS[@]}" -eq 0 ]]; then
     exit 4
 fi
 
+# Optional flags. Each is omitted entirely when its variable is unset, so the
+# binary's own defaults stay authoritative and this wrapper never has to be
+# kept in sync with them.
+OPTS=()
+[[ -n "${COLLECTOR_MIN_FREE_GB:-}" ]]  && OPTS+=(--min-free-gb "${COLLECTOR_MIN_FREE_GB}")
+[[ -n "${COLLECTOR_BYBIT_DEPTHS:-}" ]] && OPTS+=(--bybit-depths "${COLLECTOR_BYBIT_DEPTHS}")
+[[ -n "${COLLECTOR_HL_L2_MODES:-}" ]]  && OPTS+=(--hl-l2-modes "${COLLECTOR_HL_L2_MODES}")
+if [[ "${COLLECTOR_NO_SYMBOL_CHECK:-0}" == "1" ]]; then
+    echo "collector-run[${INSTANCE}]: WARNING symbol validation disabled" >&2
+    OPTS+=(--no-symbol-check)
+fi
+
 echo "collector-run[${INSTANCE}]: exchange=${COLLECTOR_EXCHANGE} symbols=${SYMBOLS[*]} data_dir=${COLLECTOR_DATA_DIR}"
+echo "collector-run[${INSTANCE}]: opts=${OPTS[*]:-(defaults)}"
 echo "collector-run[${INSTANCE}]: $("${BIN}" --version)"
 
-# argv order is positional and fixed by clap: <path> <exchange> <symbols...>
-exec "${BIN}" "${COLLECTOR_DATA_DIR}" "${COLLECTOR_EXCHANGE}" "${SYMBOLS[@]}"
+# Positional argv order is fixed by clap: <path> <exchange> <symbols...>.
+# Flags precede them so a symbol can never be mistaken for a flag value.
+exec "${BIN}" "${OPTS[@]}" "${COLLECTOR_DATA_DIR}" "${COLLECTOR_EXCHANGE}" "${SYMBOLS[@]}"
