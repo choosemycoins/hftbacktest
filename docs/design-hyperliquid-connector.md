@@ -146,7 +146,42 @@ Hyperliquid publishes [`order_book_server`](https://github.com/hyperliquid-dex/o
 which consumes a non-validating node and serves genuine per-block order diffs (`l4Book`:
 `New{sz, insertBefore}` / `Update{origSz,newSz}` / `Remove` per order). That maps almost
 exactly onto hftbacktest's L3 model and is the only path that yields true queue position.
-It also requires operating a node, has no spot support, and is not core-maintained.
+It also serves `l2book` with `n_levels` up to 100, against the public feed's 20.
+
+**What the node path actually costs** (from
+[`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node), read 2026-07-25):
+
+| | |
+|---|---|
+| Machine | 16 vCPU, 128 GB RAM, 500 GB SSD at 500 MB/s |
+| OS | *"Currently only Ubuntu 24.04 is supported"* |
+| Network | ports 4001 and 4002 open to the public, for gossip |
+| Admission | permissionless — no staking, no allowlisting |
+| Location | *"For lowest latency, run the node in Tokyo, Japan"* |
+| Mainnet | needs at least one seed peer IP in `~/override_gossip_config.json` |
+
+The optimizing-latency page states 32 logical cores where the node README states 16
+vCPU; size for the larger.
+
+**The operational cost is disk, not compute.** *"The network will generate around 100 GB
+of logs per day, so it is recommended to archive or delete old files."* The stated 500 GB
+lasts five days unpruned, so log rotation or S3 offload is part of the build, not an
+afterthought. For scale: the collector records ~22 MB/day/symbol from the public feed.
+
+Run with `--batch-by-block --write-fills --write-order-statuses --write-raw-book-diffs
+--serve-info`; output lands under `~/hl/data/`.
+
+**Caveats that are not negotiable.** `order_book_server` does not support spot order
+books, does not show untriggered trigger orders, batches by block (milliseconds of added
+latency), exits after 5 seconds without node events or on state divergence, and is
+explicitly *"a standalone educational project"* with *"no commitment… to maintain, update,
+or fix any issues"*. Adopting it means owning it. **UNVERIFIED:** whether the `hl-visor`
+binary is published for arm64 — assume x86_64 until confirmed, since it decides the
+instance family.
+
+Order-of-magnitude: a `r7i.4xlarge`-class host plus provisioned disk throughput is roughly
+two orders of magnitude more expensive per month than the `t4g.small` the public-feed
+collector runs on.
 
 v1 should not require running a node. But the seam costs almost nothing now and is
 expensive to retrofit, and the accuracy ceiling of the public feed is low enough (§5.2)
@@ -509,8 +544,21 @@ depth design needs revisiting before anything downstream is built.
 3. **Rate-limit budget** — what is the actual expected quote rate, and does it survive the
    10,000-request buffer? This may make Hyperliquid unsuitable for a high-frequency grid
    without the volume to replenish, and that is worth knowing before Phase 3, not after.
-4. **`l4Book` node** — is running a non-validating node acceptable operationally? If yes,
-   much of §5.2 becomes throwaway and the phasing should change.
+4. **`l4Book` node** — no longer a question of feasibility; the requirements are now in
+   §5.1 and admission is permissionless. It is a question of whether the strategy needs
+   queue position enough to justify the cost: a 16 vCPU / 128 GB host in Tokyo, ~100 GB of
+   logs a day to rotate, and taking ownership of an explicitly unmaintained
+   `order_book_server`. Roughly two orders of magnitude more expensive than the
+   public-feed collector.
+
+   Decide by measuring against the public feed's ceiling — 5 levels every ~0.54s and BBO
+   every ~0.14s, with no queue position at all. If quoting at the touch performs
+   acceptably within that, the node buys precision the strategy does not use. If it does
+   not, there is no alternative: no amount of work on §5.2 can synthesise queue position
+   that the public feed never transmits.
+
+   Answering this changes the phasing. If the node is adopted, most of §5.2 becomes
+   throwaway and Phase 2 should be skipped rather than built and discarded.
 5. **UNVERIFIED: does `orderUpdates` send a snapshot on subscribe?** Could not be settled
    during research. The design assumes **no** and re-queries via REST, which is correct
    either way; confirm on testnet and simplify if it does.
