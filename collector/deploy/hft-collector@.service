@@ -1,0 +1,88 @@
+[Unit]
+# Templated unit: one instance per collection job, named after its env file.
+#   systemctl enable --now hft-collector@bybit
+# reads /opt/hft-collector/etc/bybit.env and records what that file describes.
+#
+# One instance per exchange is the intended granularity. The collector binary
+# takes a single exchange and one symbol list per process, so a second venue
+# means a second instance, not a second argument.
+Description=hftbacktest market-data collector (%i)
+Documentation=file:///opt/hft-collector/current/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Every recorded line is stamped with Utc::now() and the output file is chosen
+# by UTC date, so starting before the clock is disciplined can misdate a file
+# and, worse, cause a spurious rotation when the clock steps.
+After=time-sync.target
+Wants=time-sync.target
+
+# The start rate limiter belongs to the Unit, not the Service. Placed under
+# [Service] these are silently ignored (StartLimitIntervalSec is not a
+# [Service] key at all), leaving a crash-looping instance unthrottled.
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+
+User=hftcollector
+Group=hftcollector
+WorkingDirectory=/opt/hft-collector
+
+# Versioned-release layout: `current` is a symlink that install.sh swaps
+# atomically and rollback.sh flips back. Pointing ExecStart through the
+# symlink is what makes a rollback a symlink flip plus a restart.
+Environment=COLLECTOR_HOME=/opt/hft-collector/current
+Environment=COLLECTOR_INSTANCE=%i
+Environment=RUST_LOG=info
+
+# Per-instance settings: COLLECTOR_EXCHANGE, COLLECTOR_SYMBOLS,
+# COLLECTOR_DATA_DIR. See instance.env.example. The unit refuses to start if
+# this file is missing rather than silently recording nothing.
+EnvironmentFile=/opt/hft-collector/etc/%i.env
+
+ExecStart=/opt/hft-collector/current/bin/collector-run.sh
+
+# A collector that dies mid-day leaves a gap in the recording, so restart
+# eagerly. `always` rather than `on-failure` because a clean exit still means
+# recording has stopped. The burst limit (in [Unit] above) stops a
+# crash-looping build from spinning the CPU and filling the journal.
+#
+# `systemctl stop` is unaffected by Restart=always — systemd does not restart
+# a unit it stopped itself — so the SIGTERM path stays clean.
+Restart=always
+RestartSec=5s
+
+# SIGTERM is what makes the gzip stream valid. The collector handles it
+# explicitly (see shutdown_signal in collector/src/main.rs), flushes every
+# open RotatingFile through GzEncoder::finish, and exits 0. TimeoutStopSec
+# must stay generous enough for that flush; a SIGKILL here truncates the
+# current gzip member.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Resource hygiene. One WebSocket per venue plus one file handle per symbol
+# is modest, but symbol lists grow.
+LimitNOFILE=65535
+
+# The recorded data is the only thing this service owns that matters.
+# ReadWritePaths must cover COLLECTOR_DATA_DIR from the instance env file;
+# if you point that outside /opt/hft-collector/data (e.g. a mounted volume),
+# add it here via a drop-in:
+#   systemctl edit hft-collector@bybit
+#   [Service]
+#   ReadWritePaths=/mnt/marketdata
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/hft-collector/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hft-collector-%i
+
+[Install]
+WantedBy=multi-user.target
