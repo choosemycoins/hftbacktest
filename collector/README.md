@@ -97,6 +97,41 @@ Symbol case is passed through verbatim to the venue. Binance stream names are
 lowercase (`btcusdt`), Bybit and Hyperliquid want uppercase (`BTCUSDT`, `BTC`).
 Output filenames are lowercased regardless of what you pass in.
 
+### Hyperliquid symbol names
+
+Perps have **no quote suffix** — `BTC`, not `BTCUSDT`. The quote shown in the
+web UI is the dex's collateral token, not part of the instrument name.
+
+HIP-3 lets third parties deploy their own perp dexes, each with its own
+universe and its own collateral. Their instrument names carry a `dex:` prefix,
+and that prefixed name *is* the wire name — do not concatenate it yourself:
+
+| Wire name | Dex | Collateral |
+|---|---|---|
+| `ENA` | canonical | USDC |
+| `hyna:ENA` | hyna | USDE |
+| `xyz:GOLD` | xyz | USDC |
+
+`ENA` and `hyna:ENA` are different instruments with separate books; recording
+both is legitimate and they land in `ena_*.gz` and `hyna:ena_*.gz`. Some assets
+exist only on builder dexes — `GOLD` has no canonical listing at all, so a dex
+must be chosen deliberately (measured 2026-07-25: it is on `xyz`, `flx`, `hyna`,
+`km`, `cash` and `mkts`, across four different collateral tokens).
+
+Every name is checked against the venue at startup and an unknown one is a
+refusal to start, with a hint at the likely mistake:
+
+```
+Error: unknown Hyperliquid perp symbol(s): hyna:hyna:ENA (did you mean:
+hyna:ENA?). Names are case-sensitive; the canonical dex takes a bare coin
+(BTC, not BTCUSDT) and a builder dex takes its prefixed name (xyz:GOLD).
+```
+
+The resolved set — wire name, dex, collateral, `szDecimals`, `maxLeverage` — is
+written to the sidecar as a `{"_collector":"universe"}` record. `szDecimals` is
+what a converter needs for lot size, and the collateral is the only thing that
+distinguishes two same-asset instruments after the fact.
+
 One process handles one venue. Recording two venues means two processes — see
 [Deployment](#deployment), where that maps onto one systemd instance each.
 

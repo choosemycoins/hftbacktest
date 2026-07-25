@@ -5,11 +5,13 @@ mod http;
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const REST_URL: &str = "https://api.hyperliquid.xyz";
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 pub use http::keep_connection;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{error::ConnectorError, file::META_STREAM};
 
@@ -106,7 +108,99 @@ impl SubscriptionSpec {
     }
 }
 
-/// Fails unless every requested coin exists in the venue's perp universe.
+/// The perp DEX a wire coin string belongs to. `""` is the canonical one.
+///
+/// HIP-3 lets third parties deploy their own perp DEXes, each with its own
+/// instrument universe and its own collateral token, and a universe entry's
+/// `name` already carries the prefix — `hyna:ENA` is both the entry name and
+/// the wire coin string, so nothing is concatenated. Verified live: subscribing
+/// to `hyna:ENA` returns data, and it is a different instrument from the
+/// canonical `ENA`.
+fn dex_of(symbol: &str) -> &str {
+    symbol.split_once(':').map_or("", |(dex, _)| dex)
+}
+
+/// What the venue says about one requested instrument.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolInfo {
+    pub wire: String,
+    pub dex: String,
+    pub collateral: String,
+    pub sz_decimals: i64,
+    pub max_leverage: i64,
+}
+
+/// Matches requested symbols against already-fetched universes.
+///
+/// Split out from the HTTP so the interesting half is testable without a
+/// network: `universes` maps a dex name (`""` for canonical) to that dex's
+/// `meta` response, and `collateral` maps a dex name to its collateral token.
+fn match_universes(
+    symbols: &[String],
+    universes: &HashMap<String, serde_json::Value>,
+    collateral: &HashMap<String, String>,
+) -> Result<Vec<SymbolInfo>, anyhow::Error> {
+    let mut out = Vec::new();
+    let mut unknown = Vec::new();
+
+    for symbol in symbols {
+        let dex = dex_of(symbol);
+        let Some(meta) = universes.get(dex) else {
+            return Err(anyhow::anyhow!(
+                "unknown Hyperliquid perp dex {dex:?} in symbol {symbol:?}. \
+                 The canonical dex has no prefix; builder dexes are listed by \
+                 the `perpDexs` info request."
+            ));
+        };
+        let entries = meta
+            .get("universe")
+            .and_then(|u| u.as_array())
+            .ok_or_else(|| anyhow::anyhow!("dex {dex:?}: /info meta has no `universe` array"))?;
+
+        match entries
+            .iter()
+            .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(symbol.as_str()))
+        {
+            Some(a) => out.push(SymbolInfo {
+                wire: symbol.clone(),
+                dex: dex.to_string(),
+                collateral: collateral.get(dex).cloned().unwrap_or_else(|| "?".into()),
+                sz_decimals: a.get("szDecimals").and_then(|v| v.as_i64()).unwrap_or(-1),
+                max_leverage: a.get("maxLeverage").and_then(|v| v.as_i64()).unwrap_or(-1),
+            }),
+            None => {
+                // Point at the likely mistake rather than just refusing. The
+                // two common ones are a quote suffix carried over from another
+                // venue, and double-prefixing a builder dex.
+                let base = symbol.rsplit(':').next().unwrap_or(symbol);
+                let elsewhere: Vec<&str> = universes
+                    .values()
+                    .flat_map(|m| m.get("universe").and_then(|u| u.as_array()).into_iter())
+                    .flatten()
+                    .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
+                    .filter(|n| n.rsplit(':').next() == Some(base))
+                    .collect();
+                unknown.push(if elsewhere.is_empty() {
+                    format!("{symbol} (not listed on any perp dex)")
+                } else {
+                    format!("{symbol} (did you mean: {}?)", elsewhere.join(", "))
+                });
+            }
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(anyhow::anyhow!(
+            "unknown Hyperliquid perp symbol(s): {}. Names are case-sensitive; \
+             the canonical dex takes a bare coin (BTC, not BTCUSDT) and a builder \
+             dex takes its prefixed name (xyz:GOLD). Pass --no-symbol-check to skip.",
+            unknown.join("; ")
+        ));
+    }
+    Ok(out)
+}
+
+/// Fails unless every requested coin exists on the perp dex it names.
 ///
 /// Hyperliquid closes the ENTIRE WebSocket when asked to subscribe to a coin it
 /// does not know — no error frame, no close reason, and every valid
@@ -115,46 +209,74 @@ impl SubscriptionSpec {
 /// exits 0. Verified against mainnet: `BTC NOPE_XYZ` produced eight reconnects
 /// in sixteen seconds and a file full of gaps.
 ///
-/// One REST call at startup turns that into a refusal to start.
-async fn verify_symbols(symbols: &[String], rest_url: &str) -> Result<(), anyhow::Error> {
-    let resp: serde_json::Value = reqwest::Client::new()
-        .post(format!("{rest_url}/info"))
-        .json(&serde_json::json!({ "type": "meta" }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+/// A handful of REST calls at startup turn that into a refusal to start, and
+/// yield the instrument metadata worth recording (§ the `universe` meta record).
+async fn resolve_symbols(
+    symbols: &[String],
+    rest_url: &str,
+) -> Result<Vec<SymbolInfo>, anyhow::Error> {
+    let client = reqwest::Client::new();
+    let info = async |body: serde_json::Value| -> Result<serde_json::Value, anyhow::Error> {
+        Ok(client
+            .post(format!("{rest_url}/info"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    };
 
-    let known: std::collections::HashSet<&str> = resp
-        .get("universe")
-        .and_then(|u| u.as_array())
-        .ok_or_else(|| anyhow::anyhow!("unexpected /info meta response: no `universe` array"))?
-        .iter()
-        .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
-        .collect();
+    // Token index -> name, so the collateral can be recorded as "USDE" rather
+    // than "235". Best effort: a failure here must not block startup.
+    let token_names: HashMap<i64, String> = match info(serde_json::json!({"type":"spotMeta"})).await
+    {
+        Ok(sm) => sm
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| {
+                        Some((
+                            t.get("index")?.as_i64()?,
+                            t.get("name")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            warn!(?error, "couldn't read spotMeta; collateral will be unnamed");
+            HashMap::new()
+        }
+    };
 
-    if known.is_empty() {
-        return Err(anyhow::anyhow!(
-            "the venue returned an empty perp universe; refusing to guess"
-        ));
+    // Only fetch the dexes actually referenced.
+    let mut wanted: Vec<String> = symbols.iter().map(|s| dex_of(s).to_string()).collect();
+    wanted.sort();
+    wanted.dedup();
+
+    let mut universes = HashMap::new();
+    let mut collateral = HashMap::new();
+    for dex in wanted {
+        let body = if dex.is_empty() {
+            serde_json::json!({"type": "meta"})
+        } else {
+            serde_json::json!({"type": "meta", "dex": dex})
+        };
+        let meta = info(body).await.map_err(|e| {
+            anyhow::anyhow!("couldn't read the perp universe for dex {dex:?}: {e}")
+        })?;
+        let ct = meta.get("collateralToken").and_then(|v| v.as_i64());
+        collateral.insert(
+            dex.clone(),
+            ct.and_then(|i| token_names.get(&i).cloned())
+                .unwrap_or_else(|| ct.map_or("?".into(), |i| i.to_string())),
+        );
+        universes.insert(dex, meta);
     }
 
-    let unknown: Vec<&str> = symbols
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|s| !known.contains(s))
-        .collect();
-    if !unknown.is_empty() {
-        return Err(anyhow::anyhow!(
-            "unknown Hyperliquid perp symbol(s): {}. \
-             Names are case-sensitive and unprefixed (BTC, not BTCUSDT). \
-             {} perps are listed; pass --no-symbol-check to skip this.",
-            unknown.join(", "),
-            known.len()
-        ));
-    }
-    Ok(())
+    match_universes(symbols, &universes, &collateral)
 }
 
 pub async fn run_collection(
@@ -164,24 +286,55 @@ pub async fn run_collection(
     check_symbols: bool,
 ) -> Result<(), anyhow::Error> {
     if check_symbols {
-        if let Err(error) = verify_symbols(&symbols, REST_URL).await {
-            // Recorded as well as logged: the sidecar should be able to explain
-            // an empty recording, and "we refused to start" is the clearest
-            // explanation there is.
-            let _ = writer_tx.send((
-                Utc::now(),
-                META_STREAM.to_string(),
-                serde_json::json!({
-                    "_collector": "symbol_check_failed",
-                    "error": error.to_string(),
-                    "symbols": symbols,
-                })
-                .to_string(),
-            ));
-            error!(%error, "refusing to start");
-            return Err(error);
+        match resolve_symbols(&symbols, REST_URL).await {
+            Ok(resolved) => {
+                for s in &resolved {
+                    info!(
+                        wire = %s.wire,
+                        dex = %if s.dex.is_empty() { "canonical" } else { &s.dex },
+                        collateral = %s.collateral,
+                        sz_decimals = s.sz_decimals,
+                        "resolved symbol"
+                    );
+                }
+                // Recorded, not just logged. Two instruments can share a base
+                // asset across dexes — `ENA` on the canonical dex and
+                // `hyna:ENA` on a USDE-collateralised one are different books
+                // — and `szDecimals` is what a converter needs for lot size.
+                // Without this the recording cannot say which was which.
+                let _ = writer_tx.send((
+                    Utc::now(),
+                    META_STREAM.to_string(),
+                    serde_json::json!({
+                        "_collector": "universe",
+                        "symbols": resolved.iter().map(|s| serde_json::json!({
+                            "wire": s.wire,
+                            "dex": s.dex,
+                            "collateral": s.collateral,
+                            "szDecimals": s.sz_decimals,
+                            "maxLeverage": s.max_leverage,
+                        })).collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                ));
+            }
+            Err(error) => {
+                // The sidecar should be able to explain an empty recording, and
+                // "we refused to start" is the clearest explanation there is.
+                let _ = writer_tx.send((
+                    Utc::now(),
+                    META_STREAM.to_string(),
+                    serde_json::json!({
+                        "_collector": "symbol_check_failed",
+                        "error": error.to_string(),
+                        "symbols": symbols,
+                    })
+                    .to_string(),
+                ));
+                error!(%error, "refusing to start");
+                return Err(error);
+            }
         }
-        info!(count = symbols.len(), "symbols verified against /info meta");
     }
 
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -194,6 +347,109 @@ pub async fn run_collection(
     }
     let _ = h.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod universe_tests {
+    use super::*;
+
+    fn uni(entries: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "universe": entries })
+    }
+
+    fn fixture() -> (HashMap<String, serde_json::Value>, HashMap<String, String>) {
+        let mut u = HashMap::new();
+        u.insert(
+            "".to_string(),
+            uni(serde_json::json!([
+                {"name":"BTC","szDecimals":5,"maxLeverage":40},
+                {"name":"ENA","szDecimals":0,"maxLeverage":10},
+            ])),
+        );
+        // A builder dex: the entry name already carries the prefix.
+        u.insert(
+            "hyna".to_string(),
+            uni(serde_json::json!([{"name":"hyna:ENA","szDecimals":0,"maxLeverage":10}])),
+        );
+        u.insert(
+            "xyz".to_string(),
+            uni(serde_json::json!([{"name":"xyz:GOLD","szDecimals":4,"maxLeverage":25}])),
+        );
+        let mut c = HashMap::new();
+        c.insert("".to_string(), "USDC".to_string());
+        c.insert("hyna".to_string(), "USDE".to_string());
+        c.insert("xyz".to_string(), "USDC".to_string());
+        (u, c)
+    }
+
+    fn resolve(syms: &[&str]) -> Result<Vec<SymbolInfo>, anyhow::Error> {
+        let (u, c) = fixture();
+        let v: Vec<String> = syms.iter().map(|s| s.to_string()).collect();
+        match_universes(&v, &u, &c)
+    }
+
+    #[test]
+    fn dex_prefix_is_the_part_before_the_first_colon() {
+        assert_eq!(dex_of("BTC"), "");
+        assert_eq!(dex_of("hyna:ENA"), "hyna");
+        assert_eq!(dex_of("xyz:GOLD"), "xyz");
+    }
+
+    /// The same base asset on two dexes is two instruments with two books and
+    /// two collateral tokens. Conflating them would silently mix the data.
+    #[test]
+    fn same_asset_on_two_dexes_resolves_to_distinct_instruments() {
+        let got = resolve(&["ENA", "hyna:ENA"]).unwrap();
+        assert_eq!(got[0].dex, "");
+        assert_eq!(got[0].collateral, "USDC");
+        assert_eq!(got[1].dex, "hyna");
+        assert_eq!(got[1].collateral, "USDE");
+        assert_ne!(got[0].wire, got[1].wire);
+    }
+
+    /// `szDecimals` is what a converter needs for lot size, so it has to
+    /// survive into the recording rather than being re-guessed later.
+    #[test]
+    fn instrument_metadata_is_captured() {
+        let got = resolve(&["xyz:GOLD"]).unwrap();
+        assert_eq!(got[0].sz_decimals, 4);
+        assert_eq!(got[0].max_leverage, 25);
+        assert_eq!(got[0].collateral, "USDC");
+    }
+
+    /// The entry name already contains the prefix, so concatenating the dex
+    /// onto it is the obvious mistake. It must be caught, and named.
+    #[test]
+    fn double_prefixing_is_rejected_with_a_hint() {
+        let err = resolve(&["hyna:hyna:ENA"]).unwrap_err().to_string();
+        assert!(err.contains("hyna:hyna:ENA"), "{err}");
+        assert!(err.contains("did you mean"), "{err}");
+        assert!(err.contains("hyna:ENA"), "{err}");
+    }
+
+    /// A quote suffix carried over from another venue is the other common
+    /// mistake — Hyperliquid perps have none.
+    #[test]
+    fn quote_suffixed_name_is_rejected() {
+        let err = resolve(&["ENAUSDC"]).unwrap_err().to_string();
+        assert!(err.contains("not listed on any perp dex"), "{err}");
+    }
+
+    /// An unknown dex is a different error from an unknown coin, and saying so
+    /// saves the operator hunting for a typo in the wrong half of the string.
+    #[test]
+    fn unknown_dex_is_reported_as_such() {
+        let err = resolve(&["nope:BTC"]).unwrap_err().to_string();
+        assert!(err.contains("unknown Hyperliquid perp dex"), "{err}");
+        assert!(err.contains("perpDexs"), "{err}");
+    }
+
+    #[test]
+    fn every_unknown_symbol_is_reported_not_just_the_first() {
+        let err = resolve(&["BTC", "NOPE", "ALSONOPE"]).unwrap_err().to_string();
+        assert!(err.contains("NOPE"), "{err}");
+        assert!(err.contains("ALSONOPE"), "{err}");
+    }
 }
 
 #[cfg(test)]
