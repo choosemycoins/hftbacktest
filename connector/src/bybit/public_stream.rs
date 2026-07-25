@@ -40,11 +40,20 @@ use crate::{
 pub struct PublicStream {
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
+    depths: Vec<u32>,
 }
 
 impl PublicStream {
-    pub fn new(ev_tx: UnboundedSender<PublishEvent>, symbol_rx: Receiver<String>) -> Self {
-        Self { ev_tx, symbol_rx }
+    pub fn new(
+        ev_tx: UnboundedSender<PublishEvent>,
+        symbol_rx: Receiver<String>,
+        depths: Vec<u32>,
+    ) -> Self {
+        Self {
+            ev_tx,
+            symbol_rx,
+            depths,
+        }
     }
 
     async fn handle_public_stream(&self, text: &str) -> Result<(), BybitError> {
@@ -184,16 +193,19 @@ impl PublicStream {
                 }
                 msg = self.symbol_rx.recv() => match msg {
                     Ok(symbol) => {
-                        // Subscribes to the orderbook.1, orderbook.50 and orderbook.500 topics to
-                        // obtain a wider range of depth and the most frequent updates.
-                        // The different updates are handled by data fusion.
-                        // Please see: `<https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook>`
-                        let args = vec![
-                            format!("orderbook.1.{symbol}"),
-                            format!("orderbook.50.{symbol}"),
-                            format!("orderbook.500.{symbol}"),
-                            format!("publicTrade.{symbol}")
-                        ];
+                        // Subscribes to the configured orderbook depths plus publicTrade.
+                        // A single unknown topic fails the ENTIRE batch with
+                        // `error:handler not found`, and the connector is then connected
+                        // but subscribed to nothing — so the set is operator-chosen via
+                        // `orderbook_depths` rather than hardcoded. See the doc comment on
+                        // `Config::orderbook_depths` for what mainnet actually accepts.
+                        // Ref: <https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook>
+                        let mut args: Vec<String> = self
+                            .depths
+                            .iter()
+                            .map(|d| format!("orderbook.{d}.{symbol}"))
+                            .collect();
+                        args.push(format!("publicTrade.{symbol}"));
                         let op = Op {
                             req_id: "subscribe".to_string(),
                             op: "subscribe".to_string(),

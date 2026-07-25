@@ -111,6 +111,31 @@ pub struct Config {
     secret: String,
     category: String,
     order_prefix: String,
+    /// Orderbook depth levels to subscribe to on the public stream.
+    ///
+    /// A single rejected topic fails the WHOLE subscribe batch with
+    /// `error:handler not found,topic:orderbook.<N>.<SYMBOL>`, so this set must
+    /// contain only depths the venue actually serves for every configured symbol.
+    ///
+    /// Measured against `wss://stream.bybit.com/v5/public/linear` on 2026-07-25:
+    /// `1`, `50` and `200` are accepted for BTCUSDT, ETHUSDT and SOLUSDT; `500`
+    /// is rejected for all three. Bybit's docs still advertise 500 for linear
+    /// perps, so re-measure rather than trusting either source.
+    ///
+    /// Default is the conservative `[1, 50]`. `200` is a safe widening for the
+    /// majors above; verify before adding it for anything else.
+    #[serde(default = "default_orderbook_depths")]
+    orderbook_depths: Vec<u32>,
+}
+
+fn default_orderbook_depths() -> Vec<u32> {
+    vec![1, 50]
+}
+
+impl Config {
+    pub fn orderbook_depths(&self) -> &[u32] {
+        &self.orderbook_depths
+    }
 }
 
 type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
@@ -129,6 +154,7 @@ impl Bybit {
         // Connects to the public stream for the market data.
         let public_url = self.config.public_url.clone();
         let symbol_tx = self.symbol_tx.clone();
+        let depths: Vec<u32> = self.config.orderbook_depths().to_vec();
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
@@ -143,7 +169,8 @@ impl Bybit {
                     Ok(())
                 })
                 .retry(|| async {
-                    let mut stream = PublicStream::new(ev_tx.clone(), symbol_tx.subscribe());
+                    let mut stream =
+                        PublicStream::new(ev_tx.clone(), symbol_tx.subscribe(), depths.clone());
                     if let Err(error) = stream.connect(&public_url).await {
                         error!(?error, "A connection error occurred.");
                         ev_tx
