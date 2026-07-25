@@ -378,9 +378,9 @@ fi
 if [[ "${#CONFIGURED[@]}" -eq 0 ]]; then
     echo ""
     echo "No instances configured yet. To add one:"
-    echo "  sudo cp ${ETC_DIR}/instance.env.example ${ETC_DIR}/bybit.env"
-    echo "  sudo \$EDITOR ${ETC_DIR}/bybit.env"
-    echo "  sudo systemctl enable --now hft-collector@bybit"
+    echo "  sudo cp ${ETC_DIR}/instance.env.example ${ETC_DIR}/hyperliquid.env"
+    echo "  sudo \$EDITOR ${ETC_DIR}/hyperliquid.env"
+    echo "  sudo systemctl enable --now hft-collector@hyperliquid"
 fi
 echo ""
 echo "Logs:  journalctl -u 'hft-collector@*' -f"
