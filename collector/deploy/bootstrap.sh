@@ -48,7 +48,20 @@ install -d -o root           -g root            -m 755 "${INSTALL_ROOT}/etc"
 # Recorded data is the one thing here that is expensive to lose and grows
 # without bound. It lives outside the versioned releases/ tree precisely so a
 # deploy or a rollback never touches it.
+# `install -d` sets ownership on an existing directory too, so if a separate
+# data volume is already mounted here this chowns the volume's root and no
+# manual step is needed. That is the reason to mount BEFORE bootstrapping.
 install -d -o "${USER_NAME}" -g "${GROUP_NAME}" -m 755 "${INSTALL_ROOT}/data"
+
+if mountpoint -q "${INSTALL_ROOT}/data" 2>/dev/null; then
+    echo "==> ${INSTALL_ROOT}/data is a mount point — ownership applied to the volume"
+    findmnt -no SOURCE,FSTYPE,SIZE "${INSTALL_ROOT}/data" 2>/dev/null | sed 's/^/    /'
+else
+    echo "==> NOTE: ${INSTALL_ROOT}/data is on the root filesystem."
+    echo "    If a separate volume is intended, mount it there and re-run this"
+    echo "    script — mounting afterwards hides the directory just created and"
+    echo "    leaves the volume owned by root."
+fi
 
 echo ""
 echo "==> Bootstrap complete."

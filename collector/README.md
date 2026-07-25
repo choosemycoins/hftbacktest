@@ -336,43 +336,44 @@ flip back on rollback.
 
 ### One-off host setup
 
-```bash
-sudo ./deploy/bootstrap.sh
-```
+If the recordings get their own volume — recommended, so a full data disk
+cannot take the OS with it — **mount it before bootstrapping**. `bootstrap.sh`
+sets ownership on `/opt/hft-collector/data`, and `install -d` applies that to
+an existing directory, so a volume already mounted there gets chowned by the
+script and there is no manual step to forget. Mount afterwards and you hide
+the directory it just created, leaving the volume owned by root.
 
-Creates the `hftcollector` system user and scaffolds `/opt/hft-collector`.
-Idempotent; run once per host.
-
-### Mounting a separate data volume
-
-Recommended: mount it at **`/opt/hft-collector/data`**. That path is already in
-the unit's `ReadWritePaths`, so no drop-in is needed, and a full data volume
-then cannot take the OS down with it.
-
-Order matters — the filesystem must exist and be mounted *before* ownership is
-set, because mounting over a directory hides whatever was underneath.
+`/opt/hft-collector/data` is the path to use: it is already in the unit's
+`ReadWritePaths` and `RequiresMountsFor`, so no drop-in is needed.
 
 ```bash
-lsblk                                  # find the device; Nitro shows nvme1n1, not xvdf
-sudo mkfs.ext4 -L hftdata /dev/nvme1n1 # ONLY if the volume is new and empty
-sudo blkid /dev/nvme1n1                # copy the UUID
+lsblk                                   # find the device; Nitro shows nvme1n1, not xvdf
+sudo mkfs.ext4 -L hftdata /dev/nvme1n1  # ONLY if the volume is new and empty
+sudo blkid /dev/nvme1n1                 # copy the UUID
 
 sudo mkdir -p /opt/hft-collector/data
 echo 'UUID=<uuid> /opt/hft-collector/data ext4 defaults,noatime,nofail 0 2' \
     | sudo tee -a /etc/fstab
-sudo systemctl daemon-reload           # fstab changed; refresh the mount units
+sudo systemctl daemon-reload            # fstab changed; refresh the mount units
 sudo mount -a
+findmnt /opt/hft-collector/data         # confirm before continuing
 
-# only now, on the mounted filesystem
-sudo chown hftcollector:hftcollector /opt/hft-collector/data
-sudo chmod 755 /opt/hft-collector/data
-findmnt /opt/hft-collector/data        # confirm before starting anything
+sudo ./deploy/bootstrap.sh              # creates the user, chowns the volume
 ```
 
+`bootstrap.sh` reports whether that path is a mount point, so the output tells
+you which case you are in. It is idempotent: if the volume was mounted after an
+earlier run, just run it again to fix the ownership.
+
+Doing it the other way round is recoverable — mount, then
+`sudo chown hftcollector:hftcollector /opt/hft-collector/data` by hand, or
+simply re-run `bootstrap.sh`.
+
 `noatime` avoids a metadata write per read on a volume that is append-only in
-practice. `nofail` keeps the host bootable and reachable when the volume is
-missing — and the unit's `RequiresMountsFor=/opt/hft-collector/data` is what
-stops the collector recording in that state.
+practice. Mount by UUID rather than `/dev/nvme1n1`: NVMe device names are not
+stable across reboots. `nofail` keeps the host bootable and reachable when the
+volume is missing — and the unit's `RequiresMountsFor=/opt/hft-collector/data`
+is what stops the collector recording in that state.
 
 **That pairing is load-bearing.** Without it, an unmounted volume is worse than
 an outage: `collector-run.sh` would create the data directory on the root
