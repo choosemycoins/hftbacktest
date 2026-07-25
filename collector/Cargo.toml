@@ -11,11 +11,21 @@ serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["full"] }
 serde_json = "1.0.145"
 futures-util = "0.3.31"
-tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
+# rustls, not native-tls. `native-tls` pulls in `openssl-sys`, which needs a
+# target sysroot and therefore cannot be cross-compiled from macOS — the
+# deploy path in deploy/cross-build-linux.sh fails outright with
+# "Could not find directory of OpenSSL installation". It also makes the
+# deployed binary depend on the host's libssl. The sibling `connector` crate
+# already talks to these same venues over rustls, so this is a proven
+# configuration, not a gamble.
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = [] }
+# `env-filter` is required for `RUST_LOG` to have any effect: without it
+# `fmt::init()` installs a static level filter and the unit's
+# `Environment=RUST_LOG=...` is silently ignored.
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 anyhow = "1.0.100"
-reqwest = { version = "0.12.23", features = ["json"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
 thiserror = "2.0.16"

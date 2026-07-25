@@ -36,8 +36,22 @@ pub async fn run_collection(
     let (ws_tx, mut ws_rx) = unbounded_channel();
     let h = tokio::spawn(keep_connection(topics, symbols, ws_tx.clone()));
     while let Some((recv_time, data)) = ws_rx.recv().await {
-        if let Err(error) = handle(&writer_tx, recv_time, data) {
-            error!(?error, "couldn't handle the received data.");
+        match handle(&writer_tx, recv_time, data) {
+            Ok(()) => {}
+            // A rejected subscribe is fatal, not transient. Bybit fails the
+            // whole batch if any one topic is unknown (e.g. `orderbook.500`
+            // for a symbol that does not offer that depth), and retrying the
+            // identical batch can never succeed. Merely logging it — as this
+            // loop used to — left the socket open and ping-ponging with no
+            // subscription at all: zero bytes recorded, indefinitely, while
+            // the process looked perfectly healthy to systemd.
+            Err(error @ ConnectorError::ConnectionAbort) => {
+                error!(?error, "fatal stream error; stopping the collection task.");
+                return Err(error.into());
+            }
+            Err(error) => {
+                error!(?error, "couldn't handle the received data.");
+            }
         }
     }
     let _ = h.await;
