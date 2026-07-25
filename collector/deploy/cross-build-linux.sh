@@ -120,16 +120,32 @@ echo ""
 echo "==> Packaging ${TARBALL}"
 ( cd "${BUILD_DIR}" && tar -czf "${TARBALL}" . )
 
+# Stage a complete upload set. The release tarball alone is not enough for a
+# first install — bootstrap.sh and install.sh have to exist on the host before
+# there is a release to run them from — and copying them as a separate step is
+# easy to forget. One directory, one scp.
+UPLOAD="/tmp/hft-collector-upload-${TAG}"
+rm -rf "${UPLOAD}"
+mkdir -p "${UPLOAD}"
+cp "${TARBALL}" "${UPLOAD}/"
+install -m 755 "${DEPLOY_DIR}/bootstrap.sh" "${UPLOAD}/bootstrap.sh"
+install -m 755 "${DEPLOY_DIR}/install.sh"   "${UPLOAD}/install.sh"
+install -m 644 "${DEPLOY_DIR}/instance.env.example" "${UPLOAD}/instance.env.example"
+
 echo ""
 echo "==> Done"
-ls -la "${TARBALL}"
+ls -la "${UPLOAD}"
 echo ""
 echo "Next:"
-echo "  scp ${TARBALL} <user>@<host>:/tmp/"
-echo "  # first install on a fresh host also needs bootstrap.sh + install.sh:"
-echo "  scp ${DEPLOY_DIR}/bootstrap.sh ${DEPLOY_DIR}/install.sh <user>@<host>:/tmp/"
+echo "  scp -r ${UPLOAD} <user>@<host>:/tmp/"
 # `-y` is required, not optional: `ssh host 'cmd'` allocates no TTY, install.sh
 # has no terminal to read a confirmation from, and it fails closed rather than
 # installing unattended. sudo's `use_pty` does not help — it is a no-op when
 # sudo itself has no terminal.
-echo "  ssh <host> 'sudo /tmp/bootstrap.sh && sudo /tmp/install.sh /tmp/$(basename "${TARBALL}") -y'"
+UP="/tmp/$(basename "${UPLOAD}")"
+echo "  ssh <host> 'sudo ${UP}/bootstrap.sh && sudo ${UP}/install.sh ${UP}/$(basename "${TARBALL}") -y'"
+echo ""
+echo "Then, per collection job:"
+echo "  ssh <host> 'sudo cp ${UP}/instance.env.example /opt/hft-collector/etc/hyperliquid.env'"
+echo "  ssh -t <host> 'sudo \$EDITOR /opt/hft-collector/etc/hyperliquid.env'"
+echo "  ssh <host> 'sudo systemctl enable --now hft-collector@hyperliquid'"
