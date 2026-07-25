@@ -62,7 +62,9 @@ exactly these streams.
 | `binancefuturescm` | `@trade`, `@bookTicker`, `@depth@0ms` |
 | `binance`, `binancespot` | `@trade`, `@bookTicker`, `@depth@100ms` |
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
-| `hyperliquid` | `trades`, `l2Book`, `bbo` |
+| `hyperliquid` | `trades`, `bbo`, `l2Book` × `{--hl-l2-modes}` |
+
+Two venues take a flag because their defaults are load-bearing:
 
 **`--bybit-depths` (default `1,50`).** Bybit fails the *entire* subscribe batch
 if one topic is unknown, and the connection then stays open, ping-ponging, with
@@ -73,6 +75,23 @@ three** (`error:handler not found`) despite still being documented. The
 collector previously hardcoded `1,50,500` and therefore recorded zero bytes.
 A rejected subscribe is now fatal — the process exits non-zero rather than
 idling silently.
+
+**`--hl-l2-modes` (default `slow,fast`).** Hyperliquid's `l2Book` has two
+cadences and neither is sufficient alone. Measured on mainnet 2026-07-25:
+
+| Feed | Levels/side | Median interval |
+|---|---|---|
+| `bbo` | 1 | 0.14 s |
+| `l2Book` `fast` | 5 | 0.54 s |
+| `l2Book` plain | 20 | 5.41 s |
+| `trades` | — | 0.60 s |
+
+The plain feed updates the book roughly three times a minute, which is not
+usable for backtesting an HFT strategy; the fast feed is only five levels deep.
+The venue accepts both subscriptions on one connection, so the collector records
+both and leaves fusion to the converter. Messages from the fast feed carry
+`"fast": true` in their payload, which is how they are told apart on the way
+back out.
 
 Symbol case is passed through verbatim to the venue. Binance stream names are
 lowercase (`btcusdt`), Bybit and Hyperliquid want uppercase (`BTCUSDT`, `BTC`).
@@ -142,6 +161,26 @@ data = bybit.convert_fused(
 # or process a single depth level
 data = bybit.convert_depth('btcusdt_20260725.gz')
 ```
+
+For Hyperliquid, pick which book cadence to convert — the two cannot be mixed:
+
+```python
+from hftbacktest.data.utils import hyperliquid
+
+data = hyperliquid.convert(
+    'btc_20260725.gz', tick_size=1.0, lot_size=0.00001,
+    num_levels=20, book_mode='slow',   # or num_levels=5, book_mode='fast'
+)
+```
+
+`convert` builds a `DiffOrderBookSnapshot` of a fixed depth and treats every
+`l2Book` message as a complete snapshot of that depth, so feeding it the
+interleaved stream would delete levels 6–20 on every fast message and restore
+them on the next slow one. `book_mode` selects one cadence and drops the other;
+it defaults to `'slow'`, which is exactly how recordings made before the fast
+feed existed behave. **Genuine fusion of the two cadences is not implemented
+yet** — `bybit.convert_fused` plus `FuseMarketDepth` is the pattern it would
+follow.
 
 Other converters that match what this collector records: `binancefutures.convert`
 (for `binancefutures`/`binancefuturesum`/`binancefuturescm`) and

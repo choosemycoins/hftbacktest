@@ -62,8 +62,39 @@ fn handle(
     Ok(())
 }
 
+/// One WebSocket subscription, before the coin is substituted in.
+///
+/// `l2Book` accepts a `fast` flag that trades depth for frequency: omitted (or
+/// false) gives 20 levels per side roughly every 5s, `true` gives 5 levels
+/// roughly every 0.5s (measured against mainnet 2026-07-25). Neither alone is
+/// adequate — the slow feed is far too slow to backtest against, the fast one
+/// is too shallow — so the collector records both and leaves the fusion to the
+/// converter, exactly as it does with Bybit's `orderbook.1`/`.50`/`.200`.
+#[derive(Clone, Debug)]
+pub struct SubscriptionSpec {
+    pub kind: String,
+    /// `Some(_)` serialises a `fast` field; `None` omits it entirely.
+    pub fast: Option<bool>,
+}
+
+impl SubscriptionSpec {
+    pub fn plain(kind: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            fast: None,
+        }
+    }
+
+    pub fn l2_book(fast: bool) -> Self {
+        Self {
+            kind: "l2Book".to_string(),
+            fast: Some(fast),
+        }
+    }
+}
+
 pub async fn run_collection(
-    subscriptions: Vec<String>,
+    subscriptions: Vec<SubscriptionSpec>,
     symbols: Vec<String>,
     writer_tx: UnboundedSender<(DateTime<Utc>, String, String)>,
 ) -> Result<(), anyhow::Error> {

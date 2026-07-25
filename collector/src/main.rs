@@ -50,6 +50,15 @@ struct Args {
     /// symbols you are recording.
     #[arg(long, value_delimiter = ',', default_value = "1,50")]
     bybit_depths: Vec<u32>,
+
+    /// Hyperliquid only: which `l2Book` cadences to record, comma-separated.
+    ///
+    /// `slow` = 20 levels/side at roughly 5s. `fast` = 5 levels/side at roughly
+    /// 0.5s. `none` records no book at all (trades and bbo only). The default
+    /// records both so the converter can fuse depth from the slow feed with
+    /// frequency from the fast one.
+    #[arg(long, value_delimiter = ',', default_value = "slow,fast")]
+    hl_l2_modes: Vec<String>,
 }
 
 /// Listens for the signals that mean "stop recording and close the files".
@@ -196,10 +205,31 @@ async fn main() -> Result<(), anyhow::Error> {
             tokio::spawn(bybit::run_collection(topics, args.symbols, writer_tx))
         }
         "hyperliquid" => {
-            let subscriptions = ["trades", "l2Book", "bbo"]
-                .iter()
-                .map(|sub| sub.to_string())
-                .collect();
+            use hyperliquid::SubscriptionSpec;
+
+            let mut subscriptions = vec![
+                SubscriptionSpec::plain("trades"),
+                SubscriptionSpec::plain("bbo"),
+            ];
+            // Record both book cadences and let the converter fuse them.
+            // Measured on mainnet 2026-07-25: the plain feed is 20 levels every
+            // ~5.3s, `fast` is 5 levels every ~0.5s. Recording only the plain
+            // one — as this collector used to — yields a book that updates
+            // three times a minute, which is not usable for backtesting an HFT
+            // strategy no matter how good the converter is.
+            for mode in &args.hl_l2_modes {
+                match mode.as_str() {
+                    "slow" => subscriptions.push(SubscriptionSpec::l2_book(false)),
+                    "fast" => subscriptions.push(SubscriptionSpec::l2_book(true)),
+                    "none" => {}
+                    other => {
+                        return Err(anyhow!(
+                            "--hl-l2-modes: expected slow|fast|none, got '{other}'"
+                        ));
+                    }
+                }
+            }
+            info!(modes = ?args.hl_l2_modes, "hyperliquid l2Book modes");
 
             tokio::spawn(hyperliquid::run_collection(
                 subscriptions,

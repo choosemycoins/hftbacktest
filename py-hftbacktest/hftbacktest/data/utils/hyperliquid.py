@@ -29,7 +29,8 @@ def convert(
         base_latency: float = 0,
         buffer_size: int = 100_000_000,
         exch_ts_multiplier: int = 1_000_000,
-        delete_out_of_book: bool = True
+        delete_out_of_book: bool = True,
+        book_mode: str = 'slow'
 ) -> NDArray:
     r"""
     Converts raw Hyperliquid feed stream file into a format compatible with HftBacktest.
@@ -61,6 +62,14 @@ def convert(
         Converted data compatible with HftBacktest.
     """
 
+
+    if book_mode not in ('slow', 'fast'):
+        raise ValueError(
+            f"book_mode must be 'slow' or 'fast', got {book_mode!r}. "
+            "Fusing both cadences into one depth stream is not implemented yet; "
+            "see hftbacktest.data.utils.bybit.convert_fused and FuseMarketDepth "
+            "for the pattern that would be needed."
+        )
 
     tmp = np.empty(buffer_size, event_dtype)
     row_num = 0
@@ -94,6 +103,21 @@ def convert(
 
             elif message.get("channel") == "l2Book":
                 depth_data = message.get("data", {})
+
+                # A recording may interleave two l2Book cadences: the plain feed
+                # (20 levels/side, ~5s) and the `fast` one (5 levels/side,
+                # ~0.5s), which the collector subscribes to together. They carry
+                # different depths, and `DiffOrderBookSnapshot` treats every
+                # message as a full snapshot of `num_levels` — so mixing them
+                # would delete levels 6..20 on every fast message and restore
+                # them on the next slow one, oscillating the book.
+                #
+                # Select exactly one cadence. Messages from the plain feed have
+                # no `fast` key at all, so `book_mode='slow'` reproduces the
+                # behaviour of recordings made before the fast feed existed.
+                is_fast = bool(depth_data.get("fast", False))
+                if (book_mode == 'slow' and is_fast) or (book_mode == 'fast' and not is_fast):
+                    continue
 
                 exch_ts = depth_data.get("time") * exch_ts_multiplier
                 levels = depth_data.get("levels")

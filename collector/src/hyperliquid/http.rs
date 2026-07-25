@@ -91,7 +91,7 @@ pub async fn connect(
 }
 
 pub async fn keep_connection(
-    subscription_types: Vec<String>,
+    subscription_types: Vec<super::SubscriptionSpec>,
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) {
@@ -102,13 +102,20 @@ pub async fn keep_connection(
         let subscriptions: Vec<serde_json::Value> = symbol_list
             .iter()
             .flat_map(|symbol| {
-                subscription_types.iter().map(move |sub_type| {
+                subscription_types.iter().map(move |spec| {
+                    let mut sub = serde_json::Map::new();
+                    sub.insert("type".into(), serde_json::Value::from(spec.kind.as_str()));
+                    sub.insert("coin".into(), serde_json::Value::from(symbol.as_str()));
+                    // Omit `fast` entirely rather than sending `false`: the two
+                    // are equivalent for the venue, but an omitted field keeps
+                    // the default subscription byte-identical to what earlier
+                    // recordings used, so old and new files stay comparable.
+                    if let Some(fast) = spec.fast {
+                        sub.insert("fast".into(), serde_json::Value::from(fast));
+                    }
                     serde_json::json!({
                         "method": "subscribe",
-                        "subscription": {
-                            "type": sub_type,
-                            "coin": symbol
-                        }
+                        "subscription": serde_json::Value::Object(sub),
                     })
                 })
             })
