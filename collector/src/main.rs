@@ -267,7 +267,7 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let mut shutdown = Shutdown::new()?;
-    let mut writer = Writer::new(&args.path);
+    let mut writer = Writer::new(&args.path, &args.exchange);
 
     // Distinguishes "asked to stop" from "stopped because recording broke".
     // Exiting 0 in both cases would make an unrecordable host look healthy:

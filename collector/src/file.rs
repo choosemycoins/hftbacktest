@@ -209,13 +209,21 @@ pub const META_STREAM: &str = "_meta";
 
 pub struct Writer {
     path: String,
+    meta_stream: String,
     file: HashMap<String, RotatingFile>,
 }
 
 impl Writer {
-    pub fn new(path: &str) -> Self {
+    /// `instance` disambiguates the meta stream when several collectors share
+    /// one output directory. Symbol files cannot collide in that situation —
+    /// two instances record different venues, so different symbols — but
+    /// `_meta` is the one filename every instance writes regardless of its
+    /// symbol list, so without a suffix two collectors would interleave their
+    /// session records into a single file.
+    pub fn new(path: &str, instance: &str) -> Self {
         Self {
             path: path.to_string(),
+            meta_stream: format!("{META_STREAM}_{instance}"),
             file: Default::default(),
         }
     }
@@ -226,6 +234,11 @@ impl Writer {
         symbol: String,
         data: String,
     ) -> Result<(), anyhow::Error> {
+        let symbol = if symbol == META_STREAM {
+            self.meta_stream.clone()
+        } else {
+            symbol
+        };
         match self.file.entry(symbol.to_lowercase()) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().write(recv_time, data)?;

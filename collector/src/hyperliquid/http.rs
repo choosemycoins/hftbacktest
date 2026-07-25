@@ -64,12 +64,11 @@ pub async fn connect(
             Some(Ok(Message::Text(text))) => {
                 let recv_time = Utc::now();
 
-                if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text)
-                    && j.get("channel").and_then(|c| c.as_str()) == Some("pong")
-                {
-                    continue;
-                }
-
+                // Pongs used to be filtered out here. They are kept now: a pong
+                // is the only positive evidence the socket was alive during a
+                // stretch with no market data, which is exactly what separates
+                // a quiet market from a half-open connection when reading the
+                // meta stream afterwards. `route` files them under META_STREAM.
                 if ws_tx.send((recv_time, text)).is_err() {
                     break;
                 }
@@ -108,8 +107,6 @@ pub async fn keep_connection(
     let mut error_count = 0;
     let mut attempt: u64 = 0;
     loop {
-        let connect_time = Instant::now();
-
         let subscriptions: Vec<serde_json::Value> = symbol_list
             .iter()
             .flat_map(|symbol| {
@@ -151,6 +148,12 @@ pub async fn keep_connection(
             }),
         );
         attempt += 1;
+
+        // Started here, not at the top of the loop: `connected_for_ms` must
+        // measure the connection, not the connection plus the time spent
+        // building the subscription set and writing the subscribe record.
+        // The stale-error-count reset below reads better for the same reason.
+        let connect_time = Instant::now();
 
         if let Err(error) = connect(URL, subscriptions, ws_tx.clone()).await {
             error!(?error, "websocket error");

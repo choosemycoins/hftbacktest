@@ -186,6 +186,21 @@ def convert(
 
     tmp = tmp[:row_num]
 
+    if row_num == 0:
+        # Fail closed. A file with no market data still converts cleanly to a
+        # zero-row npz that is indistinguishable from a day the venue was
+        # silent, and it lands in the dataset directory looking legitimate.
+        # The common causes are all mistakes worth surfacing: the collector's
+        # `_meta_*.gz` sidecar passed in by a wildcard, a recording from a
+        # different venue, a truncated file, or a book_mode that matched
+        # nothing in this recording.
+        raise ValueError(
+            f'{input_filename!r} yielded no market-data records. '
+            f'Check it is a Hyperliquid symbol recording (not a _meta sidecar '
+            f'or another venue), and that book_mode={book_mode!r} matches a '
+            f'cadence present in the file.'
+        )
+
     print('Correcting the latency')
     tmp = correct_local_timestamp(tmp, base_latency)
 

@@ -108,8 +108,12 @@ One file per symbol per UTC day, plus one sidecar:
 
 ```
 <output_dir>/<symbol-lowercase>_<YYYYMMDD>.gz
-<output_dir>/_meta_<YYYYMMDD>.gz
+<output_dir>/_meta_<exchange>_<YYYYMMDD>.gz
 ```
+
+The sidecar carries the exchange name because it is the one filename every
+instance writes regardless of its symbol list: two collectors sharing an output
+directory cannot collide on symbol files, but would collide on `_meta`.
 
 Each decompressed line is a receive timestamp, a single space, then the raw
 message exactly as it came off the wire:
@@ -132,14 +136,23 @@ Symbol files hold only market data. Everything else the collector observes —
 which cannot be attributed to a symbol — goes to `_meta_<date>.gz` in the same
 line format, so a recording explains itself instead of having to be guessed at:
 
-| Record | Meaning |
-|---|---|
-| `{"_collector":"session_start", …}` | collector version, commit, exchange, symbols, flags |
-| `{"_collector":"subscribe", …}` | the exact subscription payloads sent, with attempt number |
-| `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters |
-| `{"channel":"error", …}` | venue rejections |
-| `{"_collector":"disconnected", …}` | reason and how long the connection lasted |
-| `{"_collector":"stream_ended", …}` | clean end of stream |
+**Coverage is uneven across venues** — the table says which records you can
+actually expect:
+
+| Record | Meaning | Venues |
+|---|---|---|
+| `{"_collector":"session_start", …}` | collector version, commit, exchange, symbols, flags | all |
+| `{"_collector":"subscribe", …}` | the exact subscription payloads sent, with attempt number | hyperliquid |
+| `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters | hyperliquid |
+| `{"channel":"error", …}` | venue rejections | hyperliquid |
+| `{"channel":"pong", …}` | liveness during a stretch with no market data | hyperliquid |
+| `{"_collector":"disconnected", …}` | reason, and `connected_for_ms` | hyperliquid |
+| `{"_collector":"stream_ended", …}` | clean end of stream | hyperliquid |
+| `{"success":…,"ret_msg":…}` | Bybit subscribe ack, successful or not | bybit |
+
+Binance venues currently contribute only `session_start`; wiring their
+connection events into the sidecar is unfinished work, not a deliberate
+omission.
 
 This is what turns an unexplained gap into a diagnosable one. A recording made
 against a deliberately invalid symbol now reads:
@@ -214,6 +227,21 @@ data = hyperliquid.convert(
     num_levels=20, book_mode='slow',   # or num_levels=5, book_mode='fast'
 )
 ```
+
+Do not pass the sidecar to a converter. `_meta_*` contains no market data, and
+a wildcard loop over `<dir>/*_<date>.gz` will match it:
+
+```bash
+for f in "$DIR"/*_20260725.gz; do
+    [[ "$(basename "$f")" == _meta_* ]] && continue
+    ...
+done
+```
+
+`hyperliquid.convert` now raises on a recording that yields zero rows rather
+than writing an empty `.npz` that looks like a legitimately silent day. That
+guard also catches a truncated file, the wrong venue, and a `book_mode` that
+matched no message in the recording.
 
 `convert` builds a `DiffOrderBookSnapshot` of a fixed depth and treats every
 `l2Book` message as a complete snapshot of that depth, so feeding it the
@@ -356,10 +384,12 @@ members from different streams.
 
 Worth knowing before you trust a dataset.
 
-- **Reconnects are silent in the data.** Nothing is written into the file to
-  mark a gap. Cross-reference `journalctl` for `websocket error` if a recording
-  looks discontinuous; sequence numbers in the payloads (Binance `pu`/`U`,
-  Bybit `u`/`seq`) are the reliable way to detect one after the fact.
+- **Reconnects are silent in the *symbol* files on every venue.** For
+  Hyperliquid the sidecar records `subscribe`/`disconnected` markers, so a gap
+  can be attributed; for Bybit and Binance it still cannot, and `journalctl`
+  for `websocket error` remains the only source. Sequence numbers in the
+  payloads (Binance `pu`/`U`, Bybit `u`/`seq`) detect a gap after the fact
+  regardless of venue.
 - **The reconnect backoff ladder is dead code on every venue except
   Hyperliquid.** `collector/src/{binance,binancefuturesum,binancefuturescm,
   bybit}/http.rs` test `error_count > 3` before `> 10` and `> 20`, so the first
