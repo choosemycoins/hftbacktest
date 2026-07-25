@@ -314,11 +314,23 @@ Idempotent; run once per host.
 # on the target host (or a matching Linux box)
 ./deploy/build-release.sh                 # -> /tmp/hft-collector-release-<tag>.tar.gz
 
-# or cross-compile from macOS
-./deploy/cross-build-linux.sh             # needs zig + cargo-zigbuild
+# or cross-compile from macOS — needs zig + cargo-zigbuild
+./deploy/cross-build-linux.sh v0.1.0                          # x86_64
+COLLECTOR_LINUX_TARGET=aarch64-unknown-linux-gnu \
+    ./deploy/cross-build-linux.sh v0.1.0-arm                  # Graviton
 
 sudo ./deploy/install.sh /tmp/hft-collector-release-<tag>.tar.gz
 ```
+
+Both targets are known to build and produce a correct ELF; `rustup target add`
+the one you need first. Prefer **arm64/Graviton** unless something else on the
+host requires x86: the collector is idle on either — 12 MB RSS and ~50 kbit/s
+for three symbols — so the only difference that survives is instance price.
+
+The cross-build stages a complete upload set at
+`/tmp/hft-collector-upload-<tag>/`: the tarball plus `bootstrap.sh`,
+`install.sh` and `instance.env.example`, since the tarball alone cannot
+bootstrap a host.
 
 `install.sh` runs the tarball's binary and refuses to proceed if its
 `--version` disagrees with the `binary_version` in the `RELEASE` manifest —
