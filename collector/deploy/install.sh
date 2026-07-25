@@ -110,7 +110,13 @@ fi
 
 # ---------------------------------------------------------------- extract
 
-TMP="$(mktemp -d -t hft-collector-install-XXXXXX)"
+# Staged under releases/, not in /tmp. Two reasons: many hardened hosts mount
+# /tmp `noexec`, which would make the version probe below fail with a message
+# blaming the architecture; and staging on the install filesystem means the
+# final publish is a rename within one filesystem, which is atomic.
+TMP="${RELEASES_DIR}/.staging.$$"
+rm -rf "${TMP}"
+mkdir -p "${TMP}"
 trap 'rm -rf "${TMP}"' EXIT
 
 echo "==> Extracting ${TARBALL}"
@@ -169,15 +175,38 @@ ACTUAL_VERSION="$("${TMP}/bin/collector" --version 2>/dev/null || echo "<cannot 
 EXPECTED_VERSION="$(manifest binary_version)"
 echo "==> Binary reports: ${ACTUAL_VERSION}"
 if [[ "${ACTUAL_VERSION}" == "<cannot execute>" ]]; then
-    echo "ERROR: bin/collector will not execute on this host (wrong architecture or libc?)" >&2
+    echo "ERROR: bin/collector will not execute on this host." >&2
+    echo "  Staged at ${TMP}/bin/collector" >&2
+    echo "  Usual causes: wrong architecture or libc, a missing dynamic loader," >&2
+    echo "  or ${RELEASES_DIR} mounted noexec. Diagnose with:" >&2
+    echo "    file ${TMP}/bin/collector && ${TMP}/bin/collector --version" >&2
     exit 2
 fi
-if [[ -n "${EXPECTED_VERSION}" ]] && [[ "${EXPECTED_VERSION}" != "unknown" ]] \
-   && [[ "${EXPECTED_VERSION}" != "${ACTUAL_VERSION}" ]]; then
-    echo "ERROR: manifest/binary mismatch." >&2
-    echo "  manifest binary_version = ${EXPECTED_VERSION}" >&2
-    echo "  actual  --version       = ${ACTUAL_VERSION}" >&2
-    exit 2
+if [[ -n "${EXPECTED_VERSION}" ]] && [[ "${EXPECTED_VERSION}" != "unknown" ]]; then
+    if [[ "${EXPECTED_VERSION}" != "${ACTUAL_VERSION}" ]]; then
+        echo "ERROR: manifest/binary mismatch." >&2
+        echo "  manifest binary_version = ${EXPECTED_VERSION}" >&2
+        echo "  actual  --version       = ${ACTUAL_VERSION}" >&2
+        exit 2
+    fi
+else
+    # A cross-built tarball cannot record `binary_version`: the build host
+    # cannot execute a Linux binary to ask. The provenance is still checkable,
+    # because build.rs bakes commit, branch and dirty state into `--version`
+    # and the manifest records the same three independently. Comparing them
+    # here restores a real stale-binary check for cross-built releases instead
+    # of degrading to "the binary runs".
+    for field in collector_commit collector_branch collector_dirty; do
+        want="$(manifest "${field}")"
+        [[ -z "${want}" || "${want}" == "unknown" ]] && continue
+        if [[ "${ACTUAL_VERSION}" != *"${want}"* ]]; then
+            echo "ERROR: manifest/binary provenance mismatch on ${field}." >&2
+            echo "  manifest ${field} = ${want}" >&2
+            echo "  actual  --version = ${ACTUAL_VERSION}" >&2
+            echo "  The tarball's binary was not built from the commit the manifest claims." >&2
+            exit 2
+        fi
+    done
 fi
 if [[ "${ACTUAL_VERSION}" == *dirty* ]]; then
     echo "WARNING: this binary was built from a dirty tree — not reproducible from a commit."
@@ -242,23 +271,18 @@ install -d -m 755 "${RELEASES_DIR}" "${ETC_DIR}"
 # would quietly undo an operator's deliberate permission change.
 [[ -d "${DATA_DIR}" ]] || install -d -o "${USER_NAME}" -g "${USER_NAME}" -m 755 "${DATA_DIR}"
 
-# Materialise the release into a staging directory and rename it into place.
-# `cp -a` straight into releases/<tag> is not atomic: a kill or ENOSPC midway
-# leaves a partial directory that looks complete to rollback.sh, and the
-# "already exists" check above then blocks every retry of the same tarball.
-# A rename is atomic within the filesystem, so releases/<tag> either exists
-# complete or does not exist at all.
-STAGING="${RELEASES_DIR}/.staging-${TAG}.$$"
-rm -rf "${STAGING}"
-cleanup_staging() { rm -rf "${STAGING}"; }
-trap 'rm -rf "${TMP}"; cleanup_staging' EXIT
-
-cp -a "${TMP}/." "${STAGING}/"
-chown -R root:root "${STAGING}"
-chmod -R u+rwX,go+rX,go-w "${STAGING}"
-chmod 755 "${STAGING}/bin/"*
-sync -f "${STAGING}" 2>/dev/null || true
-mv -T "${STAGING}" "${NEW_RELEASE}"
+# The tarball was already extracted into a staging directory under releases/,
+# so publishing is a rename within one filesystem — atomic. `cp -a` straight
+# into releases/<tag> would not be: a kill or ENOSPC midway leaves a partial
+# directory that looks complete to rollback.sh, and the "already exists" check
+# above then blocks every retry of the same tarball.
+chown -R root:root "${TMP}"
+chmod -R u+rwX,go+rX,go-w "${TMP}"
+chmod 755 "${TMP}/bin/"*
+sync -f "${TMP}" 2>/dev/null || true
+mv -T "${TMP}" "${NEW_RELEASE}"
+# Published: stop the EXIT trap from deleting what is now the live release.
+trap - EXIT
 
 # Keep a copy of the template where an operator will look for it.
 if [[ -f "${NEW_RELEASE}/etc/instance.env.example" ]]; then
@@ -340,7 +364,18 @@ echo "==> Installed ${TAG}"
 for name in "${INSTANCES[@]}"; do
     printf '    hft-collector@%-16s %s\n' "${name}" "$(systemctl is-active "hft-collector@${name}.service")"
 done
-if [[ "${#INSTANCES[@]}" -eq 0 ]]; then
+shopt -s nullglob
+CONFIGURED=("${ETC_DIR}"/*.env)
+shopt -u nullglob
+if [[ "${#SKIPPED[@]}" -gt 0 ]]; then
+    echo ""
+    echo "Left stopped (enabled but not running): ${SKIPPED[*]}"
+    echo "They will pick up ${TAG} the next time they start."
+fi
+# Gated on whether any instance is *configured*, not on whether any is
+# running — otherwise a deploy to a host whose instances are all stopped
+# tells the operator to create the instance files that already exist.
+if [[ "${#CONFIGURED[@]}" -eq 0 ]]; then
     echo ""
     echo "No instances configured yet. To add one:"
     echo "  sudo cp ${ETC_DIR}/instance.env.example ${ETC_DIR}/bybit.env"

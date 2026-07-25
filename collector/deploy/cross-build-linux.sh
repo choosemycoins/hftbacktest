@@ -128,4 +128,8 @@ echo "Next:"
 echo "  scp ${TARBALL} <user>@<host>:/tmp/"
 echo "  # first install on a fresh host also needs bootstrap.sh + install.sh:"
 echo "  scp ${DEPLOY_DIR}/bootstrap.sh ${DEPLOY_DIR}/install.sh <user>@<host>:/tmp/"
-echo "  ssh <host> 'sudo /tmp/bootstrap.sh && sudo /tmp/install.sh /tmp/$(basename "${TARBALL}")'"
+# `-y` is required, not optional: `ssh host 'cmd'` allocates no TTY, install.sh
+# has no terminal to read a confirmation from, and it fails closed rather than
+# installing unattended. sudo's `use_pty` does not help — it is a no-op when
+# sudo itself has no terminal.
+echo "  ssh <host> 'sudo /tmp/bootstrap.sh && sudo /tmp/install.sh /tmp/$(basename "${TARBALL}") -y'"

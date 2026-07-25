@@ -34,10 +34,26 @@ fn main() {
     // and a binary reports provenance it no longer has. Unlike myhft, this
     // crate is a workspace member, so `.git` is NOT at the crate root — ask
     // git where it actually lives instead of guessing "../.git".
+    // Emitting ANY rerun-if-changed replaces cargo's default "re-run when the
+    // package changes" trigger, so these have to be restored explicitly.
+    // Without them, editing a tracked source file rebuilds the crate but reuses
+    // the cached build-script output — and the binary then reports `clean`
+    // while the working tree is dirty, which is exactly the provenance lie this
+    // script exists to prevent.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=build.rs");
+
     if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
         println!("cargo:rerun-if-changed={git_dir}/index");
     }
+
+    // Note the residual limit: `dirty` reflects the whole repository, but no
+    // set of file triggers can cover that. A change outside this crate that
+    // leaves the index untouched will not re-run the script. install.sh
+    // cross-checks the binary's provenance against the release manifest, which
+    // is computed at package time, so a stale value is caught there.
 }
 
 fn git(args: &[&str]) -> Option<String> {
