@@ -4,7 +4,7 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::error;
 
 use self::http::keep_connection;
-use crate::error::ConnectorError;
+use crate::{error::ConnectorError, file::META_STREAM};
 
 mod http;
 
@@ -19,6 +19,12 @@ fn handle(
         let symbol = topic.split(".").last().ok_or(ConnectorError::FormatError)?;
         let _ = writer_tx.send((recv_time, symbol.to_string(), data.to_string()));
     } else if let Some(j_success) = j.get("success") {
+        // Record the subscribe ack, successful or not. This is the frame that
+        // says which topics the venue actually accepted; without it in the
+        // file, a recording that captured nothing because a topic was rejected
+        // looks exactly like a recording of a silent market.
+        let _ = writer_tx.send((recv_time, META_STREAM.to_string(), data.to_string()));
+
         let success = j_success.as_bool().ok_or(ConnectorError::FormatError)?;
         if !success {
             error!(%data, "couldn't subscribe the topics.");

@@ -17,6 +17,14 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
+/// Injects a synthetic record into the same stream the venue's frames travel
+/// on, so it is timestamped, ordered and stored exactly like real data. The
+/// `_collector` key marks it as ours; `route` in mod.rs sends anything
+/// carrying that key to the meta stream.
+fn emit(ws_tx: &UnboundedSender<(DateTime<Utc>, Utf8Bytes)>, value: serde_json::Value) {
+    let _ = ws_tx.send((Utc::now(), Utf8Bytes::from(value.to_string())));
+}
+
 pub async fn connect(
     url: &str,
     subscriptions: Vec<serde_json::Value>,
@@ -95,7 +103,10 @@ pub async fn keep_connection(
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) {
+    const URL: &str = "wss://api.hyperliquid.xyz/ws";
+
     let mut error_count = 0;
+    let mut attempt: u64 = 0;
     loop {
         let connect_time = Instant::now();
 
@@ -126,10 +137,33 @@ pub async fn keep_connection(
             subscriptions.len()
         );
 
-        if let Err(error) =
-            connect("wss://api.hyperliquid.xyz/ws", subscriptions, ws_tx.clone()).await
-        {
+        // Record the exact subscription set, including the `fast` flags, into
+        // the meta stream. Without it a consumer has to infer what was
+        // recorded from what happens to be present, which is wrong whenever a
+        // subscribed feed was simply silent.
+        emit(
+            &ws_tx,
+            serde_json::json!({
+                "_collector": "subscribe",
+                "url": URL,
+                "attempt": attempt,
+                "subscriptions": &subscriptions,
+            }),
+        );
+        attempt += 1;
+
+        if let Err(error) = connect(URL, subscriptions, ws_tx.clone()).await {
             error!(?error, "websocket error");
+            // A disconnect is otherwise indistinguishable from a quiet market:
+            // the file just stops for a couple of seconds.
+            emit(
+                &ws_tx,
+                serde_json::json!({
+                    "_collector": "disconnected",
+                    "error": error.to_string(),
+                    "connected_for_ms": connect_time.elapsed().as_millis() as u64,
+                }),
+            );
             error_count += 1;
             if connect_time.elapsed() > Duration::from_secs(30) {
                 error_count = 0;
@@ -147,6 +181,13 @@ pub async fn keep_connection(
 
             tokio::time::sleep(sleep_duration).await;
         } else {
+            emit(
+                &ws_tx,
+                serde_json::json!({
+                    "_collector": "stream_ended",
+                    "connected_for_ms": connect_time.elapsed().as_millis() as u64,
+                }),
+            );
             break;
         }
     }

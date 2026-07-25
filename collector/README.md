@@ -104,10 +104,11 @@ One process handles one venue. Recording two venues means two processes — see
 
 ## Output format
 
-One file per symbol per UTC day:
+One file per symbol per UTC day, plus one sidecar:
 
 ```
 <output_dir>/<symbol-lowercase>_<YYYYMMDD>.gz
+<output_dir>/_meta_<YYYYMMDD>.gz
 ```
 
 Each decompressed line is a receive timestamp, a single space, then the raw
@@ -124,6 +125,47 @@ message exactly as it came off the wire:
   being written — not by a timer. A symbol that goes quiet across midnight
   rolls over when its next message arrives.
 - Nothing is ever pruned. Budget disk accordingly and add your own retention.
+
+### The `_meta` sidecar
+
+Symbol files hold only market data. Everything else the collector observes —
+which cannot be attributed to a symbol — goes to `_meta_<date>.gz` in the same
+line format, so a recording explains itself instead of having to be guessed at:
+
+| Record | Meaning |
+|---|---|
+| `{"_collector":"session_start", …}` | collector version, commit, exchange, symbols, flags |
+| `{"_collector":"subscribe", …}` | the exact subscription payloads sent, with attempt number |
+| `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters |
+| `{"channel":"error", …}` | venue rejections |
+| `{"_collector":"disconnected", …}` | reason and how long the connection lasted |
+| `{"_collector":"stream_ended", …}` | clean end of stream |
+
+This is what turns an unexplained gap into a diagnosable one. A recording made
+against a deliberately invalid symbol now reads:
+
+```
+session_start hyperliquid ['BTC','NOPE_XYZ'] modes=['slow','fast']
+subscribe attempt=0 n=8
+subscriptionResponse ×4          <- only BTC's four were acked
+disconnected after=1194ms err=Connection reset without closing handshake
+subscribe attempt=1 n=8
+...
+```
+
+Previously the same run produced a symbol file with seven unexplained
+1.5–2 second holes and nothing else.
+
+**Nothing is dropped.** Any frame that cannot be filed under a symbol — an
+empty trades array, an unrecognised channel, a `pong` — is written to `_meta`
+rather than discarded, so the recording stays a faithful record of the session.
+
+The collector performs no merging of its own. Feeds of different depths and
+rates are recorded side by side exactly as received; reconciling them is a
+policy decision with no single right answer, and making it at capture time
+would leave the recording unable to answer any other question. Keeping it
+downstream is what allows several merge policies to be run over the same bytes
+and compared.
 
 ### Multi-member gzip
 

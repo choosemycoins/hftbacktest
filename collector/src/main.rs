@@ -147,6 +147,30 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let (writer_tx, mut writer_rx) = unbounded_channel();
 
+    // Open the recording with a record of what produced it. The scoped clone
+    // is dropped immediately: keeping a sender alive here would stop
+    // `writer_rx.recv()` ever returning `None`, and that is what tells the
+    // main loop the collection task has died.
+    {
+        let meta_tx = writer_tx.clone();
+        let _ = meta_tx.send((
+            chrono::Utc::now(),
+            file::META_STREAM.to_string(),
+            serde_json::json!({
+                "_collector": "session_start",
+                "version": env!("CARGO_PKG_VERSION"),
+                "commit": env!("COLLECTOR_GIT_COMMIT"),
+                "branch": env!("COLLECTOR_GIT_BRANCH"),
+                "dirty": env!("COLLECTOR_GIT_DIRTY"),
+                "exchange": args.exchange,
+                "symbols": args.symbols,
+                "bybit_depths": args.bybit_depths,
+                "hl_l2_modes": args.hl_l2_modes,
+            })
+            .to_string(),
+        ));
+    }
+
     let _collection_task = match args.exchange.as_str() {
         "binancefutures" | "binancefuturesum" => {
             let streams = [

@@ -195,6 +195,18 @@ mod rotating_file_tests {
     }
 }
 
+/// Reserved stream name for records that belong to no symbol.
+///
+/// Everything the collector observes has to land somewhere, but `Writer` files
+/// by symbol and connection-level frames — subscription acks, venue errors,
+/// disconnects — carry none. They go here instead of being dropped, which is
+/// what makes a recording self-describing: a later consumer can tell what was
+/// subscribed with which parameters, and where the gaps came from, instead of
+/// inferring it from what happens to be present.
+///
+/// No venue uses a leading underscore in a symbol, so this cannot collide.
+pub const META_STREAM: &str = "_meta";
+
 pub struct Writer {
     path: String,
     file: HashMap<String, RotatingFile>,
