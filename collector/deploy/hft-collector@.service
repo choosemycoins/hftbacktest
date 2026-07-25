@@ -80,6 +80,20 @@ PrivateTmp=true
 NoNewPrivileges=true
 ReadWritePaths=/opt/hft-collector/data
 
+# Remote alerting hangs off unit failure, because that is what the collector
+# is built to produce: it exits non-zero on a disk floor breach, an unknown
+# symbol, or a write error, rather than degrading quietly. Point this at
+# whatever notifies you and the disk guard becomes an alert instead of a
+# silent stop. Create the target separately; it is intentionally not shipped
+# here, since the notification mechanism is site-specific.
+#
+#   OnFailure=hft-collector-alert@%i.service
+#
+# The other half is the sidecar: plain text, flushed per record, carrying a
+# `{"_collector":"disk","free_bytes":…}` line every minute. Ship it with the
+# journal, or scrape it, and you have free-space history per instance without
+# a metrics agent.
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hft-collector-%i

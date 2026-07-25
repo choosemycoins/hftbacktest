@@ -17,6 +17,8 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
+use super::WS_URL;
+
 /// Injects a synthetic record into the same stream the venue's frames travel
 /// on, so it is timestamped, ordered and stored exactly like real data. The
 /// `_collector` key marks it as ours; `route` in mod.rs sends anything
@@ -102,8 +104,6 @@ pub async fn keep_connection(
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) {
-    const URL: &str = "wss://api.hyperliquid.xyz/ws";
-
     let mut error_count = 0;
     let mut attempt: u64 = 0;
     loop {
@@ -142,7 +142,7 @@ pub async fn keep_connection(
             &ws_tx,
             serde_json::json!({
                 "_collector": "subscribe",
-                "url": URL,
+                "url": WS_URL,
                 "attempt": attempt,
                 "subscriptions": &subscriptions,
             }),
@@ -155,7 +155,7 @@ pub async fn keep_connection(
         // The stale-error-count reset below reads better for the same reason.
         let connect_time = Instant::now();
 
-        if let Err(error) = connect(URL, subscriptions, ws_tx.clone()).await {
+        if let Err(error) = connect(WS_URL, subscriptions, ws_tx.clone()).await {
             error!(?error, "websocket error");
             // A disconnect is otherwise indistinguishable from a quiet market:
             // the file just stops for a couple of seconds.

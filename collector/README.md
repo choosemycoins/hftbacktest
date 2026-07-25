@@ -392,9 +392,43 @@ honest signal:
 find /opt/hft-collector/data -name "*_$(date -u +%Y%m%d).gz" -mmin -10
 ```
 
-Budget roughly **20 MB per symbol per day** compressed for a Hyperliquid major
-recording trades, bbo and both book cadences (measured: BTC 22 MB/day, ETH 23,
-SOL 15). The sidecar adds about 90 KB.
+### Capacity
+
+Measured over a 12-minute run, both book cadences plus bbo and trades:
+
+| Venue / symbol | msg/s | compressed |
+|---|---|---|
+| Hyperliquid BTC | 7.4 | 22 MB/day |
+| Hyperliquid ETH | 6.7 | 23 MB/day |
+| Hyperliquid SOL | 5.6 | 15 MB/day |
+| Bybit BTCUSDT, depths `1,50` | 32 | 86 MB/day |
+| Bybit BTCUSDT, depths `1,50,200` | 43 | 159 MB/day |
+
+Hyperliquid is an order of magnitude lighter than Bybit, and that is a property
+of the venue rather than of this collector. Bybit streams an incremental delta
+on **every** book change across up to 500 levels; Hyperliquid publishes no
+incremental depth channel at all, only throttled snapshots — 20 levels every
+~5.4s, 5 levels every ~0.54s, plus BBO at ~0.14s. The venue conflates before it
+sends. Treat the small footprint as a warning about resolution, not a saving.
+
+These are quiet-period figures from one 12-minute window. `bbo` and `trades`
+are event-driven, so a volatile session costs several times more; size the
+volume with headroom.
+
+### Running out of space
+
+`--min-free-gb` (default 5) is checked at startup and every minute after.
+Below the floor the collector closes its files cleanly and exits non-zero, so
+systemd marks the unit failed — rather than writing until the filesystem is
+full and leaving a half-written gzip member. `0` disables it.
+
+Free space is also written to the sidecar every minute
+(`{"_collector":"disk","free_bytes":…}`), which gives each recording its own
+capacity history with no metrics agent involved.
+
+For remote alerting, hang `OnFailure=` off the unit: every fail-closed path in
+the collector ends in a non-zero exit, so unit failure is the single signal to
+watch. See the commented example in `deploy/hft-collector@.service`.
 
 **Restarting always costs a gap** of a second or two per instance while the
 WebSocket reconnects, and both deploy and rollback restart. There is no
@@ -418,8 +452,10 @@ Worth knowing before you trust a dataset.
   bybit}/http.rs` test `error_count > 3` before `> 10` and `> 20`, so the first
   branch always wins and the delay is a flat 1s no matter how long the venue
   has been failing. Only `hyperliquid/http.rs` orders the branches correctly.
-- **No disk-space guard.** The collector will happily fill the volume and then
-  start failing writes. Monitor `df` externally.
+- **Symbol validation is Hyperliquid-only.** There it is on by default and
+  refuses to start on an unknown coin, because one bad name closes the whole
+  WebSocket and takes every valid subscription with it. Bybit and Binance have
+  no equivalent check yet; a typo there still produces a partial recording.
 - **`binancefuturesum` and `binancefuturescm` are byte-identical modules**
   differing only in their sibling `http.rs` endpoints. A fix to one needs
   applying to the other.

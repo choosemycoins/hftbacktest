@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use anyhow::anyhow;
+use chrono::Utc;
 use clap::Parser;
 use tokio::{self, select, sync::mpsc::unbounded_channel};
 use tracing::{error, info};
@@ -9,6 +12,7 @@ mod binance;
 mod binancefuturescm;
 mod binancefuturesum;
 mod bybit;
+mod disk;
 mod error;
 mod file;
 mod hyperliquid;
@@ -59,6 +63,38 @@ struct Args {
     /// frequency from the fast one.
     #[arg(long, value_delimiter = ',', default_value = "slow,fast")]
     hl_l2_modes: Vec<String>,
+
+    /// Stop recording when free space on the output filesystem drops below
+    /// this many gigabytes. `0` disables the check.
+    ///
+    /// Checked at startup and every minute after. Crossing the floor is a
+    /// clean, non-zero exit: the files are closed properly and systemd marks
+    /// the unit failed, which is a far better outcome than writes beginning to
+    /// fail at zero bytes free with a half-written gzip member.
+    #[arg(long, default_value_t = 5)]
+    min_free_gb: u64,
+
+    /// Skip the startup check that every requested symbol exists on the venue.
+    ///
+    /// Only Hyperliquid implements the check today. Leave it on: an unknown
+    /// coin there closes the whole WebSocket, taking every valid subscription
+    /// with it, and the collector then reconnects forever writing partial data
+    /// while looking healthy.
+    #[arg(long)]
+    no_symbol_check: bool,
+}
+
+/// Reports free space, and refuses to continue below the floor.
+fn check_disk(path: &str, min_free_gb: u64) -> Result<u64, anyhow::Error> {
+    let free = disk::available_bytes(path)?;
+    let floor = min_free_gb.saturating_mul(1024 * 1024 * 1024);
+    if min_free_gb > 0 && free < floor {
+        return Err(anyhow!(
+            "only {:.1} GB free on {path}, below the --min-free-gb floor of {min_free_gb} GB",
+            free as f64 / 1e9
+        ));
+    }
+    Ok(free)
 }
 
 /// Listens for the signals that mean "stop recording and close the files".
@@ -145,6 +181,14 @@ async fn main() -> Result<(), anyhow::Error> {
         "collector_starting"
     );
 
+    // Fail before opening a single file rather than partway through the day.
+    let free_at_start = check_disk(&args.path, args.min_free_gb)?;
+    info!(
+        free_gb = format!("{:.1}", free_at_start as f64 / 1e9),
+        min_free_gb = args.min_free_gb,
+        "disk space at startup"
+    );
+
     let (writer_tx, mut writer_rx) = unbounded_channel();
 
     // Open the recording with a record of what produced it. The scoped clone
@@ -171,7 +215,7 @@ async fn main() -> Result<(), anyhow::Error> {
         ));
     }
 
-    let _collection_task = match args.exchange.as_str() {
+    let collection_task = match args.exchange.as_str() {
         "binancefutures" | "binancefuturesum" => {
             let streams = [
                 "$symbol@trade",
@@ -259,6 +303,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 subscriptions,
                 args.symbols,
                 writer_tx,
+                !args.no_symbol_check,
             ))
         }
         exchange => {
@@ -268,6 +313,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut shutdown = Shutdown::new()?;
     let mut writer = Writer::new(&args.path, &args.exchange);
+
+    // Sampled rather than checked per write: a statvfs on the hot path would be
+    // a syscall per message. A minute is far shorter than the time it takes to
+    // consume the 5 GB default floor at the observed ~20 MB/day/symbol.
+    let mut disk_check = tokio::time::interval(Duration::from_secs(60));
+    disk_check.tick().await; // the first tick is immediate; startup already checked
 
     // Distinguishes "asked to stop" from "stopped because recording broke".
     // Exiting 0 in both cases would make an unrecordable host look healthy:
@@ -281,6 +332,39 @@ async fn main() -> Result<(), anyhow::Error> {
                 info!(signal = sig, "shutdown signal received");
                 break;
             }
+            _ = disk_check.tick() => {
+                match check_disk(&args.path, args.min_free_gb) {
+                    Ok(free) => {
+                        // Written to the sidecar, not just the log: it makes a
+                        // recording carry its own capacity history, and it is
+                        // the one file an operator can tail live.
+                        let _ = writer.write(
+                            Utc::now(),
+                            file::META_STREAM.to_string(),
+                            serde_json::json!({
+                                "_collector": "disk",
+                                "free_bytes": free,
+                                "path": args.path,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        error!(%error, "stopping: not enough free disk space");
+                        let _ = writer.write(
+                            Utc::now(),
+                            file::META_STREAM.to_string(),
+                            serde_json::json!({
+                                "_collector": "disk_exhausted",
+                                "error": error.to_string(),
+                            })
+                            .to_string(),
+                        );
+                        fatal = Some(error);
+                        break;
+                    }
+                }
+            }
             r = writer_rx.recv() => match r {
                 Some((recv_time, symbol, data)) => {
                     if let Err(error) = writer.write(recv_time, symbol, data) {
@@ -292,7 +376,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 None => {
                     // Every sender is gone, i.e. the collection task ended.
                     // Nothing further will ever be recorded, so this is a
-                    // failure however tidily it happened.
+                    // failure however tidily it happened. The task's own error
+                    // is recovered below, since "the task ended" on its own
+                    // tells an operator nothing about why.
                     fatal = Some(anyhow!(
                         "the collection task ended; no further data will be recorded"
                     ));
@@ -308,6 +394,17 @@ async fn main() -> Result<(), anyhow::Error> {
     // attempted. A failed flush is logged by `Drop` itself and cannot be
     // reported through this return value.
     drop(writer);
+
+    // Prefer the collection task's own error. It knows the real cause — an
+    // unknown symbol, an unrecoverable stream failure — where the main loop
+    // only ever sees the channel close. Without this the process exits with a
+    // message that describes the symptom and not the fault.
+    if fatal.is_some()
+        && collection_task.is_finished()
+        && let Ok(Err(task_error)) = collection_task.await
+    {
+        fatal = Some(task_error);
+    }
 
     match fatal {
         None => {
