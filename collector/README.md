@@ -107,13 +107,26 @@ One process handles one venue. Recording two venues means two processes — see
 One file per symbol per UTC day, plus one sidecar:
 
 ```
-<output_dir>/<symbol-lowercase>_<YYYYMMDD>.gz
-<output_dir>/_meta_<exchange>_<YYYYMMDD>.gz
+<output_dir>/<symbol-lowercase>_<YYYYMMDD>.gz        gzipped market data
+<output_dir>/_meta_<exchange>_<YYYYMMDD>.jsonl       plain text, flushed per record
 ```
 
 The sidecar carries the exchange name because it is the one filename every
 instance writes regardless of its symbol list: two collectors sharing an output
 directory cannot collide on symbol files, but would collide on `_meta`.
+
+It is **not** compressed, on purpose. Its value is being readable while the
+collector runs, and gzip cannot provide that: `GzEncoder::flush()` emits a
+deflate sync point but no member trailer, so a reader still rejects the file
+until the member is closed at shutdown. Measured over a 12-minute run, a
+gzipped meta stream stayed at 10 bytes on disk the whole time and materialised
+only on exit — no use for diagnosing a live problem, and lost entirely to a
+SIGKILL. At ~90 KB/day it does not need compressing. The different extension
+also keeps it out of the `*_<date>.gz` wildcards that feed the converters.
+
+```bash
+tail -f /opt/hft-collector/data/hyperliquid/_meta_hyperliquid_$(date -u +%Y%m%d).jsonl
+```
 
 Each decompressed line is a receive timestamp, a single space, then the raw
 message exactly as it came off the wire:
@@ -228,17 +241,8 @@ data = hyperliquid.convert(
 )
 ```
 
-Do not pass the sidecar to a converter. `_meta_*` contains no market data, and
-a wildcard loop over `<dir>/*_<date>.gz` will match it:
-
-```bash
-for f in "$DIR"/*_20260725.gz; do
-    [[ "$(basename "$f")" == _meta_* ]] && continue
-    ...
-done
-```
-
-`hyperliquid.convert` now raises on a recording that yields zero rows rather
+The sidecar is `.jsonl`, so a `<dir>/*_<date>.gz` loop will not pick it up.
+Independently of that, `hyperliquid.convert` raises on a recording that yields zero rows rather
 than writing an empty `.npz` that looks like a legitimately silent day. That
 guard also catches a truncated file, the wrong venue, and a `book_mode` that
 matched no message in the recording.
@@ -363,15 +367,34 @@ df -h /opt/hft-collector/data                       # this is the one that bites
 ls -la /opt/hft-collector/data/bybit | tail
 ```
 
-Health at a glance: today's file for each symbol should be growing.
+**Do not health-check by file mtime.** The gzip encoder writes in ~48 KB
+blocks, so a perfectly healthy symbol file sits untouched for minutes between
+flushes — measured on a 12-minute run, BTC flushed every 3–4 minutes and SOL
+every 5, meaning a `-mmin -5` check would have reported SOL dead while it was
+recording normally. It fails the other way too: a stalled collector keeps the
+mtime of its last flush.
+
+Check the sidecar instead. It is plain text flushed per record, so it is always
+current:
 
 ```bash
-find /opt/hft-collector/data -name "*_$(date -u +%Y%m%d).gz" -mmin -5
+# what this instance is doing right now
+tail -5 /opt/hft-collector/data/hyperliquid/_meta_hyperliquid_$(date -u +%Y%m%d).jsonl
+
+# disconnects today
+grep -c '"_collector":"disconnected"' .../_meta_hyperliquid_$(date -u +%Y%m%d).jsonl
 ```
 
-A file that has not been written to in minutes means that symbol is silent —
-either the venue is quiet or the subscription was lost without the connection
-dropping.
+For the data itself, growth over a window longer than the flush interval is the
+honest signal:
+
+```bash
+find /opt/hft-collector/data -name "*_$(date -u +%Y%m%d).gz" -mmin -10
+```
+
+Budget roughly **20 MB per symbol per day** compressed for a Hyperliquid major
+recording trades, bbo and both book cadences (measured: BTC 22 MB/day, ETH 23,
+SOL 15). The sidecar adds about 90 KB.
 
 **Restarting always costs a gap** of a second or two per instance while the
 WebSocket reconnects, and both deploy and rollback restart. There is no

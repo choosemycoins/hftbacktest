@@ -9,14 +9,72 @@ use chrono::{DateTime, NaiveDate, Utc};
 use flate2::{Compression, write::GzEncoder};
 use tracing::{error, info};
 
+/// How a stream is stored.
+///
+/// Market data is gzipped: it is large, written continuously, and only ever
+/// read after the fact. The meta stream is not, because its whole purpose is to
+/// be readable *while the collector runs* — and gzip cannot deliver that.
+/// `GzEncoder::flush()` emits a deflate sync point but no member trailer, so a
+/// standard reader still rejects the file with `UnexpectedEof`; the data only
+/// becomes decodable when the member is finished at shutdown. Measured over a
+/// 12-minute run, the meta stream stayed at 10 bytes on disk throughout and
+/// materialised only on exit — useless for diagnosing a problem in progress,
+/// and lost entirely to a SIGKILL. At ~90 KB/day it does not need compressing.
+///
+/// The plain stream also uses a different extension, which keeps it out of the
+/// `*_<date>.gz` wildcards that feed the data converters.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Encoding {
+    Gzip,
+    /// Written uncompressed and flushed after every record.
+    PlainFlushed,
+}
+
+impl Encoding {
+    fn extension(self) -> &'static str {
+        match self {
+            Encoding::Gzip => "gz",
+            Encoding::PlainFlushed => "jsonl",
+        }
+    }
+}
+
+enum Sink {
+    Gz(Box<GzEncoder<File>>),
+    Plain(File),
+}
+
+impl Sink {
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), io::Error> {
+        match self {
+            Sink::Gz(f) => f.write_all(buf),
+            Sink::Plain(f) => f.write_all(buf),
+        }
+    }
+
+    /// Closes the stream. For gzip this writes the member trailer, without
+    /// which the file cannot be decoded.
+    fn finish(self) -> Result<(), io::Error> {
+        match self {
+            Sink::Gz(f) => f.finish().map(|_| ()),
+            Sink::Plain(mut f) => f.flush(),
+        }
+    }
+}
+
 pub struct RotatingFile {
     date: NaiveDate,
     path: String,
-    file: Option<GzEncoder<File>>,
+    encoding: Encoding,
+    file: Option<Sink>,
 }
 
 impl RotatingFile {
-    fn create(datetime: DateTime<Utc>, path: &str) -> Result<GzEncoder<File>, io::Error> {
+    fn create(
+        datetime: DateTime<Utc>,
+        path: &str,
+        encoding: Encoding,
+    ) -> Result<Sink, io::Error> {
         let date = datetime.date_naive().format("%Y%m%d");
         // `append`, not plain `write`: the collector reopens today's file on
         // every restart (deploy, rollback, supervisor recycle, crash). Opening
@@ -30,14 +88,22 @@ impl RotatingFile {
         let file = File::options()
             .create(true)
             .append(true)
-            .open(format!("{path}_{date}.gz"))?;
-        Ok(GzEncoder::new(file, Compression::default()))
+            .open(format!("{path}_{date}.{}", encoding.extension()))?;
+        Ok(match encoding {
+            Encoding::Gzip => Sink::Gz(Box::new(GzEncoder::new(file, Compression::default()))),
+            Encoding::PlainFlushed => Sink::Plain(file),
+        })
     }
 
-    pub fn new(datetime: DateTime<Utc>, path: String) -> Result<Self, io::Error> {
+    pub fn new(
+        datetime: DateTime<Utc>,
+        path: String,
+        encoding: Encoding,
+    ) -> Result<Self, io::Error> {
         Ok(Self {
             date: datetime.date_naive(),
-            file: Some(Self::create(datetime, &path)?),
+            file: Some(Self::create(datetime, &path, encoding)?),
+            encoding,
             path,
         })
     }
@@ -49,7 +115,7 @@ impl RotatingFile {
             // fails (disk full, data dir remounted read-only) the old encoder is
             // still installed, so this object stays in a valid state and the
             // error propagates without stranding `self.file` as `None`.
-            let next = Self::create(datetime, &self.path)?;
+            let next = Self::create(datetime, &self.path, self.encoding)?;
             if let Some(file) = self.file.replace(next)
                 && let Err(error) = file.finish()
             {
@@ -59,10 +125,20 @@ impl RotatingFile {
             info!(%date, %self.path, "date is changed");
         }
         let timestamp = datetime.timestamp_nanos_opt().unwrap();
-        self.file
-            .as_mut()
-            .unwrap()
-            .write_all(format!("{timestamp} {data}\n").as_bytes())
+        let file = self.file.as_mut().unwrap();
+        file.write_all(format!("{timestamp} {data}\n").as_bytes())?;
+
+        // A plain stream is flushed per record — that is the reason it is not
+        // compressed. Gzip streams are left to buffer; forcing a sync point on
+        // them costs compression on the high-volume path and still would not
+        // make them decodable, since the member trailer is only written on
+        // close.
+        if self.encoding == Encoding::PlainFlushed
+            && let Sink::Plain(f) = file
+        {
+            f.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -133,11 +209,11 @@ mod rotating_file_tests {
         let t = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap();
 
         {
-            let mut f = RotatingFile::new(t, path.clone()).unwrap();
+            let mut f = RotatingFile::new(t, path.clone(), Encoding::Gzip).unwrap();
             f.write(t, "before-restart".to_string()).unwrap();
         }
         {
-            let mut f = RotatingFile::new(t, path.clone()).unwrap();
+            let mut f = RotatingFile::new(t, path.clone(), Encoding::Gzip).unwrap();
             f.write(t, "after-restart".to_string()).unwrap();
         }
 
@@ -162,7 +238,7 @@ mod rotating_file_tests {
         let day2 = Utc.with_ymd_and_hms(2026, 7, 26, 0, 0, 1).unwrap();
 
         {
-            let mut f = RotatingFile::new(day1, path.clone()).unwrap();
+            let mut f = RotatingFile::new(day1, path.clone(), Encoding::Gzip).unwrap();
             f.write(day1, "day-one".to_string()).unwrap();
             f.write(day2, "day-two".to_string()).unwrap();
         }
@@ -171,6 +247,49 @@ mod rotating_file_tests {
         let d2 = read_all(&format!("{path}_20260726.gz"));
         assert!(d2.contains("day-two"));
         assert!(!d2.contains("day-one"), "day 1 data leaked into day 2 file");
+    }
+
+    /// The meta stream must be readable while the collector is still running.
+    /// Without a flush the gzip encoder holds records until ~48 KB accumulate,
+    /// which for a stream of a few dozen lines per session means they only
+    /// reach disk at shutdown — and not at all after a SIGKILL.
+    #[test]
+    fn meta_records_are_readable_before_shutdown() {
+        let dir = scratch("metaflush");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
+        let mut w = Writer::new(&dir, "hyperliquid");
+
+        w.write(t, META_STREAM.to_string(), r#"{"_collector":"disconnected"}"#.to_string())
+            .unwrap();
+
+        // Deliberately not dropping `w`: this is the live-process case.
+        // The meta stream is plain `.jsonl`, so it is readable immediately.
+        // A gzip stream could not be: `flush()` emits a deflate sync point but
+        // no member trailer, so a decoder still fails with UnexpectedEof.
+        let content = fs::read_to_string(format!("{dir}/_meta_hyperliquid_20260725.jsonl")).unwrap();
+        assert!(
+            content.contains("disconnected"),
+            "meta record not readable while the collector is running: {content:?}"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{dir}/_meta_hyperliquid_20260725.gz")).exists(),
+            "meta must not be gzipped — a *.gz wildcard would feed it to the converters"
+        );
+    }
+
+    /// Symbol streams are deliberately NOT flushed per record — that would cost
+    /// compression on the high-volume path. They are complete after a clean
+    /// shutdown, which is what the signal handling exists to guarantee.
+    #[test]
+    fn symbol_records_are_complete_after_shutdown() {
+        let dir = scratch("symflush");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
+        {
+            let mut w = Writer::new(&dir, "hyperliquid");
+            w.write(t, "BTC".to_string(), r#"{"px":"1"}"#.to_string())
+                .unwrap();
+        }
+        assert!(read_all(&format!("{dir}/btc_20260725.gz")).contains("px"));
     }
 
     /// Each line is `{recv_timestamp_nanos} {raw_payload}`. The data pipeline
@@ -183,7 +302,7 @@ mod rotating_file_tests {
         let t = Utc.with_ymd_and_hms(2026, 7, 25, 0, 0, 0).unwrap();
 
         {
-            let mut f = RotatingFile::new(t, path.clone()).unwrap();
+            let mut f = RotatingFile::new(t, path.clone(), Encoding::Gzip).unwrap();
             f.write(t, r#"{"a":1}"#.to_string()).unwrap();
         }
 
@@ -234,21 +353,24 @@ impl Writer {
         symbol: String,
         data: String,
     ) -> Result<(), anyhow::Error> {
-        let symbol = if symbol == META_STREAM {
-            self.meta_stream.clone()
+        let is_meta = symbol == META_STREAM;
+        let (symbol, encoding) = if is_meta {
+            (self.meta_stream.clone(), Encoding::PlainFlushed)
         } else {
-            symbol
+            (symbol, Encoding::Gzip)
         };
         match self.file.entry(symbol.to_lowercase()) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().write(recv_time, data)?;
-            }
+            Entry::Occupied(mut entry) => entry.get_mut().write(recv_time, data)?,
             Entry::Vacant(entry) => {
                 let symbol = entry.key().clone();
                 let path = self.path.as_str();
                 entry
-                    .insert(RotatingFile::new(recv_time, format!("{path}/{symbol}"))?)
-                    .write(recv_time, data)?;
+                    .insert(RotatingFile::new(
+                        recv_time,
+                        format!("{path}/{symbol}"),
+                        encoding,
+                    )?)
+                    .write(recv_time, data)?
             }
         }
         Ok(())
