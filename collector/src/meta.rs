@@ -5,7 +5,7 @@
 //! away again: the venue says nothing about any of that, and in the recording
 //! it is indistinguishable from a quiet market. These records are the
 //! collector's own account of the session, and every backend writes the same
-//! four of them through the constructors here so that one parser reads all five
+//! five of them through the constructors here so that one parser reads all five
 //! venues.
 //!
 //! ## Why they travel the venue's own hop
@@ -82,14 +82,31 @@ pub fn connected(url: &str) -> Value {
     record("connected", serde_json::json!({ "url": url }))
 }
 
-/// The socket went away with an error. `connected_for_ms` tells a venue that
-/// drops us after an hour from one that refuses us outright.
+/// An established socket went away with an error. `connected_for_ms` tells a
+/// venue that drops us after an hour from one that drops us after a second.
+///
+/// Only for connections that came up: a dial that never completed is
+/// [`dial_failed`], because crediting the dial as time connected is how a venue
+/// refusing us outright comes to look like one that dropped us.
 pub fn disconnected(error: &str, connected_for_ms: u64) -> Value {
     record(
         "disconnected",
         serde_json::json!({
             "error": error,
             "connected_for_ms": connected_for_ms,
+        }),
+    )
+}
+
+/// The dial never completed — DNS, TLS, a refused connection — so there was no
+/// socket and nothing was connected for any length of time. `dialling_for_ms`
+/// is how long it took to fail, which is what separates a refusal from a stall.
+pub fn dial_failed(error: &str, dialling_for_ms: u64) -> Value {
+    record(
+        "dial_failed",
+        serde_json::json!({
+            "error": error,
+            "dialling_for_ms": dialling_for_ms,
         }),
     )
 }
@@ -101,6 +118,33 @@ pub fn stream_ended(connected_for_ms: u64) -> Value {
         "stream_ended",
         serde_json::json!({ "connected_for_ms": connected_for_ms }),
     )
+}
+
+/// How a connection ended when nothing errored.
+///
+/// The read loops have two such exits and they mean opposite things, so
+/// `connect` reports which one it took rather than collapsing both into
+/// `Ok(())`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The venue closed the socket without an error.
+    Eof,
+    /// The hand-off to the parser refused a frame, so the loop stopped rather
+    /// than read on and discard data.
+    HandOffRefused,
+}
+
+/// The record that closes out a connection, if it deserves one.
+///
+/// `HandOffRefused` deserves none. The record would travel the very hop that
+/// just refused a market-data frame, and `queue.rs` has already raised the
+/// fatal signal that makes `main` write a record naming the hop from the other
+/// side — a second one claiming a clean close would contradict it.
+pub fn end_of_stream(end: StreamEnd, connected_for_ms: u64) -> Option<Value> {
+    match end {
+        StreamEnd::Eof => Some(stream_ended(connected_for_ms)),
+        StreamEnd::HandOffRefused => None,
+    }
 }
 
 /// Injects a lifecycle record into the same hop the venue's frames travel on,
@@ -132,11 +176,48 @@ mod tests {
             ),
             (connected("wss://venue/ws"), "connected"),
             (disconnected("reset", 1194), "disconnected"),
+            (dial_failed("connection refused", 12), "dial_failed"),
             (stream_ended(7), "stream_ended"),
         ] {
             assert!(is_record(&value), "{value}");
             assert_eq!(value[TAG], event, "{value}");
         }
+    }
+
+    /// A hand-off that refuses a frame stops the read loop, which reaches
+    /// `keep_connection` on exactly the same path as a socket the venue closed
+    /// cleanly. Recording it as `stream_ended` — "the socket closed without an
+    /// error" — asserts the opposite of what happened, in the one file Phase 2
+    /// reads to explain the gap that follows. Nothing is written instead: the
+    /// hop that just refused a market-data frame is no place to put the record
+    /// saying so, and `main` writes the one naming the hop from the other side.
+    #[test]
+    fn a_refused_hand_off_is_not_recorded_as_a_clean_close() {
+        let clean = end_of_stream(StreamEnd::Eof, 1194).expect("a clean close is worth recording");
+        assert_eq!(clean[TAG], "stream_ended");
+        assert_eq!(clean["connected_for_ms"], 1194);
+
+        assert!(
+            end_of_stream(StreamEnd::HandOffRefused, 1194).is_none(),
+            "a refused hand-off must not be filed as a clean end of stream"
+        );
+    }
+
+    /// `connected_for_ms` is documented as telling a venue that drops us after
+    /// an hour from one that refuses us outright, and a dial that never
+    /// completed can answer neither: there was no connection to measure. The
+    /// clock the caller has runs from before the dial, so reporting it as
+    /// `disconnected` credits a TLS or DNS stall as time spent connected.
+    #[test]
+    fn a_dial_that_never_completed_is_not_a_disconnect() {
+        let failed = dial_failed("dns error: failed to lookup address", 15_000);
+        assert!(is_record(&failed), "{failed}");
+        assert_eq!(failed[TAG], "dial_failed");
+        assert_eq!(failed["dialling_for_ms"], 15_000);
+        assert!(
+            failed.get("connected_for_ms").is_none(),
+            "nothing was connected, so there is no time connected to report: {failed}"
+        );
     }
 
     /// The fields are the whole point: a gap in a symbol file is explained by

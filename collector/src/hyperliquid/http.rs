@@ -17,17 +17,23 @@ use tracing::{error, info, warn};
 use super::WS_URL;
 use crate::{
     backoff::reconnect_delay,
-    meta,
+    meta::{self, StreamEnd},
     queue::{Frame, Tx},
 };
 
+/// `connected_at` is set the moment the socket comes up, and stays `None` if
+/// the dial itself fails. It is an out-parameter because the dial failure
+/// leaves through `?`, and the caller has to be able to tell a connection that
+/// dropped from one that never existed.
 pub async fn connect(
     url: &str,
     subscriptions: Vec<serde_json::Value>,
     ws_tx: Tx<Frame>,
-) -> Result<(), anyhow::Error> {
+    connected_at: &mut Option<Instant>,
+) -> Result<StreamEnd, anyhow::Error> {
     let request = url.into_client_request()?;
     let (ws_stream, _) = connect_async(request).await?;
+    *connected_at = Some(Instant::now());
     meta::emit(&ws_tx, meta::connected(url));
     let (mut write, mut read) = ws_stream.split();
     let (_ping_tx, mut ping_rx) = unbounded_channel::<()>();
@@ -74,7 +80,7 @@ pub async fn connect(
                 // `keep_connection`, releasing `ws_tx` and unwinding the
                 // collection task behind it.
                 if ws_tx.send((recv_time, text)).is_err() {
-                    break;
+                    return Ok(StreamEnd::HandOffRefused);
                 }
             }
             Some(Ok(Message::Binary(_))) => {}
@@ -98,7 +104,7 @@ pub async fn connect(
             }
         }
     }
-    Ok(())
+    Ok(StreamEnd::Eof)
 }
 
 pub async fn keep_connection(
@@ -145,35 +151,46 @@ pub async fn keep_connection(
         );
         attempt += 1;
 
-        // Started here, not at the top of the loop: `connected_for_ms` must
-        // measure the connection, not the connection plus the time spent
-        // building the subscription set and writing the subscribe record.
-        // The stale-error-count reset below reads better for the same reason.
-        let connect_time = Instant::now();
+        // Started here, not at the top of the loop: the dial must not be
+        // charged for the time spent building the subscription set and writing
+        // the subscribe record. The stale-error-count reset below reads better
+        // for the same reason.
+        let dial_time = Instant::now();
+        let mut connected_at = None;
 
-        if let Err(error) = connect(WS_URL, subscriptions, ws_tx.clone()).await {
-            error!(?error, "websocket error");
-            // A disconnect is otherwise indistinguishable from a quiet market:
-            // the file just stops for a couple of seconds.
-            meta::emit(
-                &ws_tx,
-                meta::disconnected(
-                    &error.to_string(),
-                    connect_time.elapsed().as_millis() as u64,
-                ),
-            );
-            error_count += 1;
-            if connect_time.elapsed() > Duration::from_secs(30) {
-                error_count = 0;
+        match connect(WS_URL, subscriptions, ws_tx.clone(), &mut connected_at).await {
+            Err(error) => {
+                error!(?error, "websocket error");
+                // A disconnect is otherwise indistinguishable from a quiet
+                // market: the file just stops for a couple of seconds. A dial
+                // that never came up is a different event, because there is no
+                // time-connected to report for a connection that never existed.
+                meta::emit(
+                    &ws_tx,
+                    match connected_at {
+                        Some(at) => {
+                            meta::disconnected(&error.to_string(), at.elapsed().as_millis() as u64)
+                        }
+                        None => meta::dial_failed(
+                            &error.to_string(),
+                            dial_time.elapsed().as_millis() as u64,
+                        ),
+                    },
+                );
+                error_count += 1;
+                if dial_time.elapsed() > Duration::from_secs(30) {
+                    error_count = 0;
+                }
+
+                tokio::time::sleep(reconnect_delay(error_count)).await;
             }
-
-            tokio::time::sleep(reconnect_delay(error_count)).await;
-        } else {
-            meta::emit(
-                &ws_tx,
-                meta::stream_ended(connect_time.elapsed().as_millis() as u64),
-            );
-            break;
+            Ok(end) => {
+                let connected_for = connected_at.map_or(0, |at| at.elapsed().as_millis() as u64);
+                if let Some(record) = meta::end_of_stream(end, connected_for) {
+                    meta::emit(&ws_tx, record);
+                }
+                break;
+            }
         }
     }
 }

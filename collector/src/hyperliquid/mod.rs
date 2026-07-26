@@ -659,8 +659,8 @@ mod route_tests {
     }
 
     /// The Hyperliquid end of the guarantee every backend asserts: each of the
-    /// four shared lifecycle records reaches the sidecar, and none of them can
-    /// be filed under a coin. The constructors are shared, so this is what ties
+    /// shared lifecycle records reaches the sidecar, and none of them can be
+    /// filed under a coin. The constructors are shared, so this is what ties
     /// this venue's routing to the vocabulary the others emit.
     #[test]
     fn every_lifecycle_record_reaches_the_sidecar() {
@@ -668,6 +668,7 @@ mod route_tests {
             meta::subscribe(WS_URL, 0, serde_json::json!([])),
             meta::connected(WS_URL),
             meta::disconnected("Connection reset without closing handshake", 1194),
+            meta::dial_failed("connection refused", 12),
             meta::stream_ended(1194),
         ] {
             assert_eq!(route(&value), META_STREAM, "{value}");

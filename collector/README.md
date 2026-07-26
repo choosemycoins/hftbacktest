@@ -213,7 +213,8 @@ as the venues themselves:
 | `{"_collector":"session_start", …}` | collector version, commit, exchange, symbols, flags | all |
 | `{"_collector":"subscribe", …}` | `url`, `attempt`, and the exact set that was requested | all |
 | `{"_collector":"connected", …}` | `url` — the socket came up | all |
-| `{"_collector":"disconnected", …}` | `error`, and `connected_for_ms` | all |
+| `{"_collector":"disconnected", …}` | an established socket went away: `error`, and `connected_for_ms` | all |
+| `{"_collector":"dial_failed", …}` | the socket never came up: `error`, and `dialling_for_ms` | all |
 | `{"_collector":"stream_ended", …}` | clean end of stream, with `connected_for_ms` | all |
 | `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
 | `{"_collector":"hand_off_closed", …}` | an internal hand-off lost its consumer, i.e. the collection task had already ended; the collector is stopping | all |
@@ -223,9 +224,15 @@ as the venues themselves:
 | `{"channel":"pong", …}` | liveness during a stretch with no market data | hyperliquid |
 | `{"success":…,"ret_msg":…}` | subscribe ack, successful or not | bybit |
 
-A `subscribe` with no `connected` after it is a dial that never completed. A
+A `subscribe` followed by `dial_failed` is a socket that never came up. A
 `connected` with no market data behind it is a subscription the venue accepted
 and never served. Neither was distinguishable from a quiet market before.
+
+`connected_for_ms` appears only on records for a connection that existed, which
+is why a failed dial is its own event rather than a `disconnected` reporting how
+long a DNS or TLS stall took. A refused internal hand-off writes no end-of-stream
+record at all: it would have to travel the hop that just refused a market-data
+frame, and `queue_overflow`/`hand_off_closed` already name it from the other end.
 
 Binance acks nothing at all — the subscription is the URL it is dialled with —
 so on those three venues the `_collector` records are the only account of the
