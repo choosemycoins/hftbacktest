@@ -89,9 +89,12 @@ cadences and neither is sufficient alone. Measured on mainnet 2026-07-25:
 The plain feed updates the book roughly three times a minute, which is not
 usable for backtesting an HFT strategy; the fast feed is only five levels deep.
 The venue accepts both subscriptions on one connection, so the collector records
-both and leaves fusion to the converter. Messages from the fast feed carry
-`"fast": true` in their payload, which is how they are told apart on the way
-back out.
+both, side by side and unmerged. The converter then selects exactly one with its
+`book_mode` argument and drops the other; **fusing the two cadences is not
+implemented** and `hyperliquid.convert` raises on any other value. Recording
+both is what keeps the choice open, and revisitable. Messages from the fast feed
+carry `"fast": true` in their payload, which is how they are told apart on the
+way back out.
 
 Symbol case is passed through verbatim to the venue. Binance stream names are
 lowercase (`btcusdt`), Bybit and Hyperliquid want uppercase (`BTCUSDT`, `BTC`).
@@ -659,18 +662,21 @@ Worth knowing before you trust a dataset.
   timestamps; nothing marks the hole where it happens. Sequence numbers in the
   payloads (Binance `pu`/`U`, Bybit `u`/`seq`) detect one after the fact,
   independently of the sidecar.
-- **The reconnect backoff ladder is dead code on every venue except
-  Hyperliquid.** `collector/src/{binance,binancefuturesum,binancefuturescm,
-  bybit}/http.rs` test `error_count > 3` before `> 10` and `> 20`, so the first
-  branch always wins and the delay is a flat 1s no matter how long the venue
-  has been failing. Only `hyperliquid/http.rs` orders the branches correctly.
+- **The reconnect backoff ladder only measures consecutive fast failures.**
+  All five backends now share `src/backoff.rs` — 500 ms, 1 s, 5 s, 10 s, with
+  every rung reachable and a floor where four of them used to retry with no
+  delay at all. But `error_count` is reset in the same iteration it is
+  incremented whenever the connection survived 30 s, so a venue that accepts a
+  connection and drops it after a minute, forever, is retried at the floor
+  forever.
 - **Symbol validation is Hyperliquid-only.** There it is on by default and
   refuses to start on an unknown coin, because one bad name closes the whole
   WebSocket and takes every valid subscription with it. Bybit and Binance have
   no equivalent check yet; a typo there still produces a partial recording.
-- **`binancefuturesum` and `binancefuturescm` are byte-identical modules**
-  differing only in their sibling `http.rs` endpoints. A fix to one needs
-  applying to the other.
+- **`binancefuturesum` and `binancefuturescm` are the same module twice**,
+  differing only in their endpoints, their test fixtures and one `handle`
+  branch. `binance` (spot) is a third near-copy. A fix to one needs applying to
+  the others; only the socket loop is shared (`src/pump.rs`).
 - **Throttler is off by one.** `Throttler` compares `len() > rate_limit`, so it
   permits `rate_limit + 1` calls per 60s window.
 - **Spot vs futures gap detection differ.** Binance USD-M/COIN-M use

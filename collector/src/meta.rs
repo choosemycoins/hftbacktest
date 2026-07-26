@@ -22,10 +22,19 @@
 //!   (`main.rs`, the `None` arm of `writer_rx.recv()`), and a retained sender
 //!   is what stops that ever happening — the same trap `run_collection`
 //!   documents for `ws_tx`.
-//! * **Ordering.** Bybit's subscribe acks are venue frames bound for this same
-//!   file. A record written straight to the writer would overtake whatever is
-//!   still queued in front of it, and `_meta` would stop being monotonic in
-//!   `local_ts` — one of the things the offline quality report checks.
+//! * **Ordering against the frames they explain.** Bybit's subscribe acks are
+//!   venue frames bound for this same file, and market data is what a
+//!   lifecycle record dates. Sending one straight to the writer would let it
+//!   overtake everything still queued in front of it, so a `disconnected`
+//!   could be filed ahead of frames that arrived before the socket dropped.
+//!
+//! This is not a claim that `_meta` is monotonic in `local_ts` overall. It is
+//! not: `main` writes its own records — the minutely disk gauge, and the
+//! terminal `disk_exhausted` / `stalled` / hand-off ones — straight to the
+//! `Writer`, because routing them through the queue would keep a `writer_tx`
+//! alive and stop `writer_rx` ever reporting that the collection task died.
+//! Whenever the writer hop has a backlog, those overtake it. Anything reading
+//! the sidecar has to sort.
 //!
 //! A lifecycle record cannot reach a symbol file: the tag is matched first and
 //! the symbol routing below it is never entered. Each backend asserts that.

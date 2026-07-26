@@ -438,6 +438,13 @@ async fn main() -> Result<(), anyhow::Error> {
                         // Written to the sidecar, not just the log: it makes a
                         // recording carry its own capacity history, and it is
                         // the one file an operator can tail live.
+                        //
+                        // Straight to the writer rather than through
+                        // `writer_tx`: a sender held here would stop
+                        // `writer_rx.recv()` ever returning `None`, which is
+                        // how a dead collection task is noticed. The cost is
+                        // that `_meta` is not ordered by `local_ts` while the
+                        // queue has a backlog — see `meta.rs`.
                         let _ = writer.write(
                             Utc::now(),
                             file::META_STREAM.to_string(),
