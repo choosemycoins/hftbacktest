@@ -45,8 +45,8 @@ Log verbosity is `RUST_LOG` (standard `EnvFilter` syntax). The default is
 events; `RUST_LOG=debug` is very noisy at tick rates.
 
 The process exits **non-zero** if recording stops for any reason other than a
-signal — a write failure, or the collection task ending. A clean `systemctl
-stop` exits 0.
+signal — a write failure, an internal hand-off filling up, a feed that has gone
+silent, or the collection task ending. A clean `systemctl stop` exits 0.
 
 ---
 
@@ -216,6 +216,7 @@ actually expect:
 | `{"_collector":"stream_ended", …}` | clean end of stream | hyperliquid |
 | `{"success":…,"ret_msg":…}` | Bybit subscribe ack, successful or not | bybit |
 | `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
+| `{"_collector":"stalled", …}` | nothing was recorded for the whole watchdog window; the collector is stopping | all |
 
 Binance venues currently contribute only `session_start`; wiring their
 connection events into the sidecar is unfinished work, not a deliberate
@@ -578,6 +579,36 @@ device that stops answering — the main loop never gets back to notice the
 signal, so the process stops recording without exiting. Memory still stays
 bounded and the reason is in `journalctl`, but only an external watchdog
 (systemd `WatchdogSec`) turns that into a restart.
+
+### Going silent
+
+`--stall-timeout-min` (default 5, `0` disables) stops the collector when **no
+market data at all** has been written for that long: a `{"_collector":"stalled",
+…}` record goes to the sidecar, the files are closed and the exit is non-zero.
+
+It exists for the failures nothing else reports. A venue that accepts a
+subscription and then sends nothing, a reconnect loop that reconnects but never
+resubscribes, a frame parsed into no stream at all — none of those raise an
+error, and every outward sign stays healthy while the recording is empty. The
+clock starts at startup, so a collector that never records anything is caught
+too, and sidecar records do not count as data (the disk gauge writes one every
+minute regardless).
+
+**5 minutes is a proposal, not a measurement** — open decision 2 of
+`docs/design-multi-venue-collection.md`. For scale, the slowest legitimate feed
+is Hyperliquid's plain `l2Book` at ~5.4s, so the default sits roughly fiftyfold
+above anything real. Lower it once a quiet-period gap has actually been
+measured.
+
+**What it does not catch**, and must not be mistaken for:
+
+- a dead depth stream while trades keep arriving, or the reverse;
+- one symbol of ten that stopped;
+- one Hyperliquid cadence stopping while the other two continue;
+- a partially accepted subscription — indistinguishable from a full one here.
+
+Answering *did we get everything we asked for* is an offline report over
+finished files, not a decision this process can make about itself.
 
 ---
 

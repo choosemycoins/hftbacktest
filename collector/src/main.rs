@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use chrono::Utc;
 use clap::Parser;
 use tokio::{self, select};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     file::Writer,
@@ -23,6 +23,7 @@ mod hyperliquid;
 mod lock;
 mod queue;
 mod throttler;
+mod watchdog;
 
 /// Build provenance, baked in by `build.rs`. Shown by `--version` and logged
 /// at startup so a running instance and a recorded dataset can both be traced
@@ -82,6 +83,26 @@ struct Args {
     /// fail at zero bytes free with a half-written gzip member.
     #[arg(long, default_value_t = 5)]
     min_free_gb: u64,
+
+    /// Stop when no market data at all has been written for this many minutes.
+    /// `0` disables the check.
+    ///
+    /// A last-resort guard against silent nothing: a venue that accepts a
+    /// subscription and never sends, a reconnect loop that never resubscribes,
+    /// a frame that is parsed into no stream. None of those raise an error, and
+    /// the process looks healthy while it records an empty day.
+    ///
+    /// The default of 5 minutes is a PROPOSAL, not a measurement (open decision
+    /// 2 of docs/design-multi-venue-collection.md). For scale, the slowest
+    /// legitimate feed is Hyperliquid's plain `l2Book` at ~5.4s, so the margin
+    /// is roughly fifty-fold — raise it if you record something slower, and
+    /// lower it once a real quiet-period gap has been measured.
+    ///
+    /// It only ever catches TOTAL silence: not a dead depth stream while trades
+    /// still arrive, not one symbol of ten that stopped, not one Hyperliquid
+    /// cadence out of three. Sidecar records do not count as data.
+    #[arg(long, default_value_t = 5)]
+    stall_timeout_min: u64,
 
     /// Skip the startup check that every requested symbol exists on the venue.
     ///
@@ -347,6 +368,19 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut disk_check = tokio::time::interval(Duration::from_secs(60));
     disk_check.tick().await; // the first tick is immediate; startup already checked
 
+    // The guard against silent nothing. Armed from here, so a venue that never
+    // sends is caught even though not one record ever arrives — see
+    // `watchdog.rs`, including what it deliberately does not catch.
+    let mut watchdog = watchdog::StallWatchdog::new(args.stall_timeout_min);
+    if args.stall_timeout_min == 0 {
+        warn!("stall watchdog disabled; a silent feed will not stop the collector");
+    } else {
+        info!(
+            minutes = args.stall_timeout_min,
+            "stall watchdog armed on total silence"
+        );
+    }
+
     // Distinguishes "asked to stop" from "stopped because recording broke".
     // Exiting 0 in both cases would make an unrecordable host look healthy:
     // systemd reports `Deactivated successfully`, the unit is never marked
@@ -392,6 +426,31 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             }
+            silence = watchdog.stalled() => {
+                // Nothing has reached disk for the whole timeout. The venue may
+                // be up and the socket connected — that is precisely the state
+                // no other guard reports, and an empty recording is worth no
+                // more than a failed one, so it ends the same way.
+                let error = anyhow!(
+                    "nothing has been recorded for {:.0}s, the --stall-timeout-min limit \
+                     is {} minute(s); the feed is silent",
+                    silence.as_secs_f64(),
+                    args.stall_timeout_min
+                );
+                error!(%error, "stopping: no data is reaching disk");
+                let _ = writer.write(
+                    Utc::now(),
+                    file::META_STREAM.to_string(),
+                    serde_json::json!({
+                        "_collector": "stalled",
+                        "silent_for_s": silence.as_secs(),
+                        "stall_timeout_min": args.stall_timeout_min,
+                    })
+                    .to_string(),
+                );
+                fatal = Some(error);
+                break;
+            }
             reason = fatal_rx.recv() => {
                 // A queue filled up, or lost its receiver. Either way frames are
                 // no longer reaching disk, and the producers have stopped rather
@@ -414,6 +473,11 @@ async fn main() -> Result<(), anyhow::Error> {
             }
             r = writer_rx.recv() => match r {
                 Some((recv_time, symbol, data)) => {
+                    // Counted here, as the record leaves the queue for the
+                    // writer, and never where it was enqueued: messages piling
+                    // up behind a stalled writer must not read as life. A write
+                    // that then fails ends the loop anyway.
+                    watchdog.record_write(&symbol);
                     if let Err(error) = writer.write(recv_time, symbol, data) {
                         error!(?error, "write error");
                         fatal = Some(error);

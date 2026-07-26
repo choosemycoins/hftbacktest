@@ -34,3 +34,9 @@ flate2 = "1.1.2"
 # ask for free space through std.
 libc = "0.2"
 clap = { version = "4.5.48", features = ["derive"] }
+
+[dev-dependencies]
+# `test-util` is not part of tokio's `full`, and it is what `tokio::time::pause`
+# needs. The stall watchdog is measured in minutes; no test can afford to wait
+# one, and one that slept for real would be a flaky test on a loaded machine.
+tokio = { version = "1.47.1", features = ["full", "test-util"] }
