@@ -9,7 +9,9 @@
 # Required environment (from EnvironmentFile=/opt/hft-collector/etc/%i.env):
 #   COLLECTOR_EXCHANGE    Venue name, e.g. bybit
 #   COLLECTOR_SYMBOLS     Whitespace-separated symbol list
-#   COLLECTOR_DATA_DIR    Output directory for the .gz files
+#
+# Optional:
+#   COLLECTOR_DATA_DIR    Output directory; defaults to one per instance
 #
 # Provided by the unit:
 #   COLLECTOR_HOME        Install root (/opt/hft-collector/current)
@@ -20,9 +22,16 @@ set -euo pipefail
 : "${COLLECTOR_HOME:?COLLECTOR_HOME must be set (normally by the unit)}"
 : "${COLLECTOR_EXCHANGE:?COLLECTOR_EXCHANGE must be set in the instance env file}"
 : "${COLLECTOR_SYMBOLS:?COLLECTOR_SYMBOLS must be set in the instance env file}"
-: "${COLLECTOR_DATA_DIR:?COLLECTOR_DATA_DIR must be set in the instance env file}"
 
 INSTANCE="${COLLECTOR_INSTANCE:-unknown}"
+
+# A directory of the instance's own by default. Two collectors may not share
+# one — the binary takes an exclusive flock on <dir>/.collector.lock and refuses
+# to start if another holds it, because sharing interleaves gzip members and
+# destroys both recordings. Defaulting per instance is what keeps an env file
+# copied between units from colliding when this line is the one not edited.
+COLLECTOR_DATA_DIR="${COLLECTOR_DATA_DIR:-/opt/hft-collector/data/${INSTANCE}}"
+
 BIN="${COLLECTOR_HOME}/bin/collector"
 
 if [[ ! -x "${BIN}" ]]; then

@@ -70,11 +70,7 @@ pub struct RotatingFile {
 }
 
 impl RotatingFile {
-    fn create(
-        datetime: DateTime<Utc>,
-        path: &str,
-        encoding: Encoding,
-    ) -> Result<Sink, io::Error> {
+    fn create(datetime: DateTime<Utc>, path: &str, encoding: Encoding) -> Result<Sink, io::Error> {
         let date = datetime.date_naive().format("%Y%m%d");
         // `append`, not plain `write`: the collector reopens today's file on
         // every restart (deploy, rollback, supervisor recycle, crash). Opening
@@ -259,14 +255,19 @@ mod rotating_file_tests {
         let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
         let mut w = Writer::new(&dir, "hyperliquid");
 
-        w.write(t, META_STREAM.to_string(), r#"{"_collector":"disconnected"}"#.to_string())
-            .unwrap();
+        w.write(
+            t,
+            META_STREAM.to_string(),
+            r#"{"_collector":"disconnected"}"#.to_string(),
+        )
+        .unwrap();
 
         // Deliberately not dropping `w`: this is the live-process case.
         // The meta stream is plain `.jsonl`, so it is readable immediately.
         // A gzip stream could not be: `flush()` emits a deflate sync point but
         // no member trailer, so a decoder still fails with UnexpectedEof.
-        let content = fs::read_to_string(format!("{dir}/_meta_hyperliquid_20260725.jsonl")).unwrap();
+        let content =
+            fs::read_to_string(format!("{dir}/_meta_hyperliquid_20260725.jsonl")).unwrap();
         assert!(
             content.contains("disconnected"),
             "meta record not readable while the collector is running: {content:?}"
@@ -333,12 +334,17 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// `instance` disambiguates the meta stream when several collectors share
-    /// one output directory. Symbol files cannot collide in that situation —
-    /// two instances record different venues, so different symbols — but
-    /// `_meta` is the one filename every instance writes regardless of its
-    /// symbol list, so without a suffix two collectors would interleave their
-    /// session records into a single file.
+    /// `instance` names the sidecar after what produced it —
+    /// `_meta_<instance>_<date>.jsonl`.
+    ///
+    /// It is **not** what makes an output directory shareable: nothing is, and
+    /// two collectors must never record into one. They would append to the same
+    /// `<symbol>_<date>.gz` — Bybit `BTCUSDT` and Binance `btcusdt` are one
+    /// filename once lowercased — and interleave two independent gzip streams
+    /// into a file no decoder can read. `lock.rs` refuses the second process
+    /// outright, so this suffix earns its keep afterwards instead: when days
+    /// from several instances are gathered into one directory for conversion,
+    /// the sidecars still do not overwrite each other.
     pub fn new(path: &str, instance: &str) -> Self {
         Self {
             path: path.to_string(),

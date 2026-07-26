@@ -144,11 +144,29 @@ One file per symbol per UTC day, plus one sidecar:
 ```
 <output_dir>/<symbol-lowercase>_<YYYYMMDD>.gz        gzipped market data
 <output_dir>/_meta_<exchange>_<YYYYMMDD>.jsonl       plain text, flushed per record
+<output_dir>/.collector.lock                         which process owns this directory
 ```
 
-The sidecar carries the exchange name because it is the one filename every
-instance writes regardless of its symbol list: two collectors sharing an output
-directory cannot collide on symbol files, but would collide on `_meta`.
+The sidecar carries the exchange name so that days from several instances can
+be gathered into one directory for conversion without their sidecars
+overwriting each other.
+
+**One collector per output directory** — this is enforced, not advised. The
+first process takes an exclusive `flock` on `.collector.lock` and writes its
+instance and pid there; a second one exits non-zero naming the holder:
+
+```
+Error: /opt/hft-collector/data/bybit is already being recorded into, by
+instance=bybit pid=4711 since=2026-07-26T09:14:02+00:00. …
+```
+
+Sharing would corrupt the recording rather than merely mix it up: both
+processes append to the same `<symbol>_<date>.gz` — Bybit `BTCUSDT` and Binance
+`btcusdt` are one filename after lowercasing — and their gzip members
+interleave into something no decoder can read, losing the day for both. The
+lock lives on the open file description, so the kernel releases it however the
+process dies, SIGKILL included; the file is left behind on purpose and its
+presence alone means nothing.
 
 It is **not** compressed, on purpose. Its value is being readable while the
 collector runs, and gzip cannot provide that: `GzEncoder::flush()` emits a
@@ -430,9 +448,15 @@ One systemd instance per collection job, named after its env file:
 
 ```bash
 sudo cp /opt/hft-collector/etc/instance.env.example /opt/hft-collector/etc/bybit.env
-sudo $EDITOR /opt/hft-collector/etc/bybit.env      # exchange, symbols, data dir
+sudo $EDITOR /opt/hft-collector/etc/bybit.env      # exchange, symbols
 sudo systemctl enable --now hft-collector@bybit
 ```
+
+`COLLECTOR_DATA_DIR` is optional: left out it becomes
+`/opt/hft-collector/data/<instance>`, so each instance gets a directory of its
+own without anyone remembering to change that line in a copied env file. Set it
+only to record somewhere else, and never to a directory another instance is
+using — see [Output format](#output-format) for what the lock does about it.
 
 `install.sh` restarts only instances that are **currently running**; an
 instance you deliberately stopped stays stopped and picks up the new release

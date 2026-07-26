@@ -20,6 +20,7 @@ mod disk;
 mod error;
 mod file;
 mod hyperliquid;
+mod lock;
 mod queue;
 mod throttler;
 
@@ -196,6 +197,14 @@ async fn main() -> Result<(), anyhow::Error> {
         min_free_gb = args.min_free_gb,
         "disk space at startup"
     );
+
+    // Claim the directory before anything opens a file in it. A second
+    // collector here would interleave its gzip members with this one's and
+    // leave the day undecodable for both — see `lock.rs`. Declared before the
+    // `Writer` so it is dropped after it: the directory is released only once
+    // every gzip member has been finished.
+    let dir_lock = lock::acquire(&args.path, &args.exchange)?;
+    info!(lock = %dir_lock.path().display(), "output directory locked");
 
     // Bounded, with `full => fatal` as the policy — see `queue.rs`. The fatal
     // channel is how a producer that has no error path of its own (the

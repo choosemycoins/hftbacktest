@@ -51,9 +51,12 @@ Environment=COLLECTOR_HOME=/opt/hft-collector/current
 Environment=COLLECTOR_INSTANCE=%i
 Environment=RUST_LOG=info
 
-# Per-instance settings: COLLECTOR_EXCHANGE, COLLECTOR_SYMBOLS,
-# COLLECTOR_DATA_DIR. See instance.env.example. The unit refuses to start if
-# this file is missing rather than silently recording nothing.
+# Per-instance settings: COLLECTOR_EXCHANGE and COLLECTOR_SYMBOLS, plus the
+# optional COLLECTOR_DATA_DIR (default /opt/hft-collector/data/%i — one
+# directory per instance, which is required: the collector locks it and a
+# second instance sharing it would not start). See instance.env.example. The
+# unit refuses to start if this file is missing rather than silently recording
+# nothing.
 EnvironmentFile=/opt/hft-collector/etc/%i.env
 
 ExecStart=/opt/hft-collector/current/bin/collector-run.sh
