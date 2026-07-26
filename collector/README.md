@@ -197,6 +197,7 @@ actually expect:
 | `{"_collector":"disconnected", …}` | reason, and `connected_for_ms` | hyperliquid |
 | `{"_collector":"stream_ended", …}` | clean end of stream | hyperliquid |
 | `{"success":…,"ret_msg":…}` | Bybit subscribe ack, successful or not | bybit |
+| `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
 
 Binance venues currently contribute only `session_start`; wiring their
 connection events into the sidecar is unfinished work, not a deliberate
@@ -530,6 +531,29 @@ watch. See the commented example in `deploy/hft-collector@.service`.
 WebSocket reconnects, and both deploy and rollback restart. There is no
 zero-gap path: two processes writing the same file would interleave gzip
 members from different streams.
+
+### Falling behind
+
+The two internal hand-offs — socket reader → parser, parser → writer — are
+bounded at 4096 messages each (`src/queue.rs`). If one fills, the collector
+stops: `{"_collector":"queue_overflow", …}` goes to the sidecar, the files are
+closed, and the exit is non-zero. It never waits for room, and it never drops a
+message to make some.
+
+That is deliberate. An unbounded queue turns a stalled writer into unbounded
+memory growth while every outward sign — connected, receiving, no errors — still
+looks healthy, and what survives the OOM killer is a set of unterminated gzip
+members. A queue deep enough to absorb a rotation but not a stall turns the same
+fault into a failed unit instead. The capacity is a starting point rather than a
+measurement: at the rates in [Capacity](#capacity) a full queue is on the order
+of a minute of traffic, and it should be recomputed once a peak has actually
+been observed.
+
+One case escapes it. If a write blocks for ever in the kernel — a hung mount, a
+device that stops answering — the main loop never gets back to notice the
+signal, so the process stops recording without exiting. Memory still stays
+bounded and the reason is in `journalctl`, but only an external watchdog
+(systemd `WatchdogSec`) turns that into a restart.
 
 ---
 
