@@ -5,7 +5,7 @@ mod http;
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const REST_URL: &str = "https://api.hyperliquid.xyz";
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 pub use http::keep_connection;
@@ -215,7 +215,13 @@ async fn resolve_symbols(
     symbols: &[String],
     rest_url: &str,
 ) -> Result<Vec<SymbolInfo>, anyhow::Error> {
-    let client = reqwest::Client::new();
+    // Bounded because this blocks startup: reqwest has no default timeout, so
+    // a hung `/info` would leave the collector "starting" indefinitely,
+    // recording nothing and reporting nothing. The responses are small, and a
+    // refusal to start is a better outcome than an invisible stall.
+    const INFO_TIMEOUT: Duration = Duration::from_secs(15);
+
+    let client = reqwest::Client::builder().timeout(INFO_TIMEOUT).build()?;
     let info = async |body: serde_json::Value| -> Result<serde_json::Value, anyhow::Error> {
         Ok(client
             .post(format!("{rest_url}/info"))
@@ -264,9 +270,9 @@ async fn resolve_symbols(
         } else {
             serde_json::json!({"type": "meta", "dex": dex})
         };
-        let meta = info(body).await.map_err(|e| {
-            anyhow::anyhow!("couldn't read the perp universe for dex {dex:?}: {e}")
-        })?;
+        let meta = info(body)
+            .await
+            .map_err(|e| anyhow::anyhow!("couldn't read the perp universe for dex {dex:?}: {e}"))?;
         let ct = meta.get("collateralToken").and_then(|v| v.as_i64());
         collateral.insert(
             dex.clone(),
@@ -376,8 +382,6 @@ where
 
 #[cfg(test)]
 mod pump_tests {
-    use std::time::Duration;
-
     use super::*;
 
     /// A producer that stops is the collector's last line of defence: the main
@@ -394,7 +398,8 @@ mod pump_tests {
         let done = tokio::time::timeout(
             Duration::from_secs(5),
             pump(writer_tx, |ws_tx| async move {
-                let frame = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
+                let frame =
+                    r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
                 ws_tx.send((Utc::now(), Utf8Bytes::from(frame))).unwrap();
                 // Returning drops the sender, exactly as `keep_connection`
                 // does when the socket closes without an error.
@@ -511,7 +516,9 @@ mod universe_tests {
 
     #[test]
     fn every_unknown_symbol_is_reported_not_just_the_first() {
-        let err = resolve(&["BTC", "NOPE", "ALSONOPE"]).unwrap_err().to_string();
+        let err = resolve(&["BTC", "NOPE", "ALSONOPE"])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("NOPE"), "{err}");
         assert!(err.contains("ALSONOPE"), "{err}");
     }
@@ -532,7 +539,9 @@ mod route_tests {
             "BTC"
         );
         assert_eq!(
-            r(r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]],"fast":true}}"#),
+            r(
+                r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]],"fast":true}}"#
+            ),
             "BTC"
         );
         assert_eq!(
@@ -555,10 +564,15 @@ mod route_tests {
             META_STREAM
         );
         assert_eq!(
-            r(r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","fast":true}}}"#),
+            r(
+                r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","fast":true}}}"#
+            ),
             META_STREAM
         );
-        assert_eq!(r(r#"{"_collector":"disconnected","error":"reset"}"#), META_STREAM);
+        assert_eq!(
+            r(r#"{"_collector":"disconnected","error":"reset"}"#),
+            META_STREAM
+        );
     }
 
     /// An empty trades array names no coin. It is still a frame the venue
@@ -566,7 +580,10 @@ mod route_tests {
     #[test]
     fn unattributable_frames_are_kept_not_dropped() {
         assert_eq!(r(r#"{"channel":"trades","data":[]}"#), META_STREAM);
-        assert_eq!(r(r#"{"channel":"somethingNew","data":{"x":1}}"#), META_STREAM);
+        assert_eq!(
+            r(r#"{"channel":"somethingNew","data":{"x":1}}"#),
+            META_STREAM
+        );
         assert_eq!(r(r#"{"channel":"pong"}"#), META_STREAM);
         assert_eq!(r(r#"{"unexpected":"shape"}"#), META_STREAM);
     }

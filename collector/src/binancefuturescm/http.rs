@@ -21,7 +21,14 @@ use tracing::{error, warn};
 use crate::backoff::reconnect_delay;
 
 pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
-    Ok(reqwest::Client::new()
+    // `exchangeInfo` is a multi-megabyte response fetched once, so this is
+    // generous — but bounded, because reqwest applies no timeout by default
+    // and a hung connect would otherwise wait for ever.
+    const EXCHANGE_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+
+    Ok(reqwest::Client::builder()
+        .timeout(EXCHANGE_INFO_TIMEOUT)
+        .build()?
         .get("https://dapi.binance.com/dapi/v1/exchangeInfo")
         .header("Accept", "application/json")
         .send()
@@ -46,7 +53,13 @@ pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
 }
 
 pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error> {
-    reqwest::Client::new()
+    // A depth snapshot is fetched to repair a gap in the incremental feed and
+    // is worthless once stale; failing fast also frees the throttler slot.
+    const DEPTH_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    reqwest::Client::builder()
+        .timeout(DEPTH_SNAPSHOT_TIMEOUT)
+        .build()?
         .get(format!(
             "https://dapi.binance.com/dapi/v1/depth?symbol={symbol}&limit=1000"
         ))

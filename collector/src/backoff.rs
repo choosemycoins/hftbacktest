@@ -67,6 +67,9 @@ mod tests {
     fn the_first_reconnect_is_delayed_but_not_stalled() {
         let first = reconnect_delay(0);
         assert!(first > Duration::ZERO, "no floor: {first:?}");
-        assert!(first < Duration::from_secs(1), "too slow to recover: {first:?}");
+        assert!(
+            first < Duration::from_secs(1),
+            "too slow to recover: {first:?}"
+        );
     }
 }
