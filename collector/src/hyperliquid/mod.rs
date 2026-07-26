@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use crate::{
     error::ConnectorError,
     file::META_STREAM,
+    meta,
     queue::{self, Frame, QUEUE_CAPACITY, Record, Tx, WS_HOP},
 };
 
@@ -27,9 +28,9 @@ use crate::{
 /// venue rejection nowhere at all, leaving a file whose gaps had no
 /// explanation.
 fn route(j: &serde_json::Value) -> &str {
-    // Synthetic frames the collector itself injects (see http.rs) are tagged
+    // Lifecycle records the collector itself injects (see `meta.rs`) are tagged
     // so they can never be confused with something the venue said.
-    if j.get("_collector").is_some() {
+    if meta::is_record(j) {
         return META_STREAM;
     }
 
@@ -655,6 +656,22 @@ mod route_tests {
             r(r#"{"_collector":"subscribe","channel":"l2Book","data":{"coin":"BTC"}}"#),
             META_STREAM
         );
+    }
+
+    /// The Hyperliquid end of the guarantee every backend asserts: each of the
+    /// four shared lifecycle records reaches the sidecar, and none of them can
+    /// be filed under a coin. The constructors are shared, so this is what ties
+    /// this venue's routing to the vocabulary the others emit.
+    #[test]
+    fn every_lifecycle_record_reaches_the_sidecar() {
+        for value in [
+            meta::subscribe(WS_URL, 0, serde_json::json!([])),
+            meta::connected(WS_URL),
+            meta::disconnected("Connection reset without closing handshake", 1194),
+            meta::stream_ended(1194),
+        ] {
+            assert_eq!(route(&value), META_STREAM, "{value}");
+        }
     }
 
     #[test]

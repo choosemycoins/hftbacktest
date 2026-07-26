@@ -10,28 +10,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::{select, sync::mpsc::unbounded_channel};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, Utf8Bytes, client::IntoClientRequest},
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use tracing::{error, info, warn};
 
 use super::WS_URL;
 use crate::{
     backoff::reconnect_delay,
+    meta,
     queue::{Frame, Tx},
 };
-
-/// Injects a synthetic record into the same stream the venue's frames travel
-/// on, so it is timestamped, ordered and stored exactly like real data. The
-/// `_collector` key marks it as ours; `route` in mod.rs sends anything
-/// carrying that key to the meta stream.
-fn emit(ws_tx: &Tx<Frame>, value: serde_json::Value) {
-    // The caller is the reconnect loop, which has no error path of its own.
-    // `send` has already raised the fatal signal, so the process is on its way
-    // down either way; logging is all that is left to add here.
-    if let Err(error) = ws_tx.send((Utc::now(), Utf8Bytes::from(value.to_string()))) {
-        error!(?error, "couldn't record a collector lifecycle event");
-    }
-}
 
 pub async fn connect(
     url: &str,
@@ -40,6 +28,7 @@ pub async fn connect(
 ) -> Result<(), anyhow::Error> {
     let request = url.into_client_request()?;
     let (ws_stream, _) = connect_async(request).await?;
+    meta::emit(&ws_tx, meta::connected(url));
     let (mut write, mut read) = ws_stream.split();
     let (_ping_tx, mut ping_rx) = unbounded_channel::<()>();
 
@@ -147,18 +136,12 @@ pub async fn keep_connection(
             subscriptions.len()
         );
 
-        // Record the exact subscription set, including the `fast` flags, into
-        // the meta stream. Without it a consumer has to infer what was
-        // recorded from what happens to be present, which is wrong whenever a
-        // subscribed feed was simply silent.
-        emit(
+        // Record the exact subscription set, including the `fast` flags: the
+        // `fast` flag is the difference between a 5-level 0.5s feed and a
+        // 20-level 5s one, and no other record says which was asked for.
+        meta::emit(
             &ws_tx,
-            serde_json::json!({
-                "_collector": "subscribe",
-                "url": WS_URL,
-                "attempt": attempt,
-                "subscriptions": &subscriptions,
-            }),
+            meta::subscribe(WS_URL, attempt, serde_json::json!(&subscriptions)),
         );
         attempt += 1;
 
@@ -172,13 +155,12 @@ pub async fn keep_connection(
             error!(?error, "websocket error");
             // A disconnect is otherwise indistinguishable from a quiet market:
             // the file just stops for a couple of seconds.
-            emit(
+            meta::emit(
                 &ws_tx,
-                serde_json::json!({
-                    "_collector": "disconnected",
-                    "error": error.to_string(),
-                    "connected_for_ms": connect_time.elapsed().as_millis() as u64,
-                }),
+                meta::disconnected(
+                    &error.to_string(),
+                    connect_time.elapsed().as_millis() as u64,
+                ),
             );
             error_count += 1;
             if connect_time.elapsed() > Duration::from_secs(30) {
@@ -187,12 +169,9 @@ pub async fn keep_connection(
 
             tokio::time::sleep(reconnect_delay(error_count)).await;
         } else {
-            emit(
+            meta::emit(
                 &ws_tx,
-                serde_json::json!({
-                    "_collector": "stream_ended",
-                    "connected_for_ms": connect_time.elapsed().as_millis() as u64,
-                }),
+                meta::stream_ended(connect_time.elapsed().as_millis() as u64),
             );
             break;
         }
