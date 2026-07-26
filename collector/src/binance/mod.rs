@@ -82,7 +82,10 @@ pub async fn run_collection(
 ) -> Result<(), anyhow::Error> {
     let mut prev_u_map = HashMap::new();
     let (ws_tx, mut ws_rx) = unbounded_channel();
-    let h = tokio::spawn(keep_connection(streams, symbols, ws_tx.clone()));
+    // By value, not a clone: the producer must hold the only sender, so that
+    // its death closes the channel and ends this loop. See the pump test in
+    // `hyperliquid/mod.rs` for what a retained clone costs.
+    let h = tokio::spawn(keep_connection(streams, symbols, ws_tx));
     // todo: check the Spot API rate limits.
     // https://www.binance.com/en/support/faq/rate-limits-on-binance-futures-281596e222414cdd9051664ea621cdc3
     // The default rate limit per IP is 2,400/min and the weight is 20 at a depth of 1000.

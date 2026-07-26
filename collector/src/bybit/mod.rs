@@ -40,7 +40,10 @@ pub async fn run_collection(
     writer_tx: UnboundedSender<(DateTime<Utc>, String, String)>,
 ) -> Result<(), anyhow::Error> {
     let (ws_tx, mut ws_rx) = unbounded_channel();
-    let h = tokio::spawn(keep_connection(topics, symbols, ws_tx.clone()));
+    // By value, not a clone: the producer must hold the only sender, so that
+    // its death closes the channel and ends this loop. See the pump test in
+    // `hyperliquid/mod.rs` for what a retained clone costs.
+    let h = tokio::spawn(keep_connection(topics, symbols, ws_tx));
     while let Some((recv_time, data)) = ws_rx.recv().await {
         match handle(&writer_tx, recv_time, data) {
             Ok(()) => {}

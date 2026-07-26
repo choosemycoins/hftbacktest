@@ -337,8 +337,33 @@ pub async fn run_collection(
         }
     }
 
+    pump(writer_tx, |ws_tx| {
+        keep_connection(subscriptions, symbols, ws_tx)
+    })
+    .await
+}
+
+/// Drains the producer's frames into the writer channel, and returns once the
+/// producer has released its sender.
+///
+/// Split out of [`run_collection`] so a test can supply a producer that ends.
+/// The real one ends only when the venue closes the socket without an error,
+/// which never happens on a live connection — so this exit path went
+/// unexercised, and the leaked sender clone that used to hold it open was
+/// invisible.
+async fn pump<P, F>(
+    writer_tx: UnboundedSender<(DateTime<Utc>, String, String)>,
+    producer: P,
+) -> Result<(), anyhow::Error>
+where
+    P: FnOnce(UnboundedSender<(DateTime<Utc>, Utf8Bytes)>) -> F,
+    F: Future<Output = ()> + Send + 'static,
+{
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
-    let h = tokio::spawn(keep_connection(subscriptions, symbols, ws_tx.clone()));
+    // The producer takes the only sender: holding a clone here would keep
+    // `recv()` pending for ever after the producer died, and the collector
+    // would sit idle recording nothing instead of exiting non-zero.
+    let h = tokio::spawn(producer(ws_tx));
 
     while let Some((recv_time, data)) = ws_rx.recv().await {
         if let Err(error) = handle(&writer_tx, recv_time, data) {
@@ -347,6 +372,46 @@ pub async fn run_collection(
     }
     let _ = h.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod pump_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A producer that stops is the collector's last line of defence: the main
+    /// loop treats the writer channel closing as fatal and exits non-zero
+    /// (`main.rs`, the `None` arm of `writer_rx.recv()`). That only fires if
+    /// the collection task actually returns, and it only returns once the last
+    /// `ws_tx` is gone. Keeping a clone alongside the producer's — as this used
+    /// to — turned a dead producer into an idle process that systemd reports as
+    /// perfectly healthy while nothing is being recorded.
+    #[tokio::test]
+    async fn producer_finishing_with_a_clean_eof_ends_the_collection() {
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            pump(writer_tx, |ws_tx| async move {
+                let frame = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
+                ws_tx.send((Utc::now(), Utf8Bytes::from(frame))).unwrap();
+                // Returning drops the sender, exactly as `keep_connection`
+                // does when the socket closes without an error.
+            }),
+        )
+        .await;
+
+        assert!(
+            done.is_ok(),
+            "pump must return once the producer releases the last ws_tx"
+        );
+        done.unwrap().unwrap();
+
+        // The frame sent before the producer exited is not lost on the way out.
+        let (_, stream, _) = writer_rx.try_recv().expect("the frame must be written");
+        assert_eq!(stream, "BTC");
+    }
 }
 
 #[cfg(test)]
