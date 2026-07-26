@@ -8,4 +8,8 @@ pub enum ConnectorError {
     FormatError,
     #[error("connection abort")]
     ConnectionAbort,
+    /// A bounded hand-off refused the record. Fatal by policy, never retried
+    /// and never swallowed — see `queue.rs`.
+    #[error("{0}")]
+    Queue(#[from] crate::queue::SendError),
 }

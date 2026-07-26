@@ -3,10 +3,13 @@ use std::time::Duration;
 use anyhow::anyhow;
 use chrono::Utc;
 use clap::Parser;
-use tokio::{self, select, sync::mpsc::unbounded_channel};
+use tokio::{self, select};
 use tracing::{error, info};
 
-use crate::file::Writer;
+use crate::{
+    file::Writer,
+    queue::{QUEUE_CAPACITY, WRITER_HOP},
+};
 
 mod backoff;
 mod binance;
@@ -17,6 +20,7 @@ mod disk;
 mod error;
 mod file;
 mod hyperliquid;
+mod queue;
 mod throttler;
 
 /// Build provenance, baked in by `build.rs`. Shown by `--version` and logged
@@ -193,7 +197,11 @@ async fn main() -> Result<(), anyhow::Error> {
         "disk space at startup"
     );
 
-    let (writer_tx, mut writer_rx) = unbounded_channel();
+    // Bounded, with `full => fatal` as the policy — see `queue.rs`. The fatal
+    // channel is how a producer that has no error path of its own (the
+    // detached REST snapshot tasks) reaches this loop.
+    let (fatal_tx, mut fatal_rx) = queue::fatal_channel();
+    let (writer_tx, mut writer_rx) = queue::bounded(WRITER_HOP, QUEUE_CAPACITY, fatal_tx);
 
     // Open the recording with a record of what produced it. The scoped clone
     // is dropped immediately: keeping a sender alive here would stop
@@ -201,7 +209,10 @@ async fn main() -> Result<(), anyhow::Error> {
     // main loop the collection task has died.
     {
         let meta_tx = writer_tx.clone();
-        let _ = meta_tx.send((
+        // Nothing has been enqueued yet, so this cannot fail; propagating
+        // rather than discarding keeps the rule that a hand-off result is
+        // never ignored.
+        meta_tx.send((
             chrono::Utc::now(),
             file::META_STREAM.to_string(),
             serde_json::json!({
@@ -216,7 +227,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 "hl_l2_modes": args.hl_l2_modes,
             })
             .to_string(),
-        ));
+        ))?;
     }
 
     let collection_task = match args.exchange.as_str() {
@@ -371,6 +382,26 @@ async fn main() -> Result<(), anyhow::Error> {
                         break;
                     }
                 }
+            }
+            reason = fatal_rx.recv() => {
+                // A queue filled up, or lost its receiver. Either way frames are
+                // no longer reaching disk, and the producers have stopped rather
+                // than drop them silently. Breaking here is what runs the
+                // writer's `Drop` — finishing the gzip members — before the
+                // non-zero exit; the producers cannot do that from where they
+                // are, which is the whole reason the signal comes back here.
+                error!(reason, "stopping: a data hand-off failed");
+                let _ = writer.write(
+                    Utc::now(),
+                    file::META_STREAM.to_string(),
+                    serde_json::json!({
+                        "_collector": "queue_overflow",
+                        "error": &reason,
+                    })
+                    .to_string(),
+                );
+                fatal = Some(anyhow!(reason));
+                break;
             }
             r = writer_rx.recv() => match r {
                 Some((recv_time, symbol, data)) => {

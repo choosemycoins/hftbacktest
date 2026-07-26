@@ -5,12 +5,9 @@ use std::{
 };
 
 use anyhow::Error;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use tokio::{
-    select,
-    sync::mpsc::{UnboundedSender, unbounded_channel},
-};
+use tokio::{select, sync::mpsc::unbounded_channel};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, Utf8Bytes, client::IntoClientRequest},
@@ -18,20 +15,28 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use super::WS_URL;
-use crate::backoff::reconnect_delay;
+use crate::{
+    backoff::reconnect_delay,
+    queue::{Frame, Tx},
+};
 
 /// Injects a synthetic record into the same stream the venue's frames travel
 /// on, so it is timestamped, ordered and stored exactly like real data. The
 /// `_collector` key marks it as ours; `route` in mod.rs sends anything
 /// carrying that key to the meta stream.
-fn emit(ws_tx: &UnboundedSender<(DateTime<Utc>, Utf8Bytes)>, value: serde_json::Value) {
-    let _ = ws_tx.send((Utc::now(), Utf8Bytes::from(value.to_string())));
+fn emit(ws_tx: &Tx<Frame>, value: serde_json::Value) {
+    // The caller is the reconnect loop, which has no error path of its own.
+    // `send` has already raised the fatal signal, so the process is on its way
+    // down either way; logging is all that is left to add here.
+    if let Err(error) = ws_tx.send((Utc::now(), Utf8Bytes::from(value.to_string()))) {
+        error!(?error, "couldn't record a collector lifecycle event");
+    }
 }
 
 pub async fn connect(
     url: &str,
     subscriptions: Vec<serde_json::Value>,
-    ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
+    ws_tx: Tx<Frame>,
 ) -> Result<(), anyhow::Error> {
     let request = url.into_client_request()?;
     let (ws_stream, _) = connect_async(request).await?;
@@ -72,6 +77,13 @@ pub async fn connect(
                 // stretch with no market data, which is exactly what separates
                 // a quiet market from a half-open connection when reading the
                 // meta stream afterwards. `route` files them under META_STREAM.
+                //
+                // A refused hand-off is terminal, whether the parser has gone
+                // or has simply stopped draining: `send` has already raised
+                // the fatal signal, and reading on would drop frames in
+                // silence. Returning also ends the retry loop in
+                // `keep_connection`, releasing `ws_tx` and unwinding the
+                // collection task behind it.
                 if ws_tx.send((recv_time, text)).is_err() {
                     break;
                 }
@@ -103,7 +115,7 @@ pub async fn connect(
 pub async fn keep_connection(
     subscription_types: Vec<super::SubscriptionSpec>,
     symbol_list: Vec<String>,
-    ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
+    ws_tx: Tx<Frame>,
 ) {
     let mut error_count: u32 = 0;
     let mut attempt: u64 = 0;

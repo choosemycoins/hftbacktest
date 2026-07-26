@@ -4,15 +4,18 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 pub use http::{fetch_depth_snapshot, keep_connection};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{error, warn};
 
-use crate::{error::ConnectorError, throttler::Throttler};
+use crate::{
+    error::ConnectorError,
+    queue::{self, QUEUE_CAPACITY, Record, Tx, WS_HOP},
+    throttler::Throttler,
+};
 
 fn handle(
     prev_u_map: &mut HashMap<String, i64>,
-    writer_tx: &UnboundedSender<(DateTime<Utc>, String, String)>,
+    writer_tx: &Tx<Record>,
     recv_time: DateTime<Utc>,
     data: Utf8Bytes,
     throttler: &Throttler,
@@ -51,7 +54,15 @@ fn handle(
                     match throttler_.execute(fetch_depth_snapshot(&symbol_)).await {
                         Some(Ok(data)) => {
                             let recv_time = Utc::now();
-                            let _ = writer_tx_.send((recv_time, symbol_, data));
+                            // Detached: there is no caller to return an error
+                            // to, so discarding this result would be the one
+                            // silent drop the bound cannot catch. `send` has
+                            // already raised the fatal signal by the time this
+                            // logs — that signal is the whole error path a
+                            // spawned task has.
+                            if let Err(error) = writer_tx_.send((recv_time, symbol_, data)) {
+                                error!(?error, "couldn't hand the depth snapshot to the writer");
+                            }
                         }
                         Some(Err(error)) => {
                             error!(
@@ -71,7 +82,7 @@ fn handle(
             }
             *prev_u_map.entry(symbol.to_string()).or_insert(0) = u;
         }
-        let _ = writer_tx.send((recv_time, symbol.to_string(), data.to_string()));
+        writer_tx.send((recv_time, symbol.to_string(), data.to_string()))?;
     }
     Ok(())
 }
@@ -79,10 +90,10 @@ fn handle(
 pub async fn run_collection(
     streams: Vec<String>,
     symbols: Vec<String>,
-    writer_tx: UnboundedSender<(DateTime<Utc>, String, String)>,
+    writer_tx: Tx<Record>,
 ) -> Result<(), anyhow::Error> {
     let mut prev_u_map = HashMap::new();
-    let (ws_tx, mut ws_rx) = unbounded_channel();
+    let (ws_tx, mut ws_rx) = queue::bounded(WS_HOP, QUEUE_CAPACITY, writer_tx.fatal());
     // By value, not a clone: the producer must hold the only sender, so that
     // its death closes the channel and ends this loop. See the pump test in
     // `hyperliquid/mod.rs` for what a retained clone costs.
@@ -93,10 +104,64 @@ pub async fn run_collection(
     // Sets the rate limit with a margin to account for connection requests.
     let throttler = Throttler::new(100);
     while let Some((recv_time, data)) = ws_rx.recv().await {
-        if let Err(error) = handle(&mut prev_u_map, &writer_tx, recv_time, data, &throttler) {
-            error!(?error, "couldn't handle the received data.");
+        match handle(&mut prev_u_map, &writer_tx, recv_time, data, &throttler) {
+            Ok(()) => {}
+            // Not a bad frame but a broken recording: the writer has stopped
+            // taking records, so every frame after this one would be discarded
+            // in silence. Returning ends the task, which closes the writer
+            // channel and brings `main` down with the files finished.
+            Err(error @ ConnectorError::Queue(_)) => {
+                error!(?error, "fatal stream error; stopping the collection task.");
+                return Err(error.into());
+            }
+            Err(error) => {
+                error!(?error, "couldn't handle the received data.");
+            }
         }
     }
     let _ = h.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::{self, WRITER_HOP};
+
+    fn depth_update(u: i64, pu: i64) -> String {
+        format!(r#"{{"data":{{"e":"depthUpdate","s":"BTCUSDT","u":{u},"pu":{pu}}}}}"#)
+    }
+
+    /// The same rule at the Binance call site, which is also the one holding
+    /// the detached REST snapshot task. That task has no caller to return an
+    /// error to at all, so its only route out is the fatal signal `Tx::send`
+    /// raises — which is why the result may not be discarded here either.
+    #[test]
+    fn a_frame_the_writer_cannot_take_is_an_error_not_a_drop() {
+        let (tx, _rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 1);
+        // Primed so both frames continue the sequence: a gap would spawn the
+        // REST snapshot fetch, which is not what this test is about.
+        let mut prev_u_map = HashMap::from([("BTCUSDT".to_string(), 1)]);
+        let throttler = Throttler::new(100);
+        let now = Utc::now();
+
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            depth_update(2, 1).as_str().into(),
+            &throttler,
+        )
+        .expect("the first frame fits");
+
+        let error = handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            depth_update(3, 2).as_str().into(),
+            &throttler,
+        )
+        .expect_err("a frame that could not be handed over must not be reported as written");
+        assert!(matches!(error, ConnectorError::Queue(_)), "{error}");
+    }
 }

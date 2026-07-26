@@ -9,11 +9,14 @@ use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 pub use http::keep_connection;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{error, info, warn};
 
-use crate::{error::ConnectorError, file::META_STREAM};
+use crate::{
+    error::ConnectorError,
+    file::META_STREAM,
+    queue::{self, Frame, QUEUE_CAPACITY, Record, Tx, WS_HOP},
+};
 
 /// Decides which stream a received frame belongs to.
 ///
@@ -57,13 +60,13 @@ fn route(j: &serde_json::Value) -> &str {
 }
 
 fn handle(
-    writer_tx: &UnboundedSender<(DateTime<Utc>, String, String)>,
+    writer_tx: &Tx<Record>,
     recv_time: DateTime<Utc>,
     data: Utf8Bytes,
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(data.as_str())?;
     let stream = route(&j).to_string();
-    let _ = writer_tx.send((recv_time, stream, data.to_string()));
+    writer_tx.send((recv_time, stream, data.to_string()))?;
     Ok(())
 }
 
@@ -288,7 +291,7 @@ async fn resolve_symbols(
 pub async fn run_collection(
     subscriptions: Vec<SubscriptionSpec>,
     symbols: Vec<String>,
-    writer_tx: UnboundedSender<(DateTime<Utc>, String, String)>,
+    writer_tx: Tx<Record>,
     check_symbols: bool,
 ) -> Result<(), anyhow::Error> {
     if check_symbols {
@@ -308,7 +311,7 @@ pub async fn run_collection(
                 // `hyna:ENA` on a USDE-collateralised one are different books
                 // — and `szDecimals` is what a converter needs for lot size.
                 // Without this the recording cannot say which was which.
-                let _ = writer_tx.send((
+                writer_tx.send((
                     Utc::now(),
                     META_STREAM.to_string(),
                     serde_json::json!({
@@ -322,12 +325,15 @@ pub async fn run_collection(
                         })).collect::<Vec<_>>(),
                     })
                     .to_string(),
-                ));
+                ))?;
             }
             Err(error) => {
                 // The sidecar should be able to explain an empty recording, and
                 // "we refused to start" is the clearest explanation there is.
-                let _ = writer_tx.send((
+                // A failure to write it does not replace the original error:
+                // the refusal to start is the more useful of the two, and
+                // `send` has already raised its own signal.
+                if let Err(queue_error) = writer_tx.send((
                     Utc::now(),
                     META_STREAM.to_string(),
                     serde_json::json!({
@@ -336,7 +342,12 @@ pub async fn run_collection(
                         "symbols": symbols,
                     })
                     .to_string(),
-                ));
+                )) {
+                    error!(
+                        ?queue_error,
+                        "couldn't record why the collector refused to start"
+                    );
+                }
                 error!(%error, "refusing to start");
                 return Err(error);
             }
@@ -357,23 +368,31 @@ pub async fn run_collection(
 /// which never happens on a live connection — so this exit path went
 /// unexercised, and the leaked sender clone that used to hold it open was
 /// invisible.
-async fn pump<P, F>(
-    writer_tx: UnboundedSender<(DateTime<Utc>, String, String)>,
-    producer: P,
-) -> Result<(), anyhow::Error>
+async fn pump<P, F>(writer_tx: Tx<Record>, producer: P) -> Result<(), anyhow::Error>
 where
-    P: FnOnce(UnboundedSender<(DateTime<Utc>, Utf8Bytes)>) -> F,
+    P: FnOnce(Tx<Frame>) -> F,
     F: Future<Output = ()> + Send + 'static,
 {
-    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ws_tx, mut ws_rx) = queue::bounded(WS_HOP, QUEUE_CAPACITY, writer_tx.fatal());
     // The producer takes the only sender: holding a clone here would keep
     // `recv()` pending for ever after the producer died, and the collector
     // would sit idle recording nothing instead of exiting non-zero.
     let h = tokio::spawn(producer(ws_tx));
 
     while let Some((recv_time, data)) = ws_rx.recv().await {
-        if let Err(error) = handle(&writer_tx, recv_time, data) {
-            error!(?error, "couldn't handle the received data.");
+        match handle(&writer_tx, recv_time, data) {
+            Ok(()) => {}
+            // Not a bad frame but a broken recording: the writer has stopped
+            // taking records, so every frame after this one would be discarded
+            // in silence. Returning ends the task, which closes the writer
+            // channel and brings `main` down with the files finished.
+            Err(error @ ConnectorError::Queue(_)) => {
+                error!(?error, "fatal stream error; stopping the collection task.");
+                return Err(error.into());
+            }
+            Err(error) => {
+                error!(?error, "couldn't handle the received data.");
+            }
         }
     }
     let _ = h.await;
@@ -383,6 +402,7 @@ where
 #[cfg(test)]
 mod pump_tests {
     use super::*;
+    use crate::queue::WRITER_HOP;
 
     /// A producer that stops is the collector's last line of defence: the main
     /// loop treats the writer channel closing as fatal and exits non-zero
@@ -393,7 +413,7 @@ mod pump_tests {
     /// perfectly healthy while nothing is being recorded.
     #[tokio::test]
     async fn producer_finishing_with_a_clean_eof_ends_the_collection() {
-        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (writer_tx, mut writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
 
         let done = tokio::time::timeout(
             Duration::from_secs(5),
@@ -416,6 +436,44 @@ mod pump_tests {
         // The frame sent before the producer exited is not lost on the way out.
         let (_, stream, _) = writer_rx.try_recv().expect("the frame must be written");
         assert_eq!(stream, "BTC");
+    }
+
+    /// The other end of the same guarantee. A writer that has stopped draining
+    /// must end the collection task, because that is what makes `main` exit
+    /// non-zero with the files closed. Logging and reading the next frame — the
+    /// behaviour a bounded channel inherits from `let _ = send` — would instead
+    /// discard market data silently for as long as the process stayed up.
+    #[tokio::test]
+    async fn a_writer_that_stops_draining_ends_the_collection() {
+        // The receiver is held but never read, so the queue fills and stays
+        // full; capacity 1 just gets there in one frame instead of 4096.
+        let (writer_tx, _writer_rx, mut fatal) = queue::test_bounded::<Record>(WRITER_HOP, 1);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            pump(writer_tx, |ws_tx| async move {
+                let frame =
+                    r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
+                // The socket keeps delivering while the writer is stuck. This
+                // hop has room, so the producer notices nothing.
+                for _ in 0..4 {
+                    ws_tx.send((Utc::now(), Utf8Bytes::from(frame))).unwrap();
+                }
+            }),
+        )
+        .await
+        .expect("pump must not hang once the writer stops draining");
+
+        assert!(
+            result.is_err(),
+            "the collection task must fail rather than carry on dropping frames"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), fatal.recv())
+                .await
+                .is_ok(),
+            "and the reason must reach main, which is the half a returned error cannot cover"
+        );
     }
 }
 
@@ -527,6 +585,7 @@ mod universe_tests {
 #[cfg(test)]
 mod route_tests {
     use super::*;
+    use crate::queue::WRITER_HOP;
 
     fn r(s: &str) -> String {
         route(&serde_json::from_str(s).unwrap()).to_string()
@@ -600,7 +659,7 @@ mod route_tests {
 
     #[test]
     fn handle_writes_every_frame_somewhere() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
         let now = Utc::now();
         for frame in [
             r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#,
@@ -622,5 +681,22 @@ mod route_tests {
         // The payload is stored verbatim — that is what makes the recording
         // replayable under a different merge policy later.
         assert!(got[1].1.contains("boom"));
+    }
+
+    /// The other half of "every frame lands somewhere": when the writer cannot
+    /// take one, `handle` has to say so. Discarding the send result — harmless
+    /// while the channel was unbounded — is a silent data drop on a bounded
+    /// one, and the only failure here that no log line would ever mention.
+    #[test]
+    fn a_frame_the_writer_cannot_take_is_an_error_not_a_drop() {
+        let (tx, _rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 1);
+        let now = Utc::now();
+        let frame = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
+
+        handle(&tx, now, frame.into()).expect("the first frame fits");
+
+        let error = handle(&tx, now, frame.into())
+            .expect_err("a frame that could not be handed over must not be reported as written");
+        assert!(matches!(error, ConnectorError::Queue(_)), "{error}");
     }
 }
