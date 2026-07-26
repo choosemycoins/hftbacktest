@@ -628,6 +628,15 @@ is Hyperliquid's plain `l2Book` at ~5.4s, so the default sits roughly fiftyfold
 above anything real. Lower it once a quiet-period gap has actually been
 measured.
 
+**What an operator sees.** The exit is non-zero, so systemd restarts the
+instance (`Restart=always`, `RestartSec=5s`) and it trips again ~305 s later.
+The unit therefore reaches `failed` — and fires `OnFailure=` — only once the
+start limit is hit: ten restarts, so roughly **50 minutes** after the feed went
+quiet, with a fresh gzip member and a `session_start` record per attempt. That
+is the shipped `StartLimitBurst=10` / `StartLimitIntervalSec=3600`; the interval
+has to stay well above ten stall periods or the limit is never reached and the
+unit restarts for ever without ever failing.
+
 **What it does not catch**, and must not be mistaken for:
 
 - a dead depth stream while trades keep arriving, or the reverse;

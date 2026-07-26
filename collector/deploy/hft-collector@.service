@@ -34,8 +34,23 @@ RequiresMountsFor=/opt/hft-collector/data
 # The start rate limiter belongs to the Unit, not the Service. Placed under
 # [Service] these are silently ignored (StartLimitIntervalSec is not a
 # [Service] key at all), leaving a crash-looping instance unthrottled.
+#
+# The interval has to be long relative to the SLOWEST way the collector exits,
+# not the fastest, or the failure it was added for is the one that never
+# surfaces. The stall watchdog (--stall-timeout-min, default 5) exits at
+# t+300s, RestartSec adds 5s, so a permanently silent-but-connected feed
+# restarts every ~305s. At the previous interval of 300s that is at most one
+# start per window, StartLimitBurst=10 is never reached, and the unit
+# oscillates between activating and active for ever — never `failed`, so
+# OnFailure below never fires and nothing alerts. Meanwhile a hard network
+# outage exits in ~1s, restarts every ~6s and reaches the limit in a minute,
+# which is why the loop is easy to miss when testing.
+#
+# At 3600s the arithmetic works out for both: ~50 minutes of silence (10
+# restarts at ~305s) or ~1 minute of a refused network. Lowering
+# --stall-timeout-min shortens the first proportionally.
 StartLimitBurst=10
-StartLimitIntervalSec=300
+StartLimitIntervalSec=3600
 
 [Service]
 Type=simple
