@@ -9,6 +9,8 @@ use tracing::{error, warn};
 
 use crate::{
     error::ConnectorError,
+    file::META_STREAM,
+    meta,
     queue::{self, QUEUE_CAPACITY, Record, Tx, WS_HOP},
     throttler::Throttler,
 };
@@ -21,6 +23,13 @@ fn handle(
     throttler: &Throttler,
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(data.as_str())?;
+    // The collector's own lifecycle records travel this hop alongside the
+    // venue's frames (see `meta.rs`). Matched before anything else, so one can
+    // never reach the symbol routing below, which has no symbol to give it.
+    if meta::is_record(&j) {
+        writer_tx.send((recv_time, META_STREAM.to_string(), data.to_string()))?;
+        return Ok(());
+    }
     if let Some(j_data) = j.get("data")
         && let Some(j_symbol) = j_data
             .as_object()
@@ -124,4 +133,54 @@ pub async fn run_collection(
     }
     let _ = h.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::{self, WRITER_HOP};
+
+    /// The collector's own lifecycle records ride the same hop as the venue's
+    /// frames, so `handle` is both what files them in the sidecar and what
+    /// keeps them out of the symbol files — this backend routes on a symbol
+    /// parsed out of the frame, and a lifecycle record has none. Until they
+    /// were wired in, a Binance recording wrote nothing to `_meta` at all and
+    /// so could not explain a single gap.
+    #[test]
+    fn lifecycle_records_are_filed_under_meta_and_market_data_still_is_not() {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 4);
+        let mut prev_u_map = HashMap::new();
+        let throttler = Throttler::new(100);
+        let now = Utc::now();
+        let lifecycle = meta::disconnected("Connection reset without closing handshake", 1194);
+
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            lifecycle.to_string().as_str().into(),
+            &throttler,
+        )
+        .unwrap();
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            r#"{"data":{"e":"trade","s":"BTCUSDT"}}"#.into(),
+            &throttler,
+        )
+        .unwrap();
+
+        let (_, stream, payload) = rx.try_recv().expect("the lifecycle record must be written");
+        assert_eq!(stream, META_STREAM);
+        let j: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(j["_collector"], "disconnected");
+        assert_eq!(j["connected_for_ms"], 1194);
+
+        assert_eq!(
+            rx.try_recv().expect("market data must still be written").1,
+            "BTCUSDT",
+            "the symbol routing below the tag check is untouched"
+        );
+    }
 }

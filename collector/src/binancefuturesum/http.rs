@@ -16,8 +16,12 @@ use tracing::{error, warn};
 
 use crate::{
     backoff::reconnect_delay,
+    meta,
     queue::{Frame, Tx},
 };
+
+/// The combined-stream endpoint; the streams themselves go in the query.
+const WS_URL: &str = "wss://fstream.binance.com/stream";
 
 pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
     // `exchangeInfo` is a multi-megabyte response fetched once, so this is
@@ -72,6 +76,7 @@ pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error
 pub async fn connect(url: &str, ws_tx: Tx<Frame>) -> Result<(), anyhow::Error> {
     let request = url.into_client_request()?;
     let (ws_stream, _) = connect_async(request).await?;
+    meta::emit(&ws_tx, meta::connected(url));
     let (mut write, mut read) = ws_stream.split();
     let (tx, mut rx) = unbounded_channel::<Bytes>();
 
@@ -144,9 +149,9 @@ pub async fn connect(url: &str, ws_tx: Tx<Frame>) -> Result<(), anyhow::Error> {
 
 pub async fn keep_connection(streams: Vec<String>, symbol_list: Vec<String>, ws_tx: Tx<Frame>) {
     let mut error_count: u32 = 0;
+    let mut attempt: u64 = 0;
     loop {
-        let connect_time = Instant::now();
-        let streams_str = symbol_list
+        let streams_ = symbol_list
             .iter()
             .flat_map(|pair| {
                 streams
@@ -159,21 +164,46 @@ pub async fn keep_connection(streams: Vec<String>, symbol_list: Vec<String>, ws_
                     })
                     .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-            .join("/");
-        if let Err(error) = connect(
-            &format!("wss://fstream.binance.com/stream?streams={streams_str}"),
-            ws_tx.clone(),
-        )
-        .await
-        {
+            .collect::<Vec<_>>();
+        let url = format!("{WS_URL}?streams={}", streams_.join("/"));
+
+        // Binance subscribes through the URL rather than a subscribe frame, so
+        // the venue never acks anything and this is the only account of what
+        // was asked for. Written before the dial, because the dial that never
+        // completes is the case it is most needed for.
+        meta::emit(
+            &ws_tx,
+            meta::subscribe(&url, attempt, serde_json::json!(&streams_)),
+        );
+        attempt += 1;
+
+        // Started here, not at the top of the loop: `connected_for_ms` must
+        // measure the connection, not the connection plus the time spent
+        // building the stream list. The stale-error-count reset below reads
+        // better for the same reason.
+        let connect_time = Instant::now();
+
+        if let Err(error) = connect(&url, ws_tx.clone()).await {
             error!(?error, "websocket error");
+            // A disconnect is otherwise indistinguishable from a quiet market:
+            // the file just stops for a couple of seconds.
+            meta::emit(
+                &ws_tx,
+                meta::disconnected(
+                    &error.to_string(),
+                    connect_time.elapsed().as_millis() as u64,
+                ),
+            );
             error_count += 1;
             if connect_time.elapsed() > Duration::from_secs(30) {
                 error_count = 0;
             }
             tokio::time::sleep(reconnect_delay(error_count)).await;
         } else {
+            meta::emit(
+                &ws_tx,
+                meta::stream_ended(connect_time.elapsed().as_millis() as u64),
+            );
             break;
         }
     }
