@@ -62,9 +62,17 @@ impl StallWatchdog {
 
     /// Notes a record on its way to disk, restarting the clock.
     ///
-    /// Sidecar records do not count. `main` writes a `_meta` disk gauge every
-    /// minute for as long as the process lives, so counting those would leave
-    /// the watchdog permanently satisfied by a collector recording nothing.
+    /// Sidecar records do not count, and the case that makes the exclusion
+    /// load-bearing is a reconnect storm: every retry emits `subscribe`,
+    /// `connected`/`dial_failed` and `disconnected` into the same hop the
+    /// venue's frames travel (`meta.rs`), all of them filed under `_meta`. With
+    /// the backoff floor at 500ms a venue refusing connections produces a
+    /// couple a second indefinitely, which would keep this satisfied while not
+    /// one market-data frame is recorded.
+    ///
+    /// `main`'s own `_meta` records — the minutely disk gauge and the two
+    /// terminal ones — never arrive here at all: they are written straight to
+    /// the `Writer`, bypassing the queue this counts records off.
     pub fn record_write(&mut self, stream: &str) {
         if stream != META_STREAM {
             self.last_write = Instant::now();
@@ -149,26 +157,50 @@ mod tests {
         }
     }
 
-    /// The sidecar must not vouch for the market data. `main` writes a disk
-    /// record to `_meta` every minute for as long as the process lives, so
-    /// counting meta writes would leave the watchdog permanently satisfied by a
-    /// collector that is recording nothing.
+    /// The sidecar must not vouch for the market data, and the case that makes
+    /// that load-bearing is a reconnect storm.
+    ///
+    /// Every retry writes `subscribe`, then `connected` or `dial_failed`, then
+    /// `disconnected` — all filed under `_meta`, all travelling the same hop as
+    /// market data and so all reaching `record_write`. With the backoff floor at
+    /// 500ms (`backoff.rs`) a venue refusing connections produces a couple a
+    /// second for as long as it stays down. Counting them would leave the
+    /// watchdog permanently satisfied by a collector recording nothing at all,
+    /// which is precisely the failure it exists for.
+    ///
+    /// Bounded by a timeout rather than left to `loop`: without the exclusion
+    /// this never stops, and under a paused clock it does not stop slowly — it
+    /// spins virtual time forwards for ever. `cargo test` is the only gate this
+    /// repo has, and a wedged run reads as "still compiling", not as a failure.
     #[tokio::test(start_paused = true)]
     async fn sidecar_records_do_not_count_as_life() {
         let start = Instant::now();
         let mut watchdog = StallWatchdog::new(TIMEOUT_MIN);
-        let mut minute = tokio::time::interval(Duration::from_secs(60));
+        let mut retry = tokio::time::interval(Duration::from_millis(500));
 
-        loop {
-            select! {
-                _ = watchdog.stalled() => break,
-                _ = minute.tick() => watchdog.record_write(META_STREAM),
+        let silence = tokio::time::timeout(TIMEOUT * 2, async {
+            loop {
+                select! {
+                    silence = watchdog.stalled() => return silence,
+                    _ = retry.tick() => {
+                        // One failed reconnect's worth of sidecar traffic.
+                        watchdog.record_write(META_STREAM);
+                        watchdog.record_write(META_STREAM);
+                        watchdog.record_write(META_STREAM);
+                    }
+                }
             }
-        }
+        })
+        .await
+        .expect("a reconnect storm's sidecar records held the watchdog off indefinitely");
 
         assert!(
+            silence >= TIMEOUT,
+            "tripped after only {silence:?} of silence"
+        );
+        assert!(
             start.elapsed() < TIMEOUT * 2,
-            "a minutely sidecar record held the watchdog off for {:?}",
+            "tripped after {:?}, expected close to {TIMEOUT:?}",
             start.elapsed()
         );
     }

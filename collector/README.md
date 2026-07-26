@@ -614,8 +614,13 @@ subscription and then sends nothing, a reconnect loop that reconnects but never
 resubscribes, a frame parsed into no stream at all — none of those raise an
 error, and every outward sign stays healthy while the recording is empty. The
 clock starts at startup, so a collector that never records anything is caught
-too, and sidecar records do not count as data (the disk gauge writes one every
-minute regardless).
+too.
+
+Sidecar records do not count as data. That matters most during a reconnect
+storm: every retry writes `subscribe`, `connected`/`dial_failed` and
+`disconnected` to `_meta`, and with the 500 ms backoff floor a venue refusing
+connections produces a couple a second for as long as it stays down. Counting
+those would leave the watchdog satisfied by a collector recording nothing.
 
 **5 minutes is a proposal, not a measurement** — open decision 2 of
 `docs/design-multi-venue-collection.md`. For scale, the slowest legitimate feed
