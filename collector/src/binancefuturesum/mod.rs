@@ -11,7 +11,8 @@ use crate::{
     error::ConnectorError,
     file::META_STREAM,
     meta,
-    queue::{self, QUEUE_CAPACITY, Record, Tx, WS_HOP},
+    pump::pump,
+    queue::{Record, Tx},
     throttler::Throttler,
 };
 
@@ -102,34 +103,19 @@ pub async fn run_collection(
     writer_tx: Tx<Record>,
 ) -> Result<(), anyhow::Error> {
     let mut prev_u_map = HashMap::new();
-    let (ws_tx, mut ws_rx) = queue::bounded(WS_HOP, QUEUE_CAPACITY, writer_tx.fatal());
-    // By value, not a clone: the producer must hold the only sender, so that
-    // its death closes the channel and ends this loop. See the pump test in
-    // `hyperliquid/mod.rs` for what a retained clone costs.
-    let h = tokio::spawn(keep_connection(streams, symbols, ws_tx));
     // https://www.binance.com/en/support/faq/rate-limits-on-binance-futures-281596e222414cdd9051664ea621cdc3
     // The default rate limit per IP is 2,400/min and the weight is 20 at a depth of 1000.
     // The maximum request rate for fetching snapshots is 120 per minute.
     // Sets the rate limit with a margin to account for connection requests.
     let throttler = Throttler::new(100);
-    while let Some((recv_time, data)) = ws_rx.recv().await {
-        match handle(&mut prev_u_map, &writer_tx, recv_time, data, &throttler) {
-            Ok(()) => {}
-            // Not a bad frame but a broken recording: the writer has stopped
-            // taking records, so every frame after this one would be discarded
-            // in silence. Returning ends the task, which closes the writer
-            // channel and brings `main` down with the files finished.
-            Err(error @ ConnectorError::Queue(_)) => {
-                error!(?error, "fatal stream error; stopping the collection task.");
-                return Err(error.into());
-            }
-            Err(error) => {
-                error!(?error, "couldn't handle the received data.");
-            }
-        }
-    }
-    let _ = h.await;
-    Ok(())
+    pump(
+        writer_tx,
+        |ws_tx| keep_connection(streams, symbols, ws_tx),
+        move |writer_tx, recv_time, data| {
+            handle(&mut prev_u_map, writer_tx, recv_time, data, &throttler)
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

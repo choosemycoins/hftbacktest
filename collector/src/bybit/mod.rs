@@ -7,7 +7,8 @@ use crate::{
     error::ConnectorError,
     file::META_STREAM,
     meta,
-    queue::{self, QUEUE_CAPACITY, Record, Tx, WS_HOP},
+    pump::pump,
+    queue::{Record, Tx},
 };
 
 mod http;
@@ -50,36 +51,12 @@ pub async fn run_collection(
     symbols: Vec<String>,
     writer_tx: Tx<Record>,
 ) -> Result<(), anyhow::Error> {
-    let (ws_tx, mut ws_rx) = queue::bounded(WS_HOP, QUEUE_CAPACITY, writer_tx.fatal());
-    // By value, not a clone: the producer must hold the only sender, so that
-    // its death closes the channel and ends this loop. See the pump test in
-    // `hyperliquid/mod.rs` for what a retained clone costs.
-    let h = tokio::spawn(keep_connection(topics, symbols, ws_tx));
-    while let Some((recv_time, data)) = ws_rx.recv().await {
-        match handle(&writer_tx, recv_time, data) {
-            Ok(()) => {}
-            // A rejected subscribe is fatal, not transient. Bybit fails the
-            // whole batch if any one topic is unknown (e.g. `orderbook.500`
-            // for a symbol that does not offer that depth), and retrying the
-            // identical batch can never succeed. Merely logging it — as this
-            // loop used to — left the socket open and ping-ponging with no
-            // subscription at all: zero bytes recorded, indefinitely, while
-            // the process looked perfectly healthy to systemd.
-            //
-            // A refused hand-off is fatal for the same reason from the other
-            // end: the writer has stopped taking records, so carrying on would
-            // discard market data in silence.
-            Err(error @ (ConnectorError::ConnectionAbort | ConnectorError::Queue(_))) => {
-                error!(?error, "fatal stream error; stopping the collection task.");
-                return Err(error.into());
-            }
-            Err(error) => {
-                error!(?error, "couldn't handle the received data.");
-            }
-        }
-    }
-    let _ = h.await;
-    Ok(())
+    pump(
+        writer_tx,
+        |ws_tx| keep_connection(topics, symbols, ws_tx),
+        handle,
+    )
+    .await
 }
 
 #[cfg(test)]

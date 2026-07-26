@@ -16,7 +16,8 @@ use crate::{
     error::ConnectorError,
     file::META_STREAM,
     meta,
-    queue::{self, Frame, QUEUE_CAPACITY, Record, Tx, WS_HOP},
+    pump::pump,
+    queue::{Record, Tx},
 };
 
 /// Decides which stream a received frame belongs to.
@@ -355,127 +356,12 @@ pub async fn run_collection(
         }
     }
 
-    pump(writer_tx, |ws_tx| {
-        keep_connection(subscriptions, symbols, ws_tx)
-    })
+    pump(
+        writer_tx,
+        |ws_tx| keep_connection(subscriptions, symbols, ws_tx),
+        handle,
+    )
     .await
-}
-
-/// Drains the producer's frames into the writer channel, and returns once the
-/// producer has released its sender.
-///
-/// Split out of [`run_collection`] so a test can supply a producer that ends.
-/// The real one ends only when the venue closes the socket without an error,
-/// which never happens on a live connection — so this exit path went
-/// unexercised, and the leaked sender clone that used to hold it open was
-/// invisible.
-async fn pump<P, F>(writer_tx: Tx<Record>, producer: P) -> Result<(), anyhow::Error>
-where
-    P: FnOnce(Tx<Frame>) -> F,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let (ws_tx, mut ws_rx) = queue::bounded(WS_HOP, QUEUE_CAPACITY, writer_tx.fatal());
-    // The producer takes the only sender: holding a clone here would keep
-    // `recv()` pending for ever after the producer died, and the collector
-    // would sit idle recording nothing instead of exiting non-zero.
-    let h = tokio::spawn(producer(ws_tx));
-
-    while let Some((recv_time, data)) = ws_rx.recv().await {
-        match handle(&writer_tx, recv_time, data) {
-            Ok(()) => {}
-            // Not a bad frame but a broken recording: the writer has stopped
-            // taking records, so every frame after this one would be discarded
-            // in silence. Returning ends the task, which closes the writer
-            // channel and brings `main` down with the files finished.
-            Err(error @ ConnectorError::Queue(_)) => {
-                error!(?error, "fatal stream error; stopping the collection task.");
-                return Err(error.into());
-            }
-            Err(error) => {
-                error!(?error, "couldn't handle the received data.");
-            }
-        }
-    }
-    let _ = h.await;
-    Ok(())
-}
-
-#[cfg(test)]
-mod pump_tests {
-    use super::*;
-    use crate::queue::WRITER_HOP;
-
-    /// A producer that stops is the collector's last line of defence: the main
-    /// loop treats the writer channel closing as fatal and exits non-zero
-    /// (`main.rs`, the `None` arm of `writer_rx.recv()`). That only fires if
-    /// the collection task actually returns, and it only returns once the last
-    /// `ws_tx` is gone. Keeping a clone alongside the producer's — as this used
-    /// to — turned a dead producer into an idle process that systemd reports as
-    /// perfectly healthy while nothing is being recorded.
-    #[tokio::test]
-    async fn producer_finishing_with_a_clean_eof_ends_the_collection() {
-        let (writer_tx, mut writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
-
-        let done = tokio::time::timeout(
-            Duration::from_secs(5),
-            pump(writer_tx, |ws_tx| async move {
-                let frame =
-                    r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
-                ws_tx.send((Utc::now(), Utf8Bytes::from(frame))).unwrap();
-                // Returning drops the sender, exactly as `keep_connection`
-                // does when the socket closes without an error.
-            }),
-        )
-        .await;
-
-        assert!(
-            done.is_ok(),
-            "pump must return once the producer releases the last ws_tx"
-        );
-        done.unwrap().unwrap();
-
-        // The frame sent before the producer exited is not lost on the way out.
-        let (_, stream, _) = writer_rx.try_recv().expect("the frame must be written");
-        assert_eq!(stream, "BTC");
-    }
-
-    /// The other end of the same guarantee. A writer that has stopped draining
-    /// must end the collection task, because that is what makes `main` exit
-    /// non-zero with the files closed. Logging and reading the next frame — the
-    /// behaviour a bounded channel inherits from `let _ = send` — would instead
-    /// discard market data silently for as long as the process stayed up.
-    #[tokio::test]
-    async fn a_writer_that_stops_draining_ends_the_collection() {
-        // The receiver is held but never read, so the queue fills and stays
-        // full; capacity 1 just gets there in one frame instead of 4096.
-        let (writer_tx, _writer_rx, mut fatal) = queue::test_bounded::<Record>(WRITER_HOP, 1);
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            pump(writer_tx, |ws_tx| async move {
-                let frame =
-                    r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
-                // The socket keeps delivering while the writer is stuck. This
-                // hop has room, so the producer notices nothing.
-                for _ in 0..4 {
-                    ws_tx.send((Utc::now(), Utf8Bytes::from(frame))).unwrap();
-                }
-            }),
-        )
-        .await
-        .expect("pump must not hang once the writer stops draining");
-
-        assert!(
-            result.is_err(),
-            "the collection task must fail rather than carry on dropping frames"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), fatal.recv())
-                .await
-                .is_ok(),
-            "and the reason must reach main, which is the half a returned error cannot cover"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -586,7 +472,7 @@ mod universe_tests {
 #[cfg(test)]
 mod route_tests {
     use super::*;
-    use crate::queue::WRITER_HOP;
+    use crate::queue::{self, WRITER_HOP};
 
     fn r(s: &str) -> String {
         route(&serde_json::from_str(s).unwrap()).to_string()

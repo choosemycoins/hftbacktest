@@ -22,6 +22,7 @@ mod file;
 mod hyperliquid;
 mod lock;
 mod meta;
+mod pump;
 mod queue;
 mod throttler;
 mod watchdog;
