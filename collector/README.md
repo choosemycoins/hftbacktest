@@ -199,28 +199,36 @@ message exactly as it came off the wire:
 ### The `_meta` sidecar
 
 Symbol files hold only market data. Everything else the collector observes —
-which cannot be attributed to a symbol — goes to `_meta_<date>.gz` in the same
-line format, so a recording explains itself instead of having to be guessed at:
+which cannot be attributed to a symbol — goes to
+`_meta_<exchange>_<date>.jsonl` in the same line format, so a recording
+explains itself instead of having to be guessed at:
 
-**Coverage is uneven across venues** — the table says which records you can
-actually expect:
+**The connection lifecycle is written by every backend, in one format.** The
+records tagged `_collector` are the collector's own account of the session;
+the untagged ones are venue frames forwarded verbatim, and those are as uneven
+as the venues themselves:
 
 | Record | Meaning | Venues |
 |---|---|---|
 | `{"_collector":"session_start", …}` | collector version, commit, exchange, symbols, flags | all |
-| `{"_collector":"subscribe", …}` | the exact subscription payloads sent, with attempt number | hyperliquid |
+| `{"_collector":"subscribe", …}` | `url`, `attempt`, and the exact set that was requested | all |
+| `{"_collector":"connected", …}` | `url` — the socket came up | all |
+| `{"_collector":"disconnected", …}` | `error`, and `connected_for_ms` | all |
+| `{"_collector":"stream_ended", …}` | clean end of stream, with `connected_for_ms` | all |
+| `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
+| `{"_collector":"stalled", …}` | nothing was recorded for the whole watchdog window; the collector is stopping | all |
 | `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters | hyperliquid |
 | `{"channel":"error", …}` | venue rejections | hyperliquid |
 | `{"channel":"pong", …}` | liveness during a stretch with no market data | hyperliquid |
-| `{"_collector":"disconnected", …}` | reason, and `connected_for_ms` | hyperliquid |
-| `{"_collector":"stream_ended", …}` | clean end of stream | hyperliquid |
-| `{"success":…,"ret_msg":…}` | Bybit subscribe ack, successful or not | bybit |
-| `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
-| `{"_collector":"stalled", …}` | nothing was recorded for the whole watchdog window; the collector is stopping | all |
+| `{"success":…,"ret_msg":…}` | subscribe ack, successful or not | bybit |
 
-Binance venues currently contribute only `session_start`; wiring their
-connection events into the sidecar is unfinished work, not a deliberate
-omission.
+A `subscribe` with no `connected` after it is a dial that never completed. A
+`connected` with no market data behind it is a subscription the venue accepted
+and never served. Neither was distinguishable from a quiet market before.
+
+Binance acks nothing at all — the subscription is the URL it is dialled with —
+so on those three venues the `_collector` records are the only account of the
+session there is.
 
 This is what turns an unexplained gap into a diagnosable one. A recording made
 against a deliberately invalid symbol now reads:
@@ -228,6 +236,7 @@ against a deliberately invalid symbol now reads:
 ```
 session_start hyperliquid ['BTC','NOPE_XYZ'] modes=['slow','fast']
 subscribe attempt=0 n=8
+connected wss://api.hyperliquid.xyz/ws
 subscriptionResponse ×4          <- only BTC's four were acked
 disconnected after=1194ms err=Connection reset without closing handshake
 subscribe attempt=1 n=8
@@ -616,12 +625,12 @@ finished files, not a decision this process can make about itself.
 
 Worth knowing before you trust a dataset.
 
-- **Reconnects are silent in the *symbol* files on every venue.** For
-  Hyperliquid the sidecar records `subscribe`/`disconnected` markers, so a gap
-  can be attributed; for Bybit and Binance it still cannot, and `journalctl`
-  for `websocket error` remains the only source. Sequence numbers in the
-  payloads (Binance `pu`/`U`, Bybit `u`/`seq`) detect a gap after the fact
-  regardless of venue.
+- **Reconnects are silent in the *symbol* files on every venue.** The gap can
+  be attributed — the sidecar carries `subscribe`/`connected`/`disconnected`
+  markers on all five backends — but only by lining the two files up on
+  timestamps; nothing marks the hole where it happens. Sequence numbers in the
+  payloads (Binance `pu`/`U`, Bybit `u`/`seq`) detect one after the fact,
+  independently of the sidecar.
 - **The reconnect backoff ladder is dead code on every venue except
   Hyperliquid.** `collector/src/{binance,binancefuturesum,binancefuturescm,
   bybit}/http.rs` test `error_count > 3` before `> 10` and `> 20`, so the first
