@@ -59,8 +59,11 @@ struct Args {
     ///
     /// `slow` = 20 levels/side at roughly 5s. `fast` = 5 levels/side at roughly
     /// 0.5s. `none` records no book at all (trades and bbo only). The default
-    /// records both so the converter can fuse depth from the slow feed with
-    /// frequency from the fast one.
+    /// records both, and the two are kept side by side rather than merged: the
+    /// converter picks exactly one with its `book_mode` argument, and fusing
+    /// them is explicitly not implemented (`hyperliquid.convert` raises on any
+    /// other value). Recording both is what lets the choice be made — and
+    /// revisited, or fused by some later converter — after the fact.
     #[arg(long, value_delimiter = ',', default_value = "slow,fast")]
     hl_l2_modes: Vec<String>,
 
@@ -279,12 +282,15 @@ async fn main() -> Result<(), anyhow::Error> {
                 SubscriptionSpec::plain("trades"),
                 SubscriptionSpec::plain("bbo"),
             ];
-            // Record both book cadences and let the converter fuse them.
+            // Record both book cadences; the converter selects one of them.
             // Measured on mainnet 2026-07-25: the plain feed is 20 levels every
             // ~5.3s, `fast` is 5 levels every ~0.5s. Recording only the plain
             // one — as this collector used to — yields a book that updates
             // three times a minute, which is not usable for backtesting an HFT
-            // strategy no matter how good the converter is.
+            // strategy no matter how good the converter is. `hyperliquid.convert`
+            // reads whichever cadence `book_mode` names and drops the other;
+            // fusing depth from the slow feed with the frequency of the fast one
+            // is not implemented. Both are written so that choice stays open.
             for mode in &args.hl_l2_modes {
                 match mode.as_str() {
                     "slow" => subscriptions.push(SubscriptionSpec::l2_book(false)),
