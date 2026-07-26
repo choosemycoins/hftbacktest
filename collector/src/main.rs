@@ -115,6 +115,43 @@ struct Args {
     no_symbol_check: bool,
 }
 
+/// Writes whatever the writer hop still holds, and reports how much that was.
+///
+/// Called once the main loop has decided to stop. Every record still queued has
+/// already been reported to its producer as accepted — that is the promise
+/// `queue.rs` makes when it treats a refused hand-off as fatal rather than
+/// dropping it — so destroying the channel with them in it would break that
+/// promise at the last possible moment. On an overflow the backlog is by
+/// definition the full capacity, and it is the newest data in the recording:
+/// the window around whatever went wrong.
+///
+/// Bounded rather than run to exhaustion. Producers do not stop because the
+/// consumer decided to: the socket keeps delivering, and an unbounded drain
+/// could be fed for as long as the venue stays up. The cap is the queue's own
+/// capacity, so everything that was waiting is written and nothing that arrives
+/// afterwards can extend the shutdown.
+fn drain_backlog(
+    rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
+    mut write: impl FnMut(queue::Record) -> Result<(), anyhow::Error>,
+) -> usize {
+    let mut written = 0;
+    for _ in 0..QUEUE_CAPACITY {
+        let Ok(record) = rx.try_recv() else { break };
+        if let Err(error) = write(record) {
+            // The same fault the loop was already leaving on, most likely. The
+            // remaining records cannot be written either, and trying would only
+            // delay the gzip flush that may still succeed.
+            error!(
+                ?error,
+                written, "couldn't write the queued backlog on the way out"
+            );
+            break;
+        }
+        written += 1;
+    }
+    written
+}
+
 /// Reports free space, and refuses to continue below the floor.
 fn check_disk(path: &str, min_free_gb: u64) -> Result<u64, anyhow::Error> {
     let free = disk::available_bytes(path)?;
@@ -452,24 +489,30 @@ async fn main() -> Result<(), anyhow::Error> {
                 fatal = Some(error);
                 break;
             }
-            reason = fatal_rx.recv() => {
+            report = fatal_rx.recv() => {
                 // A queue filled up, or lost its receiver. Either way frames are
                 // no longer reaching disk, and the producers have stopped rather
                 // than drop them silently. Breaking here is what runs the
                 // writer's `Drop` — finishing the gzip members — before the
                 // non-zero exit; the producers cannot do that from where they
                 // are, which is the whole reason the signal comes back here.
-                error!(reason, "stopping: a data hand-off failed");
+                //
+                // The record is named after which of the two happened. They are
+                // not interchangeable: a hop losing its receiver is what an
+                // ending collection task looks like from the other side, and
+                // filing that as an overflow would point Phase 2's gap
+                // attribution at a queue depth that was never reached.
+                error!(event = report.event, reason = report.reason, "stopping: a data hand-off failed");
                 let _ = writer.write(
                     Utc::now(),
                     file::META_STREAM.to_string(),
                     serde_json::json!({
-                        "_collector": "queue_overflow",
-                        "error": &reason,
+                        "_collector": report.event,
+                        "error": &report.reason,
                     })
                     .to_string(),
                 );
-                fatal = Some(anyhow!(reason));
+                fatal = Some(anyhow!(report.reason));
                 break;
             }
             r = writer_rx.recv() => match r {
@@ -500,6 +543,20 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
+    // Every break above leaves records behind in the queue, and on the fatal
+    // paths that is the last data the collector ever captured. Write it before
+    // the files are closed rather than letting the channel be destroyed with
+    // it — see `drain_backlog` for why this is bounded.
+    let recovered = drain_backlog(&mut writer_rx, |(recv_time, symbol, data)| {
+        writer.write(recv_time, symbol, data)
+    });
+    if recovered > 0 {
+        info!(
+            records = recovered,
+            "wrote the queued backlog before closing"
+        );
+    }
+
     // Drop the writer explicitly rather than letting it fall off the end of
     // `main`: `RotatingFile::drop` is what calls `GzEncoder::finish`. Doing it
     // here means the "stopped" log line is emitted after the flush has been
@@ -527,5 +584,73 @@ async fn main() -> Result<(), anyhow::Error> {
             error!(%error, "collector_stopped_with_error");
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::Record;
+
+    fn record(payload: &str) -> Record {
+        (Utc::now(), "BTC".to_string(), payload.to_string())
+    }
+
+    /// Everything still in the queue when the loop stops was already reported
+    /// to its producer as accepted — `queue.rs` promises records are "never
+    /// dropped", and the producers stopped rather than lose them. Leaving the
+    /// channel to be destroyed with `main` would break that promise at the
+    /// process level, and on an overflow it would discard the full 4096: the
+    /// newest data in the recording, which is the window around the fault.
+    #[test]
+    fn the_queued_backlog_is_written_before_the_files_are_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(8);
+        for payload in ["first", "second", "third"] {
+            tx.try_send(record(payload)).unwrap();
+        }
+
+        let mut written = Vec::new();
+        let count = drain_backlog(&mut rx, |(_, _, data)| {
+            written.push(data);
+            Ok(())
+        });
+
+        assert_eq!(count, 3);
+        assert_eq!(written, ["first", "second", "third"]);
+    }
+
+    /// The drain runs after the decision to stop, so it must not become a
+    /// reason not to. Producers may still be pushing — the socket does not stop
+    /// because the writer did — so it is capped rather than run to exhaustion.
+    #[test]
+    fn the_drain_is_bounded_even_if_the_producers_keep_pushing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(QUEUE_CAPACITY * 2);
+        for _ in 0..(QUEUE_CAPACITY + 100) {
+            tx.try_send(record("still arriving")).unwrap();
+        }
+
+        assert_eq!(drain_backlog(&mut rx, |_| Ok(())), QUEUE_CAPACITY);
+    }
+
+    /// A write that fails on the way out is the same fault the loop was already
+    /// leaving on. Retrying the rest would just fail 4095 more times and delay
+    /// the flush that still has a chance of succeeding.
+    #[test]
+    fn a_failing_write_stops_the_drain() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(8);
+        tx.try_send(record("first")).unwrap();
+        tx.try_send(record("second")).unwrap();
+
+        let mut seen = 0;
+        let count = drain_backlog(&mut rx, |_| {
+            seen += 1;
+            Err(anyhow!("the device stopped answering"))
+        });
+
+        assert_eq!(count, 0);
+        assert_eq!(
+            seen, 1,
+            "the drain must not keep trying after a write failed"
+        );
     }
 }

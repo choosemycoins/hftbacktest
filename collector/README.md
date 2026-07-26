@@ -216,6 +216,7 @@ as the venues themselves:
 | `{"_collector":"disconnected", …}` | `error`, and `connected_for_ms` | all |
 | `{"_collector":"stream_ended", …}` | clean end of stream, with `connected_for_ms` | all |
 | `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
+| `{"_collector":"hand_off_closed", …}` | an internal hand-off lost its consumer, i.e. the collection task had already ended; the collector is stopping | all |
 | `{"_collector":"stalled", …}` | nothing was recorded for the whole watchdog window; the collector is stopping | all |
 | `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters | hyperliquid |
 | `{"channel":"error", …}` | venue rejections | hyperliquid |
@@ -570,9 +571,15 @@ members from different streams.
 
 The two internal hand-offs — socket reader → parser, parser → writer — are
 bounded at 4096 messages each (`src/queue.rs`). If one fills, the collector
-stops: `{"_collector":"queue_overflow", …}` goes to the sidecar, the files are
-closed, and the exit is non-zero. It never waits for room, and it never drops a
-message to make some.
+stops: `{"_collector":"queue_overflow", …}` goes to the sidecar, whatever is
+still queued is written, the files are closed, and the exit is non-zero. It
+never waits for room, and it never drops a message to make some.
+
+A hand-off can also lose its consumer outright, which is what an already-ended
+collection task looks like from the producer side. That stops the collector the
+same way but is recorded as `{"_collector":"hand_off_closed", …}`: nothing was
+full, and reading it as an overflow would send a gap investigation after a queue
+depth that was never reached.
 
 That is deliberate. An unbounded queue turns a stalled writer into unbounded
 memory growth while every outward sign — connected, receiving, no errors — still

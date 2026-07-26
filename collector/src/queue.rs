@@ -17,8 +17,11 @@
 //! never dropped. [`Tx::send`] returns an error to callers that have an error
 //! path, and independently raises a signal on the fatal channel that `main`
 //! selects on — the only route open to the detached REST snapshot tasks, which
-//! have no caller to return to. `main` then leaves its loop, drops the `Writer`
-//! so every gzip member is finished, and exits non-zero.
+//! have no caller to return to. `main` then leaves its loop, writes whatever is
+//! still queued (`drain_backlog`), drops the `Writer` so every gzip member is
+//! finished, and exits non-zero. The signal names which of the two failures
+//! happened, because the sidecar record is named after it and the two point a
+//! later investigation in opposite directions.
 //!
 //! Awaiting the send instead — real backpressure, propagated through the socket
 //! to the venue — was rejected. A market-data recording that has fallen behind
@@ -83,6 +86,19 @@ pub type Record = (DateTime<Utc>, String, String);
 /// A frame on its way from the socket to the parser.
 pub type Frame = (DateTime<Utc>, Utf8Bytes);
 
+/// Sidecar event name for a hand-off that had no room left.
+pub const OVERFLOW_EVENT: &str = "queue_overflow";
+
+/// Sidecar event name for a hand-off whose receiver is gone.
+///
+/// Kept distinct from [`OVERFLOW_EVENT`] because the two say opposite things
+/// about the same recording, and `_meta` is what the offline quality report
+/// attributes gaps with. An overflow means the collector could not keep up; a
+/// closed hop means the consumer had already stopped, which is the ordinary
+/// consequence of a collection task returning while a detached reconnect task
+/// still holds a live socket.
+pub const CLOSED_EVENT: &str = "hand_off_closed";
+
 /// Why a hand-off refused a message. Both variants are terminal.
 #[derive(Debug, Error)]
 pub enum SendError {
@@ -92,9 +108,30 @@ pub enum SendError {
     Closed { hop: &'static str },
 }
 
+impl SendError {
+    /// What the sidecar should call this.
+    pub fn event(&self) -> &'static str {
+        match self {
+            SendError::Full { .. } => OVERFLOW_EVENT,
+            SendError::Closed { .. } => CLOSED_EVENT,
+        }
+    }
+}
+
+/// A report that recording has broken, carried to `main`.
+///
+/// `event` and `reason` are separate because they have separate readers: the
+/// event name is what a sidecar consumer greps for, the reason is the sentence
+/// an operator reads in the journal.
+#[derive(Debug, Clone)]
+pub struct Fatal {
+    pub event: &'static str,
+    pub reason: String,
+}
+
 /// The producer's end of the fatal signal. Cloned into every sender.
 #[derive(Clone)]
-pub struct FatalTx(mpsc::Sender<String>);
+pub struct FatalTx(mpsc::Sender<Fatal>);
 
 impl FatalTx {
     /// Reports a condition that must stop the process.
@@ -108,15 +145,19 @@ impl FatalTx {
     /// first one is the one that describes the original fault. Blocking here to
     /// deliver a duplicate would deadlock the producer in exactly the situation
     /// the report exists for.
-    pub fn raise(&self, reason: String) {
-        error!(reason, "a data hand-off failed; the collector will stop");
-        let _ = self.0.try_send(reason);
+    pub fn raise(&self, fatal: Fatal) {
+        error!(
+            event = fatal.event,
+            reason = fatal.reason,
+            "a data hand-off failed; the collector will stop"
+        );
+        let _ = self.0.try_send(fatal);
     }
 }
 
 /// The consumer's end of the fatal signal. There is one, in `main`.
 pub struct FatalRx {
-    rx: mpsc::Receiver<String>,
+    rx: mpsc::Receiver<Fatal>,
     /// Held so the channel can never report "every sender is gone". Without it
     /// `recv` would resolve immediately once the collection task died, spinning
     /// the select loop that is meant to be waiting on it.
@@ -125,9 +166,9 @@ pub struct FatalRx {
 
 impl FatalRx {
     /// Resolves when a producer reports that a hand-off failed.
-    pub async fn recv(&mut self) -> String {
+    pub async fn recv(&mut self) -> Fatal {
         match self.rx.recv().await {
-            Some(reason) => reason,
+            Some(fatal) => fatal,
             // Unreachable while `_keepalive` is held. Waiting for ever is the
             // safe answer anyway: the alternative in a `select!` arm is a busy
             // loop, and a panic here would skip the writer's `Drop`.
@@ -172,22 +213,19 @@ impl<T> Tx<T> {
     /// path propagate it; the fatal signal is raised regardless, because some
     /// callers are detached tasks that have no such path.
     pub fn send(&self, item: T) -> Result<(), SendError> {
-        match self.tx.try_send(item) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                let error = SendError::Full {
-                    hop: self.hop,
-                    capacity: self.capacity,
-                };
-                self.fatal.raise(error.to_string());
-                Err(error)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                let error = SendError::Closed { hop: self.hop };
-                self.fatal.raise(error.to_string());
-                Err(error)
-            }
-        }
+        let error = match self.tx.try_send(item) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => SendError::Full {
+                hop: self.hop,
+                capacity: self.capacity,
+            },
+            Err(mpsc::error::TrySendError::Closed(_)) => SendError::Closed { hop: self.hop },
+        };
+        self.fatal.raise(Fatal {
+            event: error.event(),
+            reason: error.to_string(),
+        });
+        Err(error)
     }
 
     /// The fatal signal this hand-off reports to, so a downstream hop can be
@@ -254,8 +292,9 @@ mod tests {
             .await
             .expect("an overflow must raise the fatal signal, not only return an error");
         assert!(
-            raised.contains(WRITER_HOP),
-            "the signal must name the hop that broke: {raised}"
+            raised.reason.contains(WRITER_HOP),
+            "the signal must name the hop that broke: {}",
+            raised.reason
         );
 
         // Nothing already accepted is lost on the way to the failure, and the
@@ -282,7 +321,36 @@ mod tests {
         let raised = timeout(Duration::from_secs(1), fatal_rx.recv())
             .await
             .expect("a closed hand-off must raise the fatal signal");
-        assert!(raised.contains(WS_HOP), "{raised}");
+        assert!(raised.reason.contains(WS_HOP), "{}", raised.reason);
+    }
+
+    /// The two failures reach the same path but are not the same event, and the
+    /// sidecar is where the difference is read: `_meta` is what the offline
+    /// report attributes gaps with.
+    ///
+    /// A hop losing its receiver is the ordinary consequence of a collection
+    /// task ending — Bybit's rejected subscribe returns, dropping `ws_rx`,
+    /// while the detached reconnect task is still reading a live socket — and
+    /// the very next frame raises `Closed`. Recording that as an overflow tells
+    /// whoever reads the file afterwards that the collector could not keep up,
+    /// when nothing was ever full.
+    #[tokio::test]
+    async fn the_signal_names_which_of_the_two_failures_happened() {
+        let (fatal_tx, mut fatal_rx) = fatal_channel();
+        let (tx, mut rx) = bounded::<Record>(WRITER_HOP, 1, fatal_tx);
+        tx.send(record("fills it")).unwrap();
+        tx.send(record("rejected")).unwrap_err();
+        assert_eq!(fatal_rx.recv().await.event, OVERFLOW_EVENT);
+
+        let (fatal_tx, mut fatal_rx) = fatal_channel();
+        let (tx, rx2) = bounded::<Record>(WS_HOP, 1, fatal_tx);
+        drop(rx2);
+        tx.send(record("nowhere to go")).unwrap_err();
+        assert_eq!(fatal_rx.recv().await.event, CLOSED_EVENT);
+
+        // Nothing above depends on the queue being drained; keep the receiver
+        // alive so the first hop reported `Full` rather than `Closed`.
+        drop(rx.try_recv());
     }
 
     /// Reporting must never be what blocks a producer. The first report is the
