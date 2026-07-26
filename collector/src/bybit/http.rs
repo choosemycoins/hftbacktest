@@ -17,6 +17,8 @@ use tokio_tungstenite::{
 };
 use tracing::{error, warn};
 
+use crate::backoff::reconnect_delay;
+
 pub async fn connect(
     url: &str,
     topics: Vec<String>,
@@ -105,7 +107,7 @@ pub async fn keep_connection(
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) {
-    let mut error_count = 0;
+    let mut error_count: u32 = 0;
     loop {
         let connect_time = Instant::now();
         let topics_ = symbol_list
@@ -134,13 +136,7 @@ pub async fn keep_connection(
             if connect_time.elapsed() > Duration::from_secs(30) {
                 error_count = 0;
             }
-            if error_count > 3 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            } else if error_count > 10 {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            } else if error_count > 20 {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            }
+            tokio::time::sleep(reconnect_delay(error_count)).await;
         } else {
             break;
         }

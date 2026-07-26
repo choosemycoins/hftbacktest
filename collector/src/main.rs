@@ -8,6 +8,7 @@ use tracing::{error, info};
 
 use crate::file::Writer;
 
+mod backoff;
 mod binance;
 mod binancefuturescm;
 mod binancefuturesum;

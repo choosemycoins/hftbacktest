@@ -18,6 +18,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use super::WS_URL;
+use crate::backoff::reconnect_delay;
 
 /// Injects a synthetic record into the same stream the venue's frames travel
 /// on, so it is timestamped, ordered and stored exactly like real data. The
@@ -104,7 +105,7 @@ pub async fn keep_connection(
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) {
-    let mut error_count = 0;
+    let mut error_count: u32 = 0;
     let mut attempt: u64 = 0;
     loop {
         let subscriptions: Vec<serde_json::Value> = symbol_list
@@ -172,17 +173,7 @@ pub async fn keep_connection(
                 error_count = 0;
             }
 
-            let sleep_duration = if error_count > 20 {
-                Duration::from_secs(10)
-            } else if error_count > 10 {
-                Duration::from_secs(5)
-            } else if error_count > 3 {
-                Duration::from_secs(1)
-            } else {
-                Duration::from_millis(500)
-            };
-
-            tokio::time::sleep(sleep_duration).await;
+            tokio::time::sleep(reconnect_delay(error_count)).await;
         } else {
             emit(
                 &ws_tx,
