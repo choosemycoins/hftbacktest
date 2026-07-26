@@ -282,7 +282,8 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 |---|---|
 | `hftbacktest` | 29 `#[test]` в 8 файлах: `types.rs`, `depth/{hashmap,btree,roivector,fuse}marketdepth.rs`, `backtest/models/queue.rs`, `backtest/mod.rs`, `live/bot.rs` |
 | `connector` | 5 `#[test]`, все в `src/utils.rs`. **Ни одного теста на парсинг биржевых сообщений, order manager, стримы.** |
-| `collector` | 13 `#[test]` в `src/file.rs` (ротация, дозапись, формат, читаемость мета-потока), `src/hyperliquid/mod.rs` (маршрутизация кадров) и `src/disk.rs` (свободное место) |
+| `collector` | 58 `#[test]`: `file.rs`, `disk.rs`, `hyperliquid/mod.rs`, плюс модули Фазы 1 дизайн-дока многобиржевого сбора — `queue.rs` (ограниченные хенд-оффы), `pump.rs` (владение отправителем, один цикл на все пять бэкендов), `watchdog.rs` (сторож молчания), `lock.rs` (flock директории), `backoff.rs`, `meta.rs` (единый словарь lifecycle-записей `_meta`), по два теста в каждом бэкенде. Крейт **bin-only**: `cargo test -p collector --bins` (`--lib --bins` для него ошибка «no library targets») |
+| `collector/tools` (Python) | 228 pytest: `test_quality_report.py` (47), `test_build_dataset.py` (65), `test_backtest_first.py` (116). Запуск: `.venv/bin/pytest collector/tools/` — тулинг Фаз 2–4 `docs/design-multi-venue-collection.md` |
 | `py-hftbacktest` (Rust), `hftbacktest-derive` | 0 |
 | Python | `py-hftbacktest/tests/test_hftbacktest.py` |
 
@@ -309,7 +310,7 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 Задача завершена, если:
 
 - поведение формализовано (PR-описание / design note в `docs/` / doc-комментарий к публичному API);
-- `cargo test --workspace --lib --bins` зелёный, включая новые тесты (сейчас база — 34 теста: 29 в `hftbacktest`, 5 в `connector`);
+- `cargo test --workspace --lib --bins` зелёный, включая новые тесты (сейчас база — 92: 29 в `hftbacktest`, 5 в `connector`, 58 в `collector`); для Python-тулинга коллектора — `.venv/bin/pytest collector/tools/` (база — 228);
 - `cargo clippy --workspace --lib --bins` **не добавил новых** предупреждений в тронутых файлах (обнулить счётчик нельзя — см. §5);
 - `cargo +nightly fmt` применён;
 - если менялся wire-протокол или `trait Bot` — обновлены **обе** стороны (`connector/` и `hftbacktest/`) и обе реализации трейта;

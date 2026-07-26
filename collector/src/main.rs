@@ -300,6 +300,12 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let collection_task = match args.exchange.as_str() {
+        // Two spellings, one backend — but `session_start` above stamps
+        // `args.exchange` verbatim, so the recording remembers which word the
+        // operator typed. The offline tools canonicalise it in exactly one
+        // place, `canonical_exchange` in `collector/tools/quality_report.py`;
+        // adding an alias here means adding it there too, or the same bytes
+        // become buildable or unbuildable depending on the spelling.
         "binancefutures" | "binancefuturesum" => {
             let streams = [
                 "$symbol@trade",
