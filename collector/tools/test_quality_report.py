@@ -13,6 +13,7 @@ mismatch rather than as a rounding nobody notices.
 
 import gzip
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -168,6 +169,23 @@ def um_trade(symbol, ts):
             "X": "MARKET",
             "m": True,
         },
+    }
+
+
+def um_depth_snapshot(symbol, ts, last_update_id=1000):
+    """The REST depth snapshot, written into the symbol file bare.
+
+    `binancefuturesum/mod.rs` pulls it from a **detached** `tokio::spawn` after
+    a `pu` break and sends it straight to the writer hop, while WS frames queue
+    through the WS hop first. Two producers, two `Utc::now()` stamps, one FIFO —
+    which is the whole reason `local_ts` order and file order can disagree.
+    """
+    return {
+        "lastUpdateId": last_update_id,
+        "E": ms_of(ts),
+        "T": ms_of(ts),
+        "bids": [["24670.90", "1"]],
+        "asks": [["24671.00", "2"]],
     }
 
 
@@ -524,8 +542,46 @@ def test_bybit_update_id_break_is_counted_and_a_snapshot_resets_the_chain(tmp_pa
 # --------------------------------------------------------------------------
 
 
-def test_a_cadence_gap_is_flagged_and_named(tmp_path, capsys):
-    """`bbo` has a 0.14s median; a 60s hole is a gap, and it must be named."""
+def hl_quiet_book(bbo_gap=(1, 38), fast_every=5, fast_until=66):
+    """A day where `bbo` falls silent while `l2Book_fast` keeps ticking.
+
+    This is the shape of the 26 false yellows the Phase-2 gate produced for ENA
+    on 2026-07-26: `bbo` is event-driven, so a top of book that does not move
+    emits nothing, while the throttled book feed on the *same socket* runs
+    without a hole and proves the connection was alive the whole time.
+    """
+    recs = [(ns(0), hl_trade("BTC", ns(0))), (ns(0), hl_l2("BTC", ns(0), fast=False))]
+    recs += [
+        (ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(0, fast_until, fast_every)
+    ]
+    recs += [(ns(t), hl_bbo("BTC", ns(t))) for t in bbo_gap]
+    recs.sort(key=lambda pair: pair[0])
+    return recs
+
+
+def test_a_bbo_gap_over_a_live_reference_stream_is_not_reported(tmp_path):
+    """A quiet top of book is not a hole, and must not reach the issue list.
+
+    26 of these on one thin symbol in half a day is a gate nobody reads, which
+    is exactly what the design document's acceptance line forbids.
+    """
+    d = hl_dir(tmp_path)
+    write_gz(d / f"btc_{DAY}.gz", hl_quiet_book())
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+    assert report["verdict"] == "green", issues_of(report, "hyperliquid")
+    assert "cadence_gap" not in checks_of(report, "hyperliquid")
+
+    # The measurement is still in the JSON — it is only not an issue.
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gap_count"] == 1
+    assert bbo["suppressed_gap_count"] == 1
+    assert "l2Book_fast" in bbo["gaps"][0]["suppressed_by"]
+
+
+def test_a_bbo_gap_overlapping_a_gap_in_the_reference_stream_is_reported(tmp_path, capsys):
+    """When the book feed went quiet too, the connection was not merely calm."""
     d = hl_dir(tmp_path)
     write_gz(
         d / f"btc_{DAY}.gz",
@@ -534,7 +590,8 @@ def test_a_cadence_gap_is_flagged_and_named(tmp_path, capsys):
             (ns(0), hl_l2("BTC", ns(0))),
             (ns(0), hl_l2("BTC", ns(0), fast=True)),
             (ns(1), hl_bbo("BTC", ns(1))),
-            (ns(61), hl_bbo("BTC", ns(61))),  # 60s hole
+            (ns(61), hl_bbo("BTC", ns(61))),  # 60s hole ...
+            (ns(61), hl_l2("BTC", ns(61), fast=True)),  # ... and the book too
         ],
     )
     out = tmp_path / "r.json"
@@ -547,11 +604,291 @@ def test_a_cadence_gap_is_flagged_and_named(tmp_path, capsys):
     assert gaps[0]["start_local_ts"] == ns(1)
     assert gaps[0]["end_local_ts"] == ns(61)
     assert gaps[0]["duration_ns"] == 60 * SEC
+    assert gaps[0]["suppressed_by"] is None
     assert gaps[0]["explained_by"] is None
 
     # The doc's acceptance line: gaps are listed by name, not summarised away.
     text = capsys.readouterr().out
     assert "bbo" in text and "btc" in text and "cadence_gap" in text
+
+
+def test_a_gap_the_sidecar_accounts_for_is_never_suppressed(tmp_path):
+    """A blip shorter than the reference stream's own limit leaves no hole in
+    it, so liveness alone would drop a hole the collector itself reported.
+
+    Suppression may only ever remove holes nothing is known about.
+    """
+    d = hl_dir(tmp_path)
+    write_gz(d / f"btc_{DAY}.gz", hl_quiet_book())
+    write_meta(
+        d,
+        "hyperliquid",
+        DAY,
+        [
+            (ns(0), session_start("hyperliquid", ["BTC"])),
+            # 1s: under the 5.4s l2Book_fast limit, so the book shows no gap.
+            (ns(20), {"_collector": "disconnected", "error": "reset", "connected_for_ms": 20000}),
+            (ns(21), {"_collector": "connected", "url": "wss://api.hyperliquid.xyz/ws"}),
+        ],
+    )
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gaps"][0]["suppressed_by"] is None
+    assert "disconnected" in bbo["gaps"][0]["explained_by"]
+    assert bbo["suppressed_gap_count"] == 0
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+
+
+def test_the_reference_falls_back_to_the_slow_book_when_fast_is_not_recorded(tmp_path):
+    """`--hl-l2-modes slow` is a legal recording; it still has a liveness feed."""
+    d = hl_dir(tmp_path, modes=("slow",))
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0))),
+            (ns(10), hl_bbo("BTC", ns(10))),
+            (ns(35), hl_bbo("BTC", ns(35))),  # 25s > the 14s bbo limit
+            (ns(50), hl_l2("BTC", ns(50))),  # 50s <= the 54s slow limit: no hole
+        ],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+    assert "cadence_gap" not in checks_of(report, "hyperliquid")
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert "l2Book_slow" in bbo["gaps"][0]["suppressed_by"]
+
+
+def test_bbo_keeps_its_absolute_limit_when_no_l2book_cadence_was_recorded(tmp_path):
+    """With no book feed there is no second witness, so the limit is all there is."""
+    d = hl_dir(tmp_path, modes=("slow",))
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(1), hl_bbo("BTC", ns(1))),
+            (ns(61), hl_bbo("BTC", ns(61))),
+        ],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    # Red for the missing book, and the bbo hole is still reported alongside it.
+    assert code == 1
+    assert "missing_required" in checks_of(report, "hyperliquid", severity="red")
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gaps"][0]["suppressed_by"] is None
+
+
+def test_suppressed_gaps_are_not_counted_as_further_gaps(tmp_path):
+    """The `N further gap(s)` line must count reportable holes only.
+
+    Counting them all would put the 26 false yellows straight back into the
+    report as one summary line, which is the same noise with a smaller font.
+    """
+    d = hl_dir(tmp_path)
+    recs = [(ns(0), hl_trade("BTC", ns(0))), (ns(0), hl_l2("BTC", ns(0)))]
+    # 0..900 in minutes: both feeds hole together, so all 15 bbo holes are real.
+    for t in range(0, 901, 60):
+        recs.append((ns(t), hl_l2("BTC", ns(t), fast=True)))
+        recs.append((ns(t), hl_bbo("BTC", ns(t))))
+    # Then the book runs steadily while bbo goes quiet twice: not holes. Both
+    # quiet stretches stay under MAX_SUPPRESSED_GAP_FACTOR x the 14s bbo limit,
+    # which is what makes them suppressible at all.
+    for t in range(905, 1101, 5):
+        recs.append((ns(t), hl_l2("BTC", ns(t), fast=True)))
+    recs += [(ns(905), hl_bbo("BTC", ns(905))), (ns(1000), hl_bbo("BTC", ns(1000))),
+             (ns(1100), hl_bbo("BTC", ns(1100)))]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc_{DAY}.gz", recs)
+
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gap_count"] == 17
+    assert bbo["suppressed_gap_count"] == 2
+
+    bbo_issues = [
+        i for i in issues_of(report, "hyperliquid")
+        if i["check"] == "cadence_gap" and i["detail"].startswith("btc/bbo: ")
+    ]
+    named = [i for i in bbo_issues if "further gap" not in i["detail"]]
+    assert len(named) == qr.MAX_GAP_ISSUES
+    further = [i for i in bbo_issues if "further gap" in i["detail"]]
+    assert len(further) == 1
+    assert "5 further gap(s)" in further[0]["detail"], further[0]["detail"]
+
+
+def test_a_truncated_reference_gap_list_cannot_prove_liveness(tmp_path, monkeypatch):
+    """Fail closed: gaps the recorder stopped keeping cannot be shown not to overlap.
+
+    `MAX_GAPS_RECORDED` is shrunk rather than writing thousands of frames; the
+    branch under test is `gap_count > len(gaps)`, not the constant's value.
+    """
+    monkeypatch.setattr(qr, "MAX_GAPS_RECORDED", 1)
+    d = hl_dir(tmp_path)
+    recs = [
+        (ns(0), hl_trade("BTC", ns(0))),
+        (ns(0), hl_l2("BTC", ns(0))),
+        (ns(0), hl_l2("BTC", ns(0), fast=True)),
+        (ns(10), hl_l2("BTC", ns(10), fast=True)),  # gap 1, recorded
+        (ns(20), hl_l2("BTC", ns(20), fast=True)),  # gap 2, dropped by the cap
+    ]
+    # The reference then runs steadily right across the bbo hole, so it brackets
+    # it and shows no overlapping hole of its own: the incomplete list is the
+    # only thing left standing between the hole and suppression.
+    recs += [(ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(21, 161)]
+    recs += [(ns(100), hl_bbo("BTC", ns(100))), (ns(140), hl_bbo("BTC", ns(140)))]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc_{DAY}.gz", recs)
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gaps"][0]["suppressed_by"] is None
+    assert bbo["suppressed_gap_count"] == 0
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+
+
+def test_a_reference_that_stopped_before_the_hole_cannot_prove_liveness(tmp_path):
+    """A dead reference is not a live one. `count > 0` cannot tell them apart.
+
+    A stream that simply stops leaves NO trailing gap — `StreamStat.observe`
+    only measures between two frames — so "the reference has no overlapping
+    hole" is satisfied vacuously by a reference that was not running at all.
+    This is the shape `watchdog.rs` already names as the case it cannot catch:
+    one Hyperliquid cadence stopping while the others continue.
+    """
+    d = hl_dir(tmp_path)
+    recs = [(ns(0), hl_trade("BTC", ns(0))), (ns(0), hl_l2("BTC", ns(0)))]
+    # The reference dies at t=10 and is never heard from again.
+    recs += [(ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(0, 11)]
+    # bbo then goes silent for 100s, which nothing witnessed.
+    recs += [(ns(t), hl_bbo("BTC", ns(t))) for t in (0, 5, 10, 110, 115)]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc_{DAY}.gz", recs)
+
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gaps"][0]["suppressed_by"] is None, (
+        "l2Book_fast last wrote at t=10 and was dead for every second of the "
+        "hole it was allowed to excuse"
+    )
+    assert bbo["suppressed_gap_count"] == 0
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+
+
+def test_a_reference_that_started_after_the_hole_cannot_prove_liveness(tmp_path):
+    """The mirror image: a reference whose first frame is inside or after the
+    hole says nothing about the time before it."""
+    d = hl_dir(tmp_path)
+    recs = [(ns(0), hl_trade("BTC", ns(0))), (ns(0), hl_l2("BTC", ns(0)))]
+    recs += [(ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(100, 121)]
+    recs += [(ns(t), hl_bbo("BTC", ns(t))) for t in (0, 5, 100, 105)]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc_{DAY}.gz", recs)
+
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gaps"][0]["suppressed_by"] is None
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+
+
+def test_a_reference_seen_only_once_all_day_cannot_prove_liveness(tmp_path):
+    """One frame is a recording, not a witness: it brackets nothing."""
+    d = hl_dir(tmp_path)
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0), fast=True)),  # the only one, all day
+            (ns(10), hl_bbo("BTC", ns(10))),
+            (ns(70), hl_bbo("BTC", ns(70))),
+        ],
+    )
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gaps"][0]["suppressed_by"] is None
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+
+
+def test_a_dead_preferred_reference_does_not_shadow_a_live_fallback(tmp_path):
+    """Selection is per gap, not per stream, or the tuple is never fallen through.
+
+    `l2Book_fast` dies silently at t=100 — nothing in `_meta`, the socket is up.
+    A real 60s outage then silences `bbo` AND `l2Book_slow`. Picking the first
+    reference merely *present* would let the dead one excuse the hole its live
+    sibling reported.
+    """
+    d = hl_dir(tmp_path)
+    recs = [(ns(0), hl_trade("BTC", ns(0)))]
+    recs += [(ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(0, 101)]
+    alive = list(range(0, 106, 5)) + list(range(165, 300, 5))
+    recs += [(ns(t), hl_l2("BTC", ns(t))) for t in alive]
+    recs += [(ns(t), hl_bbo("BTC", ns(t))) for t in alive]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc_{DAY}.gz", recs)
+
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    streams = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]
+    assert streams["l2Book_slow"]["gap_count"] == 1, "the fallback saw the outage"
+    assert streams["bbo"]["gaps"][0]["suppressed_by"] is None
+    assert streams["bbo"]["suppressed_gap_count"] == 0
+
+
+def test_a_multi_hour_hole_is_never_suppressed(tmp_path):
+    """Past some size "the top of book did not move" stops being a hypothesis.
+
+    A silently dropped per-channel subscription — socket alive, one channel
+    dead, the Bybit `orderbook.500` precedent in AGENTS.md §4.1 — has exactly
+    this signature, and it is the failure the report exists to catch. The
+    reference proves the *socket* was up, not that `bbo` was.
+    """
+    d = hl_dir(tmp_path)
+    span = 6 * 3600 + 60
+    recs = [(ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(0, span, 5)]
+    recs += [(ns(t), hl_l2("BTC", ns(t))) for t in range(0, span, 5)]
+    recs += [(ns(t), hl_trade("BTC", ns(t))) for t in range(0, span, 5)]
+    recs += [(ns(t), hl_bbo("BTC", ns(t))) for t in (0, 5, 6 * 3600 + 5, 6 * 3600 + 10)]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc_{DAY}.gz", recs)
+
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+    assert bbo["gap_count"] == 1
+    assert bbo["suppressed_gap_count"] == 0
+    assert bbo["gaps"][0]["suppressed_by"] is None
+    assert "cadence_gap" in checks_of(report, "hyperliquid", severity="yellow")
+
+
+def test_the_suppression_ceiling_is_pinned_to_the_nanosecond(tmp_path):
+    """The false positives it exists for were 14-37s; the ceiling is 10x the
+    channel's own limit. Raising it must break a test, not pass silently."""
+    assert qr.MAX_SUPPRESSED_GAP_FACTOR == 10
+    ceiling = qr.MAX_GAP_NS[(qr.HYPERLIQUID, "bbo")] * qr.MAX_SUPPRESSED_GAP_FACTOR
+    assert ceiling == 140 * SEC
+
+    for name, gap_ns, suppressed in (("at", ceiling, True), ("over", ceiling + 1, False)):
+        d = tmp_path / f"hl-ceiling-{name}"
+        d.mkdir()
+        end = 10 + gap_ns // SEC + 2
+        recs = [(ns(0), hl_trade("BTC", ns(0))), (ns(0), hl_l2("BTC", ns(0)))]
+        recs += [(ns(t), hl_l2("BTC", ns(t), fast=True)) for t in range(0, end)]
+        recs += [(ns(10), hl_bbo("BTC", ns(10))), (ns(10) + gap_ns, hl_bbo("BTC", ns(10)))]
+        recs.sort(key=lambda pair: pair[0])
+        write_gz(d / f"btc_{DAY}.gz", recs)
+        write_meta(d, "hyperliquid", DAY, [(ns(0), session_start("hyperliquid", ["BTC"]))])
+        out = tmp_path / f"r-{name}.json"
+        _, report = run(d, out=out)
+        bbo = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]
+        assert (bbo["gaps"][0]["suppressed_by"] is not None) is suppressed, (name, gap_ns)
 
 
 def test_a_gap_spanned_by_a_disconnect_is_annotated_as_explained(tmp_path):
@@ -563,7 +900,10 @@ def test_a_gap_spanned_by_a_disconnect_is_annotated_as_explained(tmp_path):
             (ns(0), hl_l2("BTC", ns(0))),
             (ns(0), hl_l2("BTC", ns(0), fast=True)),
             (ns(1), hl_bbo("BTC", ns(1))),
+            # A disconnect silences the whole socket, book feed included — which
+            # is also what keeps the bbo hole reportable at all.
             (ns(61), hl_bbo("BTC", ns(61))),
+            (ns(61), hl_l2("BTC", ns(61), fast=True)),
         ],
     )
     write_meta(
@@ -583,6 +923,85 @@ def test_a_gap_spanned_by_a_disconnect_is_annotated_as_explained(tmp_path):
     assert "disconnected" in gaps[0]["explained_by"]
     issue = next(i for i in issues_of(report, "hyperliquid") if i["check"] == "cadence_gap")
     assert "disconnected" in issue["detail"]
+
+
+# --------------------------------------------------------------------------
+# 8. only lifecycle records explain a gap
+# --------------------------------------------------------------------------
+
+
+def hl_gapped_day(tmp_path, meta_extra):
+    """A reportable 60s hole (both feeds silent) plus the given sidecar records."""
+    d = hl_dir(tmp_path)
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0), fast=True)),
+            (ns(1), hl_bbo("BTC", ns(1))),
+            (ns(61), hl_bbo("BTC", ns(61))),
+            (ns(61), hl_l2("BTC", ns(61), fast=True)),
+        ],
+    )
+    write_meta(
+        d,
+        "hyperliquid",
+        DAY,
+        [(ns(0), session_start("hyperliquid", ["BTC"])), *meta_extra],
+    )
+    return d
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"_collector": "disk", "free_bytes": 812_345_678_901, "path": "/data/hyperliquid"},
+        {"_collector": "universe", "symbols": [{"wire": "BTC", "szDecimals": 5}]},
+    ],
+)
+def test_a_gauge_record_inside_a_gap_does_not_explain_it(tmp_path, record):
+    """The minutely disk gauge says nothing about why data stopped arriving.
+
+    It is written on a timer (`main.rs`, `disk_check.tick()`), so one lands
+    inside any hole longer than a minute regardless of cause. Crediting it sends
+    an investigation after a number that was going to be written anyway.
+    """
+    d = hl_gapped_day(tmp_path, [(ns(30), record)])
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    gaps = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]["gaps"]
+    assert gaps[0]["explained_by"] is None
+    issue = next(i for i in issues_of(report, "hyperliquid") if i["check"] == "cadence_gap")
+    assert "unexplained by _meta" in issue["detail"]
+
+
+def test_the_more_suffix_counts_lifecycle_records_only(tmp_path):
+    """`(+N more)` is how many other records bear on the hole, not how many
+    timer ticks happened to land in it."""
+    d = hl_gapped_day(
+        tmp_path,
+        [
+            (ns(20), {"_collector": "disconnected", "error": "reset", "connected_for_ms": 20000}),
+            (ns(25), {"_collector": "connected", "url": "wss://api.hyperliquid.xyz/ws"}),
+            (ns(30), {"_collector": "disk", "free_bytes": 1, "path": "/data"}),
+            (ns(40), {"_collector": "disk", "free_bytes": 1, "path": "/data"}),
+        ],
+    )
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    gaps = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]["gaps"]
+    assert gaps[0]["explained_by"].startswith("disconnected at ")
+    assert gaps[0]["explained_by"].endswith("(+1 more)"), gaps[0]["explained_by"]
+
+
+def test_every_explanatory_record_is_a_lifecycle_record():
+    """The gauge records are the ones that must never appear as an explanation."""
+    assert "disk" not in qr._EXPLANATORY
+    assert "universe" not in qr._EXPLANATORY
+    for wanted in ("session_start", "connected", "disconnected", "dial_failed",
+                   "stream_ended", "subscribe"):
+        assert wanted in qr._EXPLANATORY
 
 
 def test_a_gap_within_the_expected_cadence_is_not_flagged(tmp_path):
@@ -605,11 +1024,13 @@ def test_a_gap_within_the_expected_cadence_is_not_flagged(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# 6. monotonicity
+# 6. monotonicity: per stream, with a bounded cross-stream tolerance
 # --------------------------------------------------------------------------
 
 
-def test_non_monotonic_local_ts_within_a_file_is_red(tmp_path):
+def test_local_ts_going_backwards_within_one_stream_is_red(tmp_path):
+    """One stream has one producer stamping in receive order, so this cannot
+    happen without a clock step or two recordings in one file."""
     d = hl_dir(tmp_path)
     write_gz(
         d / f"btc_{DAY}.gz",
@@ -625,10 +1046,271 @@ def test_non_monotonic_local_ts_within_a_file_is_red(tmp_path):
     code, report = run(d, out=out)
     assert code == 1
     assert "monotonicity" in checks_of(report, "hyperliquid", severity="red")
-    violation = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["monotonic_violation"]
+    symbol = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]
+    violation = symbol["monotonic_violation"]
+    assert violation["stream"] == "bbo"
     assert violation["previous_local_ts"] == ns(10)
     assert violation["local_ts"] == ns(5)
     assert violation["violations"] == 1
+    # An in-stream step is never also filed as an interleave.
+    assert symbol["interleave_inversion"] is None
+    assert symbol["interleave_excess"] is None
+
+
+def test_a_sub_millisecond_step_backwards_within_one_stream_is_still_red(tmp_path):
+    """The cross-stream tolerance must not leak into the per-stream check: one
+    producer going backwards by a microsecond is a defect at any size."""
+    d = hl_dir(tmp_path)
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0), fast=True)),
+            (ns(10, nanos=1_000), hl_bbo("BTC", ns(10))),
+            (ns(10), hl_bbo("BTC", ns(10))),  # 1us backwards
+        ],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "monotonicity" in checks_of(report, "hyperliquid", severity="red")
+    assert "interleave_inversion" not in checks_of(report, "hyperliquid")
+
+
+def um_interleaved(delta_ns):
+    """Incident B: the REST depth snapshot lands before WS frames stamped earlier.
+
+    Line ordering is the writer's; the stamps are each producer's own receive
+    moment. The snapshot skips the WS hop the market-data frames queue through,
+    so it can overtake them by the difference between the two paths.
+    """
+    early = ns(0, nanos=100_000_000)
+    book = ns(0, nanos=164_558_903)
+    snap = book + delta_ns
+    return [
+        (early, um_book_ticker("BTCUSDT", early)),
+        (early, um_trade("BTCUSDT", early)),
+        (early, um_depth("BTCUSDT", early, u=100, pu=99)),
+        (snap, um_depth_snapshot("BTCUSDT", snap)),
+        (book, um_book_ticker("BTCUSDT", book)),  # <- written after, stamped before
+        (book + 1_000, um_book_ticker("BTCUSDT", book + 1_000)),
+    ]
+
+
+def test_a_cross_stream_inversion_within_the_bound_is_yellow_and_named(tmp_path):
+    """The 134us measured on ethusdt, 2026-07-26 — one per ~5M lines, only at a
+    REST refetch. Both stamps are honest; the inversion is in the interleaving."""
+    d = tmp_path / "um-interleave"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(134_021))
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0, issues_of(report, "binancefuturesum")
+    assert "monotonicity" not in checks_of(report, "binancefuturesum")
+    assert "interleave_inversion" in checks_of(report, "binancefuturesum", severity="yellow")
+
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["monotonic_violation"] is None
+    assert symbol["interleave_excess"] is None
+    record = symbol["interleave_inversion"]
+    assert record["previous_stream"] == "depthSnapshot"
+    assert record["stream"] == "bookTicker"
+    assert record["delta_ns"] == 134_021
+    assert record["violations"] == 1
+    assert record["max_delta_ns"] == 134_021
+
+    detail = next(
+        i for i in issues_of(report, "binancefuturesum") if i["check"] == "interleave_inversion"
+    )["detail"]
+    # The mechanism, not just the symptom.
+    assert "depthSnapshot" in detail and "bookTicker" in detail
+    assert "producer" in detail
+    assert "REST" in detail
+
+
+@pytest.mark.parametrize("mechanism", sorted(qr._SECOND_PRODUCER))
+def test_every_mechanism_sentence_is_a_finished_sentence(mechanism):
+    """The text an operator reaches for on a red day must not stop mid-clause.
+
+    It is interpolated as `...; {mechanism}. This is {verdict}`, and the
+    depthSnapshot entry used to end on a dangling "queue in".
+    """
+    text = qr._SECOND_PRODUCER[mechanism]
+    assert not text.rstrip().endswith((" in", " the", " of", " through", ",")), text
+    # Rendered exactly as the issue renders it, so a trailing preposition shows.
+    assert "queue in." not in f"{text}. This is"
+
+
+def test_a_snapshot_overtake_the_full_depth_of_the_socket_hop_is_not_red(tmp_path):
+    """Incident A and incident B are the same day.
+
+    The socket hop holds WS frames the REST snapshot skips, so the largest
+    honest overtake is that hop's whole occupancy: `WS_QUEUE_CAPACITY` /
+    `burst::PEAK_MSG_PER_S` = 4096 / 20 000 = 204.8ms. A burst is also what
+    breaks the `pu` chain that triggers the refetch, so the deep hop and the
+    snapshot co-occur by construction — a bound below the hop's depth goes red
+    on precisely the days whose data is most wanted, and a red day is a hard
+    build refusal in `build_dataset.py`.
+    """
+    d = tmp_path / "um-socket-hop"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(qr.SOCKET_HOP_NS))
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0, issues_of(report, "binancefuturesum")
+    assert "interleave_inversion" in checks_of(report, "binancefuturesum", severity="yellow")
+
+
+def test_a_cross_stream_inversion_beyond_the_bound_is_red(tmp_path):
+    """Past the interleave bound the explanation stops being credible: not even
+    a full socket hop reorders two producers by that much."""
+    d = tmp_path / "um-interleave-wide"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(600 * MS))
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_inversion"] is None
+    assert symbol["interleave_excess"]["delta_ns"] == 600 * MS
+
+
+@pytest.mark.parametrize(
+    "delta_ns,expected_code,expected_check",
+    [
+        (250 * MS, 0, "interleave_inversion"),
+        (250 * MS + 1, 1, "interleave_excess"),
+    ],
+)
+def test_the_interleave_bound_is_pinned_to_the_nanosecond(
+    tmp_path, delta_ns, expected_code, expected_check
+):
+    """Widening the tolerance must break a test, not pass silently."""
+    assert qr.CROSS_STREAM_TOLERANCE_NS == 250 * MS
+    d = tmp_path / f"um-bound-{delta_ns}"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(delta_ns))
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+    out = tmp_path / f"r-{delta_ns}.json"
+    code, report = run(d, out=out)
+    assert code == expected_code
+    assert expected_check in checks_of(report, "binancefuturesum")
+
+
+def test_the_interleave_bound_still_covers_the_socket_hop_it_is_derived_from(tmp_path):
+    """The two halves of this must not drift apart.
+
+    The bound is the socket hop's occupancy at the measured burst rate, and both
+    numbers live in `collector/src/queue.rs`. Reading them here is what makes
+    raising `WS_QUEUE_CAPACITY` re-check the gate instead of silently turning
+    the burst days red.
+    """
+    source = (Path(__file__).resolve().parent.parent / "src" / "queue.rs").read_text()
+
+    def rust_const(name):
+        match = re.search(rf"const {name}: usize = ([0-9_]+);", source)
+        assert match, f"{name} is no longer a usize constant of collector/src/queue.rs"
+        return int(match.group(1).replace("_", ""))
+
+    assert qr.WS_QUEUE_CAPACITY == rust_const("WS_QUEUE_CAPACITY")
+    assert qr.PEAK_MSG_PER_S == rust_const("PEAK_MSG_PER_S")
+    assert qr.SOCKET_HOP_NS == qr.WS_QUEUE_CAPACITY * SEC // qr.PEAK_MSG_PER_S
+    assert qr.CROSS_STREAM_TOLERANCE_NS >= qr.SOCKET_HOP_NS, (
+        "a WS frame can sit in the socket hop for its whole depth while the REST "
+        "snapshot that skips the hop goes straight to the writer; a bound under "
+        "that reports the collector's own design as corruption"
+    )
+
+
+@pytest.mark.parametrize("delta_ns", [1, 5 * MS, 200 * MS])
+def test_a_cross_stream_inversion_with_no_second_producer_is_red_at_any_size(
+    tmp_path, delta_ns
+):
+    """The tolerance is a property of a mechanism, not of a duration.
+
+    Hyperliquid has one WS reader stamping and routing every frame of a symbol
+    file (`hyperliquid/mod.rs`), so write order IS receive order and there is
+    nothing for the tolerance to excuse. Applying it venue-agnostically
+    downgraded a real defect to yellow and printed a self-contradicting reason.
+    """
+    d = hl_dir(tmp_path, name=f"hl-noproducer-{delta_ns}")
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0))),
+            (ns(1), hl_l2("BTC", ns(1), fast=True)),
+            (ns(1) - delta_ns, hl_bbo("BTC", ns(1) - delta_ns)),
+        ],
+    )
+    out = tmp_path / f"r-{delta_ns}.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "hyperliquid", severity="red")
+    detail = next(
+        i for i in issues_of(report, "hyperliquid") if i["check"] == "interleave_excess"
+    )["detail"]
+    assert "no second producer" in detail
+    # The old text said "within the bound, so nothing is missing" in the same
+    # breath as reporting a defect.
+    assert "nothing is missing" not in detail
+
+
+def test_an_inversion_between_two_binance_websocket_streams_is_red(tmp_path):
+    """`bookTicker`, `trade` and `depthUpdate` all come off the one WS reader
+    through `pump`, so the REST snapshot's excuse does not extend to them."""
+    d = tmp_path / "um-ws-only"
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            (base + 2 * MS, um_trade("BTCUSDT", base + 2 * MS)),
+            (base + MS, um_book_ticker("BTCUSDT", base + MS, u=2)),  # 1ms backwards
+        ],
+    )
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+
+
+def test_a_whole_file_out_of_order_is_red_not_a_tolerated_interleave(tmp_path):
+    """One 134us interleave per five million lines is the measured shape. A
+    stream of them is two recordings in one file, and stays red."""
+    d = tmp_path / "um-shuffled"
+    d.mkdir()
+    base = ns(0, nanos=500_000_000)
+    recs = [(base, um_book_ticker("BTCUSDT", base))]
+    for i in range(1, 6):
+        # Each snapshot is stamped a full second after the bookTicker written
+        # next to it: far beyond any hand-off skew.
+        recs.append((base + i * SEC, um_depth_snapshot("BTCUSDT", base + i * SEC, 1000 + i)))
+        recs.append((base + i * MS, um_book_ticker("BTCUSDT", base + i * MS)))
+    write_gz(d / f"btcusdt_{DAY}.gz", recs)
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"]["violations"] == 5
+    assert symbol["interleave_excess"]["max_delta_ns"] == 5 * SEC - 5 * MS
 
 
 def test_equal_local_ts_is_not_a_violation(tmp_path):

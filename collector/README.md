@@ -557,6 +557,13 @@ These are quiet-period figures from one 12-minute window. `bbo` and `trades`
 are event-driven, so a volatile session costs several times more; size the
 volume with headroom.
 
+How much more has since been measured, on Binance UM rather than these two
+venues. On 2026-07-26 at 22:00:00 UTC four symbols on `@trade` + `@bookTicker` +
+`@depth@0ms` went from ~50 msg/s each to **4402/s and then 5514/s on btcusdt
+alone**, ~20 000/s across the four — a hundredfold, sustained over seconds. Size
+for the peak, not the average; it is also what the queue capacities in
+[Falling behind](#falling-behind) are derived from.
+
 ### Running out of space
 
 `--min-free-gb` (default 5) is checked at startup and every minute after.
@@ -579,11 +586,18 @@ members from different streams.
 
 ### Falling behind
 
-The two internal hand-offs — socket reader → parser, parser → writer — are
-bounded at 4096 messages each (`src/queue.rs`). If one fills, the collector
-stops: `{"_collector":"queue_overflow", …}` goes to the sidecar, whatever is
-still queued is written, the files are closed, and the exit is non-zero. It
-never waits for room, and it never drops a message to make some.
+The two internal hand-offs are bounded (`src/queue.rs`), and since they fail for
+different reasons they are bounded differently:
+
+| Hop | Capacity | Consumer | What a full queue means |
+|---|---|---|---|
+| socket reader → parser | 4096 | JSON parse, no syscalls | the process is out of CPU |
+| parser → writer | 32 768 | gzip + `write(2)` | the writer stalled or stopped |
+
+If either fills, the collector stops: `{"_collector":"queue_overflow", …}` goes
+to the sidecar, whatever is still queued is written, the files are closed, and
+the exit is non-zero. It never waits for room, and it never drops a message to
+make some.
 
 A hand-off can also lose its consumer outright, which is what an already-ended
 collection task looks like from the producer side. That stops the collector the
@@ -595,14 +609,50 @@ That is deliberate. An unbounded queue turns a stalled writer into unbounded
 memory growth while every outward sign — connected, receiving, no errors — still
 looks healthy, and what survives the OOM killer is a set of unterminated gzip
 members. A queue deep enough to absorb a rotation but not a stall turns the same
-fault into a failed unit instead. The capacity is a starting point rather than a
-measurement: at the rates in [Capacity](#capacity) a full queue is on the order
-of a minute of traffic, and it should be recomputed once a peak has actually
-been observed.
+fault into a failed unit instead.
 
-One case escapes it. If a write blocks for ever in the kernel — a hung mount, a
-device that stops answering — the main loop never gets back to notice the
-signal, so the process stops recording without exiting. Memory still stays
+**The writer capacity is measured, not proposed.** On 2026-07-26 at 22:00:00 UTC
+a burst took four Binance UM symbols (`@trade` + `@bookTicker` + `@depth@0ms`)
+from ~50 msg/s each to ~20 000 msg/s aggregate — 4402/s, then 5514/s, on btcusdt
+alone. The parser → writer hop, then 4096 deep, filled and the collector exited
+1; systemd restarted it 5s later and the restarted process rode out the *same
+burst still accelerating* (6118/s at 22:00:11) without filling anything. One
+overflow in 12 hours, a ~5s hole.
+
+That second half is what sized the fix. The writer keeps up with the rate; 4096
+simply is not enough buffer to ride out one stall of its own, because 4096 ÷
+20 000 is 205 ms and the writer is the only stage here that can block in the
+kernel — writeback, a gzip flush, the UTC-day rotation. 32 768 buys 1.6s at that
+peak, and 2.7 minutes at the background rate, so a full queue still means the
+writer has stopped rather than that traffic was briefly bursty.
+
+The memory that buys: a typical UM frame is 300–600 B, so a full writer hop is
+~20 MB. The worst case is the ~50 KB REST depth snapshots, but those are
+throttled to 100/min, and a queue only stays full while nothing is being
+dequeued — which is also what trips `--stall-timeout-min` and ends the process
+inside five minutes. At most ~500 of them, so ~25 MB. Call the hop **under
+50 MB**, and under 55 MB with both hops full, against 2 GB of host. Tokio's
+bounded channels do not preallocate, so this is a ceiling and not a resting
+cost. Memory is not what limits the number; the stall budget is.
+
+Two caveats on that number, neither of them a risk at this scale. Setting
+`COLLECTOR_STALL_TIMEOUT_MIN=0` disarms the watchdog, and with it the ~25 MB
+half of the cap. And the frame sizes are Binance UM's, while the capacity is
+shared by every backend: a Bybit instance carrying 1–2 KB `orderbook.200`
+deltas is nearer **65 MB**, and its snapshots come over the WebSocket, so the
+100/min throttle — which gates only the Binance REST refetch — does not bound
+them. Still an order of magnitude inside the host.
+
+The socket hop stayed at 4096 on purpose. Its consumer parses JSON and hands
+over without ever making a syscall, so it can only stall on losing the CPU —
+and the burst proves it was keeping up, since the writer hop could not have
+filled unless the parser was running flat out to fill it. A backlog there means
+something different, and burying it under a deeper buffer would only delay the
+report.
+
+One case escapes all of it. If a write blocks for ever in the kernel — a hung
+mount, a device that stops answering — the main loop never gets back to notice
+the signal, so the process stops recording without exiting. Memory still stays
 bounded and the reason is in `journalctl`, but only an external watchdog
 (systemd `WatchdogSec`) turns that into a restart.
 

@@ -31,8 +31,16 @@ What it checks, per finalized UTC day per venue directory:
    red for a configuration that never changed.
 4. **Sequence gaps** — Binance USD-M `pu` chain, Bybit `u` per topic. Hyperliquid
    has no sequence number at all: cadence is the only evidence there.
-5. **Cadence gaps** — a hole larger than K x the measured cadence of the channel.
-6. **`local_ts` monotonicity** inside each symbol file.
+5. **Cadence gaps** — a hole larger than K x the measured cadence of the channel,
+   except where a steadier stream on the same socket was **running across that
+   hole** and had none of its own (see `LIVENESS_REFERENCE` and
+   `liveness_witness`). Bounded: no reference excuses a hole past
+   `MAX_SUPPRESSED_GAP_FACTOR` x the channel's own limit, and none excuses one
+   the sidecar already accounts for.
+6. **`local_ts` monotonicity, per stream** — with a tolerance for the order two
+   streams are interleaved in, allowed only where a second producer exists to
+   have raced (`_SECOND_PRODUCER`) and only up to the socket hop that separates
+   them (`CROSS_STREAM_TOLERANCE_NS`).
 7. **Coverage at both ends**, reported **per symbol** as the interval in which
    *every* required stream of that symbol is live (max of the firsts, min of the
    lasts). That — not the venue-wide union — is what Phase 3 must trim to: a
@@ -40,7 +48,10 @@ What it checks, per finalized UTC day per venue directory:
    and the run would begin over a window where the traded book does not exist.
    The venue-level number is kept as the union across symbols, for the operator.
 8. **`_meta` cross-check** — a gap spanned by a `disconnected` / `dial_failed` /
-   restart record is annotated as explained rather than left as a mystery.
+   restart record is annotated as explained rather than left as a mystery. Only
+   the collector's *lifecycle* records may do that (`_EXPLANATORY`): the minutely
+   disk gauge lands inside every hole longer than a minute and explains none of
+   them.
 
 The sidecar is deliberately NOT checked for monotonicity: `main.rs` writes the
 disk gauge and the terminal records straight to the `Writer`, bypassing the
@@ -104,6 +115,80 @@ MAX_GAP_ISSUES = 10
 #: of the recording starts "explaining" every gap in the day.
 EXPLAIN_MARGIN_NS = SEC_NS // 10
 
+#: Streams a *second*, concurrent producer writes.
+#:
+#: Load-bearing, not decoration: this is the whole reason two streams may be
+#: written out of `local_ts` order, so it is also what decides whether an
+#: inversion is tolerable at all. Where no entry matches, the venue has one WS
+#: reader stamping and queueing every frame of a symbol file, write order IS
+#: receive order, and a step backwards is a defect at any size — see
+#: `scan_symbol_file`, which records where that was verified per venue.
+_SECOND_PRODUCER = {
+    "depthSnapshot": (
+        "the REST depth-snapshot fetcher is one such producer: it runs detached "
+        "(tokio::spawn, the same shape in all three binance* backends) and hands "
+        "its frame straight to the writer, skipping the socket hop that WS "
+        "frames queue through first"
+    ),
+}
+
+#: Said of an inversion between two streams that share the one producer.
+_NO_SECOND_PRODUCER = (
+    "no second producer is known for this venue's symbol files: one WS reader "
+    "stamps every frame at receive time and hands them on in that order"
+)
+
+
+def second_producer_of(prev_stream, stream) -> Optional[str]:
+    """The concurrent producer that can put these two out of order, if any."""
+    for name in (prev_stream, stream):
+        if name in _SECOND_PRODUCER:
+            return _SECOND_PRODUCER[name]
+    return None
+
+#: The two numbers in `collector/src/queue.rs` the interleave bound is derived
+#: from — the socket hop's depth (`WS_QUEUE_CAPACITY`) and the burst rate it was
+#: sized against (`burst::PEAK_MSG_PER_S`, measured 2026-07-26 22:00 UTC).
+#:
+#: Mirrored rather than imported: this is a Python tool reading recorded bytes,
+#: not the collector. `test_the_interleave_bound_still_covers_the_socket_hop_it_
+#: is_derived_from` reads the Rust and fails if either number moves, so raising
+#: the capacity re-checks the gate instead of silently reddening burst days.
+WS_QUEUE_CAPACITY = 4096
+PEAK_MSG_PER_S = 20_000
+
+#: The longest a WS frame can sit behind the REST snapshot that skips it: the
+#: whole socket hop, drained at the measured peak. 4096 / 20 000 = 204.8ms.
+SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
+
+#: How far the *write* order of two different streams may disagree with their
+#: `local_ts` order before it stops being an interleave and becomes a defect.
+#:
+#: A symbol file is written by one queue, but not always by one producer. Every
+#: backend stamps `Utc::now()` at its own receive moment, and the Binance
+#: backends run a second producer: the REST depth-snapshot fetcher is detached
+#: (`tokio::spawn` in `binancefuturesum/mod.rs`) and sends **straight to the
+#: writer hop**, while WS frames queue through the socket hop first. A snapshot
+#: can therefore be written ahead of market data stamped earlier. Both stamps
+#: are honest; only the interleaving is out of order.
+#:
+#: Sized from that hop rather than from the observation. Measured on ethusdt,
+#: 2026-07-26: one inversion per ~5M lines, always at a REST refetch (12 that
+#: day), worst 134us — but that was a writer keeping up. The two hops cancel
+#: (both frames pass the writer hop), so the honest maximum is exactly
+#: `SOCKET_HOP_NS`, and 250ms is that with ~20% of headroom. A bound at the
+#: observed 134us, or at the 10ms this shipped with, would go red on precisely
+#: the burst days whose data matters most: a burst is also what breaks the `pu`
+#: chain the refetch responds to, so a deep socket hop and a REST snapshot
+#: co-occur by construction. Red is a hard build refusal in `build_dataset.py`.
+#:
+#: Two things this bound is NOT. It does not apply within one stream: there is
+#: one producer appending in receive order, so a step backwards of any size is
+#: red. And it does not apply where no second producer exists — see
+#: `_SECOND_PRODUCER`; a venue with one WS reader gets no tolerance at all,
+#: whatever the size, because there is no mechanism to tolerate.
+CROSS_STREAM_TOLERANCE_NS = 250 * 1_000_000
+
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -137,6 +222,25 @@ def fmt_dur(nanos: int) -> str:
     """A duration as `12.345s`, computed with integers only."""
     whole, rest = divmod(int(nanos), SEC_NS)
     return f"{whole}.{rest // 1_000_000:03d}s"
+
+
+def fmt_short(nanos: int) -> str:
+    """A duration at a scale that survives being small — `134.021us`.
+
+    `fmt_dur` rounds to the millisecond, which renders the whole interleave
+    check as `0.000s` and hides the number the operator needs. Integers only,
+    and lossless below a second.
+    """
+    n = int(nanos)
+    if n >= SEC_NS:
+        return fmt_dur(n)
+    if n >= 1_000_000:
+        ms, rest = divmod(n, 1_000_000)
+        # Three digits normally; all six only when the tail would be lost.
+        return f"{ms}.{rest:06d}ms" if rest % 1_000 else f"{ms}.{rest // 1_000:03d}ms"
+    if n >= 1_000:
+        return f"{n // 1_000}.{n % 1_000:03d}us"
+    return f"{n}ns"
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +300,33 @@ MAX_GAP_NS = {
     (BINANCE, "trade"): 120 * SEC_NS,
     (BYBIT, "orderbook"): 30 * SEC_NS,
     (BYBIT, "publicTrade"): 120 * SEC_NS,
+}
+
+#: For an event-driven channel, the steadier channel on the SAME socket whose
+#: silence decides whether its own silence meant anything. First name present in
+#: the recording wins; if none was recorded the channel keeps its `MAX_GAP_NS`
+#: limit as its only liveness signal.
+#:
+#: Why `bbo` needs one: it fires on a change of the top of book and on nothing
+#: else, so a thin symbol in a quiet hour emits nothing for tens of seconds while
+#: the connection is perfectly healthy. Measured 2026-07-26: 26 such holes on ENA
+#: alone in half a day (14-37s), every one of them with `l2Book_fast` running
+#: gapless across it. A limit alone cannot tell that from an outage, and a gate
+#: whose yellows are mostly noise is a gate nobody reads — which the design
+#: document's acceptance line rules out.
+#:
+#: Why `l2Book_fast` first and `l2Book_slow` second: both are throttled snapshot
+#: feeds and arrive whether or not the book changed, so their cadence measures
+#: the socket rather than the market. `fast` (0.54s) resolves a hole ten times
+#: finer than `slow` (5.4s), so it is preferred where it was recorded; `slow` is
+#: the fallback for a legal `--hl-l2-modes slow` run.
+#:
+#: Binance's `bookTicker` is event-driven too, but it is not listed: its 30s
+#: limit is a flat guess (no cadence for that venue has ever been measured here),
+#: `@depth@0ms` is optional and may be absent, and no false positive has been
+#: observed. Adding a reference before the measurement would be inventing one.
+LIVENESS_REFERENCE = {
+    (HYPERLIQUID, "bbo"): ("l2Book_fast", "l2Book_slow"),
 }
 
 
@@ -338,7 +469,20 @@ class Gap:
     start_ts: int
     end_ts: int
     duration_ns: int
+    #: The lifecycle record that accounts for the hole, if the sidecar has one.
     explained_by: Optional[str] = None
+    #: Why this hole is not reportable at all — set when another stream on the
+    #: same socket ran across it without one, i.e. nothing was lost. Distinct
+    #: from `explained_by`, which says why a real hole happened.
+    suppressed_by: Optional[str] = None
+
+    def overlaps(self, other: "Gap") -> bool:
+        """Whether the two holes share any instant. Touching ends count.
+
+        Inclusive on purpose: an outage stops both feeds at approximately, not
+        exactly, the same moment, and the direction to be wrong in is reporting.
+        """
+        return self.start_ts <= other.end_ts and other.start_ts <= self.end_ts
 
     def as_json(self) -> dict:
         return {
@@ -346,6 +490,7 @@ class Gap:
             "end_local_ts": int(self.end_ts),
             "duration_ns": int(self.duration_ns),
             "explained_by": self.explained_by,
+            "suppressed_by": self.suppressed_by,
         }
 
 
@@ -369,12 +514,27 @@ class StreamStat:
         self.last_ts = ts
         self.count += 1
 
+    def gaps_truncated(self) -> bool:
+        """Whether `MAX_GAPS_RECORDED` dropped holes this stream really had.
+
+        A truncated list cannot prove another stream's hole does not overlap
+        one of the holes it stopped keeping, so it may not suppress anything.
+        """
+        return self.gap_count > len(self.gaps)
+
+    def suppressed_gap_count(self) -> int:
+        return sum(1 for g in self.gaps if g.suppressed_by is not None)
+
     def as_json(self) -> dict:
         return {
             "count": self.count,
             "first_local_ts": None if self.first_ts is None else int(self.first_ts),
             "last_local_ts": None if self.last_ts is None else int(self.last_ts),
+            # The raw count of over-limit holes. `suppressed_gap_count` of them
+            # were disproved by another stream and reach no issue; the
+            # measurement stays here either way.
             "gap_count": self.gap_count,
+            "suppressed_gap_count": self.suppressed_gap_count(),
             "gaps": [g.as_json() for g in self.gaps],
         }
 
@@ -390,7 +550,15 @@ class FileScan:
     malformed: int = 0
     malformed_example: Optional[str] = None
     unclassified: int = 0
+    #: `local_ts` went backwards WITHIN one stream: one producer, so this is a
+    #: clock step or two recordings in one file. Red.
     monotonic_violation: Optional[dict] = None
+    #: Two different streams written out of `local_ts` order, within
+    #: `CROSS_STREAM_TOLERANCE_NS`: concurrent producers racing into one FIFO.
+    #: Yellow.
+    interleave_inversion: Optional[dict] = None
+    #: The same, but beyond the bound — too far for any hand-off to explain. Red.
+    interleave_excess: Optional[dict] = None
     streams: dict = field(default_factory=dict)
     sequence_breaks: dict = field(default_factory=dict)
     #: stream -> the first few breaks, as the interval frames were lost over.
@@ -404,6 +572,8 @@ class FileScan:
             "malformed_lines": self.malformed,
             "unclassified_frames": self.unclassified,
             "monotonic_violation": self.monotonic_violation,
+            "interleave_inversion": self.interleave_inversion,
+            "interleave_excess": self.interleave_excess,
             "sequence_breaks": dict(self.sequence_breaks),
             "sequence_break_examples": {
                 stream: [g.as_json() for g in gaps]
@@ -449,6 +619,45 @@ def classify(family: str, obj: dict) -> Optional[str]:
         return None
 
     return None
+
+
+#: The bucket an unrecognised frame is ordered under. It has no stream, but it
+#: is still a line in the file, so leaving it out of the ordering check would
+#: let a whole unknown feed be written out of order unnoticed. Lumping every
+#: unrecognised shape together is deliberate: `unclassified_frames` already
+#: reports them, and one bucket cannot be worse than none.
+UNCLASSIFIED = "(unclassified)"
+
+
+def _note_inversion(
+    record: Optional[dict],
+    lineno: int,
+    prev_stream: str,
+    stream: str,
+    prev_ts: int,
+    ts: int,
+) -> dict:
+    """Folds one out-of-order pair into an O(1) summary of its kind.
+
+    The first occurrence is kept whole — a line number and both stamps is what
+    an investigation starts from — and everything after it only moves counters.
+    """
+    delta = prev_ts - ts
+    if record is None:
+        record = {
+            "line": lineno,
+            "previous_stream": prev_stream,
+            "stream": stream,
+            "previous_local_ts": int(prev_ts),
+            "local_ts": int(ts),
+            "delta_ns": int(delta),
+            "violations": 0,
+            "max_delta_ns": 0,
+        }
+    record["violations"] += 1
+    if delta > record["max_delta_ns"]:
+        record["max_delta_ns"] = int(delta)
+    return record
 
 
 def gap_limit(family: str, stream: str) -> Optional[int]:
@@ -523,13 +732,50 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
 
     Streaming and aggregate-only: a Bybit day is millions of lines, and holding
     the parsed frames would cost gigabytes for numbers that fit in a handful of
-    counters.
+    counters. The ordering check below keeps one stamp per stream, and there are
+    at most a handful of streams in a symbol file.
+
+    **Ordering has two different meanings here, and conflating them makes the
+    check structurally unsatisfiable.**
+
+    *Within one stream* `local_ts` must never go backwards. Verified for every
+    stream this file classifies:
+
+    * Hyperliquid — one WS reader stamps `Utc::now()` and `route`s every frame
+      (`hyperliquid/mod.rs`); `trades`, `bbo`, `l2Book_fast` and `l2Book_slow`
+      all come off that one loop, in receive order.
+    * Bybit — likewise, one reader for `orderbook.*` and `publicTrade`
+      (`bybit/mod.rs`); nothing else writes a symbol file.
+    * Binance (`binance`, `binancefuturesum`, `binancefuturescm`) — `bookTicker`,
+      `depthUpdate` and `trade` come off the one WS reader through `pump`, so
+      they hold. `depthSnapshot` is the exception worth knowing about: each one
+      is fetched by its own detached `tokio::spawn`, so two in flight could in
+      principle be stamped and enqueued out of order. The window is the few
+      instructions between `Utc::now()` and `send`, and the fetches are
+      throttled to 100/min, so it stays red: at that separation a real step
+      backwards is a clock, not a race.
+
+    *Between two streams* it holds exactly where the venue has one producer,
+    which is everywhere in the list above except `depthSnapshot` — so the
+    tolerance is granted on the mechanism, not on the venue and not on the size:
+    `_SECOND_PRODUCER` has to name one of the two streams before
+    `CROSS_STREAM_TOLERANCE_NS` is consulted at all. A step backwards between
+    two Hyperliquid cadences, or between `bookTicker` and `trade`, is red at a
+    nanosecond, because the one reader that stamped them also queued them in
+    that order.
+
+    The file's write order is compared with the previous line's stamp, which is
+    what "the writer put these two the wrong way round" means locally; comparing
+    against the maximum seen so far would instead count every frame written
+    during the overtake.
     """
     path = Path(path)
     family = family_of(exchange)
     symbol = path.name.rsplit("_", 1)[0]
     scan = FileScan(path=str(path), symbol=symbol, exchange=exchange)
     prev_ts = None
+    prev_stream = None
+    last_of_stream: dict = {}
     prev_id: dict = {}
 
     try:
@@ -544,27 +790,37 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
                     scan.malformed_example = f"line {lineno}: {text[:120].rstrip()}"
                 continue
 
-            if prev_ts is not None and ts < prev_ts:
-                # Equal stamps are fine — two frames can share a nanosecond.
-                # Going backwards cannot happen in a single writer appending in
-                # receive order, so it means a clock step or two collectors in
-                # one directory (which `lock.rs` exists to prevent). The count
-                # separates those: one step is a clock, a million is two
-                # interleaved recordings.
-                if scan.monotonic_violation is None:
-                    scan.monotonic_violation = {
-                        "line": lineno,
-                        "previous_local_ts": int(prev_ts),
-                        "local_ts": int(ts),
-                        "violations": 0,
-                    }
-                scan.monotonic_violation["violations"] += 1
-            prev_ts = ts
+            stream = classify(family, obj) if isinstance(obj, dict) else None
+            key = stream if stream is not None else UNCLASSIFIED
 
-            if not isinstance(obj, dict):
-                scan.unclassified += 1
-                continue
-            stream = classify(family, obj)
+            # Equal stamps are fine throughout — two frames can share a
+            # nanosecond, and on a burst many do.
+            last_seen = last_of_stream.get(key)
+            if last_seen is not None and ts < last_seen:
+                scan.monotonic_violation = _note_inversion(
+                    scan.monotonic_violation, lineno, key, key, last_seen, ts
+                )
+            elif prev_ts is not None and ts < prev_ts:
+                # In order for its own stream but written after a line stamped
+                # later. Tolerated only where two producers could actually have
+                # raced, and then only up to the socket hop that separates them:
+                # on a venue with one WS reader there is nothing to tolerate.
+                tolerated = (
+                    prev_ts - ts <= CROSS_STREAM_TOLERANCE_NS
+                    and second_producer_of(prev_stream, key) is not None
+                )
+                if tolerated:
+                    scan.interleave_inversion = _note_inversion(
+                        scan.interleave_inversion, lineno, prev_stream, key, prev_ts, ts
+                    )
+                else:
+                    scan.interleave_excess = _note_inversion(
+                        scan.interleave_excess, lineno, prev_stream, key, prev_ts, ts
+                    )
+            last_of_stream[key] = ts
+            prev_ts = ts
+            prev_stream = key
+
             if stream is None:
                 scan.unclassified += 1
                 continue
@@ -579,6 +835,98 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
         scan.truncation_error = str(error)
 
     return scan
+
+
+#: How many times its own cadence limit a hole may be before no liveness
+#: reference is allowed to excuse it.
+#:
+#: The false positives this check exists for were 14-37s on ENA (measured
+#: 2026-07-26), against a 14s `bbo` limit — so 10x is roughly four times the
+#: worst of them and cannot reach the failure on the other side. That failure is
+#: a silently dropped per-channel subscription: socket up, one channel dead, the
+#: `orderbook.500` precedent in `AGENTS.md` §4.1. It has exactly the signature
+#: this check suppresses, and at some size "the top of book did not move" stops
+#: being a hypothesis about a venue whose `bbo` median is 0.14s. A reference
+#: proves the SOCKET was alive; it never proves the channel was.
+MAX_SUPPRESSED_GAP_FACTOR = 10
+
+
+def liveness_witness(streams: dict, reference_names: tuple, gap: Gap) -> Optional[str]:
+    """The first reference stream that disproves this hole, or `None`.
+
+    A reference disproves nothing unless it was **running across the hole**.
+    Selecting on "was it recorded at all" is fail-open twice over: a stream that
+    simply stops leaves no trailing hole of its own (`StreamStat.observe` only
+    measures between two frames), so a dead reference satisfies "no overlapping
+    gap" vacuously; and picking per stream rather than per gap lets a dead
+    preferred reference shadow a live fallback that did report the outage.
+
+    Hence the bracket test, and hence the loop: `LIVENESS_REFERENCE` is a tuple
+    in preference order, and a name that cannot witness *this* hole is passed
+    over for the next one rather than ending the search.
+    """
+    for name in reference_names:
+        ref = streams.get(name)
+        if ref is None or ref.first_ts is None or ref.last_ts is None:
+            continue
+        if ref.first_ts > gap.start_ts or ref.last_ts < gap.end_ts:
+            # Recorded, but not over this interval. Its silence here is its own
+            # absence, not evidence about anything.
+            continue
+        if ref.gaps_truncated():
+            # Its hole list is incomplete, so "no overlapping hole" is not a
+            # fact about the recording, only about what was kept. Fail closed.
+            continue
+        # Both lists are capped at MAX_GAPS_RECORDED, so the quadratic pair
+        # count is bounded by 200x200 and needs no index.
+        if any(gap.overlaps(other) for other in ref.gaps):
+            continue
+        return name
+    return None
+
+
+def suppress_quiet_book_gaps(family: str, streams: dict) -> None:
+    """Marks the cadence gaps another stream on the same socket disproves.
+
+    An event-driven channel emits nothing when nothing happens, so its silence
+    is only evidence of a hole if the steady channel beside it went silent too.
+    Mutates the `Gap` objects in place; see `LIVENESS_REFERENCE` for the choice
+    of reference and the measurement behind it, and `liveness_witness` for what
+    a reference has to have done to count as one.
+
+    Three things stop a hole being suppressed, all of them reasons the reference
+    cannot settle it:
+
+    * an `explained_by` already set from the sidecar. An outage shorter than the
+      reference's own cadence limit leaves no hole in it — a two-second
+      reconnect is invisible to a feed allowed 5.4s between frames — and
+      dropping a hole the collector itself reported would be the one way this
+      check could lose information rather than noise. Call it after
+      `explain_gap`, or the guard has nothing to read;
+    * the hole being past `MAX_SUPPRESSED_GAP_FACTOR` x its own limit, where the
+      quiet-book explanation stops being credible whatever else was running;
+    * no reference that was actually live across it.
+    """
+    for stream, stat in streams.items():
+        reference_names = LIVENESS_REFERENCE.get((family, stream))
+        if reference_names is None or not stat.gaps:
+            continue
+        limit = gap_limit(family, stream)
+        ceiling = None if limit is None else limit * MAX_SUPPRESSED_GAP_FACTOR
+
+        for gap in stat.gaps:
+            if gap.explained_by is not None:
+                continue
+            if ceiling is not None and gap.duration_ns > ceiling:
+                continue
+            ref_name = liveness_witness(streams, reference_names, gap)
+            if ref_name is None:
+                continue
+            gap.suppressed_by = (
+                f"{ref_name} ran without a gap over the same interval — {stream} "
+                f"is event-driven, so this is the top of book not changing, not "
+                f"a hole in the recording"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -713,8 +1061,21 @@ def merge_session_config(records) -> Optional[dict]:
     }
 
 
-#: Sidecar events that explain a hole, most conclusive first. A restart
-#: (`session_start`) explains one as surely as a `disconnected` does.
+#: The collector's **lifecycle** records — the ones that say something happened
+#: to the recording — most conclusive first. A restart (`session_start`) explains
+#: a hole as surely as a `disconnected` does.
+#:
+#: This tuple is also the whitelist: a `_collector` record whose name is not
+#: here explains nothing. That matters because the sidecar also carries records
+#: that are *measurements*, not events — `disk` is written on a one-minute timer
+#: (`main.rs`, `disk_check.tick()`) and `universe` once at startup. One disk
+#: gauge lands inside every hole longer than a minute no matter what caused it,
+#: so annotating a gap "explained by disk at ..." states only that a minute
+#: passed. It closed investigations that had not happened.
+#:
+#: Fail closed by omission: a `_collector` record added to the Rust side later
+#: will not explain anything until it is named here, and a new gauge silently
+#: cannot.
 _EXPLANATORY = (
     "disconnected",
     "dial_failed",
@@ -731,11 +1092,16 @@ _EXPLANATORY = (
 
 
 def lifecycle_events(records) -> list:
-    """`(ts, event)` for the collector's own records, sorted by `local_ts`."""
+    """`(ts, event)` for the collector's lifecycle records, sorted by `local_ts`.
+
+    Filtered to `_EXPLANATORY` here rather than at the point of use, so the
+    `(+N more)` count in an explanation is a number of records that bear on the
+    hole — not a count of how many timer ticks landed inside it.
+    """
     out = [
         (ts, rec["_collector"])
         for ts, rec in records
-        if ts is not None and isinstance(rec.get("_collector"), str)
+        if ts is not None and rec.get("_collector") in _EXPLANATORY
     ]
     out.sort(key=lambda pair: pair[0])
     return out
@@ -771,8 +1137,10 @@ def explain_gap(gap: Gap, events) -> Optional[str]:
             if name == wanted:
                 extra = f" (+{len(inside) - 1} more)" if len(inside) > 1 else ""
                 return f"{name} at {iso(ts)}{extra}"
-    ts, name = inside[0]
-    return f"{name} at {iso(ts)}"
+    # Unreachable while `lifecycle_events` filters to `_EXPLANATORY`, and it
+    # must stay that way: falling back to "whatever was in there" is how the
+    # minutely disk gauge came to explain gaps.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +1150,49 @@ def explain_gap(gap: Gap, events) -> Optional[str]:
 
 def issue(severity: str, check: str, detail: str) -> dict:
     return {"severity": severity, "check": check, "detail": detail}
+
+
+def interleave_detail(name: str, record: dict) -> str:
+    """Why two streams are out of order, and whether that is still credible."""
+    delta = record["max_delta_ns"]
+    mechanism = second_producer_of(record["previous_stream"], record["stream"])
+    if mechanism is None:
+        # No hand-off separates these two, so no hand-off can have reordered
+        # them, and the size of the step is beside the point.
+        verdict = (
+            "not something an interleave can produce here: with one producer the "
+            "write order IS the receive order, so this is a clock step, a frame "
+            "classified into the wrong stream, or two recordings in one file"
+        )
+        mechanism = _NO_SECOND_PRODUCER
+    elif delta > CROSS_STREAM_TOLERANCE_NS:
+        # Two hypotheses, and they need different responses. The backlog one is
+        # the reason to look at `_meta` first: a hop holding thousands of frames
+        # is one capacity away from the overflow that ends the process, so a
+        # wide interleave can be the last trace of a burst the recording only
+        # just survived.
+        verdict = (
+            "beyond the %s interleave bound, which is the whole socket hop at "
+            "the measured burst rate: either a queue was deeper or slower than "
+            "that (check _meta for a burst or a queue_overflow near this line) "
+            "or the file holds two recordings"
+            % fmt_short(CROSS_STREAM_TOLERANCE_NS)
+        )
+    else:
+        verdict = (
+            "within the %s interleave bound, so nothing is missing and nothing "
+            "is mis-stamped — only the write order and the receive order "
+            "disagree" % fmt_short(CROSS_STREAM_TOLERANCE_NS)
+        )
+    return (
+        f"{name}: local_ts goes backwards BETWEEN streams {record['violations']} "
+        f"time(s), worst {fmt_short(delta)}; first at line {record['line']}: "
+        f"{record['previous_stream']} {iso(record['previous_local_ts'])} -> "
+        f"{record['stream']} {iso(record['local_ts'])}. Write order and local_ts "
+        f"order can only disagree where two producers stamp their own receive "
+        f"moment and race into one queue, so the question is whether this file "
+        f"has two: {mechanism}. This is {verdict}"
+    )
 
 
 def discover_days(data_dir: Path) -> list:
@@ -906,6 +1317,8 @@ def check_day(
                 "malformed_lines": 0,
                 "unclassified_frames": 0,
                 "monotonic_violation": None,
+                "interleave_inversion": None,
+                "interleave_excess": None,
                 "sequence_breaks": {},
                 "sequence_break_examples": {},
                 "streams": {},
@@ -973,11 +1386,21 @@ def check_day(
                 issue(
                     RED,
                     "monotonicity",
-                    f"{name}: local_ts goes backwards {v['violations']} time(s); "
-                    f"first at line {v['line']}: "
-                    f"{iso(v['previous_local_ts'])} -> {iso(v['local_ts'])}",
+                    f"{name}/{v['stream']}: local_ts goes backwards within the "
+                    f"stream {v['violations']} time(s), worst "
+                    f"{fmt_short(v['max_delta_ns'])}; first at line {v['line']}: "
+                    f"{iso(v['previous_local_ts'])} -> {iso(v['local_ts'])}. "
+                    f"One stream has one producer stamping at receive time, so "
+                    f"this is a clock step or two recordings in one file",
                 )
             )
+
+        for record, severity, check in (
+            (scan.interleave_excess, RED, "interleave_excess"),
+            (scan.interleave_inversion, YELLOW, "interleave_inversion"),
+        ):
+            if record:
+                issues.append(issue(severity, check, interleave_detail(name, record)))
 
         missing_required, missing_optional = [], []
         if expected is not None:
@@ -1026,33 +1449,42 @@ def check_day(
                 )
             )
 
-        for stream, stat in sorted(scan.streams.items()):
-            named = 0
+        # Ask the sidecar about every hole first, then drop the ones a steadier
+        # stream on the same socket disproves — a quiet top of book is not a
+        # hole, but one the collector reported on is, whatever else was running.
+        for stat in scan.streams.values():
             for gap in stat.gaps:
                 gap.explained_by = explain_gap(gap, events)
-                if named < MAX_GAP_ISSUES:
-                    named += 1
-                    limit = gap_limit(family_of(exchange), stream)
-                    tail = (
-                        f"explained by {gap.explained_by}"
-                        if gap.explained_by
-                        else "unexplained by _meta"
-                    )
-                    issues.append(
-                        issue(
-                            YELLOW,
-                            "cadence_gap",
-                            f"{name}/{stream}: {fmt_dur(gap.duration_ns)} gap "
-                            f"{iso(gap.start_ts)} -> {iso(gap.end_ts)} "
-                            f"(limit {fmt_dur(limit)}); {tail}",
-                        )
-                    )
-            if stat.gap_count > named:
+        suppress_quiet_book_gaps(family_of(exchange), scan.streams)
+
+        for stream, stat in sorted(scan.streams.items()):
+            reportable = [gap for gap in stat.gaps if gap.suppressed_by is None]
+            named = min(len(reportable), MAX_GAP_ISSUES)
+            limit = gap_limit(family_of(exchange), stream)
+            for gap in reportable[:named]:
+                tail = (
+                    f"explained by {gap.explained_by}"
+                    if gap.explained_by
+                    else "unexplained by _meta"
+                )
                 issues.append(
                     issue(
                         YELLOW,
                         "cadence_gap",
-                        f"{name}/{stream}: {stat.gap_count - named} further gap(s) "
+                        f"{name}/{stream}: {fmt_dur(gap.duration_ns)} gap "
+                        f"{iso(gap.start_ts)} -> {iso(gap.end_ts)} "
+                        f"(limit {fmt_dur(limit)}); {tail}",
+                    )
+                )
+            # Gaps past `MAX_GAPS_RECORDED` were never examined, so they could
+            # not have been suppressed; they are counted with the unnamed ones.
+            remainder = (len(reportable) - named) + (stat.gap_count - len(stat.gaps))
+            if remainder > 0:
+                issues.append(
+                    issue(
+                        YELLOW,
+                        "cadence_gap",
+                        f"{name}/{stream}: {remainder} further gap(s) "
                         f"not listed individually; see the JSON report",
                     )
                 )
@@ -1234,10 +1666,15 @@ def render_text(report: dict) -> str:
                 if not sym["streams"]:
                     lines.append(f"     {name:<12} (no frames)")
                 for stream, stat in sorted(sym["streams"].items()):
+                    # `gaps` is the raw count of over-limit holes; the note says
+                    # how many of them a reference stream showed to be the feed
+                    # simply being quiet, and so reach no issue.
+                    quiet = stat.get("suppressed_gap_count") or 0
+                    tail = f" ({quiet} quiet, not reported)" if quiet else ""
                     lines.append(
                         f"     {name:<12} {stream:<14} n={stat['count']:<9} "
                         f"{iso(stat['first_local_ts'])} .. {iso(stat['last_local_ts'])} "
-                        f"gaps={stat['gap_count']}"
+                        f"gaps={stat['gap_count']}{tail}"
                     )
                 cov = sym.get("coverage") or {}
                 if cov.get("required_streams"):

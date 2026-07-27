@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     file::Writer,
-    queue::{QUEUE_CAPACITY, WRITER_HOP},
+    queue::{WRITER_HOP, WRITER_QUEUE_CAPACITY},
 };
 
 mod backoff;
@@ -128,15 +128,23 @@ struct Args {
 ///
 /// Bounded rather than run to exhaustion. Producers do not stop because the
 /// consumer decided to: the socket keeps delivering, and an unbounded drain
-/// could be fed for as long as the venue stays up. The cap is the queue's own
-/// capacity, so everything that was waiting is written and nothing that arrives
-/// afterwards can extend the shutdown.
+/// could be fed for as long as the venue stays up. The cap is
+/// [`WRITER_QUEUE_CAPACITY`] — **this hop's** capacity, not the socket hop's,
+/// which is eight times smaller — so everything that was waiting is written and
+/// nothing that arrives afterwards can extend the shutdown. Capping it with the
+/// wrong constant would silently discard seven eighths of a full backlog, which
+/// `the_drain_is_bounded_even_if_the_producers_keep_pushing` exists to catch.
+///
+/// The full backlog is now ~13 MB of gzip work (32 768 records at a few hundred
+/// bytes) against the unit's `TimeoutStopSec=30s`, which is a sub-second job at
+/// the compression level in use — the deeper queue does not put the clean
+/// shutdown at risk.
 fn drain_backlog(
     rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
     mut write: impl FnMut(queue::Record) -> Result<(), anyhow::Error>,
 ) -> usize {
     let mut written = 0;
-    for _ in 0..QUEUE_CAPACITY {
+    for _ in 0..WRITER_QUEUE_CAPACITY {
         let Ok(record) = rx.try_recv() else { break };
         if let Err(error) = write(record) {
             // The same fault the loop was already leaving on, most likely. The
@@ -270,7 +278,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // channel is how a producer that has no error path of its own (the
     // detached REST snapshot tasks) reaches this loop.
     let (fatal_tx, mut fatal_rx) = queue::fatal_channel();
-    let (writer_tx, mut writer_rx) = queue::bounded(WRITER_HOP, QUEUE_CAPACITY, fatal_tx);
+    let (writer_tx, mut writer_rx) = queue::bounded(WRITER_HOP, WRITER_QUEUE_CAPACITY, fatal_tx);
 
     // Open the recording with a record of what produced it. The scoped clone
     // is dropped immediately: keeping a sender alive here would stop
@@ -614,8 +622,9 @@ mod tests {
     /// to its producer as accepted — `queue.rs` promises records are "never
     /// dropped", and the producers stopped rather than lose them. Leaving the
     /// channel to be destroyed with `main` would break that promise at the
-    /// process level, and on an overflow it would discard the full 4096: the
-    /// newest data in the recording, which is the window around the fault.
+    /// process level, and on an overflow it would discard a full
+    /// `WRITER_QUEUE_CAPACITY` of records: the newest data in the recording,
+    /// which is the window around the fault.
     #[test]
     fn the_queued_backlog_is_written_before_the_files_are_closed() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(8);
@@ -636,19 +645,88 @@ mod tests {
     /// The drain runs after the decision to stop, so it must not become a
     /// reason not to. Producers may still be pushing — the socket does not stop
     /// because the writer did — so it is capped rather than run to exhaustion.
+    ///
+    /// Since the two hops stopped sharing a capacity it guards the wiring as
+    /// well: capped with the socket hop's constant instead, this would recover
+    /// 4096 of 32 768 and throw away the rest of the last data the collector
+    /// captured. Checked by temporarily swapping the constant — it fails.
     #[test]
     fn the_drain_is_bounded_even_if_the_producers_keep_pushing() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(QUEUE_CAPACITY * 2);
-        for _ in 0..(QUEUE_CAPACITY + 100) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(WRITER_QUEUE_CAPACITY * 2);
+        for _ in 0..(WRITER_QUEUE_CAPACITY + 100) {
             tx.try_send(record("still arriving")).unwrap();
         }
 
-        assert_eq!(drain_backlog(&mut rx, |_| Ok(())), QUEUE_CAPACITY);
+        assert_eq!(drain_backlog(&mut rx, |_| Ok(())), WRITER_QUEUE_CAPACITY);
+    }
+
+    /// The socket hop is the one whose overflow genuinely races the stall
+    /// watchdog, and it has to win that race.
+    ///
+    /// A starved parser produces no dequeues, so `watchdog.record_write` is
+    /// never reached and the watchdog becomes the only other thing that would
+    /// ever report the fault. It can say no more than "nothing has been
+    /// recorded for five minutes"; the overflow names the hop and files
+    /// `queue_overflow` in the sidecar, which is what Phase 2's gap attribution
+    /// reads. The specific diagnosis has to arrive first.
+    ///
+    /// Bounded from both sides, or the rule has no teeth. Merely beating the
+    /// five-minute watchdog would still be satisfied at ~60 000 messages,
+    /// fifteen times the shipped depth, so the requirement is stated as the
+    /// absolute an operator cares about: **a diagnosis inside a minute** at the
+    /// measured background rate. That caps the hop near 12 000, which the
+    /// shipped 4096 clears with room and a `WRITER_QUEUE_CAPACITY`-sized hop
+    /// (32 768, ~164s) does not. The lower bound is
+    /// `the_socket_hop_covers_a_scheduling_hiccup_at_the_measured_burst` in
+    /// `queue.rs`, so between them the socket hop is pinned to [2000, 12000).
+    ///
+    /// The writer hop is deliberately not held to the same rule. Every dequeue
+    /// pets the watchdog, so a writer that is slow rather than stopped keeps it
+    /// satisfied indefinitely while the queue grows; there the bound is the only
+    /// guard there is, not the faster of two.
+    ///
+    /// The watchdog default is read from the shipped `Args` rather than copied,
+    /// so lowering the flag's default re-checks this instead of quietly
+    /// invalidating it.
+    #[test]
+    fn the_socket_hop_reports_a_starved_parser_before_the_stall_watchdog_does() {
+        /// What "first" has to mean for the diagnosis to be the one an operator
+        /// acts on, rather than a footnote found after the watchdog has already
+        /// said "silence".
+        const REQUIRED_MS: usize = 60_000;
+
+        let shipped = Args::parse_from(["collector", "/tmp/recording", "binancefuturesum"]);
+        assert!(
+            shipped.stall_timeout_min > 0,
+            "the shipped default disables the stall watchdog; this invariant is about which \
+             of two armed guards reports first"
+        );
+        let watchdog_ms = (shipped.stall_timeout_min as usize) * 60_000;
+
+        let fill_ms = queue::burst::fill_time_ms(
+            queue::WS_QUEUE_CAPACITY,
+            queue::burst::BACKGROUND_MSG_PER_S,
+        );
+        assert!(
+            fill_ms < watchdog_ms,
+            "a starved parser fills the websocket->parser hop in {fill_ms} ms at the measured \
+             background rate, which is no sooner than the {watchdog_ms} ms stall watchdog; the \
+             collector would then report silence instead of naming the hop"
+        );
+        assert!(
+            fill_ms <= REQUIRED_MS,
+            "the websocket->parser hop takes {fill_ms} ms to report a starved parser at the \
+             measured background rate ({} messages); beating the {watchdog_ms} ms watchdog is \
+             not enough — the diagnosis is only the one acted on if it lands inside \
+             {REQUIRED_MS} ms, which caps this hop near {} messages",
+            queue::WS_QUEUE_CAPACITY,
+            REQUIRED_MS * queue::burst::BACKGROUND_MSG_PER_S / 1000,
+        );
     }
 
     /// A write that fails on the way out is the same fault the loop was already
-    /// leaving on. Retrying the rest would just fail 4095 more times and delay
-    /// the flush that still has a chance of succeeding.
+    /// leaving on. Retrying the rest would just fail once per queued record and
+    /// delay the flush that still has a chance of succeeding.
     #[test]
     fn a_failing_write_stops_the_drain() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(8);

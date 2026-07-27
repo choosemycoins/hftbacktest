@@ -30,6 +30,11 @@
 //! feeding the stall watchdog evidence of life while nothing current is being
 //! recorded.
 //!
+//! The two hops no longer share a capacity. They stalled for different reasons
+//! in the 2026-07-26 burst and are sized separately from it — see
+//! [`WS_QUEUE_CAPACITY`] and [`WRITER_QUEUE_CAPACITY`], where the arithmetic
+//! and the measurement behind each are written out.
+//!
 //! ## Known limit: a writer wedged in a syscall
 //!
 //! `Writer::write` is blocking I/O called straight from `main`'s select loop. If
@@ -47,32 +52,147 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::error;
 
-/// Capacity of each bounded hand-off, **in messages**.
+/// Capacity of the socket reader → parser hand-off, **in messages**.
 ///
-/// The bound counts messages, not bytes: every item owns a payload of whatever
-/// length the venue sent, so the memory budget is capacity × realistic maximum
-/// frame.
+/// Deliberately left at the original 4096 while the writer hop below was raised
+/// eightfold, because the two hops fail for different reasons and the burst
+/// that forced the other change is itself the evidence.
 ///
-/// * A typical frame — a Bybit orderbook delta, a Binance `depthUpdate` — is
-///   1–2 KB, so a full queue holds roughly 8 MB.
-/// * The largest frames are full-depth snapshots: a Bybit `orderbook.200`
-///   snapshot is tens of KB, and the REST `depth?limit=1000` body fetched to
-///   repair a Binance gap is around 100 KB. Those are throttled to 100/min
-///   (`throttler.rs`), so they cannot fill a queue by themselves.
+/// This hop's consumer is `pump`'s loop: a `serde_json` parse and a
+/// non-blocking `try_send`. There is no `.await` in it and no syscall, so it
+/// cannot stall on I/O — only on losing the CPU, which is a scheduler-scale
+/// event of tens of milliseconds. 4096 at the measured peak
+/// (`burst::PEAK_MSG_PER_S`, below) is 205 ms, an order of magnitude over that.
 ///
-/// Worst case is therefore on the order of 100 MB per hop, ~200 MB with both
-/// hops full at once, against the 2 GB of the deployment host. That is enough
-/// headroom that hitting the bound means "the consumer has stopped", not
-/// "traffic was briefly bursty" — and small enough to leave the host usable
-/// while the process is on its way down. At the volumes measured on 2026-07-25
-/// (86–159 MB/day/symbol for Bybit, 22 MB/day for Hyperliquid) a full queue is
-/// on the order of a minute of traffic, so a rotation or a gzip flush cannot
-/// come near it.
+/// The burst confirms it rather than merely leaving it plausible: the writer
+/// hop could only reach 4096 queued records because the parser was running flat
+/// out to put them there, so this hop was being drained throughout the very
+/// event that broke the other one. Nothing was measured here that needs fixing.
 ///
-/// This number is a proposal, not a measurement — open decision 3 of
-/// `docs/design-multi-venue-collection.md`. It should be recomputed from an
-/// observed peak message rate once one has been recorded.
-pub const QUEUE_CAPACITY: usize = 4096;
+/// Depth would also cost something. A backlog **here** does not mean data is
+/// waiting to be written — it means the stage that decides where data goes has
+/// stopped, which is a different fault (out of CPU) with a different fix, and
+/// burying it under eight times the buffer only delays the report. It is the
+/// one hop whose overflow genuinely races the stall watchdog: a starved parser
+/// produces no dequeues, so nothing pets the watchdog, and at background rates
+/// 4096 reports in ~20s against the watchdog's 5 minutes — with a diagnosis,
+/// where the watchdog would only say "silence".
+pub const WS_QUEUE_CAPACITY: usize = 4096;
+
+/// Capacity of the parser → writer hand-off, **in messages**.
+///
+/// # Sized from a measured overflow, not a guess
+///
+/// This was 4096, described here as "a proposal, not a measurement". The
+/// measurement arrived on **2026-07-26 at 22:00:00 UTC**: a burst took the four
+/// recorded Binance UM symbols from ~50 msg/s each to ~20 000 msg/s aggregate
+/// (4402/s then 5514/s on btcusdt alone). This hop filled, the `full => fatal`
+/// policy did exactly what it is for — `queue_overflow` to the sidecar, files
+/// closed, exit 1 — and systemd restarted the process 5s later. One overflow in
+/// 12 hours; a ~5s hole in the recording.
+///
+/// The load-bearing half of that measurement is what happened next: **the
+/// restarted process sat through the same burst still accelerating** (6118/s on
+/// btcusdt at 22:00:11) without filling anything. So the writer keeps up with
+/// the rate. 4096 did not fail on throughput; it failed because 4096 ÷ 20 000
+/// is 205 ms, and the writer stalled for longer than that once.
+///
+/// Which is unsurprising, because this is the only consumer in the process that
+/// can block in the kernel: `Writer::write` gzips and writes synchronously from
+/// `main`'s select loop, so dirty-page writeback, a gzip flush and the UTC-day
+/// file rotation all land on it. Those are hundreds of milliseconds to seconds.
+/// A bound below a second was never going to survive one.
+///
+/// # The arithmetic
+///
+/// Budget: absorb a **multi-second** stall at the measured peak. 32 768 ÷
+/// 20 000 = **1.64s**, and it is the smallest power of two that clears 1.5s
+/// (16 384 gives 0.82s). Smallest, not largest, on purpose — depth is not free,
+/// see the byte budget below and note that anything sitting here is in RAM and
+/// not on disk. Against the observed background rate of ~200 msg/s aggregate it
+/// is 2.7 minutes, so "full" still means "the writer has stopped" rather than
+/// "traffic was briefly bursty".
+///
+/// # Byte budget
+///
+/// The bound counts messages; the memory is capacity × payload, and payloads
+/// vary by three orders of magnitude:
+///
+/// * A typical UM frame — `bookTicker`, `trade`, `depth@0ms` — is 300–600 B.
+///   Full at 600 B: **~20 MB**, plus 2 MB of queue slots (64 B per [`Record`]).
+/// * The outliers are book snapshots. A REST `depth?limit=1000` body fetched to
+///   repair a sequence gap reaches **~50 KB**, and Bybit's `orderbook.200`
+///   snapshot is tens of KB.
+///
+/// Capacity × largest frame — 32 768 × 50 KB = **1.6 GB** — would not survive
+/// the 2 GB host, so it matters that it is unreachable for a reason that is a
+/// rate rather than an assumption. Those snapshots are fetched under a 100/min
+/// throttle (`throttler.rs`), so however long the hop takes to fill, at most
+/// 100 of them can join it per minute. Two caps follow, and they are
+/// independent only while the watchdog is armed:
+///
+/// * **Filling is quick when traffic is heavy.** 1.6s at the measured peak
+///   admits ≤3 snapshots; 164s at the background rate admits ≤273, or 13 MB.
+/// * **Filling slowly runs into the stall watchdog.** A hop only stays full
+///   while nothing is dequeued, and nothing dequeued means `record_write` is
+///   never called, so the process ends after `--stall-timeout-min` — 5 minutes
+///   by default, hence ≤500 snapshots, or 25 MB. **`--stall-timeout-min 0`
+///   removes this cap**: it is a documented, deployable value
+///   (`COLLECTOR_STALL_TIMEOUT_MIN`, `deploy/instance.env.example`) that
+///   disarms the watchdog with a warning, and with it set only the first cap
+///   and the informal argument below remain.
+///
+/// The worst case is therefore around **50 MB for this hop** (the 32 268
+/// remaining slots holding ordinary frames, plus 2 MB of slots) and under
+/// 55 MB with the socket hop full at the same moment: under 3% of the host.
+/// Memory is not what limits this number; the stall budget is.
+///
+/// Two things that figure does not cover, both accuracy rather than risk.
+/// Frame sizes were measured on Binance UM and this constant governs every
+/// backend: a Bybit instance carrying `orderbook.200` deltas at 1–2 KB is
+/// nearer **65 MB** for the same 32 768 slots, and its snapshots arrive over
+/// the WebSocket, so the 100/min throttle — which gates only the Binance REST
+/// refetch — says nothing about them. Still an order of magnitude inside a 2 GB
+/// host, so the conclusion holds and the number does not.
+///
+/// And the writer wedged in a syscall (see the module docs), where neither cap
+/// applies because `main` never returns to observe anything — but even there
+/// the 1.6 GB figure needs 5.5 hours of nothing but throttled snapshots
+/// arriving, and any real feed fills the hop with ordinary frames first.
+///
+/// Two details that make the figure smaller than it looks. Tokio's bounded
+/// channel does not preallocate: `mpsc::channel(n)` takes out `n` semaphore
+/// permits and grows a list of 32-message blocks on demand, so raising the
+/// capacity moves the ceiling and not the resting footprint. And blocks a burst
+/// allocated are reinserted for reuse where they can be, so some of that ~2 MB
+/// of slots stays resident afterwards, while the payloads themselves are
+/// dropped on dequeue.
+pub const WRITER_QUEUE_CAPACITY: usize = 32768;
+
+/// The burst the capacities above are sized from, measured on the recording
+/// host on **2026-07-26 at 22:00:00 UTC**.
+///
+/// Test-only because nothing at run time reads them: they exist so the sizing
+/// arguments above are arithmetic a test can fail on, rather than prose that
+/// quietly stops being true. Raising a capacity means changing a number here
+/// too, or explaining why the old measurement still applies.
+#[cfg(test)]
+pub mod burst {
+    /// Aggregate peak across the four recorded Binance UM symbols, each with
+    /// `@trade` + `@bookTicker` + `@depth@0ms`. Per symbol the observed peaks
+    /// were 4402/s then 5514/s on btcusdt alone, and 6118/s eleven seconds
+    /// later — the last of those survived by the restarted process.
+    pub const PEAK_MSG_PER_S: usize = 20_000;
+
+    /// What the same four symbols run at outside a burst: ~50 msg/s each.
+    pub const BACKGROUND_MSG_PER_S: usize = 200;
+
+    /// How long a hop of `capacity` survives a consumer that has stopped
+    /// draining, at `rate` messages per second.
+    pub const fn fill_time_ms(capacity: usize, rate: usize) -> usize {
+        capacity * 1000 / rate
+    }
+}
 
 /// Hop names, used in the fatal message so an operator can tell which of the
 /// two stalled without reading the code.
@@ -271,6 +391,74 @@ mod tests {
 
     fn record(payload: &str) -> Record {
         (Utc::now(), "BTC".to_string(), payload.to_string())
+    }
+
+    /// The sizing basis for the writer hop, and the reason the capacity is not
+    /// the 4096 it shipped with.
+    ///
+    /// The load-bearing half of the 2026-07-26 measurement is not that the hop
+    /// filled — it is that the *restarted* process then sat through the same
+    /// burst still accelerating (6118/s on btcusdt at 22:00:11) without filling
+    /// anything. So the writer keeps up with the rate; what it could not do was
+    /// ride out one stall of its own. 4096 at the measured peak is 205 ms of
+    /// tolerance, and the writer is the one consumer in this process that can
+    /// block in the kernel — dirty-page writeback, a gzip flush, the day's file
+    /// rotation. Those are measured in hundreds of milliseconds to seconds, so
+    /// a bound below a second was never going to hold.
+    #[test]
+    fn the_writer_hop_rides_out_a_multi_second_stall_at_the_measured_burst() {
+        // A second and a half: comfortably past the ~0.2s that broke it, past
+        // the writeback and rotation stalls that are the plausible causes, and
+        // still short enough that a full queue means the writer has stopped.
+        const REQUIRED_MS: usize = 1_500;
+
+        let tolerated = burst::fill_time_ms(WRITER_QUEUE_CAPACITY, burst::PEAK_MSG_PER_S);
+        assert!(
+            tolerated >= REQUIRED_MS,
+            "the parser->writer hop tolerates only {tolerated} ms of writer stall at the \
+             measured burst rate of {} msg/s ({WRITER_QUEUE_CAPACITY} messages); the \
+             2026-07-26 22:00 UTC burst outlasted 205 ms of it, and the budget is \
+             {REQUIRED_MS} ms",
+            burst::PEAK_MSG_PER_S,
+        );
+
+        // The other side of the same budget: pinned to the *smallest* capacity
+        // that meets it, because depth costs RAM-resident data and delays the
+        // moment "full" starts meaning something. Doubling it needs a bigger
+        // measured burst, not a bigger appetite — which means changing
+        // `burst::PEAK_MSG_PER_S`, where the reason has to be written down.
+        let halved = burst::fill_time_ms(WRITER_QUEUE_CAPACITY / 2, burst::PEAK_MSG_PER_S);
+        assert!(
+            halved < REQUIRED_MS,
+            "half the capacity would already cover the {REQUIRED_MS} ms budget ({halved} ms), \
+             so {WRITER_QUEUE_CAPACITY} messages is more depth than the measurement justifies"
+        );
+    }
+
+    /// The socket hop is deliberately **not** given the same treatment, and
+    /// this is the arithmetic that says how little it needs.
+    ///
+    /// Its consumer is `pump`'s loop: a `serde_json` parse and a non-blocking
+    /// `try_send`, with no `.await` and no syscall anywhere in it. It cannot
+    /// stall on I/O, only on losing the CPU, which is a scheduler-scale event —
+    /// tens of milliseconds, not the hundreds the writer showed. The burst
+    /// itself is the evidence: the writer hop could only have reached 4096 with
+    /// the parser running flat out to fill it, so the parser was draining this
+    /// hop throughout the very event that broke the other one.
+    #[test]
+    fn the_socket_hop_covers_a_scheduling_hiccup_at_the_measured_burst() {
+        // An order of magnitude over the scheduler-scale stall it can actually
+        // suffer. Deeper would only delay a report that means something
+        // different from a writer stall: that the process is out of CPU.
+        const REQUIRED_MS: usize = 100;
+
+        let tolerated = burst::fill_time_ms(WS_QUEUE_CAPACITY, burst::PEAK_MSG_PER_S);
+        assert!(
+            tolerated >= REQUIRED_MS,
+            "the websocket->parser hop tolerates only {tolerated} ms at the measured burst \
+             rate of {} msg/s ({WS_QUEUE_CAPACITY} messages)",
+            burst::PEAK_MSG_PER_S,
+        );
     }
 
     /// The whole point of the bound. A producer that cannot hand a message over

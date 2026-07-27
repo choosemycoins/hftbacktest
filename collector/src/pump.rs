@@ -25,7 +25,7 @@ use tracing::error;
 
 use crate::{
     error::ConnectorError,
-    queue::{self, Frame, QUEUE_CAPACITY, Record, Tx},
+    queue::{self, Frame, Record, Tx, WS_QUEUE_CAPACITY},
 };
 
 /// Runs `producer` and files everything it delivers, returning when the
@@ -40,7 +40,7 @@ where
     F: Future<Output = ()> + Send + 'static,
     H: FnMut(&Tx<Record>, DateTime<Utc>, Utf8Bytes) -> Result<(), ConnectorError>,
 {
-    let (ws_tx, mut ws_rx) = queue::bounded(queue::WS_HOP, QUEUE_CAPACITY, writer_tx.fatal());
+    let (ws_tx, mut ws_rx) = queue::bounded(queue::WS_HOP, WS_QUEUE_CAPACITY, writer_tx.fatal());
     // By value. See the module docs, and `producer_finishing_with_a_clean_eof_
     // ends_the_collection` for what a retained clone costs.
     let h = tokio::spawn(producer(ws_tx));
@@ -66,7 +66,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use super::*;
     use crate::queue::WRITER_HOP;
@@ -133,7 +139,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_writer_that_stops_draining_ends_the_collection() {
         // The receiver is held but never read, so the queue fills and stays
-        // full; capacity 1 just gets there in one frame instead of 4096.
+        // full; capacity 1 just gets there in one frame instead of
+        // `WRITER_QUEUE_CAPACITY`.
         let (writer_tx, _writer_rx, mut fatal) = queue::test_bounded::<Record>(WRITER_HOP, 1);
 
         let result = tokio::time::timeout(
@@ -162,6 +169,54 @@ mod tests {
                 .await
                 .is_ok(),
             "and the reason must reach main, which is the half a returned error cannot cover"
+        );
+    }
+
+    /// The socket hop is built here and nowhere else, so this is the only place
+    /// the two capacities can be confused — and the whole reason there are two.
+    ///
+    /// `queue.rs` argues the socket hop must stay shallow: its overflow is the
+    /// one that races the stall watchdog, and it has to win that race with a
+    /// diagnosis where the watchdog would only report silence. Wiring this call
+    /// to `WRITER_QUEUE_CAPACITY` would make it eight times deeper and undo
+    /// that silently — the drain in `main` has
+    /// `the_drain_is_bounded_even_if_the_producers_keep_pushing` guarding the
+    /// symmetric mistake, and `queue.rs`'s own tests only check arithmetic over
+    /// the constants, never which one arrives here.
+    ///
+    /// Measuring it rather than reading the source: the producer has no `.await`
+    /// in its loop, so on the current-thread runtime it runs to the first
+    /// refusal before `pump` is ever polled again. What it counts is the hop's
+    /// depth and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn the_socket_hop_is_built_with_the_socket_hop_capacity() {
+        let (writer_tx, _writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 1);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            pump(
+                writer_tx,
+                move |ws_tx| async move {
+                    while ws_tx.send((Utc::now(), Utf8Bytes::from(FRAME))).is_ok() {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                // Nothing reaches the writer hop, so its capacity of 1 cannot
+                // be what the count measures.
+                |_, _, _| Ok(()),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            WS_QUEUE_CAPACITY,
+            "the socket hop must be built with WS_QUEUE_CAPACITY; a hop of \
+             WRITER_QUEUE_CAPACITY here would bury an out-of-CPU parser under \
+             eight times the buffer and let the stall watchdog report it first, \
+             as silence"
         );
     }
 
