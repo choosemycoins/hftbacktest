@@ -14,11 +14,16 @@ What the doc demands of this phase, and where it lives here:
   by :func:`native_runner` and echoed into the results JSON — including values
   that happen to equal the default — together with where each came from
   (``cli`` / ``manifest`` / ``default``).
-* **``PartialFillExchange`` is forbidden**, not chosen: a partially filled order
-  never reaches the local position (``proc/partialfillexchange.rs:233`` sets
-  ``PartiallyFilled``, ``proc/local.rs:102`` applies a fill only on ``Filled``);
-  AGENTS.md §4.6. There is no flag for it and there must not be one until that
-  is fixed upstream.
+* **The exchange model is a choice**, ``--exchange {no-partial,partial}``, and
+  the choice plus where it came from go into the results. ``PartialFillExchange``
+  used to be banned here because a partially filled order never reached the
+  local position (the local side applied a fill only on ``Status::Filled``).
+  That is fixed — both local processors now apply every execution response and
+  ``exec_qty`` is per-execution, so the fills add up; AGENTS.md §4.6 has the fix,
+  its pins and what the model still does not cover. The default stays
+  ``no-partial`` so runs made before the fix remain comparable, and
+  ``--sweep exchange=no-partial,partial`` measures the difference on one dataset
+  instead of arguing about it.
 * **Order latency is constant, explicit and non-zero**, with three named
   profiles. The numbers are an ASSUMPTION pending a live submit->ack
   measurement (open decision 5) and say so in the results.
@@ -155,19 +160,28 @@ LATENCY_ASSUMPTION = (
     'measured against the venue, and re-run the sensitivity family.'
 )
 
-PARTIAL_FILL_FORBIDDEN = (
-    'PartialFillExchange is forbidden by docs/design-multi-venue-collection.md '
-    '(Phase 4) and AGENTS.md §4.6: the exchange side sets Status::PartiallyFilled '
-    '(proc/partialfillexchange.rs:233) but the local side applies a fill only on '
-    'Status::Filled (proc/local.rs:102), so partial fills never reach the '
-    'strategy position or PnL. This harness offers no flag for it.'
+PARTIAL_FILL_FIXED = (
+    'PartialFillExchange was forbidden here until 2026-07-29: the exchange side '
+    'set Status::PartiallyFilled but the local side applied a fill only on '
+    'Status::Filled, so partial fills never reached the strategy position or '
+    'PnL. Fixed in proc/local.rs and proc/l3_local.rs — every execution '
+    'response is applied and exec_qty carries that single execution, so the '
+    'fills add up without double-counting. AGENTS.md §4.6.'
+)
+
+PARTIAL_FILL_REMAINING_GAP = (
+    'What PartialFillExchange still does not model (AGENTS.md §4.6): a '
+    'liquidity-taking order walking several price levels reports only its last '
+    'chunk to the local, and a partially executed IOC/FOK/Market order expires '
+    'without reporting the executed part at all. A pure-maker grid touches '
+    'neither, but a conclusion that leans on taking liquidity does.'
 )
 
 NO_PARTIAL_FILL_DISTORTION = (
     'NoPartialFillExchange fills the whole leaves_qty regardless of the '
     'liquidity resting at the level (proc/nopartialfillexchange.rs:58-62). '
     'Accepted in writing by the design doc; conclusions sensitive to partial '
-    'fills need the upstream fix first.'
+    'fills can now be checked against --exchange partial rather than assumed.'
 )
 
 FEE_ASSUMPTION = (
@@ -179,11 +193,23 @@ FEE_ASSUMPTION = (
     'the results file records the value and where it came from.'
 )
 
-#: The models this harness actually builds. A manifest that declares something
-#: else is refused rather than silently overridden — the whole point of Phase 4
-#: is that no model is picked up quietly.
+#: The queue model this harness actually builds. A manifest that declares
+#: something else is refused rather than silently overridden — the whole point
+#: of Phase 4 is that no model is picked up quietly.
 SUPPORTED_QUEUE_MODEL = 'LogProbQueueModel2'
-SUPPORTED_EXCHANGE_KIND = 'NoPartialFillExchange'
+
+#: The exchange models this harness builds, keyed by the ``--exchange``
+#: spelling. Unlike the queue model there are two of them, so a manifest naming
+#: one of these is a declaration to honour, not a disagreement to refuse; only a
+#: kind outside this table is refused. Whichever is used, the results say which
+#: and where the choice came from.
+EXCHANGE_KINDS = {
+    'no-partial': 'NoPartialFillExchange',
+    'partial': 'PartialFillExchange',
+}
+
+#: Continuity: every run made before the partial-fill fix used this one.
+DEFAULT_EXCHANGE = 'no-partial'
 
 DEFAULT_ELAPSE_MS = 100.0
 DEFAULT_LATENCY_PROFILE = 'base'
@@ -671,7 +697,8 @@ def build_parser():
         prog=TOOL_NAME,
         description=PHASE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='PartialFillExchange is deliberately not offered — AGENTS.md §4.6.',
+        epilog='PartialFillExchange is offered since the partial-fill fix — '
+               'see --exchange and AGENTS.md §4.6.',
     )
     p.add_argument('--manifest', required=True,
                    help='Phase-3 manifest.json describing the dataset')
@@ -692,6 +719,13 @@ def build_parser():
                    help='override the manifest max_hl_book_age_ns')
     p.add_argument('--signal-price', choices=('mid', 'microprice'), default=None,
                    help='how the strategy derives one price from a signal row')
+    p.add_argument('--exchange', choices=tuple(EXCHANGE_KINDS), default=None,
+                   help='exchange model: no-partial (default, %s) or partial '
+                        '(%s, usable since the partial-fill fix — AGENTS.md '
+                        '§4.6). Overrides what the manifest declares; the '
+                        'results record the kind and where it came from'
+                        % (EXCHANGE_KINDS['no-partial'],
+                           EXCHANGE_KINDS['partial']))
 
     p.add_argument('--latency-profile', choices=tuple(LATENCY_PROFILES), default=None,
                    help='constant order latency preset (ASSUMPTION, see results)')
@@ -827,10 +861,24 @@ def check_models(manifest):
             'that. Change the manifest or extend the harness — do not let the '
             'two disagree.' % (queue, SUPPORTED_QUEUE_MODEL))
     kind = _dig(manifest.raw, 'backtest_defaults.exchange_kind.kind')
-    if kind is not None and kind != SUPPORTED_EXCHANGE_KIND:
+    if kind is not None and kind not in EXCHANGE_KINDS.values():
         raise ConfigError(
-            'manifest declares exchange_kind %r; this harness builds %s. %s'
-            % (kind, SUPPORTED_EXCHANGE_KIND, PARTIAL_FILL_FORBIDDEN))
+            'manifest declares exchange_kind %r; this harness builds %s. Change '
+            'the manifest or extend the harness — do not let the two disagree.'
+            % (kind, ' or '.join(sorted(EXCHANGE_KINDS.values()))))
+
+
+def manifest_exchange(manifest):
+    """The ``--exchange`` spelling the manifest declares, or ``None``.
+
+    An unknown kind returns ``None`` here and is refused by :func:`check_models`
+    under its own name, which is the message an operator can act on.
+    """
+    kind = _dig(manifest.raw, 'backtest_defaults.exchange_kind.kind')
+    for spelling, name in EXCHANGE_KINDS.items():
+        if name == kind:
+            return spelling
+    return None
 
 
 def resolve_config(args, manifest):
@@ -889,6 +937,15 @@ def resolve_config(args, manifest):
     # latency profiles keep their defaults because they are conservative and
     # carry LATENCY_ASSUMPTION; a rebate is neither.
     check_models(manifest)
+
+    # The exchange model resolves like every other value: CLI, else what the
+    # manifest declares, else the pre-fix default. Nothing is silent — the kind,
+    # the spelling and the source all reach the results.
+    exchange, src['exchange'] = _resolve(
+        args.exchange, manifest_exchange(manifest), DEFAULT_EXCHANGE)
+    cfg['exchange'] = exchange
+    cfg['exchange_kind'] = EXCHANGE_KINDS[exchange]
+
     manifest_maker = _dig(manifest.raw, 'backtest_defaults.fee_model.maker_fee')
     manifest_taker = _dig(manifest.raw, 'backtest_defaults.fee_model.taker_fee')
     maker, src['maker_fee'] = _resolve(args.maker_fee, manifest_maker, None)
@@ -1071,9 +1128,13 @@ def build_results(config, manifest, stats, sweep=None):
             },
             'queue_model': {'kind': SUPPORTED_QUEUE_MODEL},
             'exchange_kind': {
-                'kind': SUPPORTED_EXCHANGE_KIND,
-                'forbidden': PARTIAL_FILL_FORBIDDEN,
-                'accepted_distortion': NO_PARTIAL_FILL_DISTORTION,
+                'kind': config['exchange_kind'],
+                'choice': config['exchange'],
+                'source': config['sources']['exchange'],
+                'partial_fill_fix': PARTIAL_FILL_FIXED,
+                'accepted_distortion': (
+                    NO_PARTIAL_FILL_DISTORTION if config['exchange'] == 'no-partial'
+                    else PARTIAL_FILL_REMAINING_GAP),
             },
             'order_latency': {
                 'kind': 'ConstantLatency',
@@ -1181,6 +1242,9 @@ SWEEP_KNOBS = {
     'resp-ms': ('resp_ms', 'resp_ns'),
     'latency-profile': ('latency_profile', 'entry_ms', 'entry_ns',
                         'resp_ms', 'resp_ns'),
+    # The sensitivity the NoPartialFillExchange distortion note asks about, now
+    # that PartialFillExchange accounts for its fills (AGENTS.md §4.6).
+    'exchange': ('exchange', 'exchange_kind'),
 }
 
 _SWEEP_TYPES = {
@@ -1191,6 +1255,7 @@ _SWEEP_TYPES = {
     'entry-ms': float,
     'resp-ms': float,
     'latency-profile': str,
+    'exchange': str,
 }
 
 SWEEP_METRICS = (
@@ -1254,6 +1319,13 @@ def sweep_configs(base_config, knob, values):
             cfg['resp_ms'] = float(value)
             cfg['resp_ns'] = _ms_to_ns(value)
             require_positive_latency(cfg['entry_ns'], cfg['resp_ns'])
+        elif knob == 'exchange':
+            if str(value) not in EXCHANGE_KINDS:
+                raise ConfigError(
+                    'sweep value exchange=%s is not one of %s'
+                    % (value, ', '.join(sorted(EXCHANGE_KINDS))))
+            cfg['exchange'] = str(value)
+            cfg['exchange_kind'] = EXCHANGE_KINDS[str(value)]
         else:  # latency-profile
             cfg['latency_profile'] = str(value)
             cfg['entry_ns'], cfg['resp_ns'] = latency_profile_ns(str(value))
@@ -1664,6 +1736,20 @@ def _build_loops():
 _LOOPS = None
 
 
+def apply_exchange_model(asset, exchange):
+    """Set the exchange model on a ``BacktestAsset``.
+
+    Separate from :func:`native_runner` so the choice is testable without the
+    native module: this one line is the whole behavioural difference between
+    ``--exchange no-partial`` and ``--exchange partial``.
+    """
+    if exchange == 'partial':
+        asset.partial_fill_exchange()
+    else:
+        asset.no_partial_fill_exchange()
+    return asset
+
+
 def native_runner(config, manifest, signal):
     """Build the asset with every model set explicitly, then run the strategy."""
     global _LOOPS
@@ -1682,7 +1768,7 @@ def native_runner(config, manifest, signal):
     asset.lot_size(config['lot_size'])
     asset.trading_value_fee_model(config['maker_fee'], config['taker_fee'])
     asset.log_prob_queue_model2()
-    asset.no_partial_fill_exchange()          # PartialFillExchange: AGENTS.md §4.6
+    apply_exchange_model(asset, config['exchange'])
     asset.last_trades_capacity(0)
     asset.latency_offset(0)
     # constant_order_latency is the non-deprecated spelling of constant_latency;

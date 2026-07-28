@@ -512,9 +512,14 @@ pub struct Order {
     /// quantity that is still open or active in the market after any partial fills.
     pub leaves_qty: f64,
     /// Executed quantity, only available when this order is executed.
+    ///
+    /// This is the quantity executed by the single execution the order reports, not the
+    /// cumulative quantity executed by the order: an order that fills in several parts reports
+    /// each part separately, and the parts sum to the order's executed quantity. Backtesting
+    /// relies on this to accumulate an order's fills without double-counting them.
     pub exec_qty: f64,
     /// Executed price in ticks (`executed_price / tick_size`), only available when this order is
-    /// executed.
+    /// executed. It is the price of the execution [`Order::exec_qty`] reports.
     pub exec_price_tick: i64,
     /// Order price in ticks (`price / tick_size`).
     pub price_tick: i64,
@@ -731,6 +736,10 @@ impl Encode for Order {
 }
 
 /// An asynchronous request to [`Connector`](`crate::connector::Connector`).
+///
+/// **Variants may only be appended.** The encoding is `bincode` with no version field, so
+/// the discriminant is positional; inserting a variant renumbers every later one and makes a
+/// connector decode one request as another.
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum LiveRequest {
     /// An order request, a tuple consisting of an asset number and an [`Order`].
@@ -741,6 +750,22 @@ pub enum LiveRequest {
         tick_size: f64,
         lot_size: f64,
     },
+    /// "This bot is still running its event loop."
+    ///
+    /// Sent by [`LiveBot`](crate::live::LiveBot) on a timer from inside `elapse`, and
+    /// carries nothing: the only thing the connector needs is *which* bot sent it, and that
+    /// rides in the IPC user header alongside every other request.
+    ///
+    /// It exists because **a bot's orders outlive the bot**. Measured on a live session
+    /// (2026-07-28), a fill landed 3 s after the bot's `SIGINT` and moved the position;
+    /// until the supervisor restarted it, the venue was hosting an unattended market maker.
+    /// A connector that has seen a bot heartbeat and then stops hearing from it may cancel
+    /// that bot's resting orders — see `connector/src/supervision.rs`.
+    ///
+    /// Being sent from `elapse` is the point: it reports that the strategy loop is *turning*,
+    /// which a live process whose loop has wedged would not do, and which no transport-level
+    /// liveness check could tell apart from health.
+    Heartbeat,
 }
 
 /// Provides state values.
@@ -1058,5 +1083,62 @@ mod tests {
         assert!(!event.is(LOCAL_BID_DEPTH_SNAPSHOT_EVENT));
         assert!(event.is(LOCAL_EVENT));
         assert!(event.is(BUY_EVENT));
+    }
+
+    /// **`LiveRequest` is bincode-encoded with no version field, so a variant may only ever
+    /// be appended.** The discriminant is a varint written first, and inserting a variant
+    /// anywhere but the end silently renumbers every one after it: a connector would decode
+    /// a bot's `RegisterInstrument` as something else and act on it. `AGENTS.md` §2 names
+    /// this rule; this test is what enforces it.
+    ///
+    /// The byte-level assertions are deliberate. A structural round-trip would pass just as
+    /// happily with the variants reordered — only the first byte tells the truth.
+    #[test]
+    fn live_request_variants_are_append_only_on_the_wire() {
+        use crate::types::{LiveRequest, OrdType, Order, Side, TimeInForce};
+
+        let encode = |request: &LiveRequest| {
+            bincode::encode_to_vec(request, bincode::config::standard()).unwrap()
+        };
+
+        let order = encode(&LiveRequest::Order {
+            symbol: "BTC".to_string(),
+            order: Order::new(
+                1,
+                100,
+                0.01,
+                1.0,
+                Side::Buy,
+                OrdType::Limit,
+                TimeInForce::GTC,
+            ),
+        });
+        let register = encode(&LiveRequest::RegisterInstrument {
+            symbol: "BTC".to_string(),
+            tick_size: 0.01,
+            lot_size: 1.0,
+        });
+        let heartbeat = encode(&LiveRequest::Heartbeat);
+
+        assert_eq!(order[0], 0, "Order must stay variant 0");
+        assert_eq!(register[0], 1, "RegisterInstrument must stay variant 1");
+        assert_eq!(
+            heartbeat[0], 2,
+            "Heartbeat must be appended, never inserted: an older connector decodes by \
+             position and would read a renumbered variant as a different request"
+        );
+
+        // A heartbeat carries nothing but its own discriminant. It is sent on a timer by
+        // every live bot, and the connector's only interest is *who* sent it — which rides
+        // in the iceoryx user header, not the payload. One byte also cannot approach
+        // `MAX_PAYLOAD_SIZE`.
+        assert_eq!(heartbeat.len(), 1, "{heartbeat:?}");
+
+        // And each one decodes back to itself, on this side of the wire.
+        for bytes in [&order, &register, &heartbeat] {
+            let (decoded, _): (LiveRequest, usize) =
+                bincode::decode_from_slice(bytes, bincode::config::standard()).unwrap();
+            assert_eq!(encode(&decoded), *bytes);
+        }
     }
 }

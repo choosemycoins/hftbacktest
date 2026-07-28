@@ -136,10 +136,19 @@ where
     /// If it is rejected before reaching the matching engine (as reflected in the order latency
     /// information), `reject` is invoked and the rejection response is appended to the local order
     /// bus.
+    ///
+    /// A request reports no execution, so its execution fields are cleared here. The local builds
+    /// a request from its own copy of the order, which carries the last execution the local
+    /// received and has already applied, and the exchange hands a request straight back as the
+    /// response whenever it rejects it or acknowledges an in-place amendment. Only a response
+    /// from the exchange reports an execution.
     pub fn request<F>(&mut self, mut order: Order, mut reject: F)
     where
         F: FnMut(&mut Order),
     {
+        order.exec_qty = 0.0;
+        order.exec_price_tick = 0;
+
         let order_entry_latency = self.order_latency.entry(order.local_timestamp, &order);
         // Negative latency indicates that the order is rejected for technical reasons, and its
         // value represents the latency that the local experiences when receiving the rejection

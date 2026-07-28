@@ -570,13 +570,24 @@ def test_cli_accepts_a_negative_maker_fee(manifest_path):
     assert args.maker_fee == pytest.approx(-0.00003)
 
 
-def test_partial_fill_exchange_is_not_offered():
-    """AGENTS.md §4.6 — the flag must not exist at all."""
+def test_exchange_model_is_an_explicit_choice(manifest_path):
+    """AGENTS.md §4.6 — banned before the partial-fill fix, a choice after it.
+
+    The default stays no-partial so runs made before the fix stay comparable,
+    and whichever is used carries its provenance.
+    """
     parser = bf.build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(['--manifest', 'x', '--partial-fill-exchange'])
-    for action in parser._actions:
-        assert not any('partial' in s for s in action.option_strings)
+        parser.parse_args(['--manifest', 'x', '--exchange', 'both'])
+
+    cfg = _cfg(manifest_path)
+    assert cfg['exchange'] == 'no-partial'
+    assert cfg['exchange_kind'] == 'NoPartialFillExchange'
+
+    cfg = _cfg(manifest_path, '--exchange', 'partial')
+    assert cfg['exchange'] == 'partial'
+    assert cfg['exchange_kind'] == 'PartialFillExchange'
+    assert cfg['sources']['exchange'] == 'cli'
 
 
 def test_config_defaults_are_recorded_with_their_source(manifest_path):
@@ -706,14 +717,33 @@ def test_results_echo_every_model_choice(manifest_path):
     assert _dig(res, 'models.clock_correction_ns') == m.clock_correction_ns
 
 
-def test_results_state_that_partial_fill_exchange_is_forbidden(manifest_path):
+def test_results_record_the_exchange_choice_and_the_partial_fill_fix(manifest_path):
     m = bf.load_manifest(str(manifest_path))
     cfg = bf.resolve_config(
         bf.build_parser().parse_args(['--manifest', str(manifest_path)]), m)
     res = bf.build_results(cfg, m, fake_stats())
-    note = json.dumps(res['models']['exchange_kind'])
+    block = res['models']['exchange_kind']
+    assert block['kind'] == 'NoPartialFillExchange'
+    assert block['choice'] == 'no-partial'
+    assert block['source'] == cfg['sources']['exchange']
+    note = json.dumps(block)
+    # The history is load-bearing: a reader of an old results file must be able
+    # to tell whether partial fills counted.
     assert 'PartialFillExchange' in note
     assert '4.6' in note
+
+
+def test_results_record_the_gap_partial_fill_exchange_still_has(manifest_path):
+    m = bf.load_manifest(str(manifest_path))
+    cfg = bf.resolve_config(
+        bf.build_parser().parse_args(
+            ['--manifest', str(manifest_path), '--exchange', 'partial']), m)
+    res = bf.build_results(cfg, m, fake_stats())
+    block = res['models']['exchange_kind']
+    assert block['kind'] == 'PartialFillExchange'
+    assert block['choice'] == 'partial'
+    assert block['source'] == 'cli'
+    assert 'IOC' in block['accepted_distortion']
 
 
 def test_results_carry_the_latency_assumption(manifest_path):
@@ -866,6 +896,53 @@ def test_sweep_over_a_latency_profile_moves_only_its_own_fields(manifest_path):
     assert diff <= owned
     assert configs[0]['entry_ns'] == 20 * MS
     assert configs[2]['resp_ns'] == 300 * MS
+
+
+class _RecordingAsset:
+    """Only the two exchange builders exist: a wrong name raises AttributeError."""
+
+    def __init__(self):
+        self.calls = []
+
+    def no_partial_fill_exchange(self):
+        self.calls.append('no_partial_fill_exchange')
+        return self
+
+    def partial_fill_exchange(self):
+        self.calls.append('partial_fill_exchange')
+        return self
+
+
+@pytest.mark.parametrize('exchange, expected', [
+    ('no-partial', 'no_partial_fill_exchange'),
+    ('partial', 'partial_fill_exchange'),
+])
+def test_the_chosen_exchange_model_is_the_one_built(exchange, expected):
+    asset = _RecordingAsset()
+    bf.apply_exchange_model(asset, exchange)
+    assert asset.calls == [expected]
+
+
+def test_sweep_over_the_exchange_model_moves_only_its_own_fields(manifest_path):
+    """The distortion note's own question, now answerable on one dataset."""
+    m = bf.load_manifest(str(manifest_path))
+    base = bf.resolve_config(
+        bf.build_parser().parse_args(['--manifest', str(manifest_path)]), m)
+    configs = bf.sweep_configs(base, 'exchange', ['no-partial', 'partial'])
+    owned = set(bf.SWEEP_KNOBS['exchange'])
+    diff = {k for k in base if configs[0][k] != configs[1][k]}
+    assert diff <= owned, diff
+    assert [c['exchange_kind'] for c in configs] == [
+        'NoPartialFillExchange', 'PartialFillExchange']
+    assert configs[1]['sources']['exchange'] == 'sweep'
+
+
+def test_sweep_rejects_an_unknown_exchange_model(manifest_path):
+    m = bf.load_manifest(str(manifest_path))
+    base = bf.resolve_config(
+        bf.build_parser().parse_args(['--manifest', str(manifest_path)]), m)
+    with pytest.raises(bf.ConfigError):
+        bf.sweep_configs(base, 'exchange', ['no-partial', 'l3'])
 
 
 def test_sweep_marks_its_provenance(manifest_path):
@@ -1245,14 +1322,39 @@ def test_a_manifest_queue_model_that_the_harness_cannot_build_is_refused(tmp_pat
     assert 'queue_model' in str(e.value)
 
 
-def test_a_manifest_asking_for_partial_fill_exchange_is_refused(tmp_path):
+def test_a_manifest_asking_for_partial_fill_exchange_is_honoured(tmp_path):
+    """It was refused before the partial-fill fix; now it is a declaration."""
     p = make_manifest(tmp_path)
     body = json.loads(p.read_text())
     body['backtest_defaults']['exchange_kind'] = {'kind': 'PartialFillExchange'}
     p.write_text(json.dumps(body))
+    cfg = _cfg(p)
+    assert cfg['exchange_kind'] == 'PartialFillExchange'
+    assert cfg['sources']['exchange'] == 'manifest'
+    # ...and the CLI still wins over it, because every manifest Phase 3 writes
+    # names an exchange and the flag would otherwise be unusable.
+    assert _cfg(p, '--exchange', 'no-partial')['exchange_kind'] == \
+        'NoPartialFillExchange'
+
+
+def test_a_manifest_declaring_no_exchange_falls_back_to_the_default(tmp_path):
+    p = make_manifest(tmp_path)
+    body = json.loads(p.read_text())
+    del body['backtest_defaults']['exchange_kind']
+    p.write_text(json.dumps(body))
+    cfg = _cfg(p)
+    assert cfg['exchange'] == bf.DEFAULT_EXCHANGE == 'no-partial'
+    assert cfg['sources']['exchange'] == 'default'
+
+
+def test_a_manifest_asking_for_an_unbuildable_exchange_is_refused(tmp_path):
+    p = make_manifest(tmp_path)
+    body = json.loads(p.read_text())
+    body['backtest_defaults']['exchange_kind'] = {'kind': 'L3NoPartialFillExchange'}
+    p.write_text(json.dumps(body))
     with pytest.raises(bf.ConfigError) as e:
         _cfg(p)
-    assert 'PartialFillExchange' in str(e.value)
+    assert 'L3NoPartialFillExchange' in str(e.value)
 
 
 # ---------------------------------------------------------------------------

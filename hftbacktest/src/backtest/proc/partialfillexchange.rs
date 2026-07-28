@@ -152,7 +152,11 @@ where
                     // q_ahead is negative since is_filled is true and its value represents the
                     // executable quantity of this order after execution in the queue ahead of this
                     // order.
-                    let exec_qty = if filled_qty > order.leaves_qty {
+                    // An execution that takes the whole remaining quantity completes the order,
+                    // including when it takes exactly that quantity: the order must be retired
+                    // here, or it rests on already filled and the next trade at its price
+                    // reaches it.
+                    let exec_qty = if filled_qty >= order.leaves_qty {
                         self.filled_orders.push(order.order_id);
                         order.leaves_qty
                     } else {
@@ -192,7 +196,11 @@ where
                     // q_ahead is negative since is_filled is true and its value represents the
                     // executable quantity of this order after execution in the queue ahead of this
                     // order.
-                    let exec_qty = if filled_qty > order.leaves_qty {
+                    // An execution that takes the whole remaining quantity completes the order,
+                    // including when it takes exactly that quantity: the order must be retired
+                    // here, or it rests on already filled and the next trade at its price
+                    // reaches it.
+                    let exec_qty = if filled_qty >= order.leaves_qty {
                         self.filled_orders.push(order.order_id);
                         order.leaves_qty
                     } else {

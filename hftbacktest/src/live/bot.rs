@@ -56,6 +56,20 @@ pub enum BotError {
 pub type ErrorHandler = Box<dyn Fn(LiveError) -> Result<(), BotError>>;
 pub type OrderRecvHook = Box<dyn Fn(&Order, &Order) -> Result<(), BotError>>;
 
+/// How often a [`LiveBot`] tells its connectors that its event loop is still turning.
+///
+/// One second, against a connector default of ten: the connector only acts after a bot has
+/// been silent for its whole window, so the ratio is the headroom a bot has to be late —
+/// through a slow `elapse`, a stalled feed, a long GC pause on the other side of the
+/// process — before its orders are cancelled underneath it.
+///
+/// The cost is one 1-byte message per instrument per second on a shared-memory queue.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The floor on a single receive, so that a pathologically small heartbeat interval polls
+/// the channel rather than spinning on it. See [`LiveBot::recv_chunk`].
+const MIN_RECV_CHUNK: Duration = Duration::from_millis(1);
+
 fn generate_random_id() -> u64 {
     // Initialize the random number generator
     let mut rng = rand::rng();
@@ -70,6 +84,7 @@ pub struct LiveBotBuilder<MD> {
     instruments: Vec<Instrument<MD>>,
     error_handler: Option<ErrorHandler>,
     order_hook: Option<OrderRecvHook>,
+    heartbeat_interval: Option<Duration>,
 }
 
 impl<MD> Default for LiveBotBuilder<MD> {
@@ -86,6 +101,7 @@ impl<MD> LiveBotBuilder<MD> {
             instruments: Default::default(),
             error_handler: None,
             order_hook: None,
+            heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
         }
     }
 
@@ -128,6 +144,29 @@ impl<MD> LiveBotBuilder<MD> {
         Self { id, ..self }
     }
 
+    /// How often to tell the connectors this bot's event loop is still turning, or `None` to
+    /// say nothing at all. Defaults to [`DEFAULT_HEARTBEAT_INTERVAL`].
+    ///
+    /// **Leaving it on is the safe choice.** A connector that has seen this bot heartbeat
+    /// will cancel its resting orders when it stops hearing from it; a bot that never
+    /// heartbeats is never watched, and its orders keep trading after it dies
+    /// (`connector/src/supervision.rs`).
+    ///
+    /// Switch it off only when pointing at a connector built before
+    /// [`LiveRequest::Heartbeat`] existed: that connector cannot decode the variant and will
+    /// exit on the first one. The two processes are updated as a pair — `AGENTS.md` §2.
+    ///
+    /// **Not reachable from Python.** `py-hftbacktest`'s `build_*_livebot` construct the
+    /// builder themselves and do not surface this, so a Python bot always heartbeats and its
+    /// connector must be new enough to decode the variant. The pairwise upgrade is not
+    /// optional there.
+    pub fn heartbeat_interval(self, interval: Option<Duration>) -> Self {
+        Self {
+            heartbeat_interval: interval,
+            ..self
+        }
+    }
+
     /// Builds a live [`LiveBot`] based on the registered connectors and assets.
     pub fn build<CH>(self) -> Result<LiveBot<CH, MD>, BuildError>
     where
@@ -163,6 +202,8 @@ impl<MD> LiveBotBuilder<MD> {
             instruments: self.instruments,
             error_handler: self.error_handler,
             order_hook: self.order_hook,
+            heartbeat_interval: self.heartbeat_interval,
+            last_heartbeat: None,
         })
     }
 }
@@ -195,6 +236,10 @@ pub struct LiveBot<CH, MD> {
     instruments: Vec<Instrument<MD>>,
     error_handler: Option<ErrorHandler>,
     order_hook: Option<OrderRecvHook>,
+    /// `None` disables the heartbeat. See [`LiveBotBuilder::heartbeat_interval`].
+    heartbeat_interval: Option<Duration>,
+    /// When the last heartbeat went out; `None` until the first one does.
+    last_heartbeat: Option<Instant>,
 }
 
 impl<CH, MD> LiveBot<CH, MD>
@@ -290,19 +335,78 @@ where
         Ok(ElapseResult::Ok)
     }
 
+    /// Tells every connector this bot trades on that its event loop is still turning, if it
+    /// is time to.
+    ///
+    /// One send per instrument, because [`Channel::send`] routes by `inst_no` and the set of
+    /// connectors this bot talks to is exactly the set its instruments live on. Two
+    /// instruments on one connector make this send twice a second instead of once, which is
+    /// two bytes on a shared-memory queue — cheaper than teaching [`Channel`] to enumerate
+    /// its connectors, which nothing else needs.
+    ///
+    /// `now` is passed in rather than read here so that the call sites can reuse a clock
+    /// reading `elapse_` already takes: this runs on the receive loop's hot path.
+    ///
+    /// A failure propagates. It is the same treatment [`Self::submit_order`] gives a failed
+    /// send, and it is the honest one: a bot that cannot reach its connector is a bot whose
+    /// orders that connector is about to cancel.
+    fn heartbeat(&mut self, now: Instant) -> Result<(), BotError> {
+        let Some(interval) = self.heartbeat_interval else {
+            return Ok(());
+        };
+        if self
+            .last_heartbeat
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return Ok(());
+        }
+        for inst_no in 0..self.instruments.len() {
+            self.channel
+                .send(self.id, inst_no, LiveRequest::Heartbeat)?;
+        }
+        self.last_heartbeat = Some(now);
+        Ok(())
+    }
+
+    /// The longest a single [`Channel::recv_timeout`] may block, given how much of the
+    /// `elapse` is left.
+    ///
+    /// **This is what keeps a bot waiting on a silent feed from looking dead.** A receive
+    /// returns when something arrives or when its timeout expires, so an `elapse` that
+    /// receives nothing spends its whole duration inside one call — and the heartbeat is
+    /// sent from around that call, never from within it. Capping the wait at the heartbeat
+    /// interval is what brings the loop back often enough to report. Without it a single
+    /// `wait_order_response` — 60 s, hardcoded by [`Self::submit_order`] and
+    /// [`Bot::cancel`] — says nothing for six times the connector's default liveness
+    /// window, and a healthy bot has its resting orders cancelled underneath it.
+    ///
+    /// With the heartbeat switched off this is the whole remaining duration: nothing is
+    /// waiting to be told anything, so there is nothing to wake up for.
+    fn recv_chunk(&self, remaining: Duration) -> Duration {
+        match self.heartbeat_interval {
+            Some(interval) => remaining.min(interval.max(MIN_RECV_CHUNK)),
+            None => remaining,
+        }
+    }
+
     fn elapse_<const WAIT_NEXT_FEED: bool>(
         &mut self,
         duration: i64,
         wait_order_response: WaitOrderResponse,
     ) -> Result<ElapseResult, BotError> {
         let instant = Instant::now();
+        // On entry, so that a strategy calling `elapse` in a tight loop heartbeats at the
+        // configured interval and no faster, and so that the paths below that `return` from
+        // inside the loop have already reported.
+        self.heartbeat(instant)?;
         let duration = Duration::from_nanos(duration as u64);
         let mut remaining_duration = duration;
         let mut batch_mode = false;
         let mut wait_resp_received = false;
 
         loop {
-            match self.channel.recv_timeout(self.id, remaining_duration) {
+            let chunk = self.recv_chunk(remaining_duration);
+            match self.channel.recv_timeout(self.id, chunk) {
                 Ok((_, LiveEvent::BatchStart)) => {
                     batch_mode = true;
                 }
@@ -337,7 +441,20 @@ where
                     }
                 }
                 Err(BotError::Timeout) => {
-                    return Ok(ElapseResult::Ok);
+                    let elapsed = instant.elapsed();
+                    // Reported before deciding anything: this is the only place a bot with
+                    // nothing to do passes through, and it is where a quiet feed used to go
+                    // silent for the whole `elapse`.
+                    self.heartbeat(instant + elapsed)?;
+                    // A *capped* receive expiring is not this call expiring. Without the cap
+                    // the channel's timeout was the call's, and this is the end of it.
+                    if chunk >= remaining_duration || elapsed >= duration {
+                        return Ok(ElapseResult::Ok);
+                    }
+                    remaining_duration = duration
+                        .saturating_sub(elapsed)
+                        .max(Duration::from_micros(1));
+                    continue;
                 }
                 Err(BotError::Interrupted) => {
                     return Ok(ElapseResult::EndOfData);
@@ -348,6 +465,10 @@ where
             }
 
             let elapsed = instant.elapsed();
+            // Again from inside the loop, so that a single long `elapse` does not look dead
+            // for its whole duration. `instant + elapsed` reuses the reading above rather
+            // than taking another one.
+            self.heartbeat(instant + elapsed)?;
             // While processing events in batch mode, all events in a batch should be processed
             // together without interruption.
             if !batch_mode && elapsed > duration {
@@ -716,14 +837,70 @@ mod tests {
             }
         }
 
-        fn send(
-            &mut self,
-            id: u64,
-            inst_no: usize,
-            request: LiveRequest,
-        ) -> Result<(), BotError> {
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
             self.sent.push((id, inst_no, request));
             Ok(())
+        }
+    }
+
+    /// A `Channel` that goes quiet the way the real one does: `recv_timeout` reports
+    /// `Timeout` only after the whole timeout it was given has passed.
+    ///
+    /// [`MockChannel`] returns instantly instead, which is exactly what hid the bug this
+    /// exists for — `IceoryxUnifiedChannel::recv_timeout` polls until `elapsed > timeout`,
+    /// so one `elapse` against a silent feed blocks for its full duration.
+    struct QuietChannel {
+        sent: Vec<(u64, usize, LiveRequest)>,
+        /// Every timeout `elapse_` asked to block for.
+        waits: Vec<Duration>,
+    }
+
+    impl Channel for QuietChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                sent: Vec::new(),
+                waits: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            self.waits.push(timeout);
+            std::thread::sleep(timeout);
+            Err(BotError::Timeout)
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    fn make_quiet_bot(symbol: &str) -> LiveBot<QuietChannel, HashMapMarketDepth> {
+        LiveBot {
+            id: 42,
+            channel: QuietChannel {
+                sent: Vec::new(),
+                waits: Vec::new(),
+            },
+            instruments: vec![Instrument::new(
+                "mock",
+                symbol,
+                0.01,
+                1.0,
+                HashMapMarketDepth::new(0.01, 1.0),
+                0,
+            )],
+            error_handler: None,
+            order_hook: None,
+            heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
+            last_heartbeat: None,
         }
     }
 
@@ -733,16 +910,7 @@ mod tests {
     ) -> LiveBot<MockChannel, HashMapMarketDepth> {
         let instruments = symbols
             .iter()
-            .map(|s| {
-                Instrument::new(
-                    "mock",
-                    s,
-                    0.01,
-                    1.0,
-                    HashMapMarketDepth::new(0.01, 1.0),
-                    0,
-                )
-            })
+            .map(|s| Instrument::new("mock", s, 0.01, 1.0, HashMapMarketDepth::new(0.01, 1.0), 0))
             .collect();
         LiveBot {
             id: 42,
@@ -750,6 +918,8 @@ mod tests {
             instruments,
             error_handler: None,
             order_hook: None,
+            heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
+            last_heartbeat: None,
         }
     }
 
@@ -844,5 +1014,185 @@ mod tests {
         let mut bot = make_bot(&["BTCUSDT"], vec![]);
         bot.elapse(1_000).unwrap();
         assert!(!bot.snapshot_ready(0));
+    }
+
+    fn heartbeats(bot: &LiveBot<MockChannel, HashMapMarketDepth>) -> Vec<(u64, usize)> {
+        bot.channel
+            .sent
+            .iter()
+            .filter(|(_, _, request)| matches!(request, LiveRequest::Heartbeat))
+            .map(|(id, inst_no, _)| (*id, *inst_no))
+            .collect()
+    }
+
+    /// **The bot must announce itself before anything else can go wrong.** A connector only
+    /// watches a bot that has heartbeated at least once, so the first `elapse` is what arms
+    /// the protection — and it has to reach every connector this bot trades on, which is
+    /// one send per instrument because `Channel::send` routes by `inst_no`.
+    #[test]
+    fn the_first_elapse_heartbeats_every_connector_the_bot_trades_on() {
+        let mut bot = make_bot(&["BTCUSDT", "ETHUSDT"], vec![]);
+        assert!(heartbeats(&bot).is_empty(), "nothing is sent before elapse");
+
+        bot.elapse(1_000).unwrap();
+
+        // The bot's own id rides on each one: it is the key the connector sweeps by.
+        assert_eq!(heartbeats(&bot), vec![(42, 0), (42, 1)]);
+    }
+
+    /// It is a heartbeat, not a flood. `elapse` is called in a tight loop by every strategy
+    /// in this repository; sending on each call would put a message on the IPC queue per
+    /// iteration for no added information.
+    #[test]
+    fn the_heartbeat_does_not_repeat_before_its_interval() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+        bot.heartbeat_interval = Some(Duration::from_secs(30));
+
+        for _ in 0..50 {
+            bot.elapse(1_000).unwrap();
+        }
+
+        assert_eq!(heartbeats(&bot).len(), 1);
+    }
+
+    /// ...and it does repeat once the interval has passed. Driven by moving the recorded
+    /// send back in time rather than by sleeping, so the test is deterministic.
+    #[test]
+    fn the_heartbeat_repeats_once_its_interval_has_passed() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+        bot.heartbeat_interval = Some(Duration::from_millis(100));
+        bot.elapse(1_000).unwrap();
+        assert_eq!(heartbeats(&bot).len(), 1);
+
+        bot.last_heartbeat = Some(Instant::now() - Duration::from_millis(101));
+        bot.elapse(1_000).unwrap();
+        assert_eq!(heartbeats(&bot).len(), 2);
+    }
+
+    /// The opt-out is real. A deployment pointed at a connector that predates
+    /// `LiveRequest::Heartbeat` must be able to stay quiet — an older connector cannot
+    /// decode variant 2 and dies on it.
+    #[test]
+    fn the_heartbeat_can_be_switched_off_entirely() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+        bot.heartbeat_interval = None;
+
+        for _ in 0..10 {
+            bot.elapse(1_000).unwrap();
+        }
+
+        assert!(heartbeats(&bot).is_empty());
+        assert!(bot.last_heartbeat.is_none());
+    }
+
+    /// The default has to be on: a bot that does not heartbeat is a bot whose orders nobody
+    /// will cancel when it dies, and that is the failure this whole mechanism exists for.
+    #[test]
+    fn the_heartbeat_is_on_by_default() {
+        let bot: LiveBotBuilder<HashMapMarketDepth> = LiveBotBuilder::new();
+        assert_eq!(bot.heartbeat_interval, Some(DEFAULT_HEARTBEAT_INTERVAL));
+        assert!(
+            DEFAULT_HEARTBEAT_INTERVAL < Duration::from_secs(10),
+            "the default interval must leave headroom under the connector's default \
+             10 s liveness window"
+        );
+
+        let quiet: LiveBotBuilder<HashMapMarketDepth> =
+            LiveBotBuilder::new().heartbeat_interval(None);
+        assert_eq!(quiet.heartbeat_interval, None);
+    }
+
+    /// A long `elapse` must still heartbeat while it is inside the loop, not only on entry:
+    /// a strategy that elapses for a minute would otherwise look dead for that minute.
+    #[test]
+    fn a_long_elapse_heartbeats_from_inside_its_loop() {
+        // Three events, so the loop body runs three times within one `elapse`.
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, order_event("BTCUSDT", 1, 100.0)),
+                (0, order_event("BTCUSDT", 2, 101.0)),
+                (0, order_event("BTCUSDT", 3, 102.0)),
+            ],
+        );
+        // Due again immediately, so every pass through the loop qualifies.
+        bot.heartbeat_interval = Some(Duration::ZERO);
+
+        // 20 ms rather than a second: a receive is now capped at the heartbeat interval, so
+        // the loop keeps turning for the whole duration instead of ending at the first
+        // `Timeout`, and a second here would be a second of polling in the test suite.
+        bot.elapse(20_000_000).unwrap();
+
+        assert!(
+            heartbeats(&bot).len() > 1,
+            "the heartbeat must be reachable from inside the receive loop, not just at its \
+             head: {:?}",
+            heartbeats(&bot)
+        );
+    }
+
+    fn quiet_heartbeats(bot: &LiveBot<QuietChannel, HashMapMarketDepth>) -> usize {
+        bot.channel
+            .sent
+            .iter()
+            .filter(|(_, _, request)| matches!(request, LiveRequest::Heartbeat))
+            .count()
+    }
+
+    /// **A quiet feed must not look like a dead bot.** This is the case the loop-based test
+    /// above cannot reach: nothing arrives at all, so the loop body never runs, and a single
+    /// `elapse` blocks inside one `recv_timeout` for its whole duration.
+    ///
+    /// It is not a corner case. `submit_order(.., wait = true)` and `cancel(.., wait = true)`
+    /// both call `wait_order_response` with a hardcoded 60 s, and a public stream that has
+    /// stopped delivering (`AGENTS.md` §4.2) is exactly when a strategy sits in
+    /// `wait_next_feed`. At the shipped 10 s connector window a healthy bot would have its
+    /// resting grid cancelled underneath it while it waits for its own order response.
+    #[test]
+    fn a_long_elapse_keeps_heartbeating_even_when_nothing_arrives_at_all() {
+        let mut bot = make_quiet_bot("BTCUSDT");
+        bot.heartbeat_interval = Some(Duration::from_millis(20));
+
+        let started = Instant::now();
+        bot.elapse(200_000_000).unwrap();
+        let blocked_for = started.elapsed();
+
+        assert!(
+            blocked_for >= Duration::from_millis(200),
+            "the elapse must still last its full duration: {blocked_for:?}"
+        );
+        assert!(
+            quiet_heartbeats(&bot) >= 5,
+            "a bot waiting on a silent feed is alive and must say so; it heartbeated \
+             {} time(s) in {blocked_for:?} with a 20 ms interval",
+            quiet_heartbeats(&bot)
+        );
+        // ...and it says so by coming back often, not by blocking for the whole duration.
+        assert!(
+            bot.channel
+                .waits
+                .iter()
+                .all(|wait| *wait <= Duration::from_millis(20)),
+            "no single receive may outlast the heartbeat interval: {:?}",
+            bot.channel.waits
+        );
+    }
+
+    /// The opt-out keeps the old shape exactly: one receive for the whole duration, and no
+    /// waking up to say anything. A bot pointed at a connector that predates the heartbeat
+    /// must not pay for a mechanism it has switched off.
+    #[test]
+    fn a_bot_with_the_heartbeat_off_still_blocks_for_the_whole_elapse() {
+        let mut bot = make_quiet_bot("BTCUSDT");
+        bot.heartbeat_interval = None;
+
+        bot.elapse(30_000_000).unwrap();
+
+        assert_eq!(quiet_heartbeats(&bot), 0);
+        assert_eq!(
+            bot.channel.waits,
+            vec![Duration::from_millis(30)],
+            "with no heartbeat there is nothing to wake up for"
+        );
     }
 }

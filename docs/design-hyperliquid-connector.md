@@ -1249,3 +1249,182 @@ this connector (7 min quoting wide — order path only; 15.75 min quoting at the
 - Operational: HL closes any socket that has **sent** nothing for 60 s (`1000 Inactive`);
   WebSocket-protocol pings do not reset that timer, only the app-level
   `{"method":"ping"}` — this connector does it correctly, but every future tool must too.
+
+---
+
+## 12. Supervision: the orderly stop, and bot liveness (2026-07-29)
+
+Two of §11.14's opened questions, closed. Both are **generic** — they live in
+`connector/src/supervision.rs` and `connector/src/main.rs`, apply to every backend, and only
+their venue-facing half is Hyperliquid's.
+
+### 12.1 The stop has an order, and the publish task is last in it
+
+A clean `SIGINT` always ended in a panic and `exit(1)`, so a supervisor could not tell a stop
+from a crash. The tempting fix — stop unwrapping `pub_tx.send(..)` — is the wrong one twice
+over: it would make an *unexpected* publish-task death silent, which is the failure those
+`unwrap`s exist to make loud (`AGENTS.md` §4.7), and it would leave a stream task publishing
+into a channel nobody reads.
+
+The cause was ordering, not the `unwrap`s. `run_publish_task` returned the instant the
+shutdown signal arrived, dropping the receiver while every stream task was still running and
+still sending. So the ordering was inverted instead, and **not one `unwrap` was touched**:
+
+1. `run_receive_task` sees `stopping` and returns — the connector stops accepting bot
+   requests before it starts cancelling anything. Checked *before* the receive, so a request
+   already sitting on the queue is not acted on either.
+2. The registered instruments are swept, if `shutdown.sweep_orders` (default on).
+3. `Connector::shutdown` winds the backend's stream tasks down.
+4. `supervision::drain_publish` publishes what is left and then waits for **every** sender to
+   be dropped.
+5. `main` calls `exit(0)` — and the publish task is still parked holding the receiver, which
+   `exit` does not drop.
+
+Step 5 is what makes it airtight rather than merely likelier: on the orderly path a
+send-after-close is not unlikely, it is impossible, because the receiver outlives the
+process. The unexpected path is untouched and still panics into `exit(1)`; a test pins that
+(`an_unexpected_publish_task_death_still_panics_a_production_sender`) so a later "cleanup" of
+the `unwrap`s fails CI-less review. The test drives a real send site — the order path's
+`expire_and_report` — because the first version of it built its own channel and unwrapped its
+own send, which asserted a property of `tokio` and would have survived exactly the change it
+was documented as preventing.
+
+**The sweep is waited for, and it has its own budget (`shutdown.sweep_timeout_ms`, 30 s).**
+The signal handler now only sets `stopping`; `main` sequences the rest and wakes the publish
+task *after* the sweep, so the publish task is in its ordinary loop while cancels are landing
+and their confirmations reach whichever bots are still listening. `Connector::sweep` returns
+its `JoinHandle` so that "the sweep finished" is observable at all. While the sweep and the
+stream wind-down shared `grace_ms`, a sweep whose per-symbol allowance is 20 s was given 5 s
+for all of them, and a stop that cut it off mid-POST still reported success — the one
+diagnosable symptom being an `info!` line that never printed.
+
+**The drain has a deadline (`shutdown.grace_ms`, 5 s) because three of the four backends do
+not implement `Connector::shutdown`.** Their stream tasks are spawned without a handle and
+loop for ever, so their senders never drop. A drain that waited would fix the panic on
+Hyperliquid and hang everywhere else. With the deadline they exit 0 too, just after the wait.
+Keeping it separate from the sweep's budget is what lets it stay short: raising a single
+shared knob past `CANCEL_BUDGET` would have added 20 s to every Bybit stop to protect a sweep
+Bybit does not implement.
+
+**`exit(0)` is reserved for a stop that kept its promises.** `supervision::exit_code` reads a
+`StopReport`, and four endings are failures: a receive loop that ended on its own, a sweep
+that ran out of time (orders may still be resting — the very thing being prevented), a
+`PublishFailed` drain, and a publish task that vanished without reporting. That last one is
+racing its own panic hook's `exit(1)`; agreeing with it is what stops the race from deciding
+whether the supervisor sees a crash or a clean stop. `GraceElapsed` is *not* a failure — it
+is the normal ending on three backends.
+
+**A registration is not answered once the connector is stopping.**
+`supervision::publishable_while_stopping` drops queued `RegisterInstrument` events, because a
+registration ends in `SnapshotComplete` — "your state is settled, you may submit" — and the
+receive task has already stopped reading requests. Everything else queued is a fact and still
+goes out.
+
+**A receive loop that ends without a signal exits 1.** It means the iceoryx node failed and
+the connector can serve no bot; it still sweeps — an unserved bot's orders are as unattended
+as a dead bot's — but it is not a clean stop and does not claim to be. The node error itself
+is logged where it happens, since that exit code is otherwise unactionable.
+
+**The runtime is built with a floor of two workers.** `run_receive_task` is synchronous and
+busy-loops for the connector's life, holding a worker throughout; on a 1-vCPU host (or with
+`TOKIO_WORKER_THREADS=1`) that is the only worker, and the death sweep — `tokio::spawn`ed
+from inside that loop — would never be polled while the registry recorded it as swept. The
+signal handler would never run either.
+
+Rejected: `notify_waiters()` for the shutdown signal. It drops the notification when nobody
+is waiting yet, so a signal arriving before the publish task reaches its `select!` would be
+lost and the connector would ignore its own SIGTERM. `notify_one()` stores a permit.
+
+### 12.2 Bot liveness is an application heartbeat, and iceoryx was asked first
+
+A fill landed 3 s after the bot's `SIGINT` and moved the position. The sweep fires on
+*re-registration*, so between a bot's death and its supervisor's restart the venue hosts an
+unattended market maker.
+
+**iceoryx2 0.6.1 was investigated first, and it does have peer-death detection:**
+`Node::list()` yields `NodeState::Dead` off a file-lock monitoring token (`node/mod.rs:357,
+871`), `DeadNodeView::remove_stale_resources()` and `Node::cleanup_dead_nodes()` reap it
+(`:499, :957`, run automatically on node creation and destruction —
+`config.rs:409`), and a publish-subscribe service's `dynamic_config()` reports
+`number_of_subscribers()` and lists each subscriber's `NodeId`
+(`dynamic_config/publish_subscribe.rs:76, 156, 169`). The `notifier_dead_event` and deadline
+machinery is `event`-service only (`config.rs:301`, `waitset.rs`); these channels are
+publish-subscribe.
+
+It was rejected on three counts, in order of weight:
+
+- **It is not attributable.** The policy is "cancel the orders of the instruments *this bot*
+  registered", and the connector's key for that is the bot id in the IPC user header — a
+  random `u64` the bot mints for itself (`live/bot.rs:59`). Nothing iceoryx exposes carries
+  it: a `SubscriberDetails` carries a `NodeId`, and no message carries a `NodeId`. With two
+  bots on one connector, node liveness can only say *somebody* left, which supports a
+  coarser policy than the one wanted.
+- **It cannot see a wedged bot.** A process whose `elapse` loop has stopped turning holds a
+  perfectly healthy node and subscriber, and its resting orders are exactly as unattended as
+  a dead process's. `LiveRequest::Heartbeat` is sent **from inside `elapse`**, so it reports
+  the loop rather than the process — strictly more than any transport-level check could.
+- **Detection would mean system-wide GC on a timer.** `Node::list`/`cleanup_dead_nodes` take
+  cleaner locks and remove *other processes'* stale resources, with latency that is not ours
+  to bound. That is a peculiar side effect for a trading-safety decision.
+
+So `LiveRequest::Heartbeat` was **appended** to the enum — variant 2, after `Order` (0) and
+`RegisterInstrument` (1) — and pinned byte-for-byte by
+`live_request_variants_are_append_only_on_the_wire`, because the encoding is `bincode` with
+no version field and an inserted variant silently renumbers the rest. It carries no payload:
+the only thing the connector needs is who sent it, and that is already in the header. One
+byte, so `MAX_PAYLOAD_SIZE` is not in question.
+
+**A bot is watched only after it has heartbeated.** This is the decision that makes the
+feature safe to deploy: arming on *registration* instead would cancel the live orders of
+every healthy bot too old to know the variant, the moment the connector was upgraded. Armed
+by the bot, never assumed.
+
+On detected death, after `bot_liveness.timeout_ms` (default 10 s): sweep that bot's
+instruments, log it at `error`, and **keep the connector up** for the restarted bot to
+reconnect to. Swept once per silence, not once per poll, and a heartbeat re-arms — a bot
+declared dead by a window too short for it is watched again rather than abandoned. Entries
+are forgotten five minutes after that (`DEAD_BOT_RETENTION`), because a restarted bot mints a
+fresh id and a crash loop would otherwise grow the map for the connector's life.
+
+**What "that bot's instruments" can mean.** Not "that bot's orders": a venue cancel reaches
+every order the *account* holds on a symbol, and nothing on the venue records which bot
+placed one, because `Connector::submit` is never told a bot id — `run_receive_task` discards
+it. So `BotRegistry::take_dead` hands the sweep only the symbols **no live bot is quoting**,
+and names the rest (`DeadBot { symbols, shared }`) so an operator learns that orders were
+left and why. The alternative — sweeping the coin anyway — flattens a healthy market maker's
+grid to tidy up after a dead one, silently from that bot's point of view, and it is the same
+hazard `private_stream.rs` already refuses on the registration path. The claim that the
+heartbeat "buys attribution" is therefore narrower than it looks: it attributes *symbols* to
+bots, which is all the connector can act on. Threading a bot id through `submit` and the
+order manager is what would widen it, and nothing needs that yet.
+
+**The residual exposure is about ten seconds, not zero.** Detection is
+`bot_liveness.timeout_ms` plus up to `LIVENESS_POLL_INTERVAL` (250 ms) plus the sweep's own
+REST round trip. §11.14's measured incident — a fill 3 s after the bot's `SIGINT` — sits
+inside that window and would still happen. What changed is the ceiling: from "until the
+supervisor restarts the bot" to ~10 s. That number is the input to choosing `timeout_ms` for
+a real deployment, and it cannot go much below the bot's heartbeat interval without sweeping
+healthy bots.
+
+### 12.3 What is deliberately not built
+
+- **No sweep on Bybit, Binance USD-M or Binance Spot.** Both hooks are implemented as
+  documented no-ops that say what they are not doing. Bybit already cancels venue-side on
+  every subscribe-ack and every registration, so its *restart* case is covered from a
+  different direction and regressing that to add this one would be a poor trade; its
+  death-to-restart window remains open. Recorded in `AGENTS.md` §4.7.
+- **No `Connector::shutdown` for those three.** Their stream tasks would need a cancellation
+  path threaded through each; the grace deadline makes that optional rather than urgent.
+- **No dead-man's switch** (§5.11) — still the right long-term answer for the case where the
+  *connector itself* is killed with `SIGKILL` and can sweep nothing. Everything here assumes
+  the connector gets to run its own shutdown.
+- **No bot id on `Connector::submit`.** It is what would make a sweep attributable to one bot
+  rather than to a symbol (§12.2), and it touches the trait, all four backends and every
+  order manager. Until something needs it, the registry refuses the ambiguous case instead.
+
+One thing on the bot's side had to change with it: `LiveBot` caps each `recv_timeout` at its
+heartbeat interval (`recv_chunk`). The heartbeat is sent from around the receive, never from
+inside it, so an `elapse` that receives *nothing* used to say nothing for its whole duration —
+measured, one heartbeat in 60 s — and `submit_order(.., wait = true)` hardcodes exactly that
+60 s. A healthy bot waiting for its own order response on a quiet feed was six times over the
+default window. With the heartbeat switched off the old shape is kept exactly.

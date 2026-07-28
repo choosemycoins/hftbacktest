@@ -99,7 +99,18 @@ where
             }
 
             // Processes receiving order response.
-            if order.status == Status::Filled {
+            //
+            // A response reports an execution when its status is [`Status::Filled`] or
+            // [`Status::PartiallyFilled`] and it carries an executed quantity. `exec_qty` is the
+            // quantity executed by that single execution, not the cumulative one, so applying
+            // every execution response accumulates the order's fills without double-counting.
+            //
+            // Requests carry no execution — `LocalToExch::request` clears their execution fields
+            // — so a request the exchange hands back, on a rejection or on an acknowledgement,
+            // cannot be mistaken for one.
+            if (order.status == Status::Filled || order.status == Status::PartiallyFilled)
+                && order.exec_qty > 0.0
+            {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.
@@ -196,10 +207,15 @@ where
 
         let orig_price_tick = order.price_tick;
         let orig_qty = order.qty;
+        let orig_leaves_qty = order.leaves_qty;
 
         let price_tick = (price / self.depth.tick_size()).round() as i64;
         order.price_tick = price_tick;
         order.qty = qty;
+        // The amended quantity is the quantity the order rests for. The exchange re-rests the
+        // order when the amendment changes its price, and it rests whatever `leaves_qty` the
+        // request carries.
+        order.leaves_qty = qty;
 
         order.req = Status::Replaced;
         order.local_timestamp = current_timestamp;
@@ -208,6 +224,7 @@ where
             order.req = Status::Rejected;
             order.price_tick = orig_price_tick;
             order.qty = orig_qty;
+            order.leaves_qty = orig_leaves_qty;
         });
 
         Ok(())

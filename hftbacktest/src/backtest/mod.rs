@@ -1153,21 +1153,40 @@ mod test {
         backtest::{
             Backtest,
             DataSource,
+            ExchangeKind,
             ExchangeKind::NoPartialFillExchange,
             L2AssetBuilder,
+            L3AssetBuilder,
             assettype::LinearAsset,
             data::Data,
             models::{
                 CommonFees,
                 ConstantLatency,
+                L3FIFOQueueModel,
                 PowerProbQueueFunc3,
                 ProbQueueModel,
+                RiskAdverseQueueModel,
                 TradingValueFeeModel,
             },
         },
         depth::HashMapMarketDepth,
         prelude::{Bot, Event},
-        types::{EXCH_EVENT, LOCAL_EVENT},
+        types::{
+            EXCH_ASK_DEPTH_EVENT,
+            EXCH_BID_ADD_ORDER_EVENT,
+            EXCH_BID_DEPTH_EVENT,
+            EXCH_BUY_TRADE_EVENT,
+            EXCH_EVENT,
+            LOCAL_ASK_DEPTH_EVENT,
+            LOCAL_BID_ADD_ORDER_EVENT,
+            LOCAL_BID_DEPTH_EVENT,
+            LOCAL_BUY_TRADE_EVENT,
+            LOCAL_EVENT,
+            OrdType,
+            OrderId,
+            Status,
+            TimeInForce,
+        },
     };
 
     #[test]
@@ -1241,6 +1260,392 @@ mod test {
 
         backtester.elapse_bt(1)?;
         assert_eq!(3, backtester.cur_ts);
+
+        Ok(())
+    }
+
+    //
+    // Fill accounting: the local state must account for every execution the exchange reports,
+    // exactly once.
+    //
+
+    const TICK_SIZE: f64 = 0.01;
+    const LOT_SIZE: f64 = 1.0;
+    const BID_PRICE: f64 = 100.00;
+    /// The price of the resting sell order, which is also the best ask.
+    const ASK_PRICE: f64 = 100.01;
+    /// The quantity resting ahead of the order in the queue.
+    const QUEUE_AHEAD_QTY: f64 = 5.0;
+    const ORDER_QTY: f64 = 10.0;
+    const ORDER_ID: OrderId = 1;
+    const LATENCY: i64 = 10_000_000;
+    const SEC: i64 = 1_000_000_000;
+    const MAKER_FEE: f64 = 0.0002;
+
+    fn feed_event(ev: u64, ts: i64, px: f64, qty: f64) -> Event {
+        Event {
+            ev,
+            exch_ts: ts,
+            local_ts: ts,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    /// The initial book followed by buy trades at [`ASK_PRICE`], given as `(timestamp, quantity)`.
+    fn feed(trades: &[(i64, f64)]) -> Vec<Event> {
+        let mut events = vec![
+            feed_event(
+                LOCAL_BID_DEPTH_EVENT | EXCH_BID_DEPTH_EVENT,
+                0,
+                BID_PRICE,
+                10.0,
+            ),
+            feed_event(
+                LOCAL_ASK_DEPTH_EVENT | EXCH_ASK_DEPTH_EVENT,
+                0,
+                ASK_PRICE,
+                QUEUE_AHEAD_QTY,
+            ),
+        ];
+        events.extend(trades.iter().map(|&(ts, qty)| {
+            feed_event(
+                LOCAL_BUY_TRADE_EVENT | EXCH_BUY_TRADE_EVENT,
+                ts,
+                ASK_PRICE,
+                qty,
+            )
+        }));
+        events
+    }
+
+    /// A single asset using [`RiskAdverseQueueModel`], whose queue position advances only by trades
+    /// at the order's own price. That makes each trade's executable quantity exactly
+    /// `traded qty - queue ahead`, so partial executions are deterministic.
+    fn backtest(
+        exch_kind: ExchangeKind,
+        events: &[Event],
+    ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
+        Ok(Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(Data::from_data(events))])
+                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(exch_kind)
+                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT_SIZE))
+                    .build()?,
+            )
+            .build()?)
+    }
+
+    /// Rests the sell order behind [`QUEUE_AHEAD_QTY`] and waits for the exchange acknowledgement.
+    fn submit_resting_sell(bt: &mut Backtest<HashMapMarketDepth>) -> Result<(), Box<dyn Error>> {
+        bt.elapse(0)?;
+        bt.submit_sell_order(
+            0,
+            ORDER_ID,
+            ASK_PRICE,
+            ORDER_QTY,
+            TimeInForce::GTX,
+            OrdType::Limit,
+            true,
+        )?;
+        assert_eq!(bt.orders(0).get(&ORDER_ID).unwrap().status, Status::New);
+        Ok(())
+    }
+
+    /// Asserts the state that a sell of `sold` at [`ASK_PRICE`], executed as a maker in
+    /// `num_trades` executions, must produce.
+    fn assert_sold(bt: &Backtest<HashMapMarketDepth>, sold: f64, num_trades: i64) {
+        let values = bt.state_values(0);
+        let value = ASK_PRICE * sold;
+        assert_eq!(values.position, -sold, "position");
+        assert_eq!(values.num_trades, num_trades, "num_trades");
+        assert_eq!(values.trading_volume, sold, "trading_volume");
+        assert!(
+            (values.trading_value - value).abs() < 1e-9,
+            "trading_value: expected {value}, got {}",
+            values.trading_value
+        );
+        assert!(
+            (values.balance - value).abs() < 1e-9,
+            "balance: expected {value}, got {}",
+            values.balance
+        );
+        let fee = MAKER_FEE * value;
+        assert!(
+            (values.fee - fee).abs() < 1e-9,
+            "fee: expected {fee}, got {}",
+            values.fee
+        );
+    }
+
+    /// [`PartialFillExchange`] reports each execution of an order separately, and `exec_qty` is the
+    /// quantity executed by that single execution. The local state must accumulate them.
+    #[test]
+    fn partial_fills_accumulate_in_the_local_state() -> Result<(), Box<dyn Error>> {
+        // 5 rests ahead of the order, so the trades execute 3, then 4, then the remaining 3.
+        let feed = feed(&[(SEC, 8.0), (2 * SEC, 4.0), (3 * SEC, 5.0)]);
+        let mut bt = backtest(ExchangeKind::PartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::PartiallyFilled);
+        assert_eq!(order.leaves_qty, 7.0);
+        assert_eq!(order.exec_qty, 3.0);
+        assert_sold(&bt, 3.0, 1);
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::PartiallyFilled);
+        assert_eq!(order.leaves_qty, 3.0);
+        assert_eq!(order.exec_qty, 4.0);
+        assert_sold(&bt, 7.0, 2);
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.exec_qty, 3.0);
+        assert_sold(&bt, ORDER_QTY, 3);
+
+        Ok(())
+    }
+
+    /// The case that silently lost the position: the remainder is canceled, so the completing
+    /// `Filled` response never arrives, and the partial is all there ever is.
+    #[test]
+    fn partial_fill_survives_the_cancellation_of_the_remainder() -> Result<(), Box<dyn Error>> {
+        let feed = feed(&[(SEC, 8.0), (2 * SEC, 8.0)]);
+        let mut bt = backtest(ExchangeKind::PartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        assert_sold(&bt, 3.0, 1);
+
+        bt.cancel(0, ORDER_ID, true)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Canceled);
+        assert_eq!(order.leaves_qty, 7.0);
+        assert_sold(&bt, 3.0, 1);
+
+        // The canceled remainder must not execute against the later trade either.
+        bt.elapse(2 * SEC)?;
+        assert_sold(&bt, 3.0, 1);
+
+        Ok(())
+    }
+
+    /// An acknowledgement is not an execution: modifying a partially filled order echoes its
+    /// status back to the local, and applying that echo would count the partial twice.
+    #[test]
+    fn modify_acknowledgement_does_not_reapply_the_partial_fill() -> Result<(), Box<dyn Error>> {
+        let feed = feed(&[(SEC, 8.0)]);
+        let mut bt = backtest(ExchangeKind::PartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        assert_sold(&bt, 3.0, 1);
+
+        // Same price and a quantity below the remaining 7, so the exchange amends the resting
+        // order in place instead of replacing it.
+        bt.modify(0, ORDER_ID, ASK_PRICE, 5.0, true)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.leaves_qty, 5.0);
+        assert_sold(&bt, 3.0, 1);
+
+        Ok(())
+    }
+
+    /// [`NoPartialFillExchange`] executes the whole remaining quantity regardless of the traded
+    /// quantity; only the single `Filled` response exists, and it must be applied once.
+    #[test]
+    fn no_partial_fill_exchange_executes_the_whole_order_at_once() -> Result<(), Box<dyn Error>> {
+        let feed = feed(&[(SEC, 8.0)]);
+        let mut bt = backtest(NoPartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.leaves_qty, 0.0);
+        // Only 3 of the traded 8 was executable by queue position, yet the whole order fills.
+        assert_eq!(order.exec_qty, ORDER_QTY);
+        assert_sold(&bt, ORDER_QTY, 1);
+
+        Ok(())
+    }
+
+    /// A rejected request carries no execution: the exchange has no record of the order, so it
+    /// echoes the local's own copy back, execution fields and all.
+    #[test]
+    fn rejected_cancel_does_not_reapply_the_fill() -> Result<(), Box<dyn Error>> {
+        let feed = feed(&[(SEC, 8.0)]);
+        let mut bt = backtest(NoPartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        assert_sold(&bt, ORDER_QTY, 1);
+
+        // The order is already gone at the exchange, so this cancel is rejected.
+        bt.cancel(0, ORDER_ID, true)?;
+        assert_sold(&bt, ORDER_QTY, 1);
+
+        Ok(())
+    }
+
+    /// The L3 twin of [`rejected_cancel_does_not_reapply_the_fill`]. `L3Local` shares the response
+    /// handling with `Local`, but `L3AssetBuilder` supports [`NoPartialFillExchange`] only, so a
+    /// partial execution cannot reach it; the rejected echo can.
+    #[test]
+    fn l3_rejected_cancel_does_not_reapply_the_fill() -> Result<(), Box<dyn Error>> {
+        let l3_event = |ev: u64, ts: i64, order_id: u64, px: f64, qty: f64| Event {
+            ev,
+            exch_ts: ts,
+            local_ts: ts,
+            px,
+            qty,
+            order_id,
+            ival: 0,
+            fval: 0.0,
+        };
+        let events = [
+            l3_event(
+                LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
+                0,
+                1000,
+                BID_PRICE,
+                10.0,
+            ),
+            // Lifts the best bid to the resting sell order's price, crossing it.
+            l3_event(
+                LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
+                SEC,
+                1001,
+                ASK_PRICE,
+                10.0,
+            ),
+        ];
+        let mut bt = Backtest::builder()
+            .add_asset(
+                L3AssetBuilder::default()
+                    .data(vec![DataSource::Data(Data::from_data(&events))])
+                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
+                    .queue_model(L3FIFOQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT_SIZE))
+                    .build()?,
+            )
+            .build()?;
+
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        assert_eq!(bt.orders(0).get(&ORDER_ID).unwrap().status, Status::Filled);
+        assert_sold(&bt, ORDER_QTY, 1);
+
+        bt.cancel(0, ORDER_ID, true)?;
+        assert_sold(&bt, ORDER_QTY, 1);
+
+        Ok(())
+    }
+
+    /// An execution that takes exactly the remaining quantity completes the order, and the
+    /// exchange must retire it like any other completed order. Otherwise it rests on, already
+    /// [`Status::Filled`], until the next trade at its price reaches it and aborts the entire
+    /// backtest with [`BacktestError::InvalidOrderStatus`]. Exact remainders are ordinary with
+    /// integer lot sizes.
+    #[test]
+    fn an_execution_that_exactly_consumes_the_remainder_completes_the_order()
+    -> Result<(), Box<dyn Error>> {
+        // 5 rests ahead of the order, so the trades execute 3, then exactly the remaining 7.
+        let feed = feed(&[(SEC, 8.0), (2 * SEC, 7.0), (3 * SEC, 4.0)]);
+        let mut bt = backtest(ExchangeKind::PartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        assert_sold(&bt, 3.0, 1);
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.exec_qty, 7.0);
+        assert_sold(&bt, ORDER_QTY, 2);
+
+        // The order is gone from the exchange, so the next trade at its price passes it by.
+        bt.elapse(SEC)?;
+        assert_sold(&bt, ORDER_QTY, 2);
+
+        Ok(())
+    }
+
+    /// Amending the price makes the exchange re-rest the order, and it must re-rest the
+    /// amended quantity. `Local::modify` sets the order's `qty`, but the quantity that
+    /// actually trades is its `leaves_qty`.
+    #[test]
+    fn amending_the_price_rests_the_amended_quantity() -> Result<(), Box<dyn Error>> {
+        let amended_price = ASK_PRICE + TICK_SIZE;
+        let amended_qty = 5.0;
+
+        let mut events = feed(&[]);
+        events.push(feed_event(
+            LOCAL_BUY_TRADE_EVENT | EXCH_BUY_TRADE_EVENT,
+            SEC,
+            amended_price,
+            20.0,
+        ));
+        let mut bt = backtest(ExchangeKind::PartialFillExchange, &events)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.modify(0, ORDER_ID, amended_price, amended_qty, true)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.qty, amended_qty);
+        assert_eq!(order.leaves_qty, amended_qty);
+
+        // Nothing rests ahead at the amended price and the trade is larger than the whole
+        // order, so whatever rests is what fills.
+        bt.elapse(2 * SEC)?;
+        assert_eq!(bt.orders(0).get(&ORDER_ID).unwrap().status, Status::Filled);
+        assert_eq!(bt.state_values(0).position, -amended_qty, "position");
+        assert_eq!(
+            bt.state_values(0).trading_volume,
+            amended_qty,
+            "trading_volume"
+        );
+
+        Ok(())
+    }
+
+    /// The re-resting counterpart of [`modify_acknowledgement_does_not_reapply_the_partial_fill`]:
+    /// whichever way the exchange handles the amendment, the acknowledgement reports no
+    /// execution. A request carries the local's copy of the last execution, which the local has
+    /// already applied.
+    #[test]
+    fn amending_the_price_of_a_partially_filled_order_reports_no_execution()
+    -> Result<(), Box<dyn Error>> {
+        let feed = feed(&[(SEC, 8.0)]);
+        let mut bt = backtest(ExchangeKind::PartialFillExchange, &feed)?;
+        submit_resting_sell(&mut bt)?;
+
+        bt.elapse(SEC)?;
+        assert_sold(&bt, 3.0, 1);
+
+        bt.modify(0, ORDER_ID, ASK_PRICE + TICK_SIZE, 5.0, true)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::New);
+        assert_eq!(order.leaves_qty, 5.0);
+        assert_eq!(order.exec_qty, 0.0);
+        assert_sold(&bt, 3.0, 1);
 
         Ok(())
     }
