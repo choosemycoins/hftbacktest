@@ -11,6 +11,14 @@ Documentation=file:///opt/hft-collector/current/README.md
 After=network-online.target
 Wants=network-online.target
 
+# Every failure alerts (Telegram via deploy/alert.sh). Wired UNCONDITIONALLY:
+# on a host without /opt/hft-collector/etc/alert.env the hook logs "alert not
+# sent" and exits 0, so an unconfigured deployment loses nothing — and a
+# configured one cannot forget to wire it. Credentials are operator-authored,
+# never in git: see deploy/alert.env.example. %n passes the FULL failed unit
+# name, which is what alert.sh expects and rate-limits on.
+OnFailure=hft-collector-alert@%n.service
+
 # Every recorded line is stamped with Utc::now() and the output file is chosen
 # by UTC date, so starting before the clock is disciplined can misdate a file
 # and, worse, cause a spurious rotation when the clock steps.
@@ -112,14 +120,13 @@ PrivateTmp=true
 NoNewPrivileges=true
 ReadWritePaths=/opt/hft-collector/data
 
-# Remote alerting hangs off unit failure, because that is what the collector
-# is built to produce: it exits non-zero on a disk floor breach, an unknown
-# symbol, or a write error, rather than degrading quietly. Point this at
-# whatever notifies you and the disk guard becomes an alert instead of a
-# silent stop. Create the target separately; it is intentionally not shipped
-# here, since the notification mechanism is site-specific.
-#
-#   OnFailure=hft-collector-alert@%i.service
+# Remote alerting hangs off unit failure (OnFailure= in [Unit] above), because
+# that is what the collector is built to produce: it exits non-zero on a disk
+# floor breach, an unknown symbol, or a write error, rather than degrading
+# quietly. The delivery mechanism IS shipped now — deploy/alert.sh +
+# hft-collector-alert@.service — only the credentials stay site-specific
+# (deploy/alert.env.example describes them, including the dead-man heartbeat
+# URL the daily gate pings).
 #
 # The other half is the sidecar: plain text, flushed per record, carrying a
 # `{"_collector":"disk","free_bytes":…}` line every minute. Ship it with the
