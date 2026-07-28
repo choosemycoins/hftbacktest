@@ -51,7 +51,15 @@ echo "${now}" > "${STAMP}"
 
 HOST=$(hostname)
 STATE=$(systemctl show "${FAILED_UNIT}" -p ActiveState,SubState,ExecMainStatus 2>/dev/null | tr '\n' ' ')
-JOURNAL=$(journalctl -u "${FAILED_UNIT}" -n 12 --no-pager -o short-iso 2>/dev/null | tail -c 2500)
+# Two subtleties, both hit in testing:
+# 1. OnFailure starts this hook in the same instant the unit fails, and
+#    journald flushes asynchronously — reading immediately can miss the very
+#    lines of the failure that triggered us. A short sleep lets them land.
+# 2. A plain `-n N` scoops up lines from PREVIOUS failures of the same unit,
+#    so an alert could carry last week's journal. `--since` scopes it to the
+#    incident at hand; `-n` stays only as a size cap.
+sleep 2
+JOURNAL=$(journalctl -u "${FAILED_UNIT}" --since "-5 min" -n 15 --no-pager -o short-iso 2>/dev/null | tail -c 2500)
 
 TEXT="🔴 ${FAILED_UNIT} failed on ${HOST}
 ${STATE}
