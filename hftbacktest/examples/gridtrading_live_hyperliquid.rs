@@ -334,12 +334,16 @@ fn main() {
         return;
     }
 
-    // 0.08% either side: wide enough that a 3-level grid sits clear of the touch and does
-    // not requote on every tick, which is the whole point on a venue that charges for
-    // requoting.
-    let relative_half_spread = 0.0008;
-    let relative_grid_interval = 0.0008;
-    let grid_num = 3;
+    // 0.008% either side — about $5 at a BTC near 63,700, which is inside the venue's own
+    // half-spread, so `bid_price.min(best_bid)` / `ask_price.max(best_ask)` clamp the quotes
+    // onto the touch. That is deliberate: the previous rehearsal at 0.08% ($51 off mid) sat
+    // wider than the entire session's price range and never filled once, which proves the
+    // order path only up to the ack. Quoting at the touch is what makes a fill — and hence
+    // the position, fee and reconcile paths — observable. It costs more requoting, which is
+    // the trade being made knowingly.
+    let relative_half_spread = 0.00008;
+    let relative_grid_interval = 0.00008;
+    let grid_num = 2;
     let skew = relative_half_spread / grid_num as f64;
     let max_position = grid_num as f64 * ORDER_QTY;
 

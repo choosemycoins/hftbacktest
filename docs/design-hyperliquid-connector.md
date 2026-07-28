@@ -1208,3 +1208,44 @@ It is replaced throughout with the well-known Hardhat account #1 that `signing.r
 uses. `connector/` is written to be upstreamable and a committed fixture should not name a
 trading account; nothing else in the captures is edited, and the properties they pin are
 untouched.
+
+### 11.14 Live grid sessions on testnet (2026-07-28): what trading proved
+
+Two supervised sessions of `hftbacktest/examples/gridtrading_live_hyperliquid.rs` through
+this connector (7 min quoting wide — order path only; 15.75 min quoting at the touch —
+20 fills, $226 notional, max |position| 0.00077 BTC, ended flat, zero venue errors).
+
+**Closed questions:**
+
+- **UTA reconcile gap does not exist.** The account is `unifiedAccount` (account
+  abstraction mode; spot USDC collateralizes perps directly, `usdClassTransfer` no longer
+  applies). `clearinghouseState.assetPositions` populated **294 ms** after the first fill
+  and `webData2` agreed; `accountValue` under UTA reads *drawn margin*, so 0 on a funded
+  idle account is normal — any margin pre-flight must branch on
+  `{"type":"userAbstraction"}` and read capacity from
+  `spotClearinghouseState.tokenToAvailableAfterMaintenance`.
+- **The maker-fee assumption is now a measurement.** 19/19 maker fills at
+  **0.014996%** (paid, no rebate) — base tier exactly; the one taker (the flatten) at
+  0.044999%. Session PnL −$0.0358 cross-checked against the spot balance to 5e-5: the
+  symmetric grid paid fees without edge, which is a fee measurement, not a strategy verdict.
+
+**Opened questions (each a real risk, none HL-review-findable from code alone):**
+
+- **`connect_policy="cancel_all"` + HL's ~10-minute socket expiry = the grid is wiped
+  every ~10 minutes** (`ConnectionAbort("Expired (1000)")` observed on both streams; the
+  reconnect sweep cancelled 2 live orders). Self-heals in one requote under supervision,
+  but **unattended runs need `reconcile`** — empirical support for this note's default.
+- **Orders outlive the bot *and keep trading*.** A fill landed 3 s after the bot's SIGINT,
+  moving the position before any sweep could run. The sweep fires on *re-registration*,
+  so between a bot death and its supervisor restart the venue hosts an unattended market
+  maker. Mitigations to weigh: a teardown sweep in the bot path, or bot-liveness detection
+  in the connector.
+- **Partial fills are routine** (5 of 20; one order filled in two pieces 2.7 s apart) —
+  which makes `AGENTS.md` §4.6 (PartialFillExchange's dropped partials in backtest) a
+  live-vs-backtest divergence for exactly this strategy class, not a corner case.
+- **Shutdown ends in a panic** (see the new §4.7 entry in `AGENTS.md`): supervisors must
+  treat exit-on-SIGINT as a stop for now; ordered shutdown in `connector/src/main.rs` is
+  the real fix.
+- Operational: HL closes any socket that has **sent** nothing for 60 s (`1000 Inactive`);
+  WebSocket-protocol pings do not reset that timer, only the app-level
+  `{"method":"ping"}` — this connector does it correctly, but every future tool must too.
