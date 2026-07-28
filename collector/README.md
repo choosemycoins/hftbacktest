@@ -96,12 +96,12 @@ cadences and neither is sufficient alone. Measured on mainnet 2026-07-25:
 The plain feed updates the book roughly three times a minute, which is not
 usable for backtesting an HFT strategy; the fast feed is only five levels deep.
 The venue accepts both subscriptions on one connection, so the collector records
-both, side by side and unmerged. The converter then selects exactly one with its
-`book_mode` argument and drops the other; **fusing the two cadences is not
-implemented** and `hyperliquid.convert` raises on any other value. Recording
-both is what keeps the choice open, and revisitable. Messages from the fast feed
-carry `"fast": true` in their payload, which is how they are told apart on the
-way back out.
+both, side by side and unmerged. The converter selects one with its `book_mode`
+argument and drops the other, or — with `book_mode='bbo+fast'` — folds the `bbo`
+touch feed into the fast cadence, which is the pairing the live connector is
+specified on. Recording all three is what keeps the choice open, and
+revisitable. Messages from the fast feed carry `"fast": true` in their payload,
+which is how they are told apart on the way back out.
 
 Symbol case is passed through verbatim to the venue. Binance stream names are
 lowercase (`btcusdt`), Bybit and Hyperliquid want uppercase (`BTCUSDT`, `BTC`).
@@ -294,8 +294,13 @@ deflate sync point but no member trailer, so a reader still rejects the file
 until the member is closed at shutdown. Measured over a 12-minute run, a
 gzipped meta stream stayed at 10 bytes on disk the whole time and materialised
 only on exit — no use for diagnosing a live problem, and lost entirely to a
-SIGKILL. At ~90 KB/day it does not need compressing. The different extension
-also keeps it out of the `*_<date>.gz` wildcards that feed the converters.
+SIGKILL. It does not need compressing either: the three minutely
+[host gauges](#host-gauges-clock-and-per-symbol-liveness) dominate its steady
+state at ~420–490 bytes a minute — `disk` ~112 B, `clock` ~129 B, `liveness`
+~180 B for thirteen symbols, measured 2026-07-28 — which is ~0.6 MB a day
+against 22 MB a day for one Hyperliquid coin. Lifecycle records add to that only
+when something happens. The different extension also keeps it out of the
+`*_<date>.gz` wildcards that feed the converters.
 
 ```bash
 tail -f /opt/hft-collector/data/hyperliquid/_meta_hyperliquid_$(date -u +%Y%m%d).jsonl
@@ -367,6 +372,15 @@ Binance acks nothing at all — the subscription is the URL it is dialled with �
 so on those three venues the `_collector` records are the only account of the
 session there is.
 
+Alongside those events the sidecar carries the collector's **gauges** —
+`disk`, `clock` and `liveness`, all written on one minute timer, plus
+`universe` once at startup on Hyperliquid. They are measurements of the host,
+not events in the recording's life, and the difference is load-bearing: a
+minutely gauge lands inside every hole longer than a minute whatever caused it,
+so `quality_report.py` refuses to let one explain a gap. See
+[Running out of space](#running-out-of-space) and
+[Host gauges](#host-gauges-clock-and-per-symbol-liveness).
+
 This is what turns an unexplained gap into a diagnosable one. A recording made
 against a deliberately invalid symbol now reads:
 
@@ -431,16 +445,25 @@ data = bybit.convert_fused(
 data = bybit.convert_depth('btcusdt_20260725.gz')
 ```
 
-For Hyperliquid, pick which book cadence to convert — the two cannot be mixed:
+For Hyperliquid, pick which depth stream to convert:
 
 ```python
 from hftbacktest.data.utils import hyperliquid
 
 data = hyperliquid.convert(
     'btc_20260725.gz', tick_size=1.0, lot_size=0.00001,
-    num_levels=20, book_mode='slow',   # or num_levels=5, book_mode='fast'
+    num_levels=5, book_mode='bbo+fast',   # or 20/'slow', or 5/'fast'
 )
 ```
+
+| `book_mode` | `num_levels` | depth from | top of book from |
+|---|---|---|---|
+| `slow` | 20 | `l2Book` plain, ~5.4 s | the same |
+| `fast` | 5 | `l2Book` `fast`, ~0.54 s | the same |
+| `bbo+fast` | 5 | `l2Book` `fast`, ~0.54 s | `bbo`, median 86 ms |
+
+The pair is not free to choose: `DiffOrderBookSnapshot` preallocates exactly
+`num_levels` rows, so a mismatch is refused.
 
 The sidecar is `.jsonl`, so a `<dir>/*_<date>.gz` loop will not pick it up.
 Independently of that, `hyperliquid.convert` raises on a recording that yields zero rows rather
@@ -469,9 +492,36 @@ overlap), and the exposed window per rotation is ~8 s for BTC and ~2 min for ENA
 interleaved stream would delete levels 6–20 on every fast message and restore
 them on the next slow one. `book_mode` selects one cadence and drops the other;
 it defaults to `'slow'`, which is exactly how recordings made before the fast
-feed existed behave. **Genuine fusion of the two cadences is not implemented
-yet** — `bybit.convert_fused` plus `FuseMarketDepth` is the pattern it would
-follow.
+feed existed behave.
+
+The two `l2Book` cadences still cannot be mixed with each other — nothing has
+changed there. `'bbo+fast'` fuses a different pair: the five-level `fast`
+cadence with the one-level `bbo` touch feed, which the earlier converter dropped
+in silence even though it is the majority of frames by count (655 873 of 978 751
+on `btc_20260727`). The fused book is a top-5 window in which `bbo` is
+authoritative about the touch — mirrored levels past a new best are emitted as
+deletions, which is also what keeps the book uncrossed when a `bbo` arrives
+through a mirror up to ~0.54 s stale — and each `fast` snapshot is diffed
+against the book *as the `bbo` frames left it*, so a level the touch moved and
+the snapshot moved back is not silently swallowed. Rows are ordinary
+`DEPTH_EVENT`s: the backtest's `Local` processor ignores `DEPTH_BBO_EVENT`.
+Measured on `btc_20260727`: 9.6 s to convert the day against 5.6 s for `fast`
+alone, 2 110 186 rows against 1 478 946, and the gap between emitted depth rows
+drops from a 540 ms median to 81 ms.
+
+Two things about the fused book are easy to get wrong. `delete_out_of_book=False`
+is **refused** for `'bbo+fast'`: suppressing a truncation deletion drops the
+level from the fused book's mirror at the same moment, so nothing can ever
+delete it afterwards and it crosses the book as soon as the market moves through
+it — 1 684 955 of 1 685 014 depth rows left the book crossed when measured with
+the flag off. And the book is thin more often than "a top-N window jitters at
+the deepest level" suggests: a `bbo` that moves the touch *through* mirrored
+levels deletes all of them, and nothing restores them until the next `fast`
+snapshot. Time-weighted over that day the fused book holds five levels a side
+96.9 % of the time and **one level 0.64 %** of it, about nine minutes; `fast`
+alone is five levels 100 % of the same span. `num_levels` must match the chosen
+cadence (`slow`=20, `fast`=5, `bbo+fast`=5) — a mispairing raises rather than
+returning a book of the wrong depth.
 
 The index/funding feeds are **skipped by every converter unless asked for**,
 so adding them changed no existing output. `binancefutures.convert` has a
@@ -934,12 +984,118 @@ host or the network.
 **What it still does not catch**, and must not be mistaken for:
 
 - a dead depth stream while trades keep arriving, or the reverse;
-- one symbol of ten that stopped;
 - one Hyperliquid cadence stopping while the other two continue;
 - a partially accepted subscription — indistinguishable from a full one here.
 
+"One symbol of ten that stopped" used to be on that list. It is now the
+[per-symbol liveness gauge](#host-gauges-clock-and-per-symbol-liveness) below,
+which warns but deliberately does not stop the collector.
+
 Answering *did we get everything we asked for* is an offline report over
 finished files, not a decision this process can make about itself.
+
+### Host gauges: clock and per-symbol liveness
+
+Two measurements written to the sidecar on the **same one-minute timer as the
+disk gauge**, for the same reason: a recording that carries its own history
+needs no metrics agent, and `_meta` is the one file an operator can tail live.
+Neither ever stops the collector.
+
+| Record | Says | Warns when |
+|---|---|---|
+| `{"_collector":"clock", …}` | `sync`, `est_error_us`, `max_error_us`, `offset_us`, `freq_ppm` | the kernel reports `STA_UNSYNC`, or `max_error_us` > 4 000 000 |
+| `{"_collector":"liveness", …}` | `threshold_s`, and `ages_s` — seconds since anything was recorded, per symbol | one symbol's age passes `--liveness-timeout-s` |
+
+Both warnings are **edge-triggered**: once when the fault starts, once when it
+clears. A fault that lasts hours is one line in the journal, not sixty an hour.
+
+#### Clock discipline
+
+Every line in every file is stamped with the host's clock at receive time, and
+nothing checked that the host's clock meant anything. On 2026-07-27 a box came
+back from a reboot undisciplined, recorded a full day, and the offline time
+policy rejected all of it on a −7.04 ms local-versus-exchange skew — discovered
+at assembly time, a day after the only moment it could have been fixed.
+
+The gauge reads `adjtimex(2)`, which is the **kernel's** view of the clock
+`Utc::now()` actually reads. Not `chronyc tracking`: that is chrony's model of
+the correction it is about to apply, one step removed from what stamped the
+line, and a chrony running happily while failing to discipline the kernel is
+exactly the reboot case. It is also one unprivileged syscall rather than a
+subprocess a minute, and it works identically under `systemd-timesyncd`.
+
+The **4 s `max_error_us` threshold** is set where a false alarm is impossible,
+not where a small skew is caught. The kernel grows `maxerror` by 500 µs/s
+between updates and every daemon resets it on a successful poll, so the widest
+legitimate excursion is `maxpoll × 500 µs` — ~512 ms under chrony's default
+1024 s `maxpoll`, but **~1.024 s under `systemd-timesyncd`**, whose
+`PollIntervalMaxSec` is 2048 s. Both are read here, so the threshold has to
+clear both: 4 s is a quarter of the kernel's own saturation at 16 s, so it still
+reports four times sooner than the kernel would, with room for a few missed
+polls. A 7 ms skew is **not** what this warns about — no threshold that caught
+7 ms could stay quiet on a healthy host. The five recorded numbers are how a
+7 ms skew is found, exactly and after the fact.
+
+Off Linux there is no `adjtimex`, so the record is
+`{"_collector":"clock","unsupported":true,"platform":"macos"}` rather than a
+healthy-looking reading. A dev run must not be able to produce a recording that
+claims a disciplined clock.
+
+**What an operator does.** `journalctl` says *"the host clock is not
+disciplined"*. Check `chronyc tracking` / `timedatectl show-timesync`, and
+whether the time service came up at all after the last reboot. The data being
+recorded is still worth keeping — fix the clock and the next sample clears the
+alarm — but note the window: everything stamped inside it is suspect, and
+`quality_report.py` raises a yellow `clock_unsynced` note over exactly that
+window when the day is checked.
+
+#### Per-symbol liveness
+
+`--stall-timeout-min` fires only on **total** silence, so nine symbols arriving
+and one silent looks perfectly healthy. `ages_s` is seconds since anything was
+last written for each symbol, and a symbol whose age passes the threshold gets
+one warning.
+
+It is **seeded with the symbols that were asked for**, aged from startup. The
+worst version of the fault is a subscription the venue accepted for nine of ten
+symbols: the tenth never produces a single record, so a gauge that only knew
+about symbols it had seen would have nothing to report.
+
+`--liveness-timeout-s` defaults to the slowest feed the venue serves *per
+symbol*, since any one of a symbol's streams resets its clock:
+
+| Venue | Default | Why |
+|---|---|---|
+| `hyperliquid` | 60 s | `activeAssetCtx` is per coin at ~1/s and always on |
+| `binancefuturescm` | 60 s | the same, via `$symbol@markPrice@1s` |
+| everything else | 300 s | order flow only, where a thin symbol is legitimately quiet; USD-M's `premiumIndex` is the collector's own poller and does not count |
+
+`0` disables the **warning** and not the measurement: `ages_s` is still
+recorded, because an operator silencing a noisy alarm has not asked to stop
+recording what the collector saw.
+
+**It counts what the venue sent**, on exactly the same terms as the stall
+watchdog — sidecar records under `_meta` do not count, and neither do the
+`premiumIndex` poller's, which file under `BTCUSDT` like any WebSocket frame and
+keep arriving with the socket dead.
+
+**It is per symbol, not per symbol × stream.** The writer only ever sees
+`(timestamp, symbol, payload)`, and the stream is inside the payload. Each
+backend already knows it — it parses every frame anyway — so the cost is not a
+parse but carrying the name: an extra owned string per record across the writer
+hop at up to ~20 000 msg/s, for a number read once a minute, or an interning
+scheme threaded through five parsers and the queue's element type. Until that is
+done, "depth died while trades flow" stays a limitation of this process and a
+job for the offline report. "One coin went quiet" is caught here.
+
+**What an operator does.** `journalctl` names the symbol and its age. Check
+`_meta` for a `disconnected`/`connected` pair near that minute — a reconnect
+that failed to resubscribe hits every symbol, so one symbol alone points at the
+venue dropping a subscription instead. Restarting the instance re-subscribes
+everything and costs the usual second or two of gap; that is the fix in almost
+every case. If it is one thin symbol in a quiet market, raise
+`--liveness-timeout-s` for that instance rather than learning to ignore the
+warning.
 
 ---
 

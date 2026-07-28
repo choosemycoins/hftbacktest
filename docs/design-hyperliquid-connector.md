@@ -227,13 +227,33 @@ implementation detail: **with the public feed, only the top N levels are trustwo
 
 Default `l2Book` at ~5 s is a reconciliation feed at best; do not build on it.
 
-**UNVERIFIED / needs a decision at implementation time:** whether interleaving `bbo` and
-`l2Book` into one mirror can transiently cross the book (a `bbo` ask below a mirrored bid).
-The connector already owns a `FusedHashMapMarketDepth` per symbol in `main.rs`, which has
-crossing-resolution logic; the cleanest answer is probably to feed both streams into the
-existing fusion rather than hand-rolling a second mirror. That needs prototyping — note
-that fusion's own generated deletion events lack the `LOCAL_EVENT` bit (`AGENTS.md` §4.7),
-which would have to be fixed for this path to work.
+**Crossing: measured, and answered offline.** The question was whether interleaving `bbo`
+and `l2Book` into one mirror can transiently cross the book. It can, and often: on
+`btc_20260727`, **~4.6 % of `bbo` frames** (30 410 bids, 30 700 asks of 655 873) arrive
+through the last `l2Book fast` snapshot's touch — the mirror is up to ~0.54 s stale, which
+is many ticks.
+
+The offline converter now implements this fusion (`hyperliquid.convert`,
+`book_mode='bbo+fast'`; Phase 5b of
+[`design-multi-venue-collection.md`](design-multi-venue-collection.md)), and the rule that
+resolves it is worth reusing verbatim: **`bbo` is authoritative about the touch.** Delete
+every mirrored bid above the new best bid and every mirrored ask below the new best ask,
+emit those deletions *before* the new touch, and the book is uncrossed after every
+individual event rather than only at the end of a batch. Verified by replaying a whole
+converted day row by row: 1 764 199 depth rows, zero crossings, on both the exchange and
+the local ordering.
+
+Two supporting measurements from the same day: `bbo` never sent a locked or crossed quote
+of its own (655 873/655 873 had bid < ask), and never sent a `null` side — though the
+field is typed nullable, so a null must be treated as "no news about that side", not as an
+empty one.
+
+The connector-side decision is still open: reuse the existing per-symbol
+`FusedHashMapMarketDepth` in `main.rs`, or port the converter's mirror. Note that fusion's
+own generated deletion events lack the `LOCAL_EVENT` bit (`AGENTS.md` §4.7), which would
+have to be fixed for that path to work — the Python converter sidesteps it because
+`correct_event_order` stamps both bits on every row on the way out, and nothing equivalent
+runs live.
 
 ### 5.3 Register the finest tick; enforce the significant-figure rule at submit
 

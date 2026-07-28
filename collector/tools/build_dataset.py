@@ -29,7 +29,10 @@ What it does, in the order the design doc requires:
    shift happened after all. How many replayed trades the converter dropped
    (Hyperliquid resends the last 30 fills per coin on every resubscribe) is read
    back and recorded under ``converter.deduplicated_trades``; a converter that
-   cannot report it records ``null``, never a zero.
+   cannot report it records ``null``, never a zero. Under a fusing ``book_mode``
+   the ``bbo`` frames folded into the book are read back the same way into
+   ``converter.bbo_depth_frames``, and a reported **zero** refuses the build: it
+   means the mode produced the plain ``l2Book`` book under another name.
 5. **Signal array** built straight from the raw ``@bookTicker`` frames — no
    converter is involved on the Binance side in mode A.
 6. **No initial snapshot** (§3.4). The window's days go to one ``BacktestAsset``
@@ -87,12 +90,46 @@ SIGNAL_VENUE = 'binancefuturesum'
 #: bounds check (``difforderbooksnapshot.py:35-41,67-72``), so a 20-level
 #: snapshot fed to a 5-level differ overruns. The pair is fixed in
 #: ``collector/README.md:275``.
-BOOK_MODE_LEVELS = {'slow': 20, 'fast': 5}
+#:
+#: ``bbo+fast`` reads the same five-level cadence as ``fast`` and additionally
+#: folds the one-level ``bbo`` feed into the top of book, which is what the live
+#: connector is specified on (design-multi-venue-collection.md, Phase 5b).
+BOOK_MODE_LEVELS = {'slow': 20, 'fast': 5, 'bbo+fast': 5}
+
+#: Book modes whose depth stream includes the ``bbo`` channel. Anything else
+#: converts ``l2Book`` only and drops ``bbo`` frames.
+BBO_BOOK_MODES = frozenset({'bbo+fast'})
 
 #: Defaults for the strategy's book-staleness guard (Phase 4). Measured cadences
 #: are ~5.4 s (slow) and ~0.54 s (fast) — ``collector/README.md:83-88`` — so these
 #: sit roughly two intervals above the median.
-BOOK_MODE_MAX_AGE_MS = {'slow': 12_000, 'fast': 1_500}
+#:
+#: ``bbo+fast`` keeps the ``fast`` number rather than scaling to the ``bbo``
+#: cadence (median 86 ms between frames on btc_20260727). ``bbo`` is
+#: event-driven, so a long gap in it means the touch did not move, not that the
+#: book went stale, and a threshold near its median would block trading on an
+#: ordinary quiet market.
+#:
+#: **What the guard measures, and what it therefore misses.** It watches
+#: ``last_book_change`` — the instant the *best* bid/ask price or quantity last
+#: changed (``backtest_first.py``, the loops' book-change block). It does not
+#: watch depth, and it does not watch either feed by name. Under ``fast`` the
+#: touch can only come from the periodic snapshot, so the guard doubles as a
+#: liveness check on that feed. Under ``bbo+fast`` the touch also comes from
+#: ``bbo``, so a stalled ``l2Book fast`` with a live ``bbo`` is only partly
+#: visible to it. Measured on btc_20260727, gaps between top-of-book changes:
+#: ``fast`` median 541 ms, p99.9 1850 ms, 672 gaps over 1500 ms; ``bbo+fast``
+#: median 97 ms, p99.9 1234 ms, 301 gaps over 1500 ms. Same day, the ``l2Book
+#: fast`` feed itself had 34 holes over 1500 ms (max 16.3 s) and 144 ``bbo``
+#: frames fell inside them — enough to shorten those holes, not to hide them.
+#:
+#: The liveness of ``l2Book fast`` is checked where the raw frames are, not
+#: here: ``quality_report.MAX_GAP_NS[(hyperliquid, 'l2Book_fast')]`` is 5.4 s
+#: and a red report refuses the build outright. Holes in the 1.5-5.4 s band are
+#: covered by neither — a known limitation of a touch-based guard on a fused
+#: feed, recorded so nobody reads this threshold as more than it is. A second
+#: cadence limit here would only give two limits that drift apart.
+BOOK_MODE_MAX_AGE_MS = {'slow': 12_000, 'fast': 1_500, 'bbo+fast': 1_500}
 
 SIGNAL_COLUMNS = ['bid_px', 'bid_qty', 'ask_px', 'ask_qty']
 
@@ -608,8 +645,13 @@ class FileScan:
     min_latency_line: Optional[int] = None
     violation: Optional[LatencyViolation] = None
     #: frames the converter will actually consume: trades + the selected
-    #: ``l2Book`` cadence, restricted to the window.
+    #: ``l2Book`` cadence (+ ``bbo`` under a fusing mode), restricted to the
+    #: window.
     converted_frames: int = 0
+    #: of those, the ``l2Book`` frames alone. Depth comes only from these: a day
+    #: with trades and ``bbo`` but no snapshot of the chosen cadence converts to
+    #: a book one level deep, which is not the dataset that was asked for.
+    converted_book_frames: int = 0
     converted_min_latency_ns: Optional[int] = None
     converted_local: array = field(default_factory=lambda: array('q'))
     converted_exch: array = field(default_factory=lambda: array('q'))
@@ -623,6 +665,7 @@ class FileScan:
             'min_local_minus_exch_ns': self.min_latency_ns,
             'min_local_minus_exch_line': self.min_latency_line,
             'converted_frames_in_window': self.converted_frames,
+            'converted_l2book_frames_in_window': self.converted_book_frames,
             'converted_min_local_minus_exch_ns': self.converted_min_latency_ns,
         }
 
@@ -637,8 +680,9 @@ def scan_hl_time_policy(
 
     Every frame that carries a venue timestamp counts — ``l2Book`` and ``bbo``
     (``data.time``) and each entry of a ``trades`` array (``time``), all in
-    milliseconds. ``bbo`` is included even though ``hyperliquid.convert`` drops
-    it silently: a negative latency there is still a clock step in the recording,
+    milliseconds. Under a ``book_mode`` that does not read ``bbo`` the frames
+    still count towards the file's minimum, just not towards the *converted*
+    one: a negative latency there is a clock step in the recording either way,
     i.e. data to investigate, not to quietly convert.
 
     Scanning a file stops at its first violation — the caller is going to refuse
@@ -656,26 +700,28 @@ def scan_hl_time_policy(
             channel = msg.get('channel')
             data = msg.get('data')
 
-            samples: list[tuple[int, bool]] = []  # (exch_ts_ns, converted?)
+            samples: list[tuple[int, bool, bool]] = []  # (exch_ts_ns, converted?, l2Book?)
             if channel == 'trades' and isinstance(data, list):
                 for trade in data:
                     t = trade.get('time') if isinstance(trade, dict) else None
                     if t is None:
                         scan.frames_without_ts += 1
                         continue
-                    samples.append((int(t) * exch_ts_multiplier, True))
+                    samples.append((int(t) * exch_ts_multiplier, True, False))
             elif channel in ('l2Book', 'bbo') and isinstance(data, dict):
                 t = data.get('time')
                 if t is None:
                     scan.frames_without_ts += 1
                 else:
                     is_fast = bool(data.get('fast', False))
-                    converted = channel == 'l2Book' and (
-                        (book_mode == 'fast') == is_fast
-                    )
-                    samples.append((int(t) * exch_ts_multiplier, converted))
+                    if channel == 'bbo':
+                        converted = book_mode in BBO_BOOK_MODES
+                    else:
+                        converted = (book_mode != 'slow') == is_fast
+                    samples.append((int(t) * exch_ts_multiplier, converted,
+                                    channel == 'l2Book'))
 
-            for exch_ts, converted in samples:
+            for exch_ts, converted, is_book in samples:
                 scan.frames_with_ts += 1
                 latency = rec.local_ts - exch_ts
                 if scan.min_latency_ns is None or latency < scan.min_latency_ns:
@@ -683,6 +729,8 @@ def scan_hl_time_policy(
                     scan.min_latency_line = rec.line_no
                 if converted and window.contains(rec.local_ts):
                     scan.converted_frames += 1
+                    if is_book:
+                        scan.converted_book_frames += 1
                     scan.converted_local.append(rec.local_ts)
                     scan.converted_exch.append(exch_ts)
                     if (scan.converted_min_latency_ns is None
@@ -828,6 +876,21 @@ def total_deduplicated_trades(hl_outputs: Sequence[dict]) -> Optional[int]:
     return int(sum(counts))
 
 
+def total_bbo_depth_frames(hl_outputs: Sequence[dict]) -> Optional[int]:
+    """``bbo`` frames fused into the book across the window, or ``None`` if unknown.
+
+    Same rule as :func:`total_deduplicated_trades`: a day that reported nothing
+    makes the total unknown rather than smaller. Under a fusing ``book_mode``
+    this is the only evidence in the manifest that the touch feed was read at
+    all — the converter prints it, and a printed line does not survive into a
+    dataset anyone later has to trust.
+    """
+    counts = [out.get('bbo_depth_frames') for out in hl_outputs]
+    if not counts or any(c is None for c in counts):
+        return None
+    return int(sum(counts))
+
+
 def convert_hl_day(
         src: Path,
         out_npz: Path,
@@ -854,9 +917,23 @@ def convert_hl_day(
         return None
     if scan.converted_frames == 0:
         raise BuildError(
-            '%s has %d lines inside the window but no %r-cadence l2Book or trade '
-            'frames. Either book_mode is wrong for this recording or the day is '
-            'unusable.' % (src, kept, book_mode)
+            '%s has %d lines inside the window but no frame %r reads (its l2Book '
+            'cadence%s, or a trade). Either book_mode is wrong for this recording '
+            'or the day is unusable.'
+            % (src, kept, book_mode,
+               ', or a bbo frame' if book_mode in BBO_BOOK_MODES else '')
+        )
+    if scan.converted_book_frames == 0:
+        # Depth comes from l2Book and nowhere else. Trades carry none, and bbo
+        # carries one level a side — a build on those alone would produce a
+        # dataset whose book has no depth to queue against, and say nothing.
+        # The cadences are selected at recording time (`--hl-l2-modes`), so this
+        # is a recording that never had what the mode needs.
+        raise BuildError(
+            '%s has %d lines inside the window but not one l2Book frame of the '
+            'cadence %r reads. Depth comes only from l2Book, so this would build '
+            'a dataset with no book depth. Check --hl-l2-modes for the recording '
+            'and --book-mode for the build.' % (src, kept, book_mode)
         )
 
     _step('converting %s (%d lines in window, book_mode=%s, num_levels=%d)'
@@ -889,6 +966,29 @@ def convert_hl_day(
     )
     shift_check = assert_no_silent_shift(arr, scan)
 
+    bbo_depth_frames = _optional_int(stats.get('bbo_depth_frames'))
+    if book_mode in BBO_BOOK_MODES and bbo_depth_frames == 0:
+        # Fail closed on the mirror image of the `converted_book_frames` guard
+        # above. A window can hold the l2Book cadence and trades and no usable
+        # `bbo` — a partially accepted subscription (`collector/README.md` lists
+        # it as undetectable at record time), or a reconnect that dropped only
+        # that topic. Every frame count stays healthy, the dataset comes out
+        # byte-identical to `book_mode='fast'`, and the manifest declares
+        # `bbo+fast` — degraded and indistinguishable from correct.
+        raise BuildError(
+            '%s converted with book_mode=%r but the converter fused 0 bbo frames '
+            'into the book, so the result is the %r book under another name. '
+            'Check the recording actually carries bbo frames inside the window.'
+            % (src, book_mode, 'fast')
+        )
+    if book_mode in BBO_BOOK_MODES and bbo_depth_frames is None:
+        # Not a refusal: "did not report" is not "fused nothing", and an older
+        # installed converter has no way to report. It does mean the manifest
+        # cannot show the fusion happened, which is worth one line in the log.
+        _warn('the installed hftbacktest converter does not report '
+              'bbo_depth_frames; nothing will attest that book_mode=%r fused '
+              'anything' % book_mode)
+
     post_min = None
     if clock_correction_ns:
         arr['local_ts'] += np.int64(clock_correction_ns)
@@ -906,6 +1006,7 @@ def convert_hl_day(
         'path': str(out_npz),
         'rows': int(len(arr)),
         'deduplicated_trades': _optional_int(stats.get('deduplicated_trades')),
+        'bbo_depth_frames': bbo_depth_frames,
         'source': str(src),
         'trimmed_source': str(trimmed),
         'lines_in_window': kept,
@@ -1063,6 +1164,7 @@ def converter_identity(
         delete_out_of_book: bool,
         exch_ts_multiplier: int,
         deduplicated_trades: Optional[int] = None,
+        bbo_depth_frames: Optional[int] = None,
 ) -> dict:
     """Which converter code produced the ``.npz`` files, and with which knobs.
 
@@ -1106,6 +1208,13 @@ def converter_identity(
         # rotation replays the previous day's fills, which this number does not
         # cover. See `hyperliquid.convert` and `collector/README.md`.
         'deduplicated_trades': deduplicated_trades,
+        # `bbo` frames the converter folded into the book, summed over the days
+        # of the window. Zero under a fusing `book_mode` is refused at build
+        # time, so a number here is the manifest's only evidence that the mode
+        # did what its name says; `null` means the converter did not report it.
+        # Outside the fusing modes the converter reads no bbo frames and zero is
+        # the correct answer.
+        'bbo_depth_frames': bbo_depth_frames,
         'snapshot_module': None,   # no snapshot is built — see `snapshots.note`
     }
 
@@ -1143,10 +1252,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help='binancefuturesum symbol of the signal instrument, e.g. BTCUSDT.')
     p.add_argument('--out-dir', required=True, type=Path)
     p.add_argument('--book-mode', choices=sorted(BOOK_MODE_LEVELS), default='slow',
-                   help='Which l2Book cadence to convert. Default: slow.')
+                   help='Which depth stream to convert: one l2Book cadence, or '
+                        '"bbo+fast" for the fast cadence with the bbo touch feed '
+                        'fused in — the pairing the live connector is specified '
+                        'on. Default: slow.')
     p.add_argument('--num-levels', type=int, default=None,
-                   help='Snapshot depth. Must match --book-mode (slow=20, fast=5); '
-                        'omit to take the paired default.')
+                   help='Snapshot depth. Must match --book-mode (slow=20, fast=5, '
+                        'bbo+fast=5); omit to take the paired default.')
     p.add_argument('--tick-size', type=float, default=None)
     p.add_argument('--lot-size', type=float, default=None,
                    help='Give both --tick-size and --lot-size, or neither and let '
@@ -1232,6 +1344,17 @@ def build(args: argparse.Namespace,
             'and writes len(bid_px) without a bounds check '
             '(difforderbooksnapshot.py:35-41), so the pair is not free to choose.'
             % (args.num_levels, args.book_mode, num_levels)
+        )
+    if args.book_mode in BBO_BOOK_MODES and not args.delete_out_of_book:
+        # The converter refuses this pair too, but only once it is running —
+        # after the time policy has read every raw file. Refuse it here, where
+        # the other pairings are checked, so the answer costs nothing.
+        raise BuildError(
+            '--keep-out-of-book cannot be used with --book-mode %s. The fused '
+            'book stays uncrossed only because every truncation deletion is '
+            'emitted: a suppressed one drops the level from the fusion mirror, '
+            'so nothing can delete it afterwards and it crosses the book as soon '
+            'as the touch moves past it.' % args.book_mode
         )
     max_hl_book_age_ms = (args.max_hl_book_age_ms
                           if args.max_hl_book_age_ms is not None
@@ -1482,6 +1605,7 @@ def build(args: argparse.Namespace,
             delete_out_of_book=bool(args.delete_out_of_book),
             exch_ts_multiplier=NS_PER_MS,
             deduplicated_trades=total_deduplicated_trades(hl_outputs),
+            bbo_depth_frames=total_bbo_depth_frames(hl_outputs),
         ),
         'instruments': {
             'execution': {'venue': HL_VENUE, 'symbol': args.hl_symbol,

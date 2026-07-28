@@ -42,7 +42,7 @@ Manifest
 Written by ``build_dataset.py`` (Phase 3). The keys read here::
 
     tick_size, lot_size                     floats
-    book_mode, num_levels                   'slow'|'fast', int
+    book_mode, num_levels                   'slow'|'fast'|'bbo+fast', int
     tick_lot_source.sz_decimals             int, optional (HL price rule)
     window.start_ns, window.end_ns          int64 ns, on the same scale as the
                                             data (the builder applies

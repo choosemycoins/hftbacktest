@@ -44,7 +44,7 @@
 | Коллектор: как пользоваться | `collector/README.md` | CLI, наборы стримов по биржам, формат выхода, конвертация в `.npz`, известные ограничения. |
 | Коллектор: эксплуатация | `collector/deploy/` | Версионированные релизы, атомарный своп симлинка, откат, шаблонный systemd-юнит. Паттерн взят из `myhft/deploy/`; два осознанных отличия описаны в `README.md`. |
 | Коннектор Hyperliquid (проект) | [`docs/design-hyperliquid-connector.md`](docs/design-hyperliquid-connector.md) | Черновик дизайна live-бэкенда HL: 11 решений с отклонёнными альтернативами, план тестов, фазовка, 8 открытых вопросов. Прошёл адверсариальное ревью; часть находок применена, статус — Draft, не Approved. |
-| Многобиржевой сбор (проект) | [`docs/design-multi-venue-collection.md`](docs/design-multi-venue-collection.md) | Черновик: как писать несколько бирж так, чтобы данные годились для мультиассетного бэктеста. Содержит **непочиненные баги коллектора** (Фаза 0) — прочитать до любой работы над записью. Прошёл три проверяющих агента, переписан по их итогам. Draft, ничего не реализовано. |
+| Многобиржевой сбор (проект) | [`docs/design-multi-venue-collection.md`](docs/design-multi-venue-collection.md) | Черновик: как писать несколько бирж так, чтобы данные годились для мультиассетного бэктеста. Содержит **непочиненные баги коллектора** (Фаза 0) — прочитать до любой работы над записью. Прошёл три проверяющих агента, переписан по их итогам. Draft, но **Фазы 1–4 и 5(б) реализованы** — статус по фазам в шапке самого документа; `book_mode='bbo+fast'` (фузия `bbo` + `l2Book fast`) живёт в `py-hftbacktest/hftbacktest/data/utils/hyperliquid.py`. |
 | Rust-примеры стратегий | `hftbacktest/examples/` — `gridtrading_backtest.rs`, `gridtrading_backtest_args.rs`, `gridtrading_live.rs` | Точки входа для новичка. **Не все примеры компилируются — см. §5.** |
 | Python-слой | `py-hftbacktest/src/` (PyO3), `py-hftbacktest/hftbacktest/` (пакет, конвертеры данных, stats) | |
 | Планы upstream | `ROADMAP.md` | |
@@ -282,10 +282,10 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 |---|---|
 | `hftbacktest` | 29 `#[test]` в 8 файлах: `types.rs`, `depth/{hashmap,btree,roivector,fuse}marketdepth.rs`, `backtest/models/queue.rs`, `backtest/mod.rs`, `live/bot.rs` |
 | `connector` | 5 `#[test]`, все в `src/utils.rs`. **Ни одного теста на парсинг биржевых сообщений, order manager, стримы.** |
-| `collector` | 58 `#[test]`: `file.rs`, `disk.rs`, `hyperliquid/mod.rs`, плюс модули Фазы 1 дизайн-дока многобиржевого сбора — `queue.rs` (ограниченные хенд-оффы), `pump.rs` (владение отправителем, один цикл на все пять бэкендов), `watchdog.rs` (сторож молчания), `lock.rs` (flock директории), `backoff.rs`, `meta.rs` (единый словарь lifecycle-записей `_meta`), по два теста в каждом бэкенде. Крейт **bin-only**: `cargo test -p collector --bins` (`--lib --bins` для него ошибка «no library targets») |
-| `collector/tools` (Python) | 228 pytest: `test_quality_report.py` (47), `test_build_dataset.py` (65), `test_backtest_first.py` (116). Запуск: `.venv/bin/pytest collector/tools/` — тулинг Фаз 2–4 `docs/design-multi-venue-collection.md` |
+| `collector` | 107 `#[test]`: `file.rs`, `disk.rs`, `hyperliquid/mod.rs`, плюс модули Фазы 1 дизайн-дока многобиржевого сбора — `queue.rs` (ограниченные хенд-оффы), `pump.rs` (владение отправителем, один цикл на все пять бэкендов), `watchdog.rs` (сторож молчания), `lock.rs` (flock директории), `backoff.rs`, `meta.rs` (единый словарь lifecycle-записей `_meta`), `clock.rs` (adjtimex-гейдж дисциплины часов), `liveness.rs` (per-symbol возраст записи), premiumIndex-поллер и по два теста в каждом бэкенде. Крейт **bin-only**: `cargo test -p collector --bins` (`--lib --bins` для него ошибка «no library targets») |
+| `collector/tools` (Python) | 318 pytest: `test_quality_report.py` (117), `test_build_dataset.py` (85), `test_backtest_first.py` (116). Запуск: `.venv/bin/pytest collector/tools/` — тулинг Фаз 2–4 `docs/design-multi-venue-collection.md` |
 | `py-hftbacktest` (Rust), `hftbacktest-derive` | 0 |
-| Python | `py-hftbacktest/tests/test_hftbacktest.py` |
+| Python | `py-hftbacktest/tests/test_hyperliquid_converter.py` (9, дедуп трейдов), `test_hyperliquid_bbo_fast.py` (30, фузия `bbo+fast`). `test_hftbacktest.py` **падает всегда** — требует отсутствующего в репозитории `tmp_20240501.npz`. |
 
 Самая большая дыра — `connector/`. Любая новая логика там должна приходить с тестом; это дешевле, чем кажется, — сообщения биржи парсятся из строк, и тест на парсинг не требует сети.
 

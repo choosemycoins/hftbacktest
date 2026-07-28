@@ -9,6 +9,7 @@ from hftbacktest.data.utils.difforderbooksnapshot import (
     DiffOrderBookSnapshot,
     CHANGED,
     INSERTED, IN_THE_BOOK_DELETION,
+    OUT_OF_BOOK_DELETION_ABOVE, OUT_OF_BOOK_DELETION_BELOW,
 )
 from hftbacktest.data.validation import correct_event_order, correct_local_timestamp, validate_event_order
 from ...types import (
@@ -30,6 +31,33 @@ from ...types import (
 #: with the recording — a multi-day conversion would pay for that with nothing
 #: in return, since a replay never reaches further back than those 30 fills.
 TRADE_TID_HISTORY = 64
+
+#: Levels a side each depth stream delivers, i.e. the ``num_levels`` each
+#: ``book_mode`` must be paired with. Measured over eight recordings (4 coins x
+#: 2 days, 2026-07-26/27): every ``fast`` frame carried exactly 5 levels a side
+#: and every plain one exactly 20 — Hyperliquid never sent a short book.
+#:
+#: The pairing is enforced rather than assumed. :class:`DiffOrderBookSnapshot`
+#: preallocates exactly ``num_levels`` rows and writes ``len(bid_px)`` into them
+#: without a bounds check (``difforderbooksnapshot.py:35-41,67-72``), so
+#: :func:`convert` truncates every snapshot to ``num_levels``; without the check
+#: a mispaired call would quietly return a half-depth book instead of raising.
+BOOK_MODE_LEVELS = {'slow': 20, 'fast': 5, 'bbo+fast': 5}
+
+#: The depth streams :func:`convert` can build a book from.
+#:
+#: ``'slow'`` and ``'fast'`` each take one ``l2Book`` cadence and ignore the
+#: other. ``'bbo+fast'`` fuses the ``bbo`` touch feed into the ``fast`` cadence;
+#: see :func:`convert` for what that means for the emitted rows.
+BOOK_MODES = tuple(BOOK_MODE_LEVELS)
+
+#: Book modes that fuse the ``bbo`` touch feed into an ``l2Book`` cadence.
+BBO_BOOK_MODES = frozenset({'bbo+fast'})
+
+#: Every deletion kind :class:`DiffOrderBookSnapshot` reports. A fusing mode
+#: emits all of them; see the ``delete_out_of_book`` check in :func:`convert`.
+ALL_DELETIONS = (IN_THE_BOOK_DELETION,
+                 OUT_OF_BOOK_DELETION_ABOVE, OUT_OF_BOOK_DELETION_BELOW)
 
 
 def convert(
@@ -70,11 +98,66 @@ def convert(
         exch_ts_multiplier: Multiplier to convert exchange timestamps to nanoseconds. Default: ``1_000_000``.
         delete_out_of_book: Whether to insert a market depth delete event when an existing level moves out of the book
                             (i.e., beyond the the given number of market depth snapshot levels)
+        book_mode: Which depth stream to build the book from; one of :data:`BOOK_MODES`. See **Book modes** below.
+                   Default: ``'slow'``.
         stats: If provided, the mapping is updated with counters describing this conversion:
-               ``deduplicated_trades`` — the number of replayed trades dropped, see below.
+               ``deduplicated_trades`` — the number of replayed trades dropped, see below;
+               ``bbo_depth_frames`` — ``bbo`` frames that changed the book, ``0`` outside ``'bbo+fast'``.
 
     Returns:
         Converted data compatible with HftBacktest.
+
+    **Book modes:**
+
+    A recording interleaves three depth feeds, and they cannot simply be concatenated:
+    ``l2Book`` is a full top-N snapshot of a *different* N per cadence — 20 levels every
+    ~5.4 s, 5 levels every ~0.54 s with ``fast: true`` — and ``bbo`` is a one-level touch
+    feed, event-driven, median 86 ms between frames. Feeding a 5-level snapshot to a
+    20-level differ would delete levels 6..20 on every fast frame and restore them on the
+    next slow one, oscillating the book.
+
+    * ``'slow'`` — the plain ``l2Book`` cadence alone, ``num_levels=20``. Reproduces the
+      behaviour of recordings made before the fast feed existed.
+    * ``'fast'`` — the ``fast: true`` cadence alone, ``num_levels=5``.
+    * ``'bbo+fast'`` — the ``fast`` cadence for depth, with the touch additionally updated
+      by every ``bbo`` frame in between; ``num_levels`` must be ``5``.
+
+    ``num_levels`` is not free to choose: it must be the level count of the chosen
+    cadence, per :data:`BOOK_MODE_LEVELS`, and a mispairing raises.
+
+    ``'bbo+fast'`` exists because the live connector is specified on ``bbo`` + ``l2Book
+    fast``: without it the backtest runs on a strictly coarser book than the bot it is
+    meant to predict. It emits ordinary ``DEPTH_EVENT`` rows, never ``DEPTH_BBO_EVENT``,
+    which the backtest's ``Local`` processor ignores.
+
+    The fused book is a **top-5 window**, and only inside that window is it meaningful:
+
+    * ``bbo`` is authoritative about the touch. Mirrored levels above the new best bid, or
+      below the new best ask, are gone and are emitted as deletions — which is also what
+      keeps the book uncrossed when a ``bbo`` arrives through a mirror up to ~0.54 s stale.
+    * Each ``fast`` snapshot is diffed against the book **as the interleaved ``bbo`` frames
+      left it**, not against the previous snapshot. Diffing against the previous snapshot
+      would silently swallow a level the ``bbo`` moved and the snapshot moved back.
+    * Within a frame every deletion is emitted before every insert, so the book is
+      uncrossed after each individual row rather than only at the end of the frame.
+    * A ``bbo`` side arriving as ``null`` leaves that side of the book untouched — it is
+      "no news", not "empty". Measured over eight recordings: Hyperliquid never sent one.
+    * ``delete_out_of_book=False`` is **refused** for this mode. Suppressing a truncation
+      deletion is safe only within the frame that produces it: the level is dropped from
+      the fused book's mirror at the same moment, so no later diff can ever delete it, and
+      it crosses as soon as the market moves through it. Measured on ``btc_20260727``,
+      running the mode with the flag off left 1 684 955 of 1 685 014 depth rows crossed and
+      grew the book to 569 x 1562 levels. (The flag is equally unsound for ``'slow'`` and
+      ``'fast'``, where it long predates this mode and is left as it was.)
+
+    Depth below the touch is thin and intermittent, and must not be read as a queue.
+    A ``bbo`` that lifts the best bid pushes the deepest level out of the window; a ``bbo``
+    that moves the touch *through* mirrored levels deletes every one of them, and nothing
+    restores them until the next ``fast`` snapshot — median 540 ms, p99.9 930 ms, max 16.3 s
+    measured. Time-weighted over ``btc_20260727`` the fused book holds 5 levels a side for
+    96.9 % of the day, 4 for 1.5 %, 3 for 0.6 %, 2 for 0.4 % and **one for 0.64 %** — about
+    nine minutes. ``'fast'`` alone is 5 levels for 100 % of the same span. This is the price
+    of a one-level touch feed on a top-N window, not a defect of the fusion.
 
     **Replayed trades:**
 
@@ -94,18 +177,152 @@ def convert(
     """
 
 
-    if book_mode not in ('slow', 'fast'):
+    if book_mode not in BOOK_MODES:
         raise ValueError(
-            f"book_mode must be 'slow' or 'fast', got {book_mode!r}. "
-            "Fusing both cadences into one depth stream is not implemented yet; "
-            "see hftbacktest.data.utils.bybit.convert_fused and FuseMarketDepth "
-            "for the pattern that would be needed."
+            'book_mode must be one of %s, got %r.'
+            % (', '.join(repr(m) for m in BOOK_MODES), book_mode)
+        )
+    fuse_bbo = book_mode in BBO_BOOK_MODES
+    expected_levels = BOOK_MODE_LEVELS[book_mode]
+    if num_levels != expected_levels:
+        raise ValueError(
+            f"book_mode={book_mode!r} builds the book from a cadence that delivers "
+            f"exactly {expected_levels} levels a side, so num_levels must be "
+            f"{expected_levels}; got {num_levels}. Every snapshot is truncated to "
+            f"num_levels because DiffOrderBookSnapshot preallocates exactly that many "
+            f"rows and writes len(bid_px) into them without a bounds check "
+            f"(difforderbooksnapshot.py:35-41,67-72), so a mispaired call would "
+            f"return a book of the wrong depth rather than raise."
+        )
+    if fuse_bbo and not delete_out_of_book:
+        # Fail closed. Suppressing a truncation deletion looks safe inside the
+        # frame that produces it — the kept level is below the new lowest bid,
+        # so it does not cross yet — but the level is gone from the mirror the
+        # moment it is suppressed, so no later diff can delete it, and it
+        # crosses as soon as the market moves through it. Measured on
+        # `btc_20260727`: 1_684_955 of 1_685_014 depth rows left the book
+        # crossed and it grew to 569 x 1562 levels.
+        raise ValueError(
+            f"book_mode={book_mode!r} requires delete_out_of_book=True. The mode's "
+            f"output invariant is an uncrossed book after every single row, and a "
+            f"suppressed truncation deletion breaks it: the level is dropped from "
+            f"the fused book's mirror, so nothing can ever delete it afterwards, and "
+            f"it crosses as soon as the touch moves past it."
         )
 
     tmp = np.empty(buffer_size, event_dtype)
     row_num = 0
     timestamp_slice = 19
     diff = DiffOrderBookSnapshot(num_levels, tick_size, lot_size)
+
+    # The top-`num_levels` book the emitted rows have built so far, as `[px, qty]`
+    # pairs, most aggressive level first. Only `bbo+fast` keeps one: it is what a
+    # `bbo` frame edits, and — through `diff`, whose previous state is always the
+    # last mirror fed to it — what the next snapshot is diffed against.
+    #
+    # One mirror, not one per coin, matching what `diff` has always done. The
+    # collector writes one coin per file, so this only matters to a caller that
+    # concatenates coins into one recording, and such a caller already had a
+    # book built from two coins' snapshots.
+    mirror_bids = []
+    mirror_asks = []
+    bbo_depth_frames = 0
+
+    def emit_updates(entries, count, side_ev, exch_ts, local_ts):
+        """Insertions and size changes, `count` levels of `entries`.
+
+        `DiffOrderBookSnapshot.snapshot` returns its whole preallocated array,
+        not the part it just filled, and it swaps two buffers between calls — so
+        rows past `count` hold what the buffer held two calls ago, complete with
+        their update flags. They are only harmless while every call carries the
+        same number of levels, which is exactly what fusing `bbo` breaks.
+        """
+        nonlocal row_num
+        for i in range(count):
+            entry = entries[i]
+            if entry[2] == INSERTED or entry[2] == CHANGED:
+                tmp[row_num] = (
+                    DEPTH_EVENT | side_ev,
+                    exch_ts,
+                    local_ts,
+                    entry[0],
+                    entry[1],
+                    0,
+                    0,
+                    0
+                )
+                row_num += 1
+
+    def emit_deletions(entries, side_ev, exch_ts, local_ts, unconditional):
+        """Levels that left the book, as zero-quantity rows.
+
+        `unconditional` lists the deletion kinds that are emitted whatever
+        `delete_out_of_book` says; the rest are truncation, i.e. a level that
+        left the observed window rather than the book.
+        """
+        nonlocal row_num
+        for entry in entries:
+            if entry[1] in unconditional or delete_out_of_book:
+                tmp[row_num] = (
+                    side_ev | DEPTH_EVENT,
+                    exch_ts,
+                    local_ts,
+                    entry[0],
+                    0,
+                    0,
+                    0,
+                    0
+                )
+                row_num += 1
+
+    def emit_fused(bids, asks, exch_ts, local_ts):
+        """Diff the fused book against what was emitted before, and emit that.
+
+        `bids`/`asks` are the new state of the mirror, as `[px, qty]` pairs.
+        """
+        bid_px = np.array([lv[0] for lv in bids], float)
+        bid_qty = np.array([lv[1] for lv in bids], float)
+        ask_px = np.array([lv[0] for lv in asks], float)
+        ask_qty = np.array([lv[1] for lv in asks], float)
+
+        bid, ask, bid_del, ask_del = diff.snapshot(bid_px, bid_qty, ask_px, ask_qty)
+
+        # Every deletion, of every kind — `delete_out_of_book=False` is refused
+        # for this mode, see `convert`. Suppressing the truncation ones would
+        # strand a level the mirror has already forgotten, and it would cross
+        # the book the moment the touch moved past it.
+        #
+        # Deletions first. Every level the new state does not keep is gone
+        # before any of the levels it does keep arrives, so the book is
+        # uncrossed after each individual row and not merely at the end of the
+        # frame — the new state is uncrossed, and a subset of an uncrossed book
+        # cannot cross.
+        emit_deletions(bid_del, BUY_EVENT, exch_ts, local_ts, ALL_DELETIONS)
+        emit_deletions(ask_del, SELL_EVENT, exch_ts, local_ts, ALL_DELETIONS)
+        emit_updates(bid, len(bids), BUY_EVENT, exch_ts, local_ts)
+        emit_updates(ask, len(asks), SELL_EVENT, exch_ts, local_ts)
+
+    def apply_bbo(bid_lv, ask_lv):
+        """The mirror as this `bbo` frame leaves it. Either side may be `None`.
+
+        `bbo` states the whole touch: no level rests above the best bid, none
+        below the best ask, and none on the far side at or through either. A
+        side that did not arrive says nothing and changes nothing.
+        """
+        # Copied, not aliased: `apply_bbo` must not be able to edit the mirror
+        # before `emit_fused` has diffed against it.
+        bids, asks = list(mirror_bids), list(mirror_asks)
+        if bid_lv is not None:
+            px = float(bid_lv['px'])
+            bids = [lv for lv in bids if lv[0] < px]
+            asks = [lv for lv in asks if lv[0] > px]
+            bids.insert(0, [px, float(bid_lv['sz'])])
+        if ask_lv is not None:
+            px = float(ask_lv['px'])
+            asks = [lv for lv in asks if lv[0] > px]
+            bids = [lv for lv in bids if lv[0] < px]
+            asks.insert(0, [px, float(ask_lv['sz'])])
+        return bids[:num_levels], asks[:num_levels]
 
     # Recently emitted trade ids, per coin. Each `dict` is an insertion-ordered
     # set, so the oldest id is its first key and eviction stays O(1) without a
@@ -168,14 +385,35 @@ def convert(
                 # Select exactly one cadence. Messages from the plain feed have
                 # no `fast` key at all, so `book_mode='slow'` reproduces the
                 # behaviour of recordings made before the fast feed existed.
+                # `'bbo+fast'` takes the same cadence as `'fast'`; only the
+                # `bbo` frames in between are extra.
                 is_fast = bool(depth_data.get("fast", False))
-                if (book_mode == 'slow' and is_fast) or (book_mode == 'fast' and not is_fast):
+                if is_fast != (book_mode != 'slow'):
                     continue
 
                 exch_ts = depth_data.get("time") * exch_ts_multiplier
                 levels = depth_data.get("levels")
-                bids = levels[0]
-                asks = levels[1]
+                # Capped because `DiffOrderBookSnapshot` writes `len(bid_px)`
+                # rows into a `num_levels`-row buffer with no bounds check, so a
+                # deeper snapshot than the mode expects would corrupt memory
+                # rather than raise. Measured over eight recordings, Hyperliquid
+                # sends exactly the levels the cadence promises, so this only
+                # ever fires on a mispaired book_mode/num_levels.
+                bids = levels[0][:num_levels]
+                asks = levels[1][:num_levels]
+
+                if fuse_bbo:
+                    # A snapshot re-states the whole window, so it replaces the
+                    # mirror outright. What it is *diffed* against is the mirror
+                    # as the interleaved `bbo` frames left it — not the previous
+                    # snapshot, which would call a level the `bbo` moved and
+                    # this snapshot moved back "unchanged" and emit nothing,
+                    # stranding the backtest on the `bbo`'s size.
+                    new_bids = [[float(b["px"]), float(b["sz"])] for b in bids]
+                    new_asks = [[float(a["px"]), float(a["sz"])] for a in asks]
+                    emit_fused(new_bids, new_asks, exch_ts, int(local_ts))
+                    mirror_bids, mirror_asks = new_bids, new_asks
+                    continue
 
                 bid_px = np.array([float(b["px"]) for b in bids])
                 bid_qty = np.array([float(b["sz"]) for b in bids])
@@ -184,64 +422,44 @@ def convert(
 
                 bid, ask, bid_del, ask_del = diff.snapshot(bid_px, bid_qty, ask_px, ask_qty)
 
-                for entry in bid:
-                    if entry[2] == INSERTED or entry[2] == CHANGED:
-                        tmp[row_num] = (
-                            DEPTH_EVENT | BUY_EVENT,
-                            exch_ts,
-                            int(local_ts),
-                            entry[0],
-                            entry[1],
-                            0,
-                            0,
-                            0
-                        )
-                        row_num += 1
-                for entry in ask:
-                    if entry[2] == INSERTED or entry[2] == CHANGED:
-                        tmp[row_num] = (
-                            DEPTH_EVENT | SELL_EVENT,
-                            exch_ts,
-                            int(local_ts),
-                            entry[0],
-                            entry[1],
-                            0,
-                            0,
-                            0
-                        )
-                        row_num += 1
-                for entry in bid_del:
-                    if entry[1] == IN_THE_BOOK_DELETION or delete_out_of_book:
-                        tmp[row_num] = (
-                            BUY_EVENT | DEPTH_EVENT,
-                            exch_ts,
-                            int(local_ts),
-                            entry[0],
-                            0,
-                            0,
-                            0,
-                            0
-                        )
-                        row_num += 1
-                for entry in ask_del:
-                    if entry[1] == IN_THE_BOOK_DELETION or delete_out_of_book:
-                        tmp[row_num] = (
-                            SELL_EVENT | DEPTH_EVENT,
-                            exch_ts,
-                            int(local_ts),
-                            entry[0],
-                            0,
-                            0,
-                            0,
-                            0
-                        )
-                        row_num += 1
+                emit_updates(bid, len(bid_px), BUY_EVENT, exch_ts, int(local_ts))
+                emit_updates(ask, len(ask_px), SELL_EVENT, exch_ts, int(local_ts))
+                emit_deletions(bid_del, BUY_EVENT, exch_ts, int(local_ts),
+                               (IN_THE_BOOK_DELETION,))
+                emit_deletions(ask_del, SELL_EVENT, exch_ts, int(local_ts),
+                               (IN_THE_BOOK_DELETION,))
+
+            elif fuse_bbo and message.get("channel") == "bbo":
+                bbo_data = message.get("data", {})
+                exch_ts = bbo_data.get("time") * exch_ts_multiplier
+                # `[bid, ask]`, either of which the venue types as nullable.
+                sides = bbo_data.get("bbo") or ()
+                bids, asks = apply_bbo(
+                    sides[0] if len(sides) > 0 else None,
+                    sides[1] if len(sides) > 1 else None,
+                )
+
+                # Most `bbo` frames restate a touch that has not moved. Diffing
+                # an unchanged book would emit nothing anyway; skipping keeps
+                # ~656k frames a day out of the differ.
+                if bids == mirror_bids and asks == mirror_asks:
+                    continue
+
+                emit_fused(bids, asks, exch_ts, int(local_ts))
+                mirror_bids, mirror_asks = bids, asks
+                bbo_depth_frames += 1
 
     # Printed unconditionally: a converter that says nothing and a recording
     # with nothing to drop must not look the same to whoever reads the log.
     print('deduplicated %d replayed trades' % deduplicated_trades)
+    if fuse_bbo:
+        # The whole reason the mode exists is that these frames used to be
+        # dropped in silence. A conversion that applied none of them fused
+        # nothing, and must not look like one that did.
+        print('applied %d bbo frames to the book' % bbo_depth_frames)
     if stats is not None:
         stats['deduplicated_trades'] = deduplicated_trades
+        stats['bbo_depth_frames'] = bbo_depth_frames
 
     tmp = tmp[:row_num]
 

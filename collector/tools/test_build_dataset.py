@@ -253,6 +253,8 @@ class FakeConverter:
                     if (book_mode == 'slow') == is_fast:
                         continue
                     rows.append((int(local_ts), msg['data']['time'] * MS))
+                elif ch == 'bbo' and book_mode in bd.BBO_BOOK_MODES:
+                    rows.append((int(local_ts), msg['data']['time'] * MS))
         arr = np.zeros(len(rows), bd.EVENT_DTYPE)
         for i, (local_ts, exch_ts) in enumerate(rows):
             arr[i]['local_ts'] = local_ts
@@ -278,6 +280,25 @@ class DedupReportingConverter(FakeConverter):
         n = self.dropped[min(len(self.calls) - 1, len(self.dropped) - 1)]
         if stats is not None and n is not None:
             stats['deduplicated_trades'] = n
+        return arr
+
+
+class BboReportingConverter(FakeConverter):
+    """A converter that reports how many `bbo` frames it fused, as the real one does.
+
+    `fused` may be a list, one entry per call, so a multi-day build can report a
+    different count per day — or `None` for a day, which is "did not report".
+    """
+
+    def __init__(self, fused=7):
+        super().__init__()
+        self.fused = fused if isinstance(fused, list) else [fused]
+
+    def __call__(self, *, stats=None, **kwargs):
+        arr = super().__call__(**kwargs)
+        n = self.fused[min(len(self.calls) - 1, len(self.fused) - 1)]
+        if stats is not None and n is not None:
+            stats['bbo_depth_frames'] = n
         return arr
 
 
@@ -670,6 +691,216 @@ def test_max_hl_book_age_default_follows_book_mode(dataset):
             snapshot_fn=FakeSnapshotter())
     m = json.loads((ds['out'] / 'manifest.json').read_text())
     assert m['max_hl_book_age_ns'] == 1_500 * MS
+
+
+# ---------------------------------------------------------------------------
+# book_mode 'bbo+fast'
+# ---------------------------------------------------------------------------
+
+def test_bbo_fast_pairs_with_five_levels(dataset):
+    ds = dataset
+    conv = FakeConverter()
+    bd.main(base_argv(ds, book_mode='bbo+fast'), convert_fn=conv,
+            snapshot_fn=FakeSnapshotter())
+    assert conv.calls[0]['book_mode'] == 'bbo+fast'
+    assert conv.calls[0]['num_levels'] == 5
+
+
+def test_bbo_fast_with_the_slow_depth_is_refused(dataset):
+    """It reads the five-level fast cadence, so twenty levels is a mispairing."""
+    ds = dataset
+    conv = FakeConverter()
+    with pytest.raises(SystemExit) as e:
+        bd.main(base_argv(ds, book_mode='bbo+fast', num_levels=20), convert_fn=conv)
+    assert e.value.code == 1
+    assert conv.calls == []
+
+
+def test_max_hl_book_age_for_bbo_fast_matches_fast(dataset):
+    """1500 ms, the same as ``fast`` — and deliberately not ~2x the bbo median.
+
+    The guard watches the instant the *best* bid/ask last changed. ``bbo`` is
+    event-driven, so a long gap in it means the touch did not move, and a
+    threshold near its 86 ms median would block an ordinary quiet market.
+
+    Sharing the number does not make the two modes equivalent: under ``fast``
+    the touch can only come from the periodic snapshot, so the guard doubles as
+    a liveness check on that feed, and under ``bbo+fast`` it does not. See
+    `BOOK_MODE_MAX_AGE_MS` for the measurement and for where `l2Book fast`
+    liveness is actually checked.
+    """
+    ds = dataset
+    bd.main(base_argv(ds, book_mode='bbo+fast'), convert_fn=FakeConverter(),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['max_hl_book_age_ns'] == 1_500 * MS
+
+
+def test_manifest_records_bbo_fast(dataset):
+    ds = dataset
+    bd.main(base_argv(ds, book_mode='bbo+fast'), convert_fn=FakeConverter(),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['book_mode'] == 'bbo+fast'
+    assert m['num_levels'] == 5
+    assert m['converter']['book_mode'] == 'bbo+fast'
+    assert m['converter']['num_levels'] == 5
+    assert '--book-mode' in m['rebuild_cmd']
+    i = m['rebuild_cmd'].index('--book-mode')
+    assert m['rebuild_cmd'][i + 1] == 'bbo+fast'
+    assert m['rebuild_cmd'][m['rebuild_cmd'].index('--num-levels') + 1] == '5'
+
+
+def test_time_policy_scan_counts_bbo_as_converted_in_bbo_fast(tmp_path):
+    """The mode converts bbo frames, so their latency is the converted minimum.
+
+    Leaving them out would make `assert_no_silent_shift` compare the npz
+    minimum against a raw minimum drawn from a different set of frames, and
+    diagnose a shift that never happened.
+    """
+    exch_ms = DAY0_START // MS
+    path = write_gz(tmp_path / f'btc_{DAY0}.gz', [
+        (exch_ms * MS + 100, hl_l2book('BTC', exch_ms, 1, 2, fast=True)),
+        (exch_ms * MS + 40, hl_bbo('BTC', exch_ms, 1, 2)),
+    ])
+    window = bd.Window(0, 2 ** 62)
+
+    fused = bd.scan_hl_time_policy([path], book_mode='bbo+fast', window=window)[0]
+    assert fused.converted_frames == 2
+    assert fused.converted_min_latency_ns == 40
+
+    fast = bd.scan_hl_time_policy([path], book_mode='fast', window=window)[0]
+    assert fast.converted_frames == 1
+    assert fast.converted_min_latency_ns == 100
+
+
+def test_a_recording_without_the_fast_cadence_is_refused_for_bbo_fast(tmp_path):
+    """Fail closed: bbo alone is a one-level-per-side book, not a depth stream.
+
+    `bbo` is unconditional in the collector (`hyperliquid::ALWAYS_ON`) while the
+    l2Book cadences are selected with `--hl-l2-modes`, so a recording made with
+    `--hl-l2-modes slow` has bbo frames and no fast ones. Counting those bbo
+    frames as converted — which `bbo+fast` must — would otherwise let such a day
+    build a dataset with no depth in it and say nothing.
+    """
+    exch_ms = DAY0_START // MS
+    path = write_gz(tmp_path / f'btc_{DAY0}.gz', [
+        (exch_ms * MS + 100, hl_bbo('BTC', exch_ms, 1, 2)),
+        (exch_ms * MS + 100, hl_l2book('BTC', exch_ms, 1, 2)),   # slow only
+        (exch_ms * MS + 100, hl_trade('BTC', exch_ms, 1, 1)),
+    ])
+    window = bd.Window(0, 2 ** 62)
+    scan = bd.scan_hl_time_policy([path], book_mode='bbo+fast', window=window)[0]
+    assert scan.converted_frames > 0, 'the bbo and trade frames do convert'
+
+    with pytest.raises(bd.BuildError, match='l2Book'):
+        bd.convert_hl_day(
+            path, tmp_path / 'out.npz', day=DAY0, window=window, scan=scan,
+            tick_size=1.0, lot_size=1.0, book_mode='bbo+fast', num_levels=5,
+            buffer_size=1000, clock_correction_ns=0, work_dir=tmp_path,
+            convert_fn=FakeConverter(),
+        )
+
+
+def test_a_recording_without_the_chosen_cadence_is_refused_for_fast_too(tmp_path):
+    """The same guard, for the modes that had only the weaker one before: a day
+    of trades and slow snapshots is not a `fast` dataset."""
+    exch_ms = DAY0_START // MS
+    path = write_gz(tmp_path / f'btc_{DAY0}.gz', [
+        (exch_ms * MS + 100, hl_l2book('BTC', exch_ms, 1, 2)),   # slow only
+        (exch_ms * MS + 100, hl_trade('BTC', exch_ms, 1, 1)),
+    ])
+    window = bd.Window(0, 2 ** 62)
+    scan = bd.scan_hl_time_policy([path], book_mode='fast', window=window)[0]
+
+    with pytest.raises(bd.BuildError, match='l2Book'):
+        bd.convert_hl_day(
+            path, tmp_path / 'out.npz', day=DAY0, window=window, scan=scan,
+            tick_size=1.0, lot_size=1.0, book_mode='fast', num_levels=5,
+            buffer_size=1000, clock_correction_ns=0, work_dir=tmp_path,
+            convert_fn=FakeConverter(),
+        )
+
+
+def test_keep_out_of_book_is_refused_for_bbo_fast(dataset):
+    """Refused on the command line, not five minutes into a conversion.
+
+    The converter refuses the pair itself — the fused book's uncrossed invariant
+    does not survive a suppressed truncation deletion — but by then the time
+    policy has run over every raw file. Same place as the `--num-levels`
+    pairing, before anything reads a file.
+    """
+    ds = dataset
+    conv = FakeConverter()
+    with pytest.raises(SystemExit) as e:
+        bd.main(base_argv(ds, book_mode='bbo+fast') + ['--keep-out-of-book'],
+                convert_fn=conv)
+    assert e.value.code == 1
+    assert conv.calls == []
+
+
+def test_a_build_that_fused_no_bbo_frames_is_refused(dataset):
+    """Fail closed on the mirror image of the guard above.
+
+    A recording can hold `l2Book fast` and trades and no usable `bbo` at all —
+    a partially accepted subscription, or a reconnect that dropped only the
+    `bbo` topic for part of the day. Every frame count stays healthy, the build
+    produces a dataset byte-identical to `book_mode='fast'`, and the manifest
+    declares `bbo+fast` — a silently degraded dataset indistinguishable from a
+    correct one. The converter already counts what it fused; refusing zero is
+    what makes the count load-bearing.
+    """
+    ds = dataset
+    conv = BboReportingConverter(fused=0)
+    with pytest.raises(SystemExit) as e:
+        bd.main(base_argv(ds, book_mode='bbo+fast'), convert_fn=conv,
+                snapshot_fn=FakeSnapshotter())
+    assert e.value.code == 1
+
+
+def test_the_fused_bbo_frame_count_reaches_the_manifest(dataset):
+    """Evidence that the fusion happened must outlive stdout."""
+    ds = dataset
+    bd.main(base_argv(ds, book_mode='bbo+fast'), convert_fn=BboReportingConverter(fused=11),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['converter']['bbo_depth_frames'] == 11
+
+
+def test_a_converter_that_reports_no_bbo_count_is_not_taken_for_zero(dataset):
+    """`null` is "did not report", which is not "fused nothing" — the same rule
+    `deduplicated_trades` follows. Refusing on it would make the build depend on
+    a stat an older `hftbacktest` has no way to produce."""
+    ds = dataset
+    bd.main(base_argv(ds, book_mode='bbo+fast'), convert_fn=FakeConverter(),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['converter']['bbo_depth_frames'] is None
+
+
+def test_a_zero_bbo_count_is_not_a_refusal_outside_the_fusing_modes(dataset):
+    """`fast` reads no bbo frames, so zero is the only correct answer there."""
+    ds = dataset
+    bd.main(base_argv(ds, book_mode='fast'), convert_fn=BboReportingConverter(fused=0),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['converter']['bbo_depth_frames'] == 0
+
+
+def test_a_bbo_frame_holding_the_minimum_passes_the_shift_check(tmp_path):
+    """End to end for the scan/convert pair: the row the converter emits from
+    the fastest bbo frame is the one the raw minimum was measured on."""
+    exch_ms = DAY0_START // MS
+    path = write_gz(tmp_path / f'btc_{DAY0}.gz', [
+        (exch_ms * MS + 100, hl_l2book('BTC', exch_ms, 1, 2, fast=True)),
+        (exch_ms * MS + 40, hl_bbo('BTC', exch_ms, 1, 2)),
+    ])
+    scan = bd.scan_hl_time_policy([path], book_mode='bbo+fast',
+                                  window=bd.Window(0, 2 ** 62))[0]
+    arr = FakeConverter()(input_filename=str(path), tick_size=1.0, lot_size=1.0,
+                          num_levels=5, book_mode='bbo+fast')
+
+    assert 'ok' in bd.assert_no_silent_shift(arr, scan)
 
 
 # ---------------------------------------------------------------------------
