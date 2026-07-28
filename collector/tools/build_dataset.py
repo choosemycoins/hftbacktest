@@ -20,13 +20,16 @@ What it does, in the order the design doc requires:
    timestamp, ``l2Book``/``bbo`` ``data.time`` and each ``trades[].time`` — and a
    violation stops the build. This must happen **before** conversion because
    ``hyperliquid.convert`` calls ``correct_local_timestamp`` unconditionally
-   (``hyperliquid.py:205``), which silently shifts a whole file by its own
+   (``hyperliquid.py:264``), which silently shifts a whole file by its own
    minimum when that minimum is negative (``validation.py:37-49``). Different
    files would get different constants and time could run backwards at a day
    boundary.
 4. **Conversion** of the HL day files with ``base_latency=0`` and
    ``book_mode``/``num_levels`` paired, then a post-conversion assertion that no
-   shift happened after all.
+   shift happened after all. How many replayed trades the converter dropped
+   (Hyperliquid resends the last 30 fills per coin on every resubscribe) is read
+   back and recorded under ``converter.deduplicated_trades``; a converter that
+   cannot report it records ``null``, never a zero.
 5. **Signal array** built straight from the raw ``@bookTicker`` frames — no
    converter is involved on the Binance side in mode A.
 6. **No initial snapshot** (§3.4). The window's days go to one ``BacktestAsset``
@@ -56,6 +59,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -770,7 +774,58 @@ def default_convert_fn(**kwargs):
             'cannot import hftbacktest.data.utils.hyperliquid (%s). Build the '
             'package first: maturin develop --release -m py-hftbacktest/Cargo.toml' % e
         )
+    # `accepts_stats` can only see this wrapper's `**kwargs`, so the out-param
+    # arrives here whether or not the installed converter takes one. Dropping it
+    # is what turns "this hftbacktest is too old" into a null in the manifest
+    # instead of a TypeError that kills the build after the gate has passed.
+    if 'stats' in kwargs and not accepts_stats(hyperliquid.convert):
+        kwargs.pop('stats')
+        _warn('the installed hftbacktest converter does not report '
+              'deduplicated_trades; the manifest will record null')
     return hyperliquid.convert(**kwargs)
+
+
+def accepts_stats(convert_fn: Callable) -> bool:
+    """Whether ``convert_fn`` takes the ``stats`` out-param.
+
+    The converter reports how many replayed trades it dropped two ways: a
+    printed line for whoever reads the log, and this mapping for whoever reads
+    the manifest. Only the mapping is parsed here — capturing the converter's
+    stdout to scrape the line would swallow its progress output, and a format
+    change would turn into a wrong number rather than a missing one.
+
+    An older installed ``hftbacktest`` has no such parameter, and passing it
+    would raise ``TypeError``; a build against one records ``null``.
+    """
+    try:
+        params = inspect.signature(convert_fn).parameters.values()
+    except (TypeError, ValueError):  # not introspectable — assume the old shape
+        return False
+    return any(p.name == 'stats' or p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params)
+
+
+def _optional_int(value) -> Optional[int]:
+    """The counter the converter reported, or ``None`` when it reported none."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def total_deduplicated_trades(hl_outputs: Sequence[dict]) -> Optional[int]:
+    """Replayed trades dropped across the window, or ``None`` if unknown.
+
+    A day that reported nothing makes the total unknown, not smaller: summing
+    the days that did answer would state a number for the whole window that no
+    converter ever produced.
+    """
+    counts = [out.get('deduplicated_trades') for out in hl_outputs]
+    if not counts or any(c is None for c in counts):
+        return None
+    return int(sum(counts))
 
 
 def convert_hl_day(
@@ -806,6 +861,10 @@ def convert_hl_day(
 
     _step('converting %s (%d lines in window, book_mode=%s, num_levels=%d)'
           % (src, kept, book_mode, num_levels))
+    # Filled by the converter with the counters of this conversion; left empty
+    # by one that predates them, which is then recorded as null.
+    stats: dict = {}
+    extra = {'stats': stats} if accepts_stats(convert_fn) else {}
     arr = convert_fn(
         input_filename=str(trimmed),
         tick_size=tick_size,
@@ -826,6 +885,7 @@ def convert_hl_day(
         # happened.
         delete_out_of_book=delete_out_of_book,
         exch_ts_multiplier=exch_ts_multiplier,
+        **extra,
     )
     shift_check = assert_no_silent_shift(arr, scan)
 
@@ -845,6 +905,7 @@ def convert_hl_day(
         'day': day,
         'path': str(out_npz),
         'rows': int(len(arr)),
+        'deduplicated_trades': _optional_int(stats.get('deduplicated_trades')),
         'source': str(src),
         'trimmed_source': str(trimmed),
         'lines_in_window': kept,
@@ -1001,6 +1062,7 @@ def converter_identity(
         num_levels: int,
         delete_out_of_book: bool,
         exch_ts_multiplier: int,
+        deduplicated_trades: Optional[int] = None,
 ) -> dict:
     """Which converter code produced the ``.npz`` files, and with which knobs.
 
@@ -1033,6 +1095,17 @@ def converter_identity(
         'num_levels': num_levels,
         'delete_out_of_book': delete_out_of_book,
         'exch_ts_multiplier': exch_ts_multiplier,
+        # Trades the converter dropped as Hyperliquid resubscribe replays,
+        # summed over the days of the window. `null` means the converter did not
+        # report it (an older `hftbacktest`), which is not the same as zero — a
+        # dataset built from a recording that reconnected would then still carry
+        # phantom TRADE_EVENTs and nothing here would say so.
+        #
+        # It is a sum of per-file counts, and the converter's window does not
+        # cross a file boundary: a resubscribe within 30 fills of the daily
+        # rotation replays the previous day's fills, which this number does not
+        # cover. See `hyperliquid.convert` and `collector/README.md`.
+        'deduplicated_trades': deduplicated_trades,
         'snapshot_module': None,   # no snapshot is built — see `snapshots.note`
     }
 
@@ -1408,6 +1481,7 @@ def build(args: argparse.Namespace,
             num_levels=num_levels,
             delete_out_of_book=bool(args.delete_out_of_book),
             exch_ts_multiplier=NS_PER_MS,
+            deduplicated_trades=total_deduplicated_trades(hl_outputs),
         ),
         'instruments': {
             'execution': {'venue': HL_VENUE, 'symbol': args.hl_symbol,

@@ -322,6 +322,22 @@ than writing an empty `.npz` that looks like a legitimately silent day. That
 guard also catches a truncated file, the wrong venue, and a `book_mode` that
 matched no message in the recording.
 
+`convert` also drops replayed trades. Hyperliquid resends the last 30 fills of a
+coin in one `trades` frame on every (re)subscribe, and a replayed fill carries
+the same `tid` as the original — measured on 2026-07-27, a day with 10
+reconnects held 223 phantom rows for BTC and 299 for ENA. They would become
+extra `TRADE_EVENT`s and bias the queue model, so a `tid` already emitted is
+skipped; the converter prints `deduplicated N replayed trades` and fills
+`stats['deduplicated_trades']` if a mapping is passed as `stats=`. Entries with
+no `tid` pass through untouched. Binance recordings need none of this (verified:
+zero duplicates).
+
+The window lives inside one `convert` call, so it stops at a file boundary: a
+resubscribe within 30 fills of the daily rotation replays fills belonging to the
+previous day's file, and a dataset built from both days keeps that one replay.
+Measured on 2026-07-26/27 the two never coincided (zero cross-file `tid`
+overlap), and the exposed window per rotation is ~8 s for BTC and ~2 min for ENA.
+
 `convert` builds a `DiffOrderBookSnapshot` of a fixed depth and treats every
 `l2Book` message as a complete snapshot of that depth, so feeding it the
 interleaved stream would delete levels 6–20 on every fast message and restore

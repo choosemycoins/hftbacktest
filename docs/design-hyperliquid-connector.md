@@ -424,9 +424,20 @@ RFC-A v2 specifies. Making the marker reconnect-aware needs a `snapshot_ready` r
 change to when `main.rs` emits it; that is a protocol change to be scoped separately, not
 something Phase 4 can deliver on the current wire format.
 
-Nothing is replayed on reconnect. `userFills` re-sends its `isSnapshot` batch and `l2Book`
-sends a fresh snapshot on the next tick, but **`orderUpdates` gaps are unrecoverable from
-the stream** — the only way back to a correct view is a REST query.
+No *order state* is replayed on reconnect. `userFills` re-sends its `isSnapshot` batch and
+`l2Book` sends a fresh snapshot on the next tick, but **`orderUpdates` gaps are
+unrecoverable from the stream** — the only way back to a correct view is a REST query.
+
+The public `trades` channel is the opposite case and needs a guard. Measured on
+2026-07-27 and checked against HL's own `candleSnapshot` to the unit: every (re)subscribe
+replays **the last 30 fills of the coin in one frame**, each carrying the same `tid` as the
+original. One day with 10 resubscribes injected 223 duplicate fills for BTC and 299 for ENA
+(+0.066% and +1.36% of trade rows). A backend that forwards `trades` straight through would
+push those into `LiveBot`'s `last_trades` as genuine `TRADE_EVENT`s after every blip, so it
+must drop a fill whose `tid` it has already emitted — a bounded per-coin ring of recent ids
+is enough, since the replay never reaches further back than 30. The offline converter now
+does exactly this (`py-hftbacktest/hftbacktest/data/utils/hyperliquid.py`,
+`TRADE_TID_HISTORY`); the live backend should reuse the same rule rather than invent one.
 
 This is exactly the gap `snapshot-complete-marker.md` documents for Bybit, where the marker
 promises "the connector's cached view" rather than exchange state. Hyperliquid should not

@@ -51,11 +51,23 @@ def hl_l2book(coin, time_ms, bid_px, ask_px, fast=False):
     return json.dumps({'channel': 'l2Book', 'data': data})
 
 
-def hl_trade(coin, time_ms, px, sz, side='B'):
-    return json.dumps({
-        'channel': 'trades',
-        'data': [{'coin': coin, 'side': side, 'px': str(px), 'sz': str(sz), 'time': time_ms}],
-    })
+def hl_trades(coin, fills, side='B'):
+    """One `trades` frame. `fills` is an iterable of `(time_ms, px, sz, tid)`.
+
+    A `tid` of `None` is left out of the entry entirely, which is how a
+    recording made before the field was captured looks.
+    """
+    data = []
+    for time_ms, px, sz, tid in fills:
+        entry = {'coin': coin, 'side': side, 'px': str(px), 'sz': str(sz), 'time': time_ms}
+        if tid is not None:
+            entry['tid'] = tid
+        data.append(entry)
+    return json.dumps({'channel': 'trades', 'data': data})
+
+
+def hl_trade(coin, time_ms, px, sz, side='B', tid=None):
+    return hl_trades(coin, [(time_ms, px, sz, tid)], side=side)
 
 
 def hl_bbo(coin, time_ms, bid_px, ask_px):
@@ -248,6 +260,47 @@ class FakeConverter:
         if output_filename is not None:
             np.savez_compressed(output_filename, data=arr)
         return arr
+
+
+class DedupReportingConverter(FakeConverter):
+    """A converter that fills the `stats` out-param, as the real one does.
+
+    `dropped` may be a list, one entry per call, so a build over several days
+    can report a different count for each — or nothing at all for one of them.
+    """
+
+    def __init__(self, dropped=3):
+        super().__init__()
+        self.dropped = dropped if isinstance(dropped, list) else [dropped]
+
+    def __call__(self, *, stats=None, **kwargs):
+        arr = super().__call__(**kwargs)
+        n = self.dropped[min(len(self.calls) - 1, len(self.dropped) - 1)]
+        if stats is not None and n is not None:
+            stats['deduplicated_trades'] = n
+        return arr
+
+
+class OldConverter:
+    """An installed `hftbacktest` predating the out-param: no `stats`, no `**kwargs`.
+
+    Passing `stats` to this raises `TypeError`, which is the failure the build
+    must not have.
+    """
+
+    def __init__(self):
+        self._inner = FakeConverter()
+        self.calls = self._inner.calls
+
+    def __call__(self, *, input_filename, tick_size, lot_size, num_levels, book_mode,
+                 base_latency=0, buffer_size=0, output_filename=None,
+                 delete_out_of_book=True, exch_ts_multiplier=MS):
+        return self._inner(
+            input_filename=input_filename, tick_size=tick_size, lot_size=lot_size,
+            num_levels=num_levels, book_mode=book_mode, base_latency=base_latency,
+            buffer_size=buffer_size, output_filename=output_filename,
+            delete_out_of_book=delete_out_of_book, exch_ts_multiplier=exch_ts_multiplier,
+        )
 
 
 class FakeSnapshotter:
@@ -1174,6 +1227,131 @@ def test_converter_arguments_are_explicit_and_recorded(dataset):
     assert m['converter']['exch_ts_multiplier'] == bd.NS_PER_MS
     assert m['converter']['num_levels'] == 20
     assert m['converter']['book_mode'] == 'slow'
+
+
+# ---------------------------------------------------------------------------
+# replayed-trade de-duplication (converter -> manifest)
+# ---------------------------------------------------------------------------
+
+
+def add_second_day(ds):
+    """Extend the one-day fixture to two days, report included."""
+    hl2 = hl_day_lines(DAY1_START)
+    bn2 = bn_day_lines(DAY1_START)
+    write_gz(ds['hl_dir'] / f'btc_{DAY1}.gz', hl2)
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY1}.gz', bn2)
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], hl2[-1][0]),
+                (ds['bn_lines'][0][0], bn2[-1][0]),
+                hl_days={DAY0: {'verdict': 'green'}, DAY1: {'verdict': 'green'}},
+                bn_days={DAY0: {'verdict': 'green'}, DAY1: {'verdict': 'green'}})
+
+
+def test_manifest_records_how_many_replayed_trades_were_dropped(dataset):
+    """Hyperliquid replays its last 30 fills per coin on every (re)subscribe.
+
+    The converter drops them; how many it dropped is a property of the dataset,
+    so it belongs in the manifest next to the rest of the converter identity.
+    """
+    ds = dataset
+    bd.main(base_argv(ds), convert_fn=DedupReportingConverter(3),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['converter']['deduplicated_trades'] == 3
+    assert m['outputs']['hl_depth'][0]['deduplicated_trades'] == 3
+
+
+def test_manifest_sums_the_dedup_count_over_the_days_of_the_window(dataset):
+    ds = dataset
+    add_second_day(ds)
+    bd.main(base_argv(ds), convert_fn=DedupReportingConverter([3, 4]),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert [o['deduplicated_trades'] for o in m['outputs']['hl_depth']] == [3, 4]
+    assert m['converter']['deduplicated_trades'] == 7
+
+
+def test_dedup_count_is_null_when_the_converter_does_not_report_it(dataset):
+    """Null, never a guess: a converter that says nothing is not a clean day."""
+    ds = dataset
+    bd.main(base_argv(ds), convert_fn=FakeConverter(), snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert 'deduplicated_trades' in m['converter'], 'the key is always present'
+    assert m['converter']['deduplicated_trades'] is None
+    assert m['outputs']['hl_depth'][0]['deduplicated_trades'] is None
+
+
+def test_a_converter_without_the_stats_parameter_still_builds(dataset):
+    """The out-param is additive; an older installed `hftbacktest` has no `stats`."""
+    ds = dataset
+    conv = OldConverter()
+    bd.main(base_argv(ds), convert_fn=conv, snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert len(conv.calls) == 1
+    assert m['converter']['deduplicated_trades'] is None
+
+
+def test_a_partially_reported_dedup_count_is_null_not_a_partial_sum(dataset):
+    """One day reporting 3 and another reporting nothing does not make the day 3."""
+    ds = dataset
+    add_second_day(ds)
+    bd.main(base_argv(ds), convert_fn=DedupReportingConverter([3, None]),
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert [o['deduplicated_trades'] for o in m['outputs']['hl_depth']] == [3, None]
+    assert m['converter']['deduplicated_trades'] is None
+
+
+def test_the_default_convert_fn_drops_stats_for_an_older_hftbacktest(tmp_path, monkeypatch):
+    """The default path hides the installed converter behind its own `**kwargs`.
+
+    `accepts_stats` can only see that wrapper, so it hands over the out-param;
+    forwarding it verbatim to a converter that predates it would raise
+    `TypeError` and kill the build instead of recording null.
+    """
+    hyperliquid = pytest.importorskip('hftbacktest.data.utils.hyperliquid')
+    old = OldConverter()
+    monkeypatch.setattr(hyperliquid, 'convert', old)
+    src = write_gz(tmp_path / f'btc_{DAY0}.gz', hl_day_lines(DAY0_START))
+
+    stats = {}
+    arr = bd.default_convert_fn(
+        input_filename=str(src), tick_size=0.1, lot_size=0.00001, num_levels=20,
+        book_mode='slow', base_latency=0, buffer_size=20000, output_filename=None,
+        delete_out_of_book=True, exch_ts_multiplier=bd.NS_PER_MS, stats=stats)
+
+    assert len(arr) > 0
+    assert stats == {}, 'nothing reported, so nothing is recorded'
+    assert len(old.calls) == 1
+
+
+def test_the_real_converter_reports_its_dedup_count_into_the_manifest(dataset):
+    """The seam that matters: real converter, real replay, manifest number."""
+    pytest.importorskip('hftbacktest.data.utils.hyperliquid')
+    from hftbacktest.data.utils import hyperliquid
+
+    ds = dataset
+    base_ms = DAY0_START // MS
+    lines = list(ds['hl_lines'])
+    for i in range(3):
+        exch_ms = base_ms + i * 1000
+        lines.append((exch_ms * MS + 200 * MS + 3500,
+                      hl_trades('BTC', [(exch_ms, 100 + i, 0.5, 900 + i)])))
+    # The resubscribe frame: two fills already seen, with their original tids
+    # and venue times, plus one that is new.
+    replay_ms = base_ms + 4000
+    lines.append((replay_ms * MS + 200 * MS + 3500, hl_trades('BTC', [
+        (base_ms + 1000, 101, 0.5, 901),
+        (base_ms + 2000, 102, 0.5, 902),
+        (replay_ms, 104, 0.5, 904),
+    ])))
+    lines.sort(key=lambda record: record[0])
+    write_gz(ds['hl_dir'] / f'btc_{DAY0}.gz', lines)
+
+    bd.main(base_argv(ds, buffer_size='20000'), convert_fn=hyperliquid.convert,
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['converter']['deduplicated_trades'] == 2
 
 
 def test_multi_day_window_builds_no_intra_window_snapshots(dataset):

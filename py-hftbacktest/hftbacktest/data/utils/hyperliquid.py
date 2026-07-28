@@ -19,6 +19,18 @@ from ...types import (
     event_dtype
 )
 
+#: Number of trade ids remembered per coin when dropping replayed trades.
+#:
+#: Hyperliquid replays the last 30 fills of a coin in a single ``trades`` frame
+#: on every (re)subscribe, so any window above 30 covers a whole replay; the
+#: margin absorbs a replay that arrives interleaved with fresh fills.
+#:
+#: The window is bounded on purpose. A liquid coin sees hundreds of thousands of
+#: fills a day, and remembering every id would make the converter's memory grow
+#: with the recording — a multi-day conversion would pay for that with nothing
+#: in return, since a replay never reaches further back than those 30 fills.
+TRADE_TID_HISTORY = 64
+
 
 def convert(
         input_filename: str,
@@ -30,7 +42,8 @@ def convert(
         buffer_size: int = 100_000_000,
         exch_ts_multiplier: int = 1_000_000,
         delete_out_of_book: bool = True,
-        book_mode: str = 'slow'
+        book_mode: str = 'slow',
+        stats: Optional[dict] = None
 ) -> NDArray:
     r"""
     Converts raw Hyperliquid feed stream file into a format compatible with HftBacktest.
@@ -57,9 +70,27 @@ def convert(
         exch_ts_multiplier: Multiplier to convert exchange timestamps to nanoseconds. Default: ``1_000_000``.
         delete_out_of_book: Whether to insert a market depth delete event when an existing level moves out of the book
                             (i.e., beyond the the given number of market depth snapshot levels)
+        stats: If provided, the mapping is updated with counters describing this conversion:
+               ``deduplicated_trades`` — the number of replayed trades dropped, see below.
 
     Returns:
         Converted data compatible with HftBacktest.
+
+    **Replayed trades:**
+
+    Hyperliquid replays the last 30 fills of a coin in a single ``trades`` frame on every
+    (re)subscribe, and a replayed fill carries the same ``tid`` as the original. A recording that
+    reconnected therefore holds trades that never happened twice, which would feed phantom
+    ``TRADE_EVENT`` rows into the backtest and bias any model that counts trades. Trades whose
+    ``tid`` was already emitted are dropped; the count is printed and reported through ``stats``.
+    Entries carrying no ``tid`` are passed through unchanged — two fills of the same size at the
+    same price and time are legitimate, so there is nothing to tell them apart by.
+
+    The guard spans one call, i.e. one recording file. A resubscribe that lands within 30 fills
+    of a file rotation replays fills recorded in the *previous* file; nothing here remembers
+    them, so a dataset assembled from consecutive days can still hold that one replay twice and
+    the reported count will not mention it. Deduplicating across files would need the caller to
+    carry the window between calls.
     """
 
 
@@ -76,6 +107,14 @@ def convert(
     timestamp_slice = 19
     diff = DiffOrderBookSnapshot(num_levels, tick_size, lot_size)
 
+    # Recently emitted trade ids, per coin. Each `dict` is an insertion-ordered
+    # set, so the oldest id is its first key and eviction stays O(1) without a
+    # second structure. Keyed by coin because a recording may interleave several
+    # of them, and one busy coin must not evict another's ids before its replay
+    # arrives. See `TRADE_TID_HISTORY` for why the window is bounded.
+    recent_tids = {}
+    deduplicated_trades = 0
+
     with gzip.open(input_filename, 'r') as f:
         while True:
             line = f.readline()
@@ -87,6 +126,20 @@ def convert(
             if message.get("channel") == "trades":
                 trades_data = message.get("data", [])
                 for trade in trades_data:
+                    tid = trade.get("tid")
+                    if tid is not None:
+                        emitted = recent_tids.setdefault(trade.get("coin"), {})
+                        if tid in emitted:
+                            # A replay from a (re)subscribe: this fill is
+                            # already in the output under the same tid.
+                            deduplicated_trades += 1
+                            continue
+                        if len(emitted) >= TRADE_TID_HISTORY:
+                            del emitted[next(iter(emitted))]
+                        emitted[tid] = None
+                    # An entry without a tid carries no evidence either way, so
+                    # it is emitted as is rather than guessed at.
+
                     exch_ts = trade.get("time") * exch_ts_multiplier
 
                     tmp[row_num] = (
@@ -183,6 +236,12 @@ def convert(
                             0
                         )
                         row_num += 1
+
+    # Printed unconditionally: a converter that says nothing and a recording
+    # with nothing to drop must not look the same to whoever reads the log.
+    print('deduplicated %d replayed trades' % deduplicated_trades)
+    if stats is not None:
+        stats['deduplicated_trades'] = deduplicated_trades
 
     tmp = tmp[:row_num]
 
