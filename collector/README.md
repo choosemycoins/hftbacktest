@@ -63,6 +63,7 @@ exactly these streams.
 | `binance`, `binancespot` | `@trade`, `@bookTicker`, `@depth@100ms` |
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
 | `hyperliquid` | `trades`, `bbo`, `activeAssetCtx`, `l2Book` × `{--hl-l2-modes}` |
+| `lighter` | `order_book`, `ticker`, `trade`, `market_stats` — all four per market |
 
 USD-M is the odd row: it carries no `@markPrice@1s`, because **that class
 lives on fstream's routed `/market` path** (Binance split fstream into
@@ -119,6 +120,7 @@ own book and tape cannot tell you afterwards:
 | Binance USD-M | **REST** `GET /fapi/v1/premiumIndex`, polled every 10 s | `indexPrice` — the Binance index, aggregated across its constituent spot exchanges | `markPrice`, `lastFundingRate`, `estimatedSettlePrice`, `interestRate`, `nextFundingTime` |
 | Binance COIN-M | WS `<symbol>@markPrice@1s` | `i` — the same index | `p` mark price, `r` funding rate, `T` next funding time |
 | Hyperliquid | WS `activeAssetCtx` | `ctx.oraclePx` — Hyperliquid's own spot basket, the direct input to its funding calculation | `ctx.markPx`, `ctx.midPx`, `ctx.premium`, `ctx.funding`, `ctx.openInterest` |
+| Lighter | WS `market_stats/{market_id}` | `index_price` — the venue's own index | `mark_price`, `current_funding_rate`, `funding_rate`, `funding_timestamp`, `open_interest` |
 
 Recording the constituent spot books instead would cost orders of magnitude
 more and still only approximate what the venue actually used. These are the
@@ -136,6 +138,12 @@ byte-identical, which is why they compress an order of magnitude and why a
 volatile session costs no more than a quiet one. Neither is behind a flag —
 there is no trade-off to expose, and a recording made without them cannot be
 repaired afterwards.
+
+Lighter's is the exception to "periodic": `market_stats` arrives on change,
+several times a second on a liquid market (0.12–0.25 s median, 1.77 s worst
+over a 40 s window, 2026-07-28) and not at all on a still one. It is recorded
+for the same reason — the index and funding it carries cannot be recovered from
+the book afterwards — but its silence is not evidence on its own.
 
 The Hyperliquid subscription takes the coin exactly as `l2Book` does, prefix
 and all (`{"type":"activeAssetCtx","coin":"xyz:GOLD"}`), so a builder-dex
@@ -252,6 +260,173 @@ written to the sidecar as a `{"_collector":"universe"}` record. `szDecimals` is
 what a converter needs for lot size, and the collateral is the only thing that
 distinguishes two same-asset instruments after the fact.
 
+### Lighter: markets are integers
+
+Lighter subscribes by **market id**, not by symbol: `order_book/0` is ETH and
+`order_book/1` is BTC. Nothing on the wire ever names the instrument, so the
+collector resolves every requested symbol against
+`GET /api/v1/orderBooks` at startup and refuses to run if one does not resolve.
+
+That check is not optional here, and `--no-symbol-check` is **refused** rather
+than honoured: on the other venues the flag skips a lookup that only validates,
+but on this one the lookup *is* the addressing — there is nothing to subscribe
+to without it.
+
+Symbols are the venue's own bare names (`ETH`, `BTC`), matched case-insensitively
+and recorded under the venue's spelling. Three things are refused, each because
+it produces a silent failure rather than a loud one:
+
+| Refused | Why |
+|---|---|
+| a symbol not in the catalog | subscribing to a market id the venue does not know is answered with `{"error":{"code":30005,...}}` and **the socket stays open** — a healthy connection recording nothing |
+| a market whose `status` is not `active` | 18 of the venue's 227 markets were `inactive` on 2026-07-28; they are listed, subscribable and silent |
+| a symbol that cannot be a filename | the venue's spot markets are named `ETH/USDC`, and the collector names files after the symbol — `<dir>/eth/usdc_<date>.gz` is a directory that does not exist, so the first frame would end the recording with `ENOENT` minutes after a clean start |
+
+The resolved catalog — symbol, `market_id`, `market_type`, price and size
+decimals, minimums — is written to the sidecar as a `{"_collector":"universe"}`
+record, the same record name Hyperliquid's instrument metadata uses. The
+symbol → id map is *also* stamped into `session_start` as `lighter_markets`,
+because the recorded payloads are keyed by the integer and the ids are venue
+configuration rather than constants: a day's files cannot be read back without
+it.
+
+**The four channels, measured on mainnet 2026-07-28** (ETH and BTC, 40 s):
+
+| Channel | What it is | Median interval | Notes |
+|---|---|---|---|
+| `order_book` | full snapshot on subscribe, then diffs | 0.050 s | batched on a ~50 ms timer; a level with size `"0.0000"` is a **deletion** |
+| `ticker` | top of book, event-driven per engine nonce | 0.0095 s | the low-latency touch, ten times finer than the book batches |
+| `trade` | prints, per block | 0.07–0.18 s | the subscribe frame replays the **last 50 trades** — the first frame is history |
+| `market_stats` | mark, index, funding, open interest | 0.12–0.25 s | see [Index, oracle and funding](#index-oracle-and-funding) |
+
+All four are recorded for every market and none is behind a flag: they are not
+substitutes for one another, and the book alone is neither fast enough at the
+touch nor able to say what funding was priced against.
+
+#### The nonce chain, and what the collector does about a break
+
+Every `order_book` frame carries `begin_nonce`..`nonce` — matching-engine
+sequence numbers — and `begin_nonce(N+1)` must equal `nonce(N)`. The snapshot
+seeds the chain (`begin_nonce: 0`) and the diffs continue it, so the check
+spans both frame types.
+
+A break means the venue advanced without us. It is invisible everywhere else in
+the recording: the frames keep arriving on time, so there is no hole in
+`local_ts` for the offline report to measure, and only the numbers inside the
+payloads say a batch is missing. The collector therefore:
+
+1. writes `{"_collector":"sequence_gap","channel":"order_book","market":0,
+   "symbol":"ETH","expected_begin_nonce":…,"begin_nonce":…,"count":N}` to the
+   sidecar, immediately behind the frame that revealed it;
+2. repairs **that market's book only**, by sending `unsubscribe` and then
+   `subscribe` on `order_book/<id>`;
+3. counts the breaks per market for the life of the process.
+
+**The repair is two frames, and the obvious one on its own does nothing.**
+Re-sending `subscribe` for a channel the connection already holds is answered
+`{"error":{"code":30003,"message":"Already Subscribed to : order_book:0"}}` and
+**no snapshot** — measured against mainnet twice on 2026-07-28, snapshots after
+the duplicate: 0. A repair built that way would leave the book on a broken chain
+until the socket happened to drop for some other reason, possibly hours, with
+nothing in the recording saying the repair never happened. The unsubscribe is
+what makes the subscribe a fresh one; the pair is honoured sent back to back,
+ack at +267 ms and a fresh 105 KB snapshot with `begin_nonce: 0` at +522 ms.
+Both of the venue's answers are recorded: the `{"type":"unsubscribed",…}` ack
+names the market's channel, so it lands in that symbol's file, marking the exact
+point the diff chain was deliberately broken.
+
+A market is repaired **at most once a minute**. A venue that has genuinely lost
+us breaks the chain on every frame that follows, and at ~20 book frames a second
+one repair per frame would spend the venue's whole minute budget in five
+seconds. Nor is "one repair outstanding, cleared by its snapshot" enough: that
+makes the repair rate the repair's own 522 ms round trip, so a persistently
+lossy market would cycle break → repair → snapshot → break at ~4 client messages
+a second and drag a fresh 105–141 KB snapshot through the writer hop each time.
+The cooldown is on the **attempt**, not the outcome, which also means a repair
+the venue refuses cannot disarm a market permanently. Subsequent breaks are
+still recorded and counted; only the repair is suppressed.
+
+At 25 markets that is at worst 50 client messages a minute for repairs, which
+leaves room for the keepalives and for a reconnect's whole subscribe set inside
+the same minute.
+
+**`offset` is not a sequence number.** The venue sends one on every book frame
+and it is tempting; it is API-server-local and jumps on reconnect, so a chain
+built on it would report a break for every reconnect and miss the losses that
+matter.
+
+#### Message budget, and why the market count is capped
+
+The venue allows **200 client messages per minute** per connection, 500
+subscriptions per connection and 255 connections per IP. Exceeding the message
+budget is not answered with an error — the connection is throttled, which from
+this side is a socket that goes quiet, i.e. the one failure this collector is
+least able to tell from a quiet market.
+
+So one connection's subscribe set is held to **half** the budget, leaving room
+for the keepalives, the per-market repairs and a reconnect inside the same
+minute. Four channels per market makes that **25 markets**, and
+`match_catalog` refuses more with a message pointing at a second instance.
+Subscribes go out in chunks of 8 with 250 ms between them; the pacing is logged
+at every connect:
+
+```
+connecting to the Lighter WebSocket subscriptions=8 markets=2 chunk=8
+  chunk_delay_ms=250 paced_over_ms=0 budget_per_min=100 venue_limit_per_min=200
+```
+
+Keepalive is a **protocol-level Ping every 30 s**. The venue sends no pings of
+its own and requires a client frame at least every two minutes; the protocol
+ping is used rather than the app-level `{"type":"ping"}` because it does not
+enter the recording as a frame. A connection that delivers nothing at all for
+90 s is torn down and redialled — an unknown market id is answered with an error
+frame and *not* a close, so a silent socket has to be found from this side.
+
+#### Geoblocking is checked before recording starts
+
+`/stream` sits behind a CloudFront jurisdiction check. From a restricted region
+the **upgrade** fails as `Protocol(ResetWithoutClosingHandshake)` —
+indistinguishable from a network error — while REST keeps working, so a catalog
+fetch that succeeded proves nothing about the socket. The collector probes the
+upgrade once at startup with a 5 s timeout and refuses to start if it fails,
+rather than reconnecting for ever and exiting 0. The error names the likely
+cause and mentions the `?readonly=true` endpoint that exists for restricted
+regions — deliberately not used, because it is a different data guarantee and a
+recording made against it would not be comparable.
+
+The refusal is recorded as `{"_collector":"probe_failed","url":…,"error":…}`,
+under its own name rather than `symbol_check_failed`: by the time the probe
+runs every symbol has already resolved against REST, so annotating the hole
+with a symbol problem would send whoever reads it to check a list that was
+never wrong.
+
+#### Compression: none, measured
+
+The venue offers `permessage-deflate`; a Python `websockets` client negotiates
+it. This collector does not: tungstenite 0.27 implements no such extension and
+never sends `Sec-WebSocket-Extensions`, so the server has nothing to accept and
+every frame arrives as plain text. Recorded lines are therefore ordinary JSON
+either way — what reaches the file is always the decompressed text — but the
+bandwidth is not saved. The startup probe logs what the server answered, so the
+day the stack grows the extension the journal says so rather than the bytes:
+
+```
+the venue is reachable from this host took_ms=941 extensions=None
+```
+
+#### Volume
+
+Measured over a 4-minute mainnet recording of ETH and BTC, 2026-07-28:
+
+| | Lines | Gzipped |
+|---|---|---|
+| ETH | 17 150 in 243 s (~71/s) | 1.27 MB → **~450 MB/day** |
+| BTC | 16 346 in 243 s (~67/s) | 1.47 MB → **~520 MB/day** |
+
+That is one to two orders of magnitude above Hyperliquid (~22 MB/day/coin) and
+comparable to Bybit's busiest symbols — `ticker` alone is 60% of the lines.
+Plan disk accordingly: a ten-market instance is roughly 5 GB/day.
+
 One process handles one venue. Recording two venues means two processes — see
 [Deployment](#deployment), where that maps onto one systemd instance each.
 
@@ -345,10 +520,16 @@ as the venues themselves:
 | `{"_collector":"hand_off_closed", …}` | an internal hand-off lost its consumer, i.e. the collection task had already ended; the collector is stopping | all |
 | `{"_collector":"stalled", …}` | nothing was recorded for the whole watchdog window; the collector is stopping | all |
 | `{"_collector":"poller_degraded", …}` | a REST poller has failed `consecutive_failures` times running, `interval_s` apart, with `error`. The collector is **not** stopping — see below | binancefuturesum |
+| `{"_collector":"sequence_gap", …}` | a venue sequence number skipped ahead, so frames were lost: `channel`, `market`, `symbol`, `expected_begin_nonce`, `begin_nonce`, and the market's running `count`. The collector is **not** stopping — it repairs that market's book, at most once a minute per market | lighter |
+| `{"_collector":"probe_failed", …}` | the venue refused the WebSocket upgrade from this host before anything was recorded: `url`, `error`. The collector **is** stopping, and this is not a symbol problem — see [Geoblocking is checked before recording starts](#geoblocking-is-checked-before-recording-starts) | lighter |
 | `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters | hyperliquid |
 | `{"channel":"error", …}` | venue rejections | hyperliquid |
 | `{"channel":"pong", …}` | liveness during a stretch with no market data | hyperliquid |
 | `{"success":…,"ret_msg":…}` | subscribe ack, successful or not | bybit |
+| `{"type":"connected","session_id":…}` | the session handshake | lighter |
+| `{"error":{"code":30005,…}}` | a subscription the venue would not serve | lighter |
+| `{"error":{"code":30003,…}}` | a subscribe for a channel this connection already holds. It names no channel, so it can only land here | lighter |
+| `{"channel":"height",…}`, `{"channel":"market_stats:all",…}` | channels that name no single market, if they ever arrive | lighter |
 
 A `subscribe` followed by `dial_failed` is a socket that never came up. A
 `connected` with no market data behind it is a subscription the venue accepted
@@ -360,13 +541,16 @@ long a DNS or TLS stall took. A refused internal hand-off writes no end-of-strea
 record at all: it would have to travel the hop that just refused a market-data
 frame, and `queue_overflow`/`hand_off_closed` already name it from the other end.
 
-`poller_degraded` is the one record that reports a fault the collector then
-carries on through. Every other `_collector` record above is either routine or
-terminal; this one says a feed is missing while the recording continues, because
-the feed in question is auxiliary and stopping over it would be out of all
-proportion (see [Index, oracle and funding](#index-oracle-and-funding)). It is
-written once per outage rather than once per failure, and a successful poll
-re-arms it.
+`poller_degraded` and `sequence_gap` are the two records that report a fault the
+collector then carries on through. Every other `_collector` record above is
+either routine or terminal. `poller_degraded` says a feed is missing while the
+recording continues, because the feed in question is auxiliary and stopping over
+it would be out of all proportion (see
+[Index, oracle and funding](#index-oracle-and-funding)); it is written once per
+outage rather than once per failure, and a successful poll re-arms it.
+`sequence_gap` says a stretch of book updates was lost — the one damage that
+leaves no trace in the data itself, since the frames either side of it arrive
+perfectly on time (see [the nonce chain](#the-nonce-chain-and-what-the-collector-does-about-a-break)).
 
 Binance acks nothing at all — the subscription is the URL it is dialled with —
 so on those three venues the `_collector` records are the only account of the
@@ -374,7 +558,7 @@ session there is.
 
 Alongside those events the sidecar carries the collector's **gauges** —
 `disk`, `clock` and `liveness`, all written on one minute timer, plus
-`universe` once at startup on Hyperliquid. They are measurements of the host,
+`universe` once at startup on Hyperliquid and Lighter. They are measurements of the host,
 not events in the recording's life, and the difference is load-bearing: a
 minutely gauge lands inside every hole longer than a minute whatever caused it,
 so `quality_report.py` refuses to let one explain a gap. See
@@ -974,6 +1158,7 @@ always-on feed died too, which narrows the diagnosis considerably:
 | `hyperliquid` | the `activeAssetCtx` subscription, on every coin at once — so the socket or the process, not one channel |
 | `binancefuturescm` | the same, via `markPriceUpdate` |
 | `binancefuturesum` | the socket. The `premiumIndex` poller is deliberately not counted, so a trip says the WebSocket stopped and says nothing about REST — check `_meta` for `poller_degraded` to learn whether the venue or this host was the problem |
+| `lighter` | every market's book, tape, ticker **and** `market_stats` at once. None of the four is periodic — `market_stats` is event-driven, so its silence is not evidence on its own — but four channels across every market going quiet together is the socket or the process, not a still market. The connection's own 90 s idle check normally reaches that first and reconnects |
 | `binance`, `binancespot`, `bybit` | nothing extra; these record order flow only, and a genuinely dead market still trips it |
 
 The USD-M row is the useful one, but for the opposite reason to the others: the
@@ -1068,6 +1253,7 @@ symbol*, since any one of a symbol's streams resets its clock:
 |---|---|---|
 | `hyperliquid` | 60 s | `activeAssetCtx` is per coin at ~1/s and always on |
 | `binancefuturescm` | 60 s | the same, via `$symbol@markPrice@1s` |
+| `lighter` | 60 s | four channels a market and any one resets the clock; the slowest, `market_stats`, ran at a 0.25 s median and a 1.77 s worst interval (2026-07-28). Event-driven rather than periodic, so this is thirty times a measured worst case rather than sixty times a fixed period |
 | everything else | 300 s | order flow only, where a thin symbol is legitimately quiet; USD-M's `premiumIndex` is the collector's own poller and does not count |
 
 `0` disables the **warning** and not the measurement: `ages_s` is still
@@ -1142,10 +1328,39 @@ Worth knowing before you trust a dataset.
   60 s timeout and still going. Any future producer that is not a venue feed has
   to travel `queue::POLLER_HOP` for the same reason; putting it on the writer
   hop would silently disarm the guard again, and nothing would say so.
-- **Symbol validation is Hyperliquid-only.** There it is on by default and
-  refuses to start on an unknown coin, because one bad name closes the whole
-  WebSocket and takes every valid subscription with it. Bybit and Binance have
-  no equivalent check yet; a typo there still produces a partial recording.
+- **Symbol validation is Hyperliquid and Lighter only.** On both it is on by
+  default and refuses to start on an unknown name — one bad coin closes
+  Hyperliquid's whole WebSocket, and Lighter cannot address a market without
+  resolving it at all. Bybit and Binance have no equivalent check yet; a typo
+  there still produces a partial recording.
+- **Lighter has no converter.** Nothing in `py-hftbacktest` reads these files
+  yet, so a Lighter recording is raw material rather than a dataset, and
+  `quality_report.py` treats every one of its streams as checked-but-not-
+  required for that reason. The diffs are recorded exactly as sent, deletions
+  (`"size":"0.0000"`) included, and no book is maintained at capture time —
+  which is what leaves the merge policy open, and what makes writing that
+  converter the next piece of work rather than a rerun.
+- **A recovered Lighter book is not a complete one.** The repair after a nonce
+  break gets a fresh snapshot, so the recording resumes correctly, but the
+  updates lost between the break and the snapshot are gone — the sidecar's
+  `sequence_gap` says how far the chain jumped, and that is all anyone will
+  ever know about what was in them. Two further limits on the repair itself:
+  a market is repaired at most once a minute, so a persistently lossy market
+  spends most of that minute on a chain known to be broken; and nothing in the
+  process reads the venue's answer, so if the venue ever stops honouring
+  `unsubscribe`+`subscribe` the evidence will be a `sequence_gap` `count` that
+  climbs without a recovery rather than an error. The wire sequence is pinned
+  by a test against captured frames, not merely by this paragraph.
+- **Lighter replays the last 50 trades on every subscribe, and nothing
+  deduplicates them.** One `subscribed/trade` frame per market carries 50
+  prints spanning ~12 s of history (measured: ~94 KB), and one arrives on every
+  reconnect. Recording it verbatim is correct and it does not disturb the
+  offline report — `classify` keys on the channel head and nothing iterates the
+  array — but a converter that expands `trades` will emit phantom prints unless
+  it skips a `trade_id` it has already seen. This is the same trap Hyperliquid's
+  `tid` guard exists for (30 fills there, 223 phantom rows measured for BTC on a
+  10-reconnect day); Lighter's exposure is larger, and `trade_id` is present on
+  every print.
 - **`binancefuturesum` and `binancefuturescm` are the same module twice**,
   differing only in their endpoints, their test fixtures and one `handle`
   branch. `binance` (spot) is a third near-copy. A fix to one needs applying to

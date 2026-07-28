@@ -6,11 +6,12 @@
 //! it is indistinguishable from a quiet market. These records are the
 //! collector's own account of the session, and every backend writes the same
 //! five of them through the constructors here so that one parser reads all five
-//! venues. [`poller_degraded`] is the sixth and the exception: only a backend
-//! that runs a REST poller writes it. It is constructed here regardless,
-//! because the point of this module is that the sidecar has one vocabulary — a
-//! record spelled locally inside one backend is one the offline report does not
-//! know to look for.
+//! venues. [`poller_degraded`], [`probe_failed`] and [`sequence_gap`] are the
+//! exceptions: each is written by the one backend whose venue makes it
+//! possible. All three are constructed here regardless, because the point of
+//! this module is that the sidecar has one vocabulary — a record spelled
+//! locally inside one backend is one the offline report does not know to look
+//! for.
 //!
 //! ## Why they travel the venue's own hop
 //!
@@ -169,6 +170,73 @@ pub fn poller_degraded(
     )
 }
 
+/// The venue would not talk to this host at all, so the collector refused to
+/// start.
+///
+/// The eighth record, and the third exception: only a backend that probes
+/// before it records writes it, which today is Lighter alone. It is spelled
+/// here for the reason the module exists — one vocabulary — and it exists at
+/// all because the nearest name already in that vocabulary would be a lie.
+///
+/// Lighter's `/stream` sits behind a jurisdiction check. From a restricted
+/// region the WebSocket **upgrade** fails while REST keeps answering, so the
+/// symbols resolve perfectly and the recording is empty anyway. Filing that
+/// under `symbol_check_failed` would have the offline report annotate the hole
+/// "explained by symbol_check_failed" and send whoever reads it to check a
+/// symbol list that was never wrong. `url` is carried because that is the thing
+/// that was unreachable, and it is not the endpoint the catalog came from.
+pub fn probe_failed(url: &str, error: &str) -> Value {
+    record(
+        "probe_failed",
+        serde_json::json!({
+            "url": url,
+            "error": error,
+        }),
+    )
+}
+
+/// A venue sequence number skipped ahead, so frames were lost.
+///
+/// The seventh record, and the second exception to "every backend writes these":
+/// only a venue that publishes a sequence number can notice, and only Lighter
+/// acts on one live today (`begin_nonce`..`nonce` per market, `lighter/mod.rs`).
+/// It is constructed here for the reason the whole module exists — the sidecar
+/// has one vocabulary, and a record spelled locally inside one backend is one
+/// the offline report does not know to look for.
+///
+/// It earns its place because this loss is invisible everywhere else. A cadence
+/// gap leaves a hole in `local_ts` that the offline report can measure; a
+/// sequence break does not — the frames keep arriving on time, and only the
+/// numbers inside them say that a batch in between is gone. Without this record
+/// the only account of it would be the journal, which is not what an offline
+/// report reads.
+///
+/// `count` is the market's running total in this process, so a single break and
+/// a market that has been breaking all day are told apart without joining
+/// records. `expected_begin_nonce` and `begin_nonce` are both carried because
+/// their difference is the size of what was missed, which is the one thing a
+/// consumer cannot recover from the frames it does have.
+pub fn sequence_gap(
+    channel: &str,
+    market: i64,
+    symbol: &str,
+    expected_begin_nonce: u64,
+    begin_nonce: u64,
+    count: u64,
+) -> Value {
+    record(
+        "sequence_gap",
+        serde_json::json!({
+            "channel": channel,
+            "market": market,
+            "symbol": symbol,
+            "expected_begin_nonce": expected_begin_nonce,
+            "begin_nonce": begin_nonce,
+            "count": count,
+        }),
+    )
+}
+
 /// How a connection ended when nothing errored.
 ///
 /// The read loops have two such exits and they mean opposite things, so
@@ -231,10 +299,40 @@ mod tests {
                 poller_degraded("premiumIndex", 30, 10, "operation timed out"),
                 "poller_degraded",
             ),
+            (
+                probe_failed("wss://venue/stream", "the upgrade failed"),
+                "probe_failed",
+            ),
         ] {
             assert!(is_record(&value), "{value}");
             assert_eq!(value[TAG], event, "{value}");
         }
+    }
+
+    /// A venue that will not talk to this host is not a bad symbol.
+    ///
+    /// The distinction is the whole point of a separate name: Lighter's
+    /// `/stream` sits behind a jurisdiction check and refuses the **upgrade**
+    /// while REST keeps answering, so the symbols resolved perfectly and the
+    /// recording is empty anyway. Filing that as `symbol_check_failed` — the
+    /// nearest existing name — would have the offline report annotate the hole
+    /// "explained by symbol_check_failed" and send whoever reads it to look at
+    /// the symbol list.
+    #[test]
+    fn an_unreachable_venue_is_not_reported_as_a_bad_symbol() {
+        let refused = probe_failed(
+            "wss://mainnet.zklighter.elliot.ai/stream",
+            "the upgrade failed: Protocol(ResetWithoutClosingHandshake)",
+        );
+        assert_eq!(refused[TAG], "probe_failed");
+        assert_eq!(refused["url"], "wss://mainnet.zklighter.elliot.ai/stream");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("ResetWithoutClosingHandshake"),
+            "{refused}"
+        );
     }
 
     /// A poller that has been failing for minutes is invisible everywhere else.

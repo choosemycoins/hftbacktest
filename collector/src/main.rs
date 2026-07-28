@@ -22,6 +22,7 @@ mod disk;
 mod error;
 mod file;
 mod hyperliquid;
+mod lighter;
 mod liveness;
 mod lock;
 mod meta;
@@ -344,6 +345,44 @@ async fn main() -> Result<(), anyhow::Error> {
     let dir_lock = lock::acquire(&args.path, &args.exchange)?;
     info!(lock = %dir_lock.path().display(), "output directory locked");
 
+    // Constructed here rather than beside the main loop, which is the only
+    // place it is used from afterwards. `Writer::new` opens no file — it does
+    // that on the first write — so this costs nothing, and it is what lets the
+    // symbol resolution below record a refusal to start in the sidecar. Every
+    // other startup failure happens before there is anything to explain; that
+    // one happens after a previous session may have left a day's file behind,
+    // and "we refused to start" is the clearest explanation a gap can have.
+    let mut writer = Writer::new(&args.path, &args.exchange);
+
+    // Lighter subscribes by integer market id, and the map from symbol to id
+    // is a runtime fact of the venue rather than a constant. It is resolved
+    // here, before anything is recorded, for two reasons that neither of the
+    // other venues has: nothing can be subscribed without it, and it has to be
+    // stamped into `session_start` below — the recorded payloads are keyed by
+    // the integer, so a recording that does not carry the key cannot be read
+    // back after the venue relists a market.
+    let lighter_markets = if args.exchange == "lighter" {
+        match lighter::resolve_markets(&args.symbols, lighter::REST_URL, !args.no_symbol_check)
+            .await
+        {
+            Ok(markets) => Some(markets),
+            Err(error) => {
+                write_meta(
+                    &mut writer,
+                    serde_json::json!({
+                        "_collector": "symbol_check_failed",
+                        "error": error.to_string(),
+                        "symbols": args.symbols,
+                    }),
+                );
+                error!(%error, "refusing to start");
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     // Bounded, with `full => fatal` as the policy — see `queue.rs`. The fatal
     // channel is how a producer that has no error path of its own (the
     // detached REST snapshot tasks) reaches this loop.
@@ -370,24 +409,37 @@ async fn main() -> Result<(), anyhow::Error> {
     // main loop the collection task has died.
     {
         let meta_tx = writer_tx.clone();
+        let mut session_start = serde_json::json!({
+            "_collector": "session_start",
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": env!("COLLECTOR_GIT_COMMIT"),
+            "branch": env!("COLLECTOR_GIT_BRANCH"),
+            "dirty": env!("COLLECTOR_GIT_DIRTY"),
+            "exchange": args.exchange,
+            "symbols": args.symbols,
+            "bybit_depths": args.bybit_depths,
+            "hl_l2_modes": args.hl_l2_modes,
+        });
+        // Added only where it means something, rather than as a null on four
+        // other venues. Lighter's frames name a market by integer and never by
+        // symbol, so this map is what makes the day's files readable: the ids
+        // are venue configuration and can be reassigned between recordings.
+        // The fuller catalog — tick sizes, minimums, market type — travels in
+        // the `universe` record the backend writes next.
+        if let Some(markets) = &lighter_markets {
+            session_start["lighter_markets"] = markets
+                .iter()
+                .map(|m| (m.symbol.clone(), serde_json::Value::from(m.market_id)))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+                .into();
+        }
         // Nothing has been enqueued yet, so this cannot fail; propagating
         // rather than discarding keeps the rule that a hand-off result is
         // never ignored.
         meta_tx.send((
             chrono::Utc::now(),
             file::META_STREAM.to_string(),
-            serde_json::json!({
-                "_collector": "session_start",
-                "version": env!("CARGO_PKG_VERSION"),
-                "commit": env!("COLLECTOR_GIT_COMMIT"),
-                "branch": env!("COLLECTOR_GIT_BRANCH"),
-                "dirty": env!("COLLECTOR_GIT_DIRTY"),
-                "exchange": args.exchange,
-                "symbols": args.symbols,
-                "bybit_depths": args.bybit_depths,
-                "hl_l2_modes": args.hl_l2_modes,
-            })
-            .to_string(),
+            session_start.to_string(),
         ))?;
     }
 
@@ -498,6 +550,20 @@ async fn main() -> Result<(), anyhow::Error> {
                 !args.no_symbol_check,
             ))
         }
+        "lighter" => {
+            // Resolved before `session_start`, which is the only place it can
+            // be: the venue has no symbol addressing at all, so there is
+            // nothing to hand this backend until the catalog has been read.
+            let markets = lighter_markets.expect("lighter markets are resolved for this exchange");
+            info!(
+                markets = markets.len(),
+                channels = ?lighter::CHANNELS,
+                subscriptions = markets.len() * lighter::CHANNELS.len(),
+                "lighter markets"
+            );
+
+            tokio::spawn(lighter::run_collection(markets, writer_tx))
+        }
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));
         }
@@ -511,7 +577,6 @@ async fn main() -> Result<(), anyhow::Error> {
     drop(poller_tx);
 
     let mut shutdown = Shutdown::new()?;
-    let mut writer = Writer::new(&args.path, &args.exchange);
 
     // One timer for all three gauges. Disk is sampled rather than checked per
     // write because a statvfs on the hot path would be a syscall per message,

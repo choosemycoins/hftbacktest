@@ -76,9 +76,8 @@ pub const MAX_TRACKED_SYMBOLS: usize = 256;
 /// seconds.
 ///
 /// Derived from the slowest feed the venue serves **per symbol**, because any
-/// one of a symbol's streams arriving resets its clock. Two venues carry a
-/// periodic per-symbol feed — one that arrives whether or not the market moved
-/// — and can therefore be held to something far tighter than the rest:
+/// one of a symbol's streams arriving resets its clock. Three venues serve a
+/// symbol often enough to be held to something far tighter than the rest:
 ///
 /// * `hyperliquid` — `activeAssetCtx` at ~1.018 s per coin, and it is in
 ///   [`crate::hyperliquid::ALWAYS_ON`], so no combination of `--hl-l2-modes`
@@ -86,6 +85,13 @@ pub const MAX_TRACKED_SYMBOLS: usize = 256;
 ///   the limit the offline report holds the same stream to.
 /// * `binancefuturescm` — the same, through `$symbol@markPrice@1s` at ~1.000 s
 ///   (measured 2026-07-28, `README.md`).
+/// * `lighter` — four channels per market, the slowest of which
+///   (`market_stats`, carrying mark/index/funding) ran at a 0.25 s median and
+///   a 1.77 s worst interval over a 40 s mainnet window on 2026-07-28. Any one
+///   of the four resets the symbol's clock, so 60 s is thirty times the worst
+///   interval measured on the slowest of them. Unlike the two above this is a
+///   worst case rather than a period: none of Lighter's channels is periodic,
+///   so the margin is deliberately taken from the tail.
 ///
 /// Everything else records order flow only, where silence is legal: USD-M lost
 /// the whole markPrice class of streams, its `premiumIndex` replacement is the
@@ -102,7 +108,7 @@ pub const MAX_TRACKED_SYMBOLS: usize = 256;
 /// gauge worthless.
 pub fn default_threshold_s(exchange: &str) -> u64 {
     match exchange {
-        "hyperliquid" | "binancefuturescm" => 60,
+        "hyperliquid" | "binancefuturescm" | "lighter" => 60,
         _ => 300,
     }
 }
@@ -524,6 +530,11 @@ mod tests {
         // ~1/s per coin, always on: activeAssetCtx / markPrice@1s.
         assert_eq!(default_threshold_s("hyperliquid"), 60);
         assert_eq!(default_threshold_s("binancefuturescm"), 60);
+
+        // Four channels a market, the slowest of them measured at a 1.77 s
+        // worst interval — event-driven rather than periodic, so the number is
+        // thirty times the worst case rather than sixty times a fixed period.
+        assert_eq!(default_threshold_s("lighter"), 60);
 
         // Order flow only, where a quiet symbol is legitimately silent.
         for venue in [

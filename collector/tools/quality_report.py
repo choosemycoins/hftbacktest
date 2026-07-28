@@ -260,8 +260,10 @@ def fmt_short(nanos: int) -> str:
 HYPERLIQUID = "hyperliquid"
 BINANCE = "binance"
 BYBIT = "bybit"
+LIGHTER = "lighter"
 
 _FAMILY = {
+    "lighter": LIGHTER,
     "hyperliquid": HYPERLIQUID,
     "binancefutures": BINANCE,
     "binancefuturesum": BINANCE,
@@ -351,7 +353,28 @@ MAX_GAP_NS = {
     (BINANCE, "premiumIndex"): 100 * SEC_NS,
     (BYBIT, "orderbook"): 30 * SEC_NS,
     (BYBIT, "publicTrade"): 120 * SEC_NS,
+    (LIGHTER, "order_book"): 30 * SEC_NS,
+    (LIGHTER, "ticker"): 20 * SEC_NS,
+    (LIGHTER, "trade"): 120 * SEC_NS,
+    (LIGHTER, "market_stats"): 30 * SEC_NS,
 }
+
+#: Lighter's four limits above are round numbers far above a measurement, and
+#: the honesty about which is the point. Measured on mainnet 2026-07-28 over a
+#: single 40s window on ETH and BTC — two of the venue's most liquid markets:
+#:
+#:   * `order_book`    0.050s median, 0.25s worst — diffs batched at ~50ms
+#:   * `ticker`        0.0095s median, 0.38s worst — event-driven per engine nonce
+#:   * `trade`         0.07-0.18s median, 1.66s worst — per block, ~500ms
+#:   * `market_stats`  0.12-0.25s median, 1.77s worst
+#:
+#: Forty seconds measures a median well and a tail not at all, and nothing here
+#: has been watched on an illiquid market or through a quiet hour. So rather
+#: than cadence x K — which would claim a precision the window cannot support —
+#: these are flat limits an order of magnitude above the worst interval seen,
+#: in the spirit the Binance ones are set in: this check names reconnect-sized
+#: holes, it does not grade liquidity. Tighten them once a full day of a thin
+#: market has been recorded and looked at.
 
 #: For an event-driven channel, the steadier channel on the SAME socket whose
 #: silence decides whether its own silence meant anything. First name present in
@@ -384,8 +407,23 @@ MAX_GAP_NS = {
 #: to be noisy, on the strength of a stream no recording older than 2026-07-28
 #: contains. `bbo`'s references are there because 26 false positives were counted
 #: first; this one has no such measurement behind it yet.
+#: Lighter's `ticker` is the same kind of channel as `bbo` and gets the same
+#: treatment: it fires on a change of the touch and on nothing else, so a
+#: market whose top of book stops moving emits nothing while the connection is
+#: healthy. `order_book` is the reference because it is the steadiest thing on
+#: the same socket — the venue batches book diffs on a ~50ms timer, so its
+#: cadence measures the socket far more than the market — with `market_stats`
+#: behind it, which carries mark price, index price and funding and therefore
+#: moves even when the book does not.
+#:
+#: Unlike `bbo`'s, this pairing is a prediction rather than a response to
+#: counted false positives: no full day of this venue has been recorded yet. It
+#: is here because the alternative — waiting for the noise — means shipping a
+#: gate whose first day is yellow for a reason nobody can act on. Revisit it
+#: with a day's evidence.
 LIVENESS_REFERENCE = {
     (HYPERLIQUID, "bbo"): ("l2Book_fast", "l2Book_slow"),
+    (LIGHTER, "ticker"): ("order_book", "market_stats"),
 }
 
 
@@ -528,6 +566,22 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
         optional = [f"orderbook.{d}" for d in config.get("bybit_depths") or []]
         optional.append("publicTrade")
         return Expected((), tuple(optional))
+
+    if exchange == "lighter":
+        # Same standing as Bybit, for the same reason: no mode-A dataset reads
+        # Lighter, so nothing it does can make one red. Optional rather than
+        # informational, though — its four channels are not a stream added late
+        # to an old recording, they are the whole subscription set, and every
+        # day since the backend existed should carry all four. An absent one is
+        # a warning worth raising: this venue answers a subscription to a
+        # market it does not know with an error frame and keeps the socket
+        # open, so a dropped channel is invisible from the inside.
+        #
+        # The set is fixed rather than read from `config`, unlike Bybit's
+        # depths and Hyperliquid's cadences: `lighter::CHANNELS` is a constant
+        # with no flag behind it, so there is no legal recording that asked for
+        # fewer.
+        return Expected((), ("order_book", "ticker", "trade", "market_stats"))
 
     raise ValueError(
         f"profile {profile!r} defines no expected stream set for exchange "
@@ -771,6 +825,19 @@ def classify(family: str, obj: dict) -> Optional[str]:
             return ".".join(parts[:-1]) if len(parts) > 1 else topic
         return None
 
+    if family == LIGHTER:
+        # `order_book:0`, `ticker:1`, `trade:0`, `market_stats:0`. The tail is
+        # the **market id**, and it must not become part of the stream name:
+        # every symbol file would then carry a stream with no cadence limit and
+        # no expectation, and one instance's streams would not be comparable
+        # with another's. The symbol the frame belongs to is the file it is in
+        # — `collector/src/lighter/mod.rs` resolves the id at subscribe time,
+        # which is the only place the mapping exists.
+        channel = obj.get("channel")
+        if isinstance(channel, str):
+            return channel.split(":", 1)[0]
+        return None
+
     return None
 
 
@@ -878,6 +945,33 @@ def _track_sequence(
         if last is not None and u != last[0] + 1:
             note_break(last[1])
         prev[stream] = (u, ts)
+        return
+
+    if family == LIGHTER and stream == "order_book":
+        # `begin_nonce(N+1)` must equal `nonce(N)`. Not "the next id": these are
+        # matching-engine nonces and jump by tens between batches, so the only
+        # thing that can be checked is the explicit link the venue publishes.
+        # The same rule the collector applies live (`lighter/mod.rs`), where it
+        # also triggers the resubscribe that produces the snapshot below.
+        #
+        # `offset` is deliberately not read. It is API-server-local and jumps
+        # on reconnect, so a chain built on it would report a break for every
+        # reconnect and miss the losses that matter.
+        book = obj.get("order_book") or {}
+        nonce, begin = book.get("nonce"), book.get("begin_nonce")
+        if not isinstance(nonce, int) or not isinstance(begin, int):
+            return
+        scan.sequence_breaks.setdefault(stream, 0)
+        last = prev.get(stream)
+        if str(obj.get("type", "")).startswith("subscribed/"):
+            # A full snapshot: the venue restarting the chain. It carries
+            # `begin_nonce: 0`, and it is what the collector's own repair asks
+            # for, so counting it as a break would count every recovery twice.
+            prev[stream] = (nonce, ts)
+            return
+        if last is not None and begin != last[0]:
+            note_break(last[1])
+        prev[stream] = (nonce, ts)
 
 
 def scan_symbol_file(path, exchange: str) -> FileScan:
@@ -1260,6 +1354,13 @@ _EXPLANATORY = (
     "hand_off_closed",
     "disk_exhausted",
     "symbol_check_failed",
+    # The venue refused the WebSocket upgrade from this host, so the collector
+    # never started. Distinct from `symbol_check_failed` on purpose: Lighter's
+    # `/stream` sits behind a jurisdiction check that refuses the upgrade while
+    # REST keeps answering, so every symbol resolved and the recording is empty
+    # anyway. Sharing a name would send whoever reads the annotation to check a
+    # symbol list that was never wrong.
+    "probe_failed",
     "stream_ended",
     "session_start",
     "subscribe",

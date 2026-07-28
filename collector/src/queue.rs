@@ -155,6 +155,18 @@ pub const WS_QUEUE_CAPACITY: usize = 4096;
 /// refetch — says nothing about them. Still an order of magnitude inside a 2 GB
 /// host, so the conclusion holds and the number does not.
 ///
+/// Lighter is now the largest of those, and also over the WebSocket: measured
+/// 2026-07-28, its `subscribed/order_book` snapshot is **104 KB** (ETH) to
+/// **141 KB** (BTC) and its `subscribed/trade` frame replays the last 50 trades
+/// at up to **95 KB**; ordinary frames average 559–721 B. Both of the big ones
+/// arrive on subscribe, so the burst is bounded by the market count rather than
+/// by a rate: a full connect at `lighter::MAX_MARKETS` is 25 × ~236 KB ≈ 5.9 MB
+/// on top of ~23 MB of ordinary frames, so **~29 MB** — inside the figure
+/// above. What is *not* bounded by the connect is the repair snapshot after a
+/// nonce break, which is why `lighter::REPAIR_COOLDOWN` bounds it by time
+/// instead: uncapped, a lossy market repairing at its 522 ms round trip would
+/// put ~190 MB of snapshots through this hop before `full => fatal` fired.
+///
 /// And the writer wedged in a syscall (see the module docs), where neither cap
 /// applies because `main` never returns to observe anything — but even there
 /// the 1.6 GB figure needs 5.5 hours of nothing but throttled snapshots

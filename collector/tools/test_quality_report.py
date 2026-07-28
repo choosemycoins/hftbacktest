@@ -278,6 +278,127 @@ def um_depth_snapshot(symbol, ts, last_update_id=1000):
     }
 
 
+def lighter_book(market_id, ts, begin, nonce, kind="update"):
+    """A Lighter order-book frame, shaped as mainnet sends them (2026-07-28).
+
+    Two details this mirrors deliberately. The channel carries the **market
+    id**, not the symbol — `order_book:0` — so the stream name has to be the
+    head of it. And the chain lives inside `order_book`, not on the envelope:
+    `begin_nonce`..`nonce`, with a snapshot carrying `begin_nonce: 0` and the
+    `nonce` the first diff after it chains from.
+
+    `offset` rides along because the venue sends it and it is a trap: it is
+    API-server-local and jumps on reconnect, so it must never be read as a
+    sequence number.
+    """
+    return {
+        "channel": f"order_book:{market_id}",
+        "type": f"{kind}/order_book",
+        "timestamp": ms_of(ts),
+        "last_updated_at": ts // 1000,
+        "offset": 2043106 + nonce,
+        "order_book": {
+            "code": 0,
+            "asks": [{"price": "1914.28", "size": "0.1021"}],
+            "bids": [{"price": "1914.22", "size": "0.0000"}],
+            "offset": 2043106 + nonce,
+            "nonce": nonce,
+            "begin_nonce": begin,
+            "last_updated_at": ts // 1000,
+        },
+    }
+
+
+def lighter_ticker(market_id, ts, symbol="ETH"):
+    """The event-driven touch. Carries a bare `nonce` and no `begin_nonce`."""
+    return {
+        "channel": f"ticker:{market_id}",
+        "type": "update/ticker",
+        "timestamp": ms_of(ts),
+        "last_updated_at": ts // 1000,
+        "nonce": 17926043071,
+        "ticker": {
+            "s": symbol,
+            "a": {"price": "1914.28", "size": "0.1021"},
+            "b": {"price": "1914.26", "size": "0.1900"},
+            "last_updated_at": ts // 1000,
+        },
+    }
+
+
+def lighter_trade(market_id, ts):
+    return {
+        "channel": f"trade:{market_id}",
+        "type": "update/trade",
+        "nonce": 17926062253,
+        "liquidation_trades": [],
+        "trades": [
+            {
+                "trade_id": 26280867773,
+                "market_id": market_id,
+                "size": "0.0008",
+                "price": "1913.99",
+                "is_maker_ask": True,
+                "timestamp": ms_of(ts),
+                "transaction_time": ts // 1000,
+            }
+        ],
+    }
+
+
+def lighter_stats(market_id, ts, symbol="ETH"):
+    """`market_stats` — the venue's funding/oracle aggregate."""
+    return {
+        "channel": f"market_stats:{market_id}",
+        "type": "update/market_stats",
+        "timestamp": ms_of(ts),
+        "market_stats": {
+            "symbol": symbol,
+            "market_id": market_id,
+            "index_price": "1915.31",
+            "mark_price": "1914.32",
+            "current_funding_rate": "-0.0012",
+            "funding_timestamp": ms_of(ts),
+            "open_interest": "86574362.972120",
+        },
+    }
+
+
+def lighter_session_start(symbols, markets=None):
+    """`session_start` as the lighter arm of `main.rs` writes it.
+
+    The `lighter_markets` map is the venue-specific field: the frames name a
+    market by integer and never by symbol, so without it a finished recording
+    cannot say which instrument market 0 was.
+    """
+    record = session_start("lighter", symbols)
+    record["lighter_markets"] = markets or {
+        symbol: index for index, symbol in enumerate(symbols)
+    }
+    return record
+
+
+def lighter_dir(tmp_path, channels=("order_book", "ticker", "trade", "market_stats"), day=DAY):
+    """A minimal, complete Lighter recording of one market."""
+    d = tmp_path / "lighter"
+    d.mkdir()
+    builders = {
+        "order_book": lambda ts: lighter_book(0, ts, begin=0, nonce=100, kind="subscribed"),
+        "ticker": lambda ts: lighter_ticker(0, ts),
+        "trade": lambda ts: lighter_trade(0, ts),
+        "market_stats": lambda ts: lighter_stats(0, ts),
+    }
+    # Two frames per channel, at both ends of the same window. Coverage is the
+    # interval in which every stream is live — an intersection — so one frame
+    # per channel at a different second each would leave no overlap at all and
+    # a null window that says nothing about this venue.
+    recs = [(ns(t), builders[c](ns(t))) for t in (0, 10) for c in channels]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"eth_{day}.gz", recs)
+    write_meta(d, "lighter", day, [(ns(0), lighter_session_start(["ETH"]))])
+    return d
+
+
 def bybit_book(symbol, depth, ts, u, kind="delta"):
     return {
         "topic": f"orderbook.{depth}.{symbol}",
@@ -624,6 +745,119 @@ def test_bybit_update_id_break_is_counted_and_a_snapshot_resets_the_chain(tmp_pa
     assert code == 0
     sym = report["venues"]["bybit"]["days"][DAY]["symbols"]["btcusdt"]
     assert sym["sequence_breaks"]["orderbook.50"] == 1, sym["sequence_breaks"]
+
+
+def test_lighter_nonce_chain_break_is_counted_and_a_snapshot_resets_the_chain(tmp_path):
+    """Lighter's chain runs `begin_nonce(N+1) == nonce(N)`, snapshots included.
+
+    Unlike Bybit's `u`, the numbers do not increment by one — they are engine
+    nonces and jump by tens between batches — so "the next id" is not a thing
+    that can be checked here. Only the explicit link is.
+
+    The snapshot restarting the chain is what the collector's own resubscribe
+    produces after a break (`lighter/mod.rs`), so a report that did not treat
+    it as a restart would count every repair as a second break.
+    """
+    d = tmp_path / "lighter"
+    d.mkdir()
+    write_gz(
+        d / f"eth_{DAY}.gz",
+        [
+            (ns(0), lighter_book(0, ns(0), begin=0, nonce=100, kind="subscribed")),
+            (ns(1), lighter_book(0, ns(1), begin=100, nonce=170)),
+            (ns(2), lighter_book(0, ns(2), begin=999, nonce=1040)),  # break: 170 -> 999
+            (ns(3), lighter_book(0, ns(3), begin=0, nonce=2000, kind="subscribed")),  # repair
+            (ns(4), lighter_book(0, ns(4), begin=2000, nonce=2050)),
+        ],
+    )
+    write_meta(d, "lighter", DAY, [(ns(0), lighter_session_start(["ETH"]))])
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+    sym = report["venues"]["lighter"]["days"][DAY]["symbols"]["eth"]
+    assert sym["sequence_breaks"]["order_book"] == 1, sym["sequence_breaks"]
+
+
+def test_lighter_streams_are_classified_not_lumped_as_unknown(tmp_path):
+    """The four channels are told apart by the head of `channel`.
+
+    The market id is the tail (`order_book:0`), and it must not become part of
+    the stream name: every symbol file would then carry a stream nothing has a
+    cadence limit for, and the whole venue would read as `unclassified_frame`.
+    """
+    d = lighter_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+    sym = report["venues"]["lighter"]["days"][DAY]["symbols"]["eth"]
+    assert set(sym["streams"]) == {"order_book", "ticker", "trade", "market_stats"}, sym["streams"]
+    assert sym["unclassified_frames"] == 0
+
+
+def test_a_lighter_day_is_checked_but_can_never_be_red_for_a_missing_stream(tmp_path):
+    """Lighter is not part of a mode-A dataset, so nothing it does blocks one.
+
+    Its declared channels are still checked, as warnings, because a silently
+    dropped subscription is exactly what this report exists to catch — the
+    venue answers an unknown market with an error frame and keeps the socket
+    open, so an unsubscribed channel looks identical to a quiet one.
+    """
+    d = lighter_dir(tmp_path, channels=("order_book", "ticker"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0, "a missing lighter stream must not block a build"
+    day = report["venues"]["lighter"]["days"][DAY]
+    assert day["verdict"] == "yellow", day["issues"]
+    sym = day["symbols"]["eth"]
+    assert sym["missing_required"] == []
+    assert set(sym["missing_optional"]) == {"trade", "market_stats"}
+
+
+def test_a_complete_lighter_day_reports_a_coverage_window(tmp_path):
+    """Coverage is still computed for a venue nothing is required of.
+
+    With no required stream the window falls back to everything recorded — the
+    same path Bybit takes — and a null window on a directory full of data would
+    read as "this day holds nothing".
+    """
+    d = lighter_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+    cov = report["venues"]["lighter"]["days"][DAY]["symbols"]["eth"]["coverage"]
+    assert cov["first_local_ts"] is not None and cov["last_local_ts"] is not None, cov
+    assert set(cov["required_streams"]) == {"order_book", "ticker", "trade", "market_stats"}
+
+
+def test_a_quiet_lighter_ticker_over_a_live_book_is_not_reported(tmp_path):
+    """`ticker` fires on a change of the touch and on nothing else.
+
+    Measured on mainnet 2026-07-28 it is the fastest channel of the four
+    (0.0095s median), which is exactly why its silence means the least: a
+    market whose top of book stops moving emits nothing while the batched
+    `order_book` feed beside it keeps arriving. Same shape as Hyperliquid's
+    `bbo`, same treatment.
+    """
+    d = tmp_path / "lighter"
+    d.mkdir()
+    # The book runs gaplessly across the whole window, chain and all.
+    recs = [
+        (ns(t), lighter_book(0, ns(t), begin=t * 10, nonce=(t + 2) * 10))
+        for t in range(0, 60, 2)
+    ]
+    recs += [(ns(t), lighter_trade(0, ns(t))) for t in range(0, 60, 5)]
+    recs += [(ns(t), lighter_stats(0, ns(t))) for t in range(0, 60, 5)]
+    # A 40s hole in the ticker, well past its own limit, with the book running
+    # gaplessly across it.
+    recs += [(ns(t), lighter_ticker(0, ns(t))) for t in (0, 1, 41, 59)]
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"eth_{DAY}.gz", recs)
+    write_meta(d, "lighter", DAY, [(ns(0), lighter_session_start(["ETH"]))])
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    assert "cadence_gap" not in checks_of(report, "lighter"), issues_of(report, "lighter")
 
 
 # --------------------------------------------------------------------------
@@ -1089,8 +1323,23 @@ def test_every_explanatory_record_is_a_lifecycle_record():
     assert "disk" not in qr._EXPLANATORY
     assert "universe" not in qr._EXPLANATORY
     for wanted in ("session_start", "connected", "disconnected", "dial_failed",
-                   "stream_ended", "subscribe"):
+                   "stream_ended", "subscribe", "probe_failed"):
         assert wanted in qr._EXPLANATORY
+
+
+def test_an_unreachable_venue_explains_a_hole_under_its_own_name():
+    """`probe_failed` is not `symbol_check_failed`, and a hole must not say it is.
+
+    Lighter's `/stream` sits behind a jurisdiction check that refuses the
+    WebSocket upgrade while REST keeps answering, so every symbol resolved and
+    the recording is empty anyway. Borrowing the nearest existing name would
+    annotate the hole "explained by symbol_check_failed" and send whoever reads
+    it to check the symbol list.
+    """
+    assert "probe_failed" in qr._EXPLANATORY
+    gap = qr.Gap(start_ts=ns(10), end_ts=ns(50), duration_ns=ns(40) - ns(0))
+    explained = qr.explain_gap(gap, [(ns(20), "probe_failed")])
+    assert explained is not None and explained.startswith("probe_failed at "), explained
 
 
 def test_a_gap_within_the_expected_cadence_is_not_flagged(tmp_path):
