@@ -16,6 +16,30 @@ use crate::{
     throttler::Throttler,
 };
 
+/// The streams recorded for every symbol, before `$symbol` is substituted.
+///
+/// A constant rather than a literal at the call site because a wrong stream
+/// name is invisible at runtime: Binance accepts any name in the
+/// combined-stream URL, acks it, and sends nothing — measured 2026-07-28, a
+/// deliberately bogus `btcusdt@totalnonsense` behaved exactly like a stream
+/// that exists and is quiet. `every_recorded_stream_name_is_well_formed` is
+/// therefore the only place a typo here can be caught at all.
+///
+/// `@markPrice@1s` is the odd one out: it is not order flow. Its
+/// `markPriceUpdate` frames carry the **index price** — Binance's own spot
+/// basket, aggregated across its constituent exchanges — alongside the mark
+/// price and the funding rate. That basket is the cheap way to record what
+/// perpetual funding is priced against, at a few hundred bytes a second
+/// instead of the raw spot books of every constituent venue.
+pub const STREAMS: [&str; 4] = [
+    "$symbol@trade",
+    "$symbol@bookTicker",
+    "$symbol@depth@0ms",
+    // Not `@@markPrice@1s`, which is how this line sat commented out for a
+    // while. The venue would have accepted the doubled `@` without a word.
+    "$symbol@markPrice@1s",
+];
+
 fn handle(
     prev_u_map: &mut HashMap<String, i64>,
     writer_tx: &Tx<Record>,
@@ -125,6 +149,93 @@ mod tests {
 
     fn depth_update(u: i64, pu: i64) -> String {
         format!(r#"{{"data":{{"e":"depthUpdate","s":"BTCUSDT","u":{u},"pu":{pu}}}}}"#)
+    }
+
+    /// A `markPriceUpdate` frame as the combined-stream endpoint delivers it.
+    ///
+    /// The field set is Binance's documented USD-M one; it could not be
+    /// captured here, because `fstream.binance.com` serves only `@trade`,
+    /// `@bookTicker` and `@depth@0ms` from this vantage point — see the note on
+    /// [`STREAMS`]. The COIN-M sibling of this fixture in `binancefuturescm` was
+    /// captured live and agrees on every field this test depends on.
+    fn mark_price_update() -> String {
+        concat!(
+            r#"{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","#,
+            r#""E":1785239516000,"s":"BTCUSDT","p":"63406.00000000","#,
+            r#""i":"63427.35155222","P":"63402.48303662","r":"0.00005945","#,
+            r#""T":1785254400000}}"#
+        )
+        .to_string()
+    }
+
+    /// A misspelled stream name is not an error anywhere: Binance accepts any
+    /// name in the combined-stream URL, acks it, and simply never sends for it.
+    /// Measured 2026-07-28 — `btcusdt@totalnonsense` connected and delivered
+    /// zero frames in eight seconds, which is indistinguishable from a stream
+    /// that exists and is quiet. The mark-price line sat in this list commented
+    /// out and misspelled with two `@` (`$symbol@@markPrice@1s`); had it simply
+    /// been uncommented, the recording would have been missing the index price
+    /// and funding rate with nothing at all to say so. Nothing but this
+    /// assertion can catch that class of typo before it reaches a recording.
+    #[test]
+    fn every_recorded_stream_name_is_well_formed() {
+        assert!(
+            STREAMS.contains(&"$symbol@markPrice@1s"),
+            "the mark-price feed carries the index price — Binance's own spot \
+             basket — and the funding rate, which is why it is recorded at all"
+        );
+        for stream in STREAMS {
+            assert!(
+                stream.starts_with("$symbol@"),
+                "{stream}: every stream is per-symbol and the placeholder is substituted verbatim"
+            );
+            assert!(
+                !stream.contains("@@"),
+                "{stream}: a doubled `@` is silently accepted by the venue and records nothing"
+            );
+        }
+    }
+
+    /// Mark-price frames have to reach the symbol's file, and they have to
+    /// leave the depth-gap detector alone on the way.
+    ///
+    /// They carry `s` but neither `u` nor `pu`, so they route by symbol like
+    /// everything else — but the `e == "depthUpdate"` guard is the only thing
+    /// standing between them and the gap logic. Without it, every one of them
+    /// would fail to find `u` and leave through `FormatError`, killing the
+    /// collector once a second; with a laxer guard they would reset `prev_u_map`
+    /// and make the next genuine depth frame look like a gap, firing a REST
+    /// snapshot refetch per second against a 100/min throttle.
+    #[test]
+    fn mark_price_frames_are_filed_under_their_symbol_and_leave_gap_detection_alone() {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 4);
+        let mut prev_u_map = HashMap::from([("BTCUSDT".to_string(), 100)]);
+        let throttler = Throttler::new(100);
+        let now = Utc::now();
+
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            mark_price_update().as_str().into(),
+            &throttler,
+        )
+        .expect("a mark-price frame is ordinary market data, not a parse failure");
+
+        let (_, stream, payload) = rx.try_recv().expect("the frame must be written");
+        assert_eq!(
+            stream, "BTCUSDT",
+            "it belongs to the symbol, not the sidecar"
+        );
+        assert!(
+            payload.contains(r#""i":"63427.35155222""#),
+            "the index price is the whole reason this stream is recorded"
+        );
+        assert_eq!(
+            prev_u_map.get("BTCUSDT"),
+            Some(&100),
+            "a non-depth frame must not touch the depth sequence state"
+        );
     }
 
     /// The same rule at the Binance call site, which is also the one holding

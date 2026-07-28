@@ -58,11 +58,11 @@ exactly these streams.
 
 | `<exchange>` | Streams / topics recorded |
 |---|---|
-| `binancefutures`, `binancefuturesum` | `@trade`, `@bookTicker`, `@depth@0ms` |
-| `binancefuturescm` | `@trade`, `@bookTicker`, `@depth@0ms` |
+| `binancefutures`, `binancefuturesum` | `@trade`, `@bookTicker`, `@depth@0ms`, `@markPrice@1s` |
+| `binancefuturescm` | `@trade`, `@bookTicker`, `@depth@0ms`, `@markPrice@1s` |
 | `binance`, `binancespot` | `@trade`, `@bookTicker`, `@depth@100ms` |
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
-| `hyperliquid` | `trades`, `bbo`, `l2Book` × `{--hl-l2-modes}` |
+| `hyperliquid` | `trades`, `bbo`, `activeAssetCtx`, `l2Book` × `{--hl-l2-modes}` |
 
 Two venues take a flag because their defaults are load-bearing:
 
@@ -99,6 +99,54 @@ way back out.
 Symbol case is passed through verbatim to the venue. Binance stream names are
 lowercase (`btcusdt`), Bybit and Hyperliquid want uppercase (`BTCUSDT`, `BTC`).
 Output filenames are lowercased regardless of what you pass in.
+
+### Index, oracle and funding
+
+Two of those streams are not order flow. `@markPrice@1s` on Binance futures and
+`activeAssetCtx` on Hyperliquid are recorded because **they carry the spot
+basket each venue's funding is priced against** — the one thing about a
+perpetual that its own book and tape cannot tell you afterwards:
+
+| Venue | Stream | The field that matters | Also carries |
+|---|---|---|---|
+| Binance UM / CM | `<symbol>@markPrice@1s` | `i` — the Binance index, aggregated across its constituent spot exchanges | `p` mark price, `r` funding rate, `T` next funding time |
+| Hyperliquid | `activeAssetCtx` | `ctx.oraclePx` — Hyperliquid's own spot basket, the direct input to its funding calculation | `ctx.markPx`, `ctx.midPx`, `ctx.premium`, `ctx.funding`, `ctx.openInterest` |
+
+Recording the constituent spot books instead would cost orders of magnitude
+more and still only approximate what the venue actually used. These are the
+venues' own aggregates, at a few hundred bytes a second per instrument.
+Measured 2026-07-28 over a five-minute recording made by this collector,
+~295 frames each:
+
+| Venue / stream | Median interval | Frame | Gzip | Cost |
+|---|---|---|---|---|
+| Binance COIN-M `btcusd_perp@markPrice@1s` | 1.000 s | 231 B | 8.2× | 2.7 MB/day/symbol |
+| Hyperliquid BTC `activeAssetCtx` | 1.018 s | 312 B | 11.9× | 2.4 MB/day/coin |
+
+Both are periodic rather than event-driven: consecutive frames are frequently
+byte-identical, which is why they compress an order of magnitude and why a
+volatile session costs no more than a quiet one. Neither is behind a flag —
+there is no trade-off to expose, and a recording made without them cannot be
+repaired afterwards.
+
+The Hyperliquid subscription takes the coin exactly as `l2Book` does, prefix
+and all (`{"type":"activeAssetCtx","coin":"xyz:GOLD"}`), so a builder-dex
+instrument's context lands in the same file as its book. Verified against
+mainnet.
+
+**The USD-M row above is COIN-M's number.** `fstream.binance.com` served only
+`@trade`, `@bookTicker` and `@depth@0ms` from the vantage point these
+measurements were taken from: on one connection carrying thousands of book
+ticks, `@aggTrade`, `@kline_1m`, `@forceOrder`, `@miniTicker` and
+`@markPrice@1s` all delivered exactly zero. `@aggTrade` returning nothing while
+`@trade` returns hundreds is not a plausible property of the venue, so the
+pattern points at that network path rather than at the stream names.
+`dstream.binance.com` served every one of them, so COIN-M is what could be
+measured; USD-M's documented cadence is the same 1 s. The two payloads are the
+same event with the same `i`/`r`/`T` fields, COIN-M adding `ap` and `st`. If a
+USD-M recording contains no `markPriceUpdate` at all, suspect the path before
+the code — and note that Binance acks a stream name it will never serve, so
+there is no error to look for. See [Known limitations](#known-limitations).
 
 ### Hyperliquid symbol names
 
@@ -347,6 +395,25 @@ feed existed behave. **Genuine fusion of the two cadences is not implemented
 yet** — `bybit.convert_fused` plus `FuseMarketDepth` is the pattern it would
 follow.
 
+The index/funding streams are **skipped by every converter unless asked for**,
+so adding them changed no existing output. `binancefutures.convert` has a
+long-standing `opt` flag for exactly this stream, which until now had nothing to
+read:
+
+```python
+from hftbacktest.data.utils import binancefutures
+
+# opt='m' turns each markPriceUpdate into three rows with custom event ids:
+#   100 = index price (the spot basket)   101 = mark price   102 = funding rate
+data = binancefutures.convert('btcusdt_20260728.gz', opt='m')
+```
+
+`hyperliquid.convert` has no equivalent yet: its loop handles `trades` and
+`l2Book` and silently ignores every other channel, so `activeAssetCtx` is
+recorded and preserved but not converted. Read it straight out of the `.gz` in
+the meantime — `ctx.oraclePx`, `ctx.markPx` and `ctx.funding` need no
+reconstruction.
+
 Other converters that match what this collector records: `binancefutures.convert`
 (for `binancefutures`/`binancefuturesum`/`binancefuturescm`) and
 `hyperliquid.convert`. There is **no converter for Binance spot** — the
@@ -573,6 +640,14 @@ These are quiet-period figures from one 12-minute window. `bbo` and `trades`
 are event-driven, so a volatile session costs several times more; size the
 volume with headroom.
 
+They also predate the index/funding streams. Add **2.4 MB/day per coin** for
+`activeAssetCtx` on Hyperliquid and **2.7 MB/day per symbol** for
+`@markPrice@1s` on either Binance futures venue — about a tenth of a
+Hyperliquid coin's total, and under 4% of a Bybit symbol's. Unlike everything
+else in the table those figures are flat: both feeds are periodic at 1/s and do
+not grow with volatility. See
+[Index, oracle and funding](#index-oracle-and-funding).
+
 How much more has since been measured, on Binance UM rather than these two
 venues. On 2026-07-26 at 22:00:00 UTC four symbols on `@trade` + `@bookTicker` +
 `@depth@0ms` went from ~50 msg/s each to **4402/s and then 5514/s on btcusdt
@@ -735,6 +810,14 @@ Worth knowing before you trust a dataset.
   incremented whenever the connection survived 30 s, so a venue that accepts a
   connection and drops it after a minute, forever, is retried at the floor
   forever.
+- **A Binance stream name that does not exist is not an error.** It is accepted
+  in the combined-stream URL, acked by `SUBSCRIBE`, and then never served —
+  measured 2026-07-28, `btcusdt@totalnonsense` was indistinguishable from a
+  stream that exists and is quiet. A typo in the stream list therefore costs a
+  feed silently, which is what happened to `@markPrice@1s` while it sat
+  commented out as `@@markPrice@1s`. The names now live in
+  `binancefutures{um,cm}::STREAMS` with a test on their shape, because nothing
+  at runtime will ever object.
 - **Symbol validation is Hyperliquid-only.** There it is on by default and
   refuses to start on an unknown coin, because one bad name closes the whole
   WebSocket and takes every valid subscription with it. Bybit and Binance have

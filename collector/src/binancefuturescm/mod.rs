@@ -16,6 +16,31 @@ use crate::{
     throttler::Throttler,
 };
 
+/// The streams recorded for every symbol, before `$symbol` is substituted.
+///
+/// See [`crate::binancefuturesum::STREAMS`] for why this is a constant with a
+/// test on it rather than a literal at the call site.
+///
+/// `@markPrice@1s` is carried here for the same reason as on USD-M: `i` is the
+/// venue's own spot basket and `r` is the funding rate that basket determines.
+/// It was worth checking rather than assuming, because COIN-M also publishes a
+/// separate `<pair>@indexPrice` stream and might have kept the index only
+/// there — measured on `dstream.binance.com` 2026-07-28, it does not: the
+/// per-symbol `markPriceUpdate` carries `i` directly, alongside two fields
+/// USD-M does not document (`ap`, `st`).
+///
+/// That settles the pairing too. An `indexPriceUpdate` frame is keyed by pair
+/// (`"i":"BTCUSD"`) and has no `s` at all, so `handle` would file it nowhere
+/// and return `Ok` — a stream that records absolutely nothing, silently. Not
+/// needing it is the reason this backend gets the same one line as USD-M
+/// rather than a second, differently-shaped path.
+pub const STREAMS: [&str; 4] = [
+    "$symbol@trade",
+    "$symbol@bookTicker",
+    "$symbol@depth@0ms",
+    "$symbol@markPrice@1s",
+];
+
 fn handle(
     prev_u_map: &mut HashMap<String, i64>,
     writer_tx: &Tx<Record>,
@@ -122,6 +147,90 @@ pub async fn run_collection(
 mod tests {
     use super::*;
     use crate::queue::{self, WRITER_HOP};
+
+    /// Captured verbatim from `dstream.binance.com` on 2026-07-28, combined
+    /// stream `btcusd_perp@markPrice@1s`.
+    ///
+    /// Recorded here because COIN-M's payload is not the documented USD-M one:
+    /// it carries two extra fields (`ap`, `st`) and — the question that decided
+    /// whether this stream was worth subscribing to on COIN-M at all — it does
+    /// carry `i`, the index price, per symbol. The separate `<pair>@indexPrice`
+    /// stream is therefore not needed, which matters because an
+    /// `indexPriceUpdate` frame is keyed by pair (`"i":"BTCUSD"`) and has no
+    /// `s` at all: `handle` would file it nowhere and return `Ok`.
+    fn mark_price_update() -> String {
+        concat!(
+            r#"{"stream":"btcusd_perp@markPrice@1s","data":{"e":"markPriceUpdate","#,
+            r#""E":1785239516000,"s":"BTCUSD_PERP","p":"63406.00000000","#,
+            r#""ap":"63406.00000000","P":"63402.48303662","i":"63427.35155222","#,
+            r#""r":"0.00005945","T":1785254400000,"st":2}}"#
+        )
+        .to_string()
+    }
+
+    /// The COIN-M half of the rule spelled out on `binancefuturesum::STREAMS`:
+    /// a misspelled stream name is accepted, acked and then silently never
+    /// served, so nothing but this assertion stands between a typo and a
+    /// recording that is quietly missing a feed.
+    #[test]
+    fn every_recorded_stream_name_is_well_formed() {
+        assert!(
+            STREAMS.contains(&"$symbol@markPrice@1s"),
+            "the mark-price feed carries the index price and funding rate"
+        );
+        for stream in STREAMS {
+            assert!(
+                stream.starts_with("$symbol@"),
+                "{stream}: every stream is per-symbol and the placeholder is substituted verbatim"
+            );
+            assert!(
+                !stream.contains("@@"),
+                "{stream}: a doubled `@` is silently accepted by the venue and records nothing"
+            );
+        }
+    }
+
+    /// Mark-price frames have to reach the symbol's file, and they have to
+    /// leave the depth-gap detector alone on the way.
+    ///
+    /// They carry `s` but neither `u` nor `pu`, so they route by symbol like
+    /// everything else — but the `e == "depthUpdate"` guard is the only thing
+    /// standing between them and the gap logic. Without it, every one of them
+    /// would fail to find `u` and leave through `FormatError`, killing the
+    /// collector once a second; with a laxer guard they would reset
+    /// `prev_u_map` and make the next genuine depth frame look like a gap,
+    /// firing a REST snapshot refetch per second against a 100/min throttle.
+    #[test]
+    fn mark_price_frames_are_filed_under_their_symbol_and_leave_gap_detection_alone() {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 4);
+        let mut prev_u_map = HashMap::from([("BTCUSD_PERP".to_string(), 100)]);
+        let throttler = Throttler::new(100);
+        let now = Utc::now();
+
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            mark_price_update().as_str().into(),
+            &throttler,
+        )
+        .expect("a mark-price frame is ordinary market data, not a parse failure");
+
+        let (_, stream, payload) = rx.try_recv().expect("the frame must be written");
+        assert_eq!(
+            stream, "BTCUSD_PERP",
+            "it belongs to the symbol, not the sidecar"
+        );
+        assert!(
+            payload.contains(r#""i":"63427.35155222""#),
+            "the index price is the whole reason this stream is recorded"
+        );
+        assert_eq!(
+            prev_u_map.get("BTCUSD_PERP"),
+            Some(&100),
+            "a non-depth frame must not touch the depth sequence state"
+        );
+    }
 
     /// A record the writer cannot take must be an error, not a discarded frame.
     /// Bounding the channel is what makes that distinction exist at all: the

@@ -20,6 +20,21 @@ use crate::{
     queue::{Record, Tx},
 };
 
+/// The subscriptions taken for every coin, whatever the flags say.
+///
+/// `--hl-l2-modes` adds `l2Book` on top of these; these three are not
+/// configurable because nothing about them is a trade-off worth exposing.
+///
+/// `activeAssetCtx` is the odd one out: it is not order flow. Its `ctx` carries
+/// `oraclePx` — Hyperliquid's own spot basket, and the exact input its funding
+/// is computed from — alongside `markPx`, `midPx`, `premium` and the current
+/// `funding` rate. None of that can be reconstructed from the book or the tape
+/// after the fact, so a recording made without it cannot be repaired; and at a
+/// frame a second per coin it costs about a tenth of what the book feeds do.
+/// Measured on mainnet 2026-07-28: 1.018s median interval, ~312 B per frame,
+/// 2.4 MB/day/coin gzipped.
+pub const ALWAYS_ON: [&str; 3] = ["trades", "bbo", "activeAssetCtx"];
+
 /// Decides which stream a received frame belongs to.
 ///
 /// Every frame lands somewhere. A frame that can be attributed to a coin goes
@@ -49,7 +64,9 @@ fn route(j: &serde_json::Value) -> &str {
             .and_then(|t| t.get("coin"))
             .and_then(|c| c.as_str())
             .unwrap_or(META_STREAM),
-        // Everything else that carries a coin is filed under it. `error`
+        // Everything else that carries a coin is filed under it: `l2Book`,
+        // `bbo` and `activeAssetCtx` all name it as `data.coin`, dex prefix
+        // included, so one instrument's feeds stay in one file. `error`
         // frames carry a bare string as `data`, and `subscriptionResponse`
         // carries the echoed subscription — neither has a coin, so both fall
         // through to meta, which is exactly where they are wanted.
@@ -476,6 +493,58 @@ mod route_tests {
 
     fn r(s: &str) -> String {
         route(&serde_json::from_str(s).unwrap()).to_string()
+    }
+
+    /// Captured verbatim from mainnet on 2026-07-28. The wrapper is
+    /// `data.coin` + `data.ctx`, which is the shape `route` already keys on —
+    /// no new branch, but nothing said so until this test did.
+    ///
+    /// `oraclePx` is the reason the subscription exists: it is Hyperliquid's
+    /// own spot basket, and the exact input its funding is computed from.
+    const ACTIVE_ASSET_CTX_BTC: &str = concat!(
+        r#"{"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{"#,
+        r#""funding":"0.0000125","openInterest":"36584.28596","prevDayPx":"65126.0","#,
+        r#""dayNtlVlm":"2278613264.705988884","premium":"-0.0003453518","#,
+        r#""oraclePx":"63413.6","markPx":"63390.0","midPx":"63389.5","#,
+        r#""impactPxs":["63389.0","63391.7"],"dayBaseVlm":"35444.01912"}}}"#
+    );
+
+    /// The same frame for a HIP-3 builder-dex instrument, also captured live.
+    /// The coin string keeps its `dex:` prefix on the way back, so it files
+    /// itself under the same name `l2Book` and `trades` already use — the two
+    /// must not end up in different files for one instrument.
+    const ACTIVE_ASSET_CTX_DEX: &str = concat!(
+        r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:GOLD","ctx":{"#,
+        r#""funding":"0.00000625","openInterest":"41657.4252","prevDayPx":"4097.2","#,
+        r#""dayNtlVlm":"39058137.6294000074","premium":"0.0001365578","#,
+        r#""oraclePx":"4027.6","markPx":"4028.4","midPx":"4028.15","#,
+        r#""impactPxs":["4028.1","4028.2"],"dayBaseVlm":"9602.0065"}}}"#
+    );
+
+    /// The funding/oracle feed has to land in the coin's own file, next to that
+    /// coin's book and trades. In the sidecar it would be mixed with every
+    /// other coin's and with the lifecycle records, and the converter reads
+    /// per-coin files.
+    #[test]
+    fn active_asset_ctx_is_filed_under_its_coin() {
+        assert_eq!(r(ACTIVE_ASSET_CTX_BTC), "BTC");
+        assert_eq!(
+            r(ACTIVE_ASSET_CTX_DEX),
+            "xyz:GOLD",
+            "a builder-dex instrument must not be split across two files"
+        );
+    }
+
+    /// `activeAssetCtx` is subscribed for every coin, unconditionally.
+    ///
+    /// It is what makes a recording able to say what funding was priced
+    /// against: `ctx.oraclePx` is Hyperliquid's own spot basket and the direct
+    /// input to its funding calculation, and `ctx.funding` is the rate itself.
+    /// Neither is derivable from the book or the tape afterwards, so a
+    /// recording made without this is not repairable later.
+    #[test]
+    fn the_funding_and_oracle_feed_is_always_subscribed() {
+        assert!(ALWAYS_ON.contains(&"activeAssetCtx"));
     }
 
     #[test]

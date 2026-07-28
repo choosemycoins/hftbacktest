@@ -172,6 +172,95 @@ def um_trade(symbol, ts):
     }
 
 
+def um_mark_price(symbol, ts, index="63427.35155222"):
+    """`markPriceUpdate` as the USD-M combined stream delivers it.
+
+    Recorded from `<symbol>@markPrice@1s` (`binancefuturesum::STREAMS`). `i` is
+    the **index price** — Binance's own spot basket, aggregated across its
+    constituent exchanges — which with `r` (funding rate) is the reason the
+    stream is recorded at all; neither can be reconstructed from the book or the
+    tape afterwards.
+
+    The field set is Binance's documented USD-M one. It could not be captured
+    from the host these fixtures were written on — `fstream.binance.com` served
+    only `@trade`, `@bookTicker` and `@depth@0ms` there — but the COIN-M sibling
+    below WAS captured live and agrees on every field this report reads (`e`,
+    and the stream envelope). COIN-M adds `ap` and `st`; nothing here looks at
+    either.
+    """
+    return {
+        "stream": f"{symbol.lower()}@markPrice@1s",
+        "data": {
+            "e": "markPriceUpdate",
+            "E": ms_of(ts),
+            "s": symbol,
+            "p": "63406.00000000",
+            "i": index,
+            "P": "63402.48303662",
+            "r": "0.00005945",
+            "T": 1_785_254_400_000,
+        },
+    }
+
+
+#: Captured verbatim from `dstream.binance.com` on 2026-07-28. Kept as the raw
+#: line rather than a builder: the point of it is that the bytes the venue
+#: actually sends classify, not that a dict this file wrote does.
+CM_MARK_PRICE_CAPTURED = (
+    '{"stream":"btcusd_perp@markPrice@1s","data":{"e":"markPriceUpdate",'
+    '"E":1785239516000,"s":"BTCUSD_PERP","p":"63406.00000000",'
+    '"ap":"63406.00000000","P":"63402.48303662","i":"63427.35155222",'
+    '"r":"0.00005945","T":1785254400000,"st":2}}'
+)
+
+
+def hl_active_asset_ctx(coin, ts, oracle="63413.6"):
+    """`activeAssetCtx`, the Hyperliquid half of the same information.
+
+    `ctx.oraclePx` is Hyperliquid's own spot basket and the direct input to its
+    funding calculation; `ctx.funding` is the rate itself. Subscribed for every
+    coin unconditionally (`hyperliquid::ALWAYS_ON`).
+
+    Field set captured verbatim from mainnet 2026-07-28. Note what is NOT in it:
+    no venue timestamp and no sequence number of any kind, so `local_ts` and its
+    cadence are the only evidence this report has about the feed — the same
+    position `l2Book` and `bbo` are in.
+
+    `ts` is accepted for symmetry with the other builders and deliberately
+    unused: the frame carries no field to put it in.
+    """
+    return {
+        "channel": "activeAssetCtx",
+        "data": {
+            "coin": coin,
+            "ctx": {
+                "funding": "0.0000125",
+                "openInterest": "36584.28596",
+                "prevDayPx": "65126.0",
+                "dayNtlVlm": "2278613264.705988884",
+                "premium": "-0.0003453518",
+                "oraclePx": oracle,
+                "markPx": "63390.0",
+                "midPx": "63389.5",
+                "impactPxs": ["63389.0", "63391.7"],
+                "dayBaseVlm": "35444.01912",
+            },
+        },
+    }
+
+
+#: The same frame for a HIP-3 builder-dex instrument, captured live the same
+#: day. The `dex:` prefix rides along in `data.coin`, which is what files it
+#: next to that instrument's book instead of splitting one instrument in two.
+HL_ACTIVE_ASSET_CTX_DEX_CAPTURED = (
+    '{"channel":"activeAssetCtx","data":{"coin":"xyz:GOLD","ctx":'
+    '{"funding":"0.00000625","openInterest":"41657.4252","prevDayPx":"4097.2",'
+    '"dayNtlVlm":"39058137.6294000074","premium":"0.0001365578",'
+    '"oraclePx":"4027.6","markPx":"4028.4","midPx":"4028.15",'
+    '"impactPxs":["4028.1","4028.2"],"dayBaseVlm":"9602.0065"}}}'
+)
+
+
 def um_depth_snapshot(symbol, ts, last_update_id=1000):
     """The REST depth snapshot, written into the symbol file bare.
 
@@ -1786,3 +1875,331 @@ def test_the_binancefutures_alias_is_canonicalised_to_the_backend_name(tmp_path)
     assert code == 0, report
     assert set(report["venues"]) == {"binancefuturesum"}
     assert report["venues"]["binancefuturesum"]["exchange_as_recorded"] == "binancefutures"
+
+
+# --------------------------------------------------------------------------
+# Index, oracle and funding: the informational stream class
+#
+# `<symbol>@markPrice@1s` (Binance UM/CM) and `activeAssetCtx` (Hyperliquid)
+# were added to the collector on 2026-07-28. They carry each venue's own spot
+# basket — the input its funding is priced against — which is why they are
+# recorded; they are not order flow, mode A does not trade on them, and every
+# recording made before that date lacks them entirely.
+#
+# So they are neither required nor optional: the profile knows them, checks
+# them while they are there, and says nothing when they are not. Making their
+# absence even a warning would turn every historical day yellow at once, which
+# is precisely the noisy gate the design document's acceptance line rules out.
+# --------------------------------------------------------------------------
+
+#: Both feeds are periodic at ~1/s (measured 2026-07-28: 1.000s median on
+#: COIN-M `markPrice`, 1.018s on Hyperliquid `activeAssetCtx`), so both take the
+#: same K=10 the other periodic feeds in `MAX_GAP_NS` take.
+INDEX_LIMIT_NS = 10 * SEC
+
+
+def index_day(tmp_path, venue, name, gap_ns, meta_extra=()):
+    """A one-symbol day whose index feed has a single hole of `gap_ns`.
+
+    Everything the profile requires is written once, at the start: a stream seen
+    once has no interval to measure and so contributes no hole of its own, which
+    leaves exactly one gap in the report for the feed under test.
+    """
+    d = tmp_path / name
+    d.mkdir()
+    start, end = ns(0), ns(0) + gap_ns
+    if venue == "hyperliquid":
+        write_gz(
+            d / f"btc_{DAY}.gz",
+            [
+                (start, hl_trade("BTC", start)),
+                (start, hl_bbo("BTC", start)),
+                (start, hl_l2("BTC", start)),
+                (start, hl_l2("BTC", start, fast=True)),
+                (start, hl_active_asset_ctx("BTC", start)),
+                (end, hl_active_asset_ctx("BTC", end)),
+            ],
+        )
+        write_meta(
+            d,
+            "hyperliquid",
+            DAY,
+            [(ns(0), session_start("hyperliquid", ["BTC"])), *meta_extra],
+        )
+        return d, "btc"
+
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (start, um_book_ticker("BTCUSDT", start)),
+            (start, um_trade("BTCUSDT", start)),
+            (start, um_depth("BTCUSDT", start, u=100, pu=99)),
+            (start, um_mark_price("BTCUSDT", start)),
+            (end, um_mark_price("BTCUSDT", end)),
+        ],
+    )
+    write_meta(
+        d,
+        "binancefuturesum",
+        DAY,
+        [(ns(0), session_start("binancefuturesum", ["BTCUSDT"])), *meta_extra],
+    )
+    return d, "btcusdt"
+
+
+@pytest.mark.parametrize(
+    "family,raw,stream",
+    [
+        (qr.BINANCE, json.dumps(um_mark_price("BTCUSDT", ns(0))), "markPriceUpdate"),
+        (qr.BINANCE, CM_MARK_PRICE_CAPTURED, "markPriceUpdate"),
+        (qr.HYPERLIQUID, json.dumps(hl_active_asset_ctx("BTC", ns(0))), "activeAssetCtx"),
+        (qr.HYPERLIQUID, HL_ACTIVE_ASSET_CTX_DEX_CAPTURED, "activeAssetCtx"),
+    ],
+)
+def test_the_index_and_funding_frames_classify_as_their_own_streams(family, raw, stream):
+    """Each new shape has to become a stream of its own, not `(unclassified)`.
+
+    Nothing in the classifier was added for them — Binance keys on `data.e` and
+    Hyperliquid on `channel`, and both frames answer those — but "it happens to
+    work" and "it is checked" are different states, and only the second one
+    survives someone tightening either rule to a whitelist. An unclassified
+    frame is a yellow issue per file, so getting this wrong would also have
+    made every day carrying the new feeds noisy.
+    """
+    assert qr.classify(family, json.loads(raw)) == stream
+
+
+@pytest.mark.parametrize(
+    "family,stream",
+    [(qr.BINANCE, "markPriceUpdate"), (qr.HYPERLIQUID, "activeAssetCtx")],
+)
+def test_the_index_feeds_have_a_cadence_expectation(family, stream):
+    """A stream with no entry in `MAX_GAP_NS` is never checked for holes at all.
+
+    That is the default for anything the table has not heard of, and it is the
+    wrong default here: both feeds are periodic, so unlike an event-driven one
+    their silence is evidence on its own and needs no liveness witness.
+    """
+    assert qr.MAX_GAP_NS[(family, stream)] == INDEX_LIMIT_NS
+    assert qr.gap_limit(family, stream) == INDEX_LIMIT_NS
+
+
+@pytest.mark.parametrize(
+    "venue,stream",
+    [("hyperliquid", "activeAssetCtx"), ("binancefuturesum", "markPriceUpdate")],
+)
+def test_an_index_gap_of_exactly_the_limit_is_not_flagged_and_one_nanosecond_more_is(
+    tmp_path, venue, stream
+):
+    """Pins the limit to the nanosecond, the way the other cadences are pinned."""
+    for label, gap_ns, expected in (
+        ("at", INDEX_LIMIT_NS, 0),
+        ("over", INDEX_LIMIT_NS + 1, 1),
+    ):
+        d, sym = index_day(tmp_path, venue, f"{venue}-{label}", gap_ns)
+        out = tmp_path / f"r-{venue}-{label}.json"
+        _, report = run(d, out=out)
+        stat = report["venues"][venue]["days"][DAY]["symbols"][sym]["streams"][stream]
+        assert stat["gap_count"] == expected, (venue, label, gap_ns)
+
+
+@pytest.mark.parametrize(
+    "venue,stream",
+    [("hyperliquid", "activeAssetCtx"), ("binancefuturesum", "markPriceUpdate")],
+)
+def test_an_index_gap_is_flagged_and_a_reconnect_explains_it(tmp_path, venue, stream):
+    """Present, so it is checked — and answerable from the sidecar like any other.
+
+    A 30s hole in a 1/s feed is three times what the other streams' own limits
+    would notice on this venue, so the informational class is not a quiet class:
+    it is the finest cadence signal either socket has.
+    """
+    d, sym = index_day(
+        tmp_path,
+        venue,
+        f"{venue}-reconnect",
+        30 * SEC,
+        meta_extra=[
+            (ns(20), {"_collector": "disconnected", "error": "reset", "connected_for_ms": 20000}),
+            (ns(25), {"_collector": "connected", "url": "wss://example.invalid/ws"}),
+        ],
+    )
+    out = tmp_path / f"r-{venue}.json"
+    code, report = run(d, out=out)
+    assert code == 0, "a hole the collector itself reported is a warning, not a refusal"
+    assert "unclassified_frame" not in checks_of(report, venue)
+
+    detail = next(
+        i["detail"]
+        for i in issues_of(report, venue)
+        if i["check"] == "cadence_gap" and stream in i["detail"]
+    )
+    assert "disconnected" in detail
+    assert "limit 10.000s" in detail
+    gap = report["venues"][venue]["days"][DAY]["symbols"][sym]["streams"][stream]["gaps"][0]
+    assert gap["explained_by"].startswith("disconnected at ")
+    assert gap["suppressed_by"] is None, (
+        "these feeds are periodic, so nothing else running is evidence that "
+        "their own silence was harmless"
+    )
+
+
+def test_an_absent_index_feed_is_a_fact_and_never_a_warning(tmp_path):
+    """The whole point: recordings made before 2026-07-28 must not start yellowing.
+
+    Every day of every recording in existence lacks both feeds. Reporting that
+    as `missing_optional` would put a warning on all of them at once and bury
+    the gate's real signal, so absence is recorded in the JSON and raises
+    nothing.
+    """
+    hl = hl_dir(tmp_path)
+    um = um_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(hl, um, out=out)
+
+    assert code == 0
+    assert checks_of(report, "hyperliquid") == []
+    assert checks_of(report, "binancefuturesum") == []
+
+    hl_sym = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]
+    um_sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert hl_sym["missing_informational"] == ["activeAssetCtx"]
+    assert um_sym["missing_informational"] == ["markPriceUpdate"]
+    assert hl_sym["missing_optional"] == []
+    assert um_sym["missing_optional"] == []
+    assert hl_sym["missing_required"] == []
+    assert um_sym["missing_required"] == []
+    # And they stay out of the window Phase 3 trims to, whether present or not.
+    assert "activeAssetCtx" not in hl_sym["coverage"]["required_streams"]
+    assert "markPriceUpdate" not in um_sym["coverage"]["required_streams"]
+
+
+def test_a_symbol_with_no_file_at_all_still_lists_its_informational_streams(tmp_path):
+    """The no-file branch builds its own JSON entry, so it needs the key too.
+
+    A consumer reading `missing_informational` cannot be made to guess which
+    shape of entry it is holding.
+    """
+    d = tmp_path / "um-one-symbol-missing"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", [(ns(0), um_book_ticker("BTCUSDT", ns(0)))])
+    write_meta(
+        d,
+        "binancefuturesum",
+        DAY,
+        [(ns(0), session_start("binancefuturesum", ["BTCUSDT", "ETHUSDT"]))],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 1, "the symbol has no bookTicker, which mode A does require"
+    sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["ethusdt"]
+    assert sym["missing_required"] == ["bookTicker"]
+    assert sym["missing_informational"] == ["markPriceUpdate"]
+
+
+def test_the_index_feeds_have_no_sequence_chain_and_leave_the_depth_one_alone(tmp_path):
+    """No `pu` chain, no `u` chain — and no effect on the one that exists.
+
+    The Python-side counterpart of the Rust guard: `markPriceUpdate` carries `s`
+    but neither `u` nor `pu`, so a sequence tracker that keyed on the symbol
+    rather than on the stream would see every mark-price frame break the depth
+    chain, and the report would claim a lost-frame gap once a second.
+    """
+    d = tmp_path / "um-markprice-sequence"
+    d.mkdir()
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (ns(0), um_book_ticker("BTCUSDT", ns(0))),
+            (ns(0), um_depth("BTCUSDT", ns(0), u=100, pu=99)),
+            (ns(1), um_mark_price("BTCUSDT", ns(1))),
+            (ns(2), um_depth("BTCUSDT", ns(2), u=101, pu=100)),
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r-um.json"
+    code, report = run(d, out=out)
+    assert code == 0, issues_of(report, "binancefuturesum")
+    assert "sequence_gap" not in checks_of(report, "binancefuturesum")
+    sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert set(sym["sequence_breaks"]) == {"depthUpdate"}
+
+    # Hyperliquid publishes no sequence number on any channel, and the new one
+    # is no exception: cadence is all the evidence there is.
+    hl = hl_dir(tmp_path, name="hl-ctx-sequence")
+    write_gz(hl / f"btc_{DAY}.gz", [(ns(4), hl_active_asset_ctx("BTC", ns(4)))], append=True)
+    out = tmp_path / "r-hl.json"
+    code, report = run(hl, out=out)
+    assert code == 0, issues_of(report, "hyperliquid")
+    assert report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["sequence_breaks"] == {}
+
+
+@pytest.mark.parametrize("venue", ["hyperliquid", "binancefuturesum"])
+def test_an_index_stream_going_backwards_within_itself_is_red(tmp_path, venue):
+    """One WS reader stamps these at receive time and queues them in that order.
+
+    Both feeds come off the same socket loop as the book and the tape
+    (`hyperliquid/mod.rs`, `binancefutures*::pump`), so within one of them a
+    step backwards of any size is a clock or two recordings in one file — the
+    same rule every other stream here is held to.
+    """
+    d, _ = index_day(tmp_path, venue, f"{venue}-backwards", 5 * SEC)
+    path = next(d.glob(f"*_{DAY}.gz"))
+    late = ns(5) - MS
+    frame = (
+        hl_active_asset_ctx("BTC", late)
+        if venue == "hyperliquid"
+        else um_mark_price("BTCUSDT", late)
+    )
+    write_gz(path, [(late, frame)], append=True)
+    out = tmp_path / f"r-{venue}.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "monotonicity" in checks_of(report, venue, severity="red")
+
+
+@pytest.mark.parametrize("venue", ["hyperliquid", "binancefuturesum"])
+def test_an_index_frame_out_of_order_against_another_stream_is_red(tmp_path, venue):
+    """No second producer writes these files, so there is no race to excuse one.
+
+    The REST depth-snapshot fetcher is the only concurrent producer the report
+    knows of, and it writes neither of these feeds; granting them the interleave
+    tolerance would downgrade a real defect to yellow.
+    """
+    d = tmp_path / f"{venue}-interleave"
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    if venue == "hyperliquid":
+        write_gz(
+            d / f"btc_{DAY}.gz",
+            [
+                (base, hl_trade("BTC", base)),
+                (base, hl_l2("BTC", base)),
+                (base, hl_l2("BTC", base, fast=True)),
+                (base + 2 * MS, hl_bbo("BTC", base + 2 * MS)),
+                (base + MS, hl_active_asset_ctx("BTC", base + MS)),
+            ],
+        )
+        write_meta(d, "hyperliquid", DAY, [(ns(0), session_start("hyperliquid", ["BTC"]))])
+    else:
+        write_gz(
+            d / f"btcusdt_{DAY}.gz",
+            [
+                (base, um_book_ticker("BTCUSDT", base)),
+                (base + 2 * MS, um_trade("BTCUSDT", base + 2 * MS)),
+                (base + MS, um_mark_price("BTCUSDT", base + MS)),
+            ],
+        )
+        write_meta(
+            d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+        )
+    out = tmp_path / f"r-{venue}.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, venue, severity="red")
+    detail = next(
+        i["detail"] for i in issues_of(report, venue) if i["check"] == "interleave_excess"
+    )
+    assert "no second producer" in detail

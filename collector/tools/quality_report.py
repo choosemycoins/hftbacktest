@@ -19,8 +19,11 @@ What it checks, per finalized UTC day per venue directory:
 2. **gzip integrity** — a full decode through every member (a restart appends
    one; Python's `gzip` reads them transparently).
 3. **Expected symbol x stream set** = the `session_start` record x the dataset
-   profile. Missing required stream => red; missing optional => warning. The
-   profile may also contradict the recording outright: mode A trades the
+   profile. Missing required stream => red; missing optional => warning; missing
+   *informational* => nothing at all, only a line in the JSON (see `Expected`:
+   a stream added to the collector after a recording was made cannot be
+   backfilled, and warning about it would yellow every historical day at once).
+   The profile may also contradict the recording outright: mode A trades the
    Hyperliquid book, so a recording configured with no `l2Book` cadence at all
    is red however cleanly it was written.
 
@@ -290,14 +293,41 @@ def canonical_exchange(exchange: str) -> str:
 #: README's capacity table covers HL and Bybit volume only), so rather than
 #: inventing a cadence they get a flat absolute limit. It is deliberately loose:
 #: this check exists to name reconnect-sized holes, not to grade liquidity.
+#:
+#: The two index/funding feeds are the exception on both counts, because both
+#: were measured on 2026-07-28 (`collector/README.md`, "Index, oracle and
+#: funding") and both are **periodic**: a frame arrives whether or not anything
+#: changed — consecutive ones are frequently byte-identical — so their silence
+#: is evidence on its own and needs no liveness witness, exactly like the
+#: throttled `l2Book` feeds. They take the same K=10:
+#:
+#:   * `activeAssetCtx`  1.018s x 10  (n=292 over 300s, Hyperliquid mainnet)
+#:   * `markPriceUpdate` 1.000s x 10  (n=298 over 300s, Binance COIN-M; the
+#:                       USD-M stream is the same event at the same documented
+#:                       1s cadence — see `binancefuturesum::STREAMS` for why it
+#:                       could not be captured from here)
+#:
+#: Both are written as a round 10s rather than as the cadence x 10 to the
+#: decimal. Five minutes of each measures a median well and a tail not at all
+#: (the widest interval anyone has watched for is 1.253s, over 45s of
+#: `activeAssetCtx`), so a limit carrying two decimal places would be claiming
+#: precision that was never observed; 10x a 1/s heartbeat is eight times that
+#: worst interval either way.
+#:
+#: Note what this makes them: at 10s they are the tightest cadence check on
+#: either socket — finer than Binance's 30s guesses and than `bbo`'s 14s. That
+#: is the point. A periodic feed is the one channel whose silence means
+#: something without a second opinion.
 MAX_GAP_NS = {
     (HYPERLIQUID, "l2Book_slow"): 54 * SEC_NS,
     (HYPERLIQUID, "l2Book_fast"): 5_400_000_000,
     (HYPERLIQUID, "bbo"): 14 * SEC_NS,
     (HYPERLIQUID, "trades"): 120 * SEC_NS,
+    (HYPERLIQUID, "activeAssetCtx"): 10 * SEC_NS,
     (BINANCE, "bookTicker"): 30 * SEC_NS,
     (BINANCE, "depthUpdate"): 30 * SEC_NS,
     (BINANCE, "trade"): 120 * SEC_NS,
+    (BINANCE, "markPriceUpdate"): 10 * SEC_NS,
     (BYBIT, "orderbook"): 30 * SEC_NS,
     (BYBIT, "publicTrade"): 120 * SEC_NS,
 }
@@ -325,6 +355,14 @@ MAX_GAP_NS = {
 #: limit is a flat guess (no cadence for that venue has ever been measured here),
 #: `@depth@0ms` is optional and may be absent, and no false positive has been
 #: observed. Adding a reference before the measurement would be inventing one.
+#:
+#: The 1/s index feeds would make fine references — they are periodic, they are
+#: on the same socket, and `markPriceUpdate` is the first steady channel Binance
+#: has here. They are deliberately not listed anyway. A reference can only ever
+#: remove a warning, and adding one would loosen a check that has not been shown
+#: to be noisy, on the strength of a stream no recording older than 2026-07-28
+#: contains. `bbo`'s references are there because 26 false positives were counted
+#: first; this one has no such measurement behind it yet.
 LIVENESS_REFERENCE = {
     (HYPERLIQUID, "bbo"): ("l2Book_fast", "l2Book_slow"),
 }
@@ -333,6 +371,30 @@ LIVENESS_REFERENCE = {
 @dataclass(frozen=True)
 class Expected:
     """The stream set one symbol of this venue must (or may) contain.
+
+    Three classes, and the third is not a quieter second:
+
+    * `required` — the dataset cannot be built without it. Absent: red.
+    * `optional` — recorded on purpose and its absence costs something, but
+      nothing mode A reads. Absent: yellow.
+    * `informational` — checked exactly as the others are **while it is there**
+      (classification, cadence, ordering), and not reported at all when it is
+      not. Absent: nothing.
+
+    The third class exists because a stream can be added to the collector after
+    recordings have already been made. `@markPrice@1s` and `activeAssetCtx` were
+    added on 2026-07-28; every day recorded before then lacks them by
+    construction, and no rerun can fix that. Calling those days `missing_optional`
+    would put a warning on every recording in existence at once — a gate whose
+    yellows are mostly history is a gate nobody reads, which is the outcome the
+    design document's acceptance line rules out. It is also a warning nobody can
+    act on: Binance acks a stream name it will never serve and reports no error
+    for it, so an absent `markPriceUpdate` is not always something the recording
+    could have done anything about (`collector/README.md`, "Known limitations").
+
+    What it is NOT is unknown. An unrecognised frame shape is still a yellow
+    `unclassified_frame`, and the absence is still stated in the JSON as
+    `missing_informational` — a fact the report reports, not a problem it raises.
 
     `violation` is set when the *profile* contradicts the recording
     configuration rather than the data: a legal recording that can never make
@@ -343,6 +405,7 @@ class Expected:
     required: tuple
     optional: tuple
     violation: Optional[str] = None
+    informational: tuple = ()
 
 
 def family_of(exchange: str) -> str:
@@ -398,7 +461,14 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
                 "would block with no bid. Record with --hl-l2-modes slow or fast."
                 % (config.get("hl_l2_modes") or [],)
             )
-        return Expected(tuple(dict.fromkeys(required)), (), violation)
+        # `activeAssetCtx` (`hyperliquid::ALWAYS_ON`) carries `ctx.oraclePx` —
+        # Hyperliquid's own spot basket and the direct input to its funding —
+        # plus the funding rate itself. Mode A trades the book and does not read
+        # either, so it is informational; see `Expected` for why that is not the
+        # same as optional.
+        return Expected(
+            tuple(dict.fromkeys(required)), (), violation, ("activeAssetCtx",)
+        )
 
     if exchange in ("binancefuturesum", "binancefuturescm"):
         # Mode A depends on `@bookTicker` alone. `@trade` and `@depth@0ms` are
@@ -406,7 +476,15 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
         # without depth the recording is permanently unconvertible into a
         # tradable asset and the `pu` check above loses its input — but the
         # backtest itself does not read them.
-        return Expected(("bookTicker",), ("trade", "depthUpdate"))
+        #
+        # `@markPrice@1s` is the Binance half of the index/funding pair: `i` is
+        # the Binance index, its own spot basket. Informational for the same
+        # reason, and with one more of its own — the venue acks a stream it then
+        # never serves, so its absence is not always something the recording
+        # could have done anything about.
+        return Expected(
+            ("bookTicker",), ("trade", "depthUpdate"), None, ("markPriceUpdate",)
+        )
 
     if exchange == "bybit":
         # Bybit is not part of the mode-A dataset, so nothing it does can make
@@ -591,6 +669,15 @@ def classify(family: str, obj: dict) -> Optional[str]:
     cadences apart) and `binancefutures.py` (combined-stream envelope, `data.e`).
     Bybit's topic string is `orderbook.<depth>.<symbol>` / `publicTrade.<symbol>`
     (`collector/src/bybit/mod.rs` routes on its last segment).
+
+    The two index/funding feeds need no rule of their own and deliberately do
+    not get one: Hyperliquid's `activeAssetCtx` names itself in `channel`, and
+    Binance's `markPriceUpdate` in `data.e`, so both fall out of the rules above
+    as streams in their own right — including the dex-prefixed `xyz:GOLD` form,
+    whose coin only ever appears in the payload the routing already keyed on.
+    Pinned by `test_the_index_and_funding_frames_classify_as_their_own_streams`
+    over frames captured from mainnet, because "happens to work" is one
+    whitelist away from a whole feed being counted as `unclassified_frame`.
     """
     if family == HYPERLIQUID:
         channel = obj.get("channel")
@@ -742,13 +829,18 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     stream this file classifies:
 
     * Hyperliquid — one WS reader stamps `Utc::now()` and `route`s every frame
-      (`hyperliquid/mod.rs`); `trades`, `bbo`, `l2Book_fast` and `l2Book_slow`
-      all come off that one loop, in receive order.
+      (`hyperliquid/mod.rs`); `trades`, `bbo`, `l2Book_fast`, `l2Book_slow` and
+      `activeAssetCtx` all come off that one loop, in receive order. The last is
+      one more subscription on the same socket (`hyperliquid::ALWAYS_ON`), not a
+      second producer.
     * Bybit — likewise, one reader for `orderbook.*` and `publicTrade`
       (`bybit/mod.rs`); nothing else writes a symbol file.
     * Binance (`binance`, `binancefuturesum`, `binancefuturescm`) — `bookTicker`,
-      `depthUpdate` and `trade` come off the one WS reader through `pump`, so
-      they hold. `depthSnapshot` is the exception worth knowing about: each one
+      `depthUpdate`, `trade` and `markPriceUpdate` come off the one WS reader
+      through `pump`, so they hold; `@markPrice@1s` is a stream of the same
+      combined-stream URL (`binancefutures{um,cm}::STREAMS`), which is also why
+      it carries no `pu` chain to check and never enters `_track_sequence`.
+      `depthSnapshot` is the exception worth knowing about: each one
       is fetched by its own detached `tokio::spawn`, so two in flight could in
       principle be stamped and enqueued out of order. The window is the few
       instructions between `Utc::now()` and `send`, and the fetches are
@@ -1324,6 +1416,9 @@ def check_day(
                 "streams": {},
                 "missing_required": missing,
                 "missing_optional": list(expected.optional) if expected else [],
+                "missing_informational": (
+                    list(expected.informational) if expected else []
+                ),
                 "coverage": {
                     "first_local_ts": None,
                     "last_local_ts": None,
@@ -1402,7 +1497,7 @@ def check_day(
             if record:
                 issues.append(issue(severity, check, interleave_detail(name, record)))
 
-        missing_required, missing_optional = [], []
+        missing_required, missing_optional, missing_informational = [], [], []
         if expected is not None:
             for stream in expected.required:
                 if scan.streams.get(stream, StreamStat()).count == 0:
@@ -1410,6 +1505,16 @@ def check_day(
             for stream in expected.optional:
                 if scan.streams.get(stream, StreamStat()).count == 0:
                     missing_optional.append(stream)
+            # Recorded, never raised. An informational stream absent from a day
+            # older than the stream itself is the normal case, not a finding —
+            # see `Expected`. It reaches the JSON so the question "does this day
+            # carry the funding basket?" has an answer, and it deliberately
+            # reaches no `issue()` below — which is also why `render_text` never
+            # prints it: that view is the operator's issue list, and a fact
+            # printed among warnings is read as one.
+            for stream in expected.informational:
+                if scan.streams.get(stream, StreamStat()).count == 0:
+                    missing_informational.append(stream)
             if missing_required:
                 issues.append(
                     issue(
@@ -1492,6 +1597,7 @@ def check_day(
         entry = scan.as_json()
         entry["missing_required"] = missing_required
         entry["missing_optional"] = missing_optional
+        entry["missing_informational"] = missing_informational
 
         if expected is not None:
             # Coverage is measured over the REQUIRED streams: an optional feed
@@ -1671,15 +1777,18 @@ def render_text(report: dict) -> str:
                     # simply being quiet, and so reach no issue.
                     quiet = stat.get("suppressed_gap_count") or 0
                     tail = f" ({quiet} quiet, not reported)" if quiet else ""
+                    # Width 16 fits the longest stream name any venue produces,
+                    # which is `markPriceUpdate` at 15; at 14 that one row broke
+                    # the alignment of every column after it.
                     lines.append(
-                        f"     {name:<12} {stream:<14} n={stat['count']:<9} "
+                        f"     {name:<12} {stream:<16} n={stat['count']:<9} "
                         f"{iso(stat['first_local_ts'])} .. {iso(stat['last_local_ts'])} "
                         f"gaps={stat['gap_count']}{tail}"
                     )
                 cov = sym.get("coverage") or {}
                 if cov.get("required_streams"):
                     lines.append(
-                        f"     {name:<12} {'coverage':<14} "
+                        f"     {name:<12} {'coverage':<16} "
                         f"{iso(cov['first_local_ts'])} .. {iso(cov['last_local_ts'])} "
                         f"(all of: {', '.join(cov['required_streams'])})"
                     )

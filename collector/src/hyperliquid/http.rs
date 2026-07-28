@@ -107,6 +107,41 @@ pub async fn connect(
     Ok(StreamEnd::Eof)
 }
 
+/// The subscribe frames for one connection: the cross product of the requested
+/// subscription kinds and the requested coins.
+///
+/// Split out from [`keep_connection`] so the wire shape can be asserted without
+/// a socket. It is the one thing about this backend that no log line and no
+/// error would ever contradict — Hyperliquid answers a malformed subscription
+/// by closing the entire WebSocket, taking every valid subscription on it with
+/// it, and the collector then reconnects for ever recording a trickle.
+fn subscription_frames(
+    subscription_types: &[super::SubscriptionSpec],
+    symbol_list: &[String],
+) -> Vec<serde_json::Value> {
+    symbol_list
+        .iter()
+        .flat_map(|symbol| {
+            subscription_types.iter().map(move |spec| {
+                let mut sub = serde_json::Map::new();
+                sub.insert("type".into(), serde_json::Value::from(spec.kind.as_str()));
+                sub.insert("coin".into(), serde_json::Value::from(symbol.as_str()));
+                // Omit `fast` entirely rather than sending `false`: the two
+                // are equivalent for the venue, but an omitted field keeps
+                // the default subscription byte-identical to what earlier
+                // recordings used, so old and new files stay comparable.
+                if let Some(fast) = spec.fast {
+                    sub.insert("fast".into(), serde_json::Value::from(fast));
+                }
+                serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": serde_json::Value::Object(sub),
+                })
+            })
+        })
+        .collect()
+}
+
 pub async fn keep_connection(
     subscription_types: Vec<super::SubscriptionSpec>,
     symbol_list: Vec<String>,
@@ -115,27 +150,7 @@ pub async fn keep_connection(
     let mut error_count: u32 = 0;
     let mut attempt: u64 = 0;
     loop {
-        let subscriptions: Vec<serde_json::Value> = symbol_list
-            .iter()
-            .flat_map(|symbol| {
-                subscription_types.iter().map(move |spec| {
-                    let mut sub = serde_json::Map::new();
-                    sub.insert("type".into(), serde_json::Value::from(spec.kind.as_str()));
-                    sub.insert("coin".into(), serde_json::Value::from(symbol.as_str()));
-                    // Omit `fast` entirely rather than sending `false`: the two
-                    // are equivalent for the venue, but an omitted field keeps
-                    // the default subscription byte-identical to what earlier
-                    // recordings used, so old and new files stay comparable.
-                    if let Some(fast) = spec.fast {
-                        sub.insert("fast".into(), serde_json::Value::from(fast));
-                    }
-                    serde_json::json!({
-                        "method": "subscribe",
-                        "subscription": serde_json::Value::Object(sub),
-                    })
-                })
-            })
-            .collect();
+        let subscriptions = subscription_frames(&subscription_types, &symbol_list);
 
         info!(
             "Connecting to Hyperliquid WebSocket with {} subscriptions",
@@ -192,5 +207,88 @@ pub async fn keep_connection(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hyperliquid::{ALWAYS_ON, SubscriptionSpec};
+
+    fn coins(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The exact frame mainnet accepted on 2026-07-28 — the ack echoed it back
+    /// unchanged and data followed, for the canonical coin and for a HIP-3
+    /// builder-dex one alike.
+    ///
+    /// The dex prefix is the part worth pinning: `xyz:GOLD` is the wire name in
+    /// full, so it goes across verbatim rather than being split into a coin and
+    /// a dex field. Getting that wrong is not a rejected subscription but a
+    /// closed WebSocket, which takes every other coin's subscriptions with it.
+    #[test]
+    fn the_funding_and_oracle_subscription_goes_out_per_coin_dex_prefix_and_all() {
+        let specs = [SubscriptionSpec::plain("activeAssetCtx")];
+        let frames = subscription_frames(&specs, &coins(&["BTC", "xyz:GOLD"]));
+
+        assert_eq!(
+            frames,
+            vec![
+                serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": {"type": "activeAssetCtx", "coin": "BTC"},
+                }),
+                serde_json::json!({
+                    "method": "subscribe",
+                    "subscription": {"type": "activeAssetCtx", "coin": "xyz:GOLD"},
+                }),
+            ]
+        );
+    }
+
+    /// One subscribe frame per coin per kind, and no coin left without the
+    /// always-on set. A missing pairing here is invisible at runtime: the venue
+    /// serves the ones it was asked for and says nothing about the rest, which
+    /// reads downstream as a coin that was simply quiet.
+    #[test]
+    fn every_coin_gets_every_always_on_subscription() {
+        let specs: Vec<SubscriptionSpec> = ALWAYS_ON
+            .iter()
+            .map(|k| SubscriptionSpec::plain(k))
+            .collect();
+        let symbols = coins(&["BTC", "ETH", "xyz:GOLD"]);
+        let frames = subscription_frames(&specs, &symbols);
+
+        assert_eq!(frames.len(), ALWAYS_ON.len() * symbols.len());
+        for coin in &symbols {
+            for kind in ALWAYS_ON {
+                assert!(
+                    frames.iter().any(|f| {
+                        f["subscription"]["type"] == kind
+                            && f["subscription"]["coin"] == coin.as_str()
+                    }),
+                    "{coin} was never subscribed to {kind}"
+                );
+            }
+        }
+    }
+
+    /// `fast` is omitted rather than sent as `false`, which keeps a default
+    /// recording's subscribe frames byte-identical to those made before the
+    /// fast feed existed. Only `l2Book` ever carries the flag; the funding feed
+    /// must not grow one by accident.
+    #[test]
+    fn only_the_book_subscription_carries_the_fast_flag() {
+        let specs = [
+            SubscriptionSpec::l2_book(false),
+            SubscriptionSpec::l2_book(true),
+            SubscriptionSpec::plain("activeAssetCtx"),
+        ];
+        let frames = subscription_frames(&specs, &coins(&["BTC"]));
+
+        assert!(frames[0]["subscription"].get("fast").is_none());
+        assert_eq!(frames[1]["subscription"]["fast"], true);
+        assert!(frames[2]["subscription"].get("fast").is_none());
     }
 }

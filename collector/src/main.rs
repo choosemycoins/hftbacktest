@@ -314,16 +314,16 @@ async fn main() -> Result<(), anyhow::Error> {
         // place, `canonical_exchange` in `collector/tools/quality_report.py`;
         // adding an alias here means adding it there too, or the same bytes
         // become buildable or unbuildable depending on the spelling.
+        //
+        // The stream sets themselves live next to the `handle` that parses
+        // their frames (`binancefutures{um,cm}::STREAMS`) rather than here: a
+        // misspelled stream name is silent at runtime — the venue acks it and
+        // never serves it — so only a test can catch one.
         "binancefutures" | "binancefuturesum" => {
-            let streams = [
-                "$symbol@trade",
-                "$symbol@bookTicker",
-                "$symbol@depth@0ms",
-                // "$symbol@@markPrice@1s"
-            ]
-            .iter()
-            .map(|stream| stream.to_string())
-            .collect();
+            let streams = binancefuturesum::STREAMS
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
 
             tokio::spawn(binancefuturesum::run_collection(
                 streams,
@@ -332,15 +332,10 @@ async fn main() -> Result<(), anyhow::Error> {
             ))
         }
         "binancefuturescm" => {
-            let streams = [
-                "$symbol@trade",
-                "$symbol@bookTicker",
-                "$symbol@depth@0ms",
-                // "$symbol@@markPrice@1s"
-            ]
-            .iter()
-            .map(|stream| stream.to_string())
-            .collect();
+            let streams = binancefuturescm::STREAMS
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
 
             tokio::spawn(binancefuturescm::run_collection(
                 streams,
@@ -373,10 +368,12 @@ async fn main() -> Result<(), anyhow::Error> {
         "hyperliquid" => {
             use hyperliquid::SubscriptionSpec;
 
-            let mut subscriptions = vec![
-                SubscriptionSpec::plain("trades"),
-                SubscriptionSpec::plain("bbo"),
-            ];
+            // `trades`, `bbo` and `activeAssetCtx` — see `hyperliquid::ALWAYS_ON`
+            // for why the funding/oracle feed is among them and unconditional.
+            let mut subscriptions: Vec<SubscriptionSpec> = hyperliquid::ALWAYS_ON
+                .iter()
+                .map(|kind| SubscriptionSpec::plain(kind))
+                .collect();
             // Record both book cadences; the converter selects one of them.
             // Measured on mainnet 2026-07-25: the plain feed is 20 levels every
             // ~5.3s, `fast` is 5 levels every ~0.5s. Recording only the plain
