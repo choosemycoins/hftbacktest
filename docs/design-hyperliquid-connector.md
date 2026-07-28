@@ -1,9 +1,15 @@
 # Design: Hyperliquid connector
 
-Status: Draft — for review, not yet approved
-Date: 2026-07-25
+Status: **Phase 1 (public market data) implemented**; Phases 2–5 still draft
+Date: 2026-07-25, Phase 1 built and measured 2026-07-28
 Scope: a new `hyperliquid` backend in the `connector/` crate (market data + order management)
 Related: [`snapshot-complete-marker.md`](snapshot-complete-marker.md), `AGENTS.md` §4 (codebase traps)
+
+**What exists in the tree today** is `connector/src/hyperliquid/`: config, universe
+resolution, the public WebSocket, snapshot→delta synthesis, the trade-replay guard, and the
+reconnect policy. It holds no key and **rejects every order** with `ErrorKind::OrderError`.
+§10 records what the build changed about this document; read it before trusting §5.2's
+first formulation.
 
 API facts in this document were verified on **2026-07-25**, several by live measurement
 against mainnet. Hyperliquid's docs were stale in at least four places at that date, so
@@ -208,16 +214,21 @@ visible. A level that leaves the window is indistinguishable from a level that w
 cancelled. Naively emitting `qty: 0.0` for everything absent from the new snapshot
 corrupts the book on every volatile tick — the bot would see depth evaporate and reappear.
 
-Policy: **the mirror is authoritative only inside the observed window.**
+Policy as first written here: *the mirror is authoritative only inside the observed
+window*, emitting deletions **only** for mirrored levels inside `[deepest_bid, best_bid]`
+(resp. `[best_ask, deepest_ask]`) and leaving levels beyond the window untouched.
 
-- Let `deepest_bid` / `deepest_ask` be the furthest prices in the incoming snapshot.
-- Emit deletions **only** for mirrored levels that are inside `[deepest_bid, best_bid]`
-  (resp. `[best_ask, deepest_ask]`) and absent from the new snapshot.
-- Levels beyond the window are left untouched in the bot's book. They are stale by
-  construction, and the bot must not treat depth beyond level *N* as meaningful.
+> **Superseded by the build — see §10.1.** That rule is incomplete in a way that breaks the
+> book: it says nothing about mirrored levels **above** the new best bid, which is exactly
+> where a falling touch leaves them. Under the rule as written, a bid at 100 that the
+> market has left behind stays in the bot's book for ever while the venue's best bid is 95
+> — a permanently crossed book. The implemented rule deletes every mirrored level absent
+> from the snapshot, including truncation; §10.1 has the reasoning and the alternative it
+> was weighed against.
 
-This must be stated in the connector's docs, because it is a real accuracy limit, not an
-implementation detail: **with the public feed, only the top N levels are trustworthy.**
+Either way, the accuracy limit is real and belongs in the connector's docs rather than
+being treated as an implementation detail: **with the public feed, only the top N levels
+are trustworthy.**
 
 **Feed selection.** Subscribe to `bbo` *and* `l2Book fast:true`:
 
@@ -598,3 +609,299 @@ depth design needs revisiting before anything downstream is built.
 7. **UNVERIFIED: max order batch size** — undocumented. Affects `batchModify` sizing (§5.9).
 8. **UNVERIFIED: testnet feed cadence and asset indices** — mainnet only was measured, and
    indices are known to differ between networks.
+
+---
+
+## 10. Phase 1 as built (2026-07-28)
+
+Phase 1 is `connector/src/hyperliquid/`: `mod.rs` (config, `Connector` impl), `rest.rs`
+(universe), `msg.rs` (wire types), `depth.rs` (snapshot→delta), `trades.rs` (replay guard),
+`public_stream.rs` (the connection). 68 tests, every fixture a byte-for-byte capture from
+testnet. What follows is where the build departed from this document, and why. Where the
+two disagree, **the build is right and this section says so** — the earlier text is kept so
+the reasoning is auditable.
+
+### 10.1 Deletion policy: everything absent from the snapshot goes
+
+§5.2's rule covers only the window's interior. Two cases it leaves undefined decide whether
+the book is usable at all:
+
+* **Above the new best bid** (below the new best ask). A falling touch leaves mirrored
+  levels there. Not deleting them leaves the bot's book permanently crossed with no error
+  anywhere. These deletions are mandatory, and `bbo` — which restates the whole touch —
+  produces them between snapshots too.
+* **Beyond the deepest observed level** — genuine truncation, genuinely ambiguous.
+
+The build deletes both, so the invariant is one sentence: **the bot's book is exactly the
+last observed window**, plus any touch levels `bbo` has added since. The alternative
+(keeping truncated levels) was rejected on two grounds: the residue never expires, so the
+book accumulates levels of unknown age for as long as the process runs and any
+depth-derived number is silently part stale; and the offline converter deletes them by
+default (`delete_out_of_book=True`), so keeping them would make a backtest of this feed
+disagree with the live bot it is meant to predict.
+
+**The mirror is not capped at N.** A `bbo` may push it to N+1 levels between snapshots; the
+next snapshot brings it back. Capping would delete a real level and re-insert it on the
+next frame — churn for nothing.
+
+**What the retained touch levels actually are.** The invariant above reads as benign and is
+not. A `bbo` touch level was accurate only at the instant it *was* the touch; once the touch
+moves past it, its size is **unverified resting size** until a snapshot reconciles, and any
+depth-derived quantity computed in between includes it. Measured: 1 000 upward `bbo` ticks
+with no intervening snapshot leave 999 such levels, and the next snapshot clears them in one
+batch. Bounded in practice by the snapshot cadence — roughly 4 levels at `l2_book = "fast"`
+(0.54 s against a ~0.14 s `bbo`), roughly 38 at `"slow"` (5.4 s). That ratio is another
+reason `"fast"` is the default, and it is now stated in `depth.rs`'s module comment rather
+than left to be rediscovered.
+
+### 10.2 One unlistable coin must not blind the others
+
+Resolution is per coin, not all-or-nothing. A coin the venue does not list is refused with
+a `LiveEvent::Error(CriticalConnectionError)` naming it, and the remaining coins subscribe
+normally. All-or-nothing resolution had a failure mode worth recording: the subscribe step
+fails, the connection is torn down and retried, the bad coin is still in the shared symbol
+set — an endless reconnect loop with no market data for anyone, caused by one bot
+registering a typo.
+
+Measured on testnet 2026-07-28: `POST /info {"type":"meta","dex":"nope_xyz"}` answers
+**HTTP 500 with a `null` body**. Verified live: with
+`coins = ["BTC","ETH","NOPE_XYZ","nope:ABC"]`, both bad coins produced a bot-visible error
+and BTC/ETH kept flowing.
+
+> **Corrected after review.** The first build read *any* status-bearing error as "that dex
+> does not exist". `/info` is weight-20 against a 1200/min IP budget and the venue sits
+> behind a CDN, so a 429 or a 502 on the **canonical** dex would have left its universe
+> unfetched, every bare coin refused as unlistable — and then written off, because the
+> subscription tracker marked the whole pending batch. The socket stays up (the keepalive
+> feeds the idle detector), no later registration re-asks (`pending` is empty), and the
+> connector runs for hours connected and publishing nothing; a supervisor restart does not
+> help, because the bot re-registers the same coins into the same window. It is the
+> `AGENTS.md` §4.2 failure reached by a different route.
+>
+> Two rules now close it: only the **measured signature** (HTTP 500, body `null`) means "no
+> such dex" and everything else propagates so the connection is retried; and only coins the
+> venue gave a **listing verdict** on are marked subscribed
+> (`HyperliquidError::is_listing_verdict`). A coin left unresolved because the venue would
+> not answer stays pending and is asked about again on the next wake-up. A connection that
+> resolved nothing now says so at `error!` instead of logging `coins = []` at `info!`.
+
+### 10.3 Frames older than the last applied one are dropped
+
+The fused depth in `main.rs` rejects any event whose timestamp precedes the state it would
+update (`fuse.rs:80,196`), so an out-of-order frame applied to this backend's mirror would
+be dropped downstream and the mirror would stop describing the bot's book. Frames are
+therefore required to be non-decreasing in exchange time per coin; older ones are counted
+(`FeedCounts::stale_frames`) and ignored. Measured: **zero** out-of-order frames in 644
+interleaved `bbo`/`l2Book` frames across two coins, and zero in every live run since.
+
+**The gate is shared by both channels, on purpose.** `bbo` and `l2Book` are produced by
+different venue subsystems and nothing promises their `time` fields are monotonic in
+socket-send order, so a snapshot stamped behind the last `bbo` is discarded whole — costing
+up to one snapshot interval (~0.54 s at `"fast"`). Per-channel gates were considered and
+rejected: fusion would then reject that snapshot's write to the level the `bbo` had just
+stamped, leaving the mirror believing it published something the bot never received, which
+is the one failure this whole module exists to prevent.
+
+That leaves a tail risk the 644-frame testnet sample is too thin to rule out: if the venue's
+`bbo` clock ran systematically ahead of its `l2Book` clock, most snapshots would be refused
+and the bot would run on a touch-only book with the deeper levels frozen, indefinitely. So
+the assumption is made **self-reporting** rather than assumed: refusals are measured as a
+*rate* over each reporting interval (`public_stream::degraded`) and logged at `warn!` above
+5 % of the interval's depth frames, instead of only appearing as a cumulative count in an
+`info!` line.
+
+**Two ways the latch could be poisoned, both closed.** The gate is latched, which makes the
+timestamp it latches safety-critical. `exch_ts_ms * 1_000_000` was unchecked: `overflow-checks`
+is on for `dev`/`test` and **off** for `release`, so any `time > 9_223_372_036_854` panicked
+in a test and wrapped silently in production (`9_999_999_999_999_999` →
+`1_864_712_049_422_024_128`). And nothing bounded the value even when it did fit: one frame
+stamped year 2100 refused **1 000 out of 1 000** well-formed frames that followed, with no
+recovery. Now the multiply is checked and the value is sanity-checked against the local
+receive clock (`MAX_CLOCK_LEAD_NS`, 60 s); either refusal drops the frame and leaves the
+gate where it was.
+
+### 10.4 §4.7 is answered by construction, and pinned by a test
+
+Open question 2 asked whether `bbo` and `l2Book` can be fed into the existing
+`FusedHashMapMarketDepth` without transient crossing, given that fusion's own deletion
+events lack the `LOCAL_EVENT` bit and are dropped by `LiveBot`.
+
+Answer: a **private mirror**, with fusion left in place downstream. Because deletions are
+always emitted before the levels that displace them, the published stream is uncrossed
+after every individual event, so fusion never reaches the branch that generates a deletion
+of its own. `fusion_never_generates_a_bitless_event_from_this_stream` replays real frames
+through the same fusion `main.rs` uses and asserts it returns exactly what it was given.
+Inverting the emission order makes that test fail with three `ev: 0x10000001` events —
+`SELL_EVENT | DEPTH_EVENT` and no `LOCAL_EVENT` — which is the §4.7 trap itself. Nothing in
+`fuse.rs` had to change.
+
+> **The claim was conditional; it is now unconditional.** "Deletions before inserts" keeps
+> every intermediate state uncrossed *only while the new state is uncrossed*. `on_bbo`
+> resolved a self-crossed touch; `on_snapshot` did not, so a crossed `l2Book` — which the
+> venue has never sent, but nothing forbids — would have put a low ask into fusion under a
+> mirrored bid and produced exactly the bitless events this section says are unreachable.
+> Measured: two `ev = 0x20000001` events out of fusion from one constructed frame. A crossed
+> snapshot is now **refused whole and counted** (it cannot be resolved in favour of either
+> side without inventing a book), before the monotonic gate latches, so the next good frame
+> still lands.
+>
+> Two smaller versions of the same rule — *the mirror may only record what it published* —
+> were closed with it. A level shrinking below one lot was emitted with a non-zero quantity
+> that fusion rounded to zero and **deleted**, leaving the mirror holding a level the bot did
+> not have and no way to re-emit it; it is now mirrored as absent and emitted as a deletion.
+> Two venue prices rounding to one tick collapsed last-writer-wins, discarding the displaced
+> level's size; they are now summed. Neither is reachable while `szDecimals` is right, which
+> is why both are counted (`collapsed_levels`, `sub_lot_levels`) — a non-zero count is the
+> only evidence that it is not.
+
+### 10.5 The bot, not the connector, declares tick and lot
+
+§5.3 says `RegisterInstrument` gets `tick_size = 10^-(6-szDecimals)`. In the current trait
+that value is **not the connector's to set**: `LiveRequest::RegisterInstrument` carries the
+tick and lot the *bot* chose, and `Connector::register(&mut self, symbol)` never sees them.
+The backend derives them from `szDecimals` for its own mirror and logs them per coin
+("Resolved a Hyperliquid instrument…"), and `connector/examples/hyperliquid.toml` says to
+copy those numbers. Closing that hole means passing tick/lot to `register`, which is a trait
+change for all four backends — separate work, not Phase 1.
+
+**The consequence, measured, is worse than "collapses two price levels into one".** With
+venue lot `1e-5` (BTC) and a bot that registered `1e-3`, `FusedHashMapMarketDepth` computes
+`qty_lot = round(qty / lot) == 0` for every level below the bot's lot, takes the
+`Entry::Vacant` branch, inserts nothing and returns an empty result: 3 of 10 events vanish
+before the bot sees them, and the bot holds 3 bid levels against the mirror's 5.
+
+It is **not** repairable by the connector, and it is worth recording why, because the
+obvious remedy does not work. Re-sending the full book does not help: a size that rounds to
+zero in the bot's lot grid rounds to zero every time. Measured both ways — 50 identical
+snapshots through the diff, and 50 full restatements through a stateless relay — the bot
+ends with 3 levels in both. The connector cannot see the bot's lot, and no level below it is
+representable in the bot's book at all. This is a registration error whose only fix is at the
+registration, which is what §10.5 is about. What *was* fixed is the adjacent, connector-side
+half: the bot now gets everything it can represent immediately on registration (§10.9)
+rather than only as sizes happen to change.
+
+### 10.6 Phase 1 refuses orders rather than pretending
+
+`submit`/`cancel` publish `LiveEvent::Error(ErrorKind::OrderError)` and do nothing else,
+and `order_manager()` returns an always-empty implementation. Note what that means for
+`SnapshotComplete`, which `main.rs` emits for every registration: for this backend it
+truthfully says "no orders, no position, because this connector has none", **not** "the
+exchange is flat". Hyperliquid's resting orders survive disconnects and restarts (§5.10),
+so Phase 2 must re-query before that marker means anything about the account.
+
+### 10.7 Smoke, on testnet
+
+Connector plus a `LiveBot` registering BTC and ETH, 2026-07-28:
+
+* Both instruments reached `snapshot_ready = true` on the first `elapse`.
+* The bot's book filled within ~3 s and held the window: 5/5 levels a side, transiently
+  6–7 after a `bbo` touch move. **74/74 samples uncrossed**; no empty side.
+* 60 s of feed: 230 snapshots, 180 `bbo` frames, 921 depth events, 71 trades, 0 stale
+  frames, 0 untracked-coin frames, 0 venue errors.
+* Reconnects forced with a local relay that drops the socket every 20–25 s: every drop was
+  followed by a full re-subscribe of both coins from the shared symbol set — the `AGENTS.md`
+  §4.2 bug, which would have left the connection subscribed to nothing.
+* **The replay guard, live:** `replayed_trades` went 0 → 60 → 120 across three forced
+  reconnects — exactly 30 fills per coin per reconnect, dropped — while genuinely new
+  trades continued to be published. Unguarded, those 120 phantom fills would have entered
+  the bot's `last_trades`.
+
+Feed counters are logged every 60 s **and on every disconnect**: the periodic tick lives
+inside a connection, so on a venue that drops sockets this often it would otherwise never
+fire, and the feed would be unobservable exactly when it matters.
+
+### 10.8 Two things this document asks for that were deliberately not built
+
+* **The `PublicWsSource` / `L4NodeSource` trait seam (§5.1).** There is one implementation
+  and no second in sight; a trait with one implementor is an abstraction bought before it
+  is needed (`AGENTS.md` §1.2). The seam it protects is small anyway — `MarketState` and
+  `DepthMirror` are already independent of the transport, and open question 4 may delete
+  §5.2 entirely rather than add a second source.
+* **A `nSigFigs`/`mantissa` choice.** Not used: the default full-precision book is what the
+  mirror wants, so open question 6 stays unanswered and harmless.
+
+**Phase mapping.** The delivery called "Phase 1" in the task brief is this document's Phase
+1 *minus signing* plus its Phase 2 (public stream, depth synthesis, testnet rehearsal).
+Signing and the golden vectors move into the order-path phase, where they are first needed.
+
+### 10.9 A bot that registers late is handed the book (review fix)
+
+The first build's diff suppressed every level whose size was unchanged — correct, and the
+whole point of synthesising deltas from a feed that restates the book twice a second. What
+it missed is that the mirror is then **the only record of what a bot holds**, and a bot that
+registers against an already-running connector holds nothing.
+
+`main.rs` gives a newly registered instrument a *fresh* `FusedHashMapMarketDepth` (the
+`Entry::Vacant` arm) and publishes `SnapshotComplete` regardless. The one path that replays
+an existing book — `Entry::Occupied` → `depth_.snapshot()` — emits `DEPTH_SNAPSHOT_EVENT`,
+which `LiveBot` drops without a word (`AGENTS.md` §4.1); measured, 10 events out, 10 dropped.
+So the bot got an affirmative go signal and an empty book, and filled it only from levels
+that happened to *change size*. Measured: a mirror primed by one snapshot, then the same
+snapshot again, produces **0 events**; the bot's best bid and best ask are both `NaN`, and a
+run in which only the bid side moved left `best_bid = 100.1, best_ask = NaN` after 100
+snapshots — so `(bid + ask) / 2` is `NaN` with no bound on how long that lasts.
+
+Three ordinary situations reach it: the shipped `coins = ["BTC", "ETH"]` primes the mirror at
+process start before any bot exists; a bot restarting against a long-running connector (the
+`myhft` deployment shape); any second bot on the same symbol.
+
+**Fix.** `Hyperliquid::register` already broadcasts the coin unconditionally on every
+registration, including re-registrations. The stream now uses that payload — previously
+discarded — to publish `DepthMirror::restate`: every mirrored level as a kind-1 insert,
+bids then asks so the sequence is never crossed, stamped with the exchange time the mirror
+was built from so nothing downstream sees a rewind. A registration for an already-subscribed
+coin therefore costs one batch of events and **no** REST call. If the broadcast lagged and
+the coin names were lost, every tracked coin is restated instead; a restatement is
+idempotent, so that is cheaper than guessing.
+
+Two cases that look alike and are not, and are deliberately different code paths:
+`MarketState::track` **keeps** an existing mirror (reconnect: the bot's book is undisturbed,
+a fresh mirror would leave every level above the new touch in place), while
+`MarketState::restate` **re-publishes** it (registration: the bot's book is empty and the
+mirror is right). Both are pinned by tests.
+
+### 10.10 Four more things the review found
+
+* **The same unchecked millisecond→nanosecond multiply, in the trade path.** `trades.rs`
+  carried it too. It is two different bugs in the two profiles this crate is built with:
+  `overflow-checks` is `true` for `dev`/`test` and `false` for `release`, so an absurd `time`
+  panics a test and wraps silently in production — and a panic in the connector is `exit(1)`
+  under its own hook, market data down for every bot. `trade_event` now returns `Option` and
+  a fill that cannot be timestamped is refused and counted (`FeedCounts::malformed_trades`).
+
+
+* **An unbounded error string kills the connector.** `LiveEvent` is bincode-encoded into a
+  fixed `MAX_PAYLOAD_SIZE = 512` byte slice, and an encode that does not fit propagates out
+  of `run_publish_task` into a `.unwrap()` under the `exit(1)` panic hook — the process dies,
+  taking every bot's market data with it, and dies again on restart because the bot
+  re-registers the same symbol. Measured: 506 characters encode to exactly 512 bytes, 510 do
+  not fit; and the unlisted-coin message's "did you mean" list was unbounded — a symbol whose
+  portion after the last `:` is empty matched every name in a 103-name universe and produced
+  780 characters. This is the first backend to compose its own error text rather than relay
+  the venue's short one, so it is the first that can reach the ceiling. Every published
+  message is now clamped to 400 bytes on a character boundary in `HyperliquidError::to_value`
+  — one choke point, so no future call site can miss it — and the suggestion list is capped
+  at five names and skipped for prefixes shorter than two characters.
+
+* **A rejected order left a phantom.** `LiveBot::submit_order` inserts the order into its own
+  map as `Status::New` *before* the request leaves, and nothing in `process_event` removes it
+  on an `Error` event. Phase 1's `reject_order` published only the error, so a bot that
+  mistakenly pointed at this connector was left holding a live order that exists nowhere and
+  an `order_id` that returns `OrderIdExist` for the life of the process. It now publishes the
+  order back as `Status::Expired` first — the same answer `binancefutures/mod.rs` and
+  `bybit/ordermanager.rs` give an unsendable request — and the error second, so the bot's
+  state is clean before an error handler that may abort the `elapse` ever runs.
+
+* **The `/info` round trip stalled the keepalive.** It is awaited inside the read loop, so
+  while it is pending no other `select!` arm runs — including the 30 s keepalive, against a
+  venue that drops a connection after 60 s of silence. `rest::INFO_TIMEOUT` bounds one dex at
+  15 s, so two referenced perp dexes (a bot registering a HIP-3 coin mid-session is enough)
+  put the worst case at the edge. The resolve is now bounded as a whole (`RESOLVE_BUDGET`,
+  20 s) and preceded by a keepalive of its own, so the silence it can cause is the stall
+  itself rather than the stall plus a missed interval.
+
+Also in this pass: `SubscriptionTracker::reset` was deleted. It had exactly one caller — the
+§4.2 regression test — so that test asserted the resubscribe property against a code path
+production never took, and a change that hoisted the tracker out of `connect` would have kept
+it green. The test now drives `apply_resolution` through a recording sink and models a
+reconnect the way `connect` does it, with a fresh tracker.

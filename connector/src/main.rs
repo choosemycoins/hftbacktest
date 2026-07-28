@@ -37,6 +37,7 @@ use crate::{
     binancespot::BinanceSpot,
     bybit::Bybit,
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
+    hyperliquid::Hyperliquid,
 };
 
 #[cfg(feature = "binancefutures")]
@@ -45,6 +46,8 @@ pub mod binancefutures;
 pub mod binancespot;
 #[cfg(feature = "bybit")]
 pub mod bybit;
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;
 
 mod connector;
 //mod fuse;
@@ -336,7 +339,9 @@ struct Args {
 
     /// Connector
     /// * binancefutures: Binance USD-m Futures
+    /// * binancespot: Binance Spot
     /// * bybit: Bybit Linear Futures
+    /// * hyperliquid: Hyperliquid perpetuals (market data only; orders are rejected)
     connector: String,
 
     /// Connector's configuration file path.
@@ -415,6 +420,15 @@ async fn main() {
             let mut connector = BinanceSpot::build_from(&config)
                 .map_err(|error| {
                     error!(?error, "Couldn't build the Bybit connector.");
+                })
+                .unwrap();
+            connector.run(pub_tx.clone());
+            Box::new(connector)
+        }
+        "hyperliquid" => {
+            let mut connector = Hyperliquid::build_from(&config)
+                .map_err(|error| {
+                    error!(?error, "Couldn't build the Hyperliquid connector.");
                 })
                 .unwrap();
             connector.run(pub_tx.clone());

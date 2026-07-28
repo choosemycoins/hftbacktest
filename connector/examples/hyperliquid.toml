@@ -1,0 +1,76 @@
+# Hyperliquid connector — Phase 1: PUBLIC MARKET DATA ONLY.
+#
+# This backend subscribes to bbo + l2Book + trades and publishes depth and trade
+# events. It holds no key, signs nothing, and REJECTS every order with
+# ErrorKind::OrderError. Do not point a trading bot at it expecting fills.
+#
+# Run:
+#   cargo run -p connector -- <connector-name> hyperliquid connector/examples/hyperliquid.toml
+# where <connector-name> is the name the bot passes to Instrument::new.
+
+# WebSocket endpoint.
+#   testnet: wss://api.hyperliquid-testnet.xyz/ws
+#   mainnet: wss://api.hyperliquid.xyz/ws
+public_url = "wss://api.hyperliquid-testnet.xyz/ws"
+
+# REST endpoint, used for `POST /info` to read the perp universe (szDecimals).
+#   testnet: https://api.hyperliquid-testnet.xyz
+#   mainnet: https://api.hyperliquid.xyz
+#
+# Must match `public_url`'s network: the two universes differ, and asset lists are
+# reshuffled by delistings, so a coin validated on one network may not exist on the
+# other.
+rest_url = "https://api.hyperliquid-testnet.xyz"
+
+# Which l2Book cadence to subscribe to. Both are FULL SNAPSHOTS, and only one may be
+# subscribed: they carry different depths, so feeding both into one book would delete
+# levels 6..20 on every fast frame and restore them on the next slow one.
+#
+#   "fast" —  5 levels a side, ~0.54 s  (default; the only cadence fast enough to quote on)
+#   "slow" — 20 levels a side, ~5.4 s   (deeper, but stale for a market maker)
+#
+# The touch is additionally updated by every `bbo` frame (median ~0.14 s) in between,
+# whichever cadence is chosen.
+l2_book = "fast"
+
+# Coins to validate and subscribe at startup, before any bot registers. Optional —
+# a bot's own registration is added dynamically either way.
+#
+# Two reasons to set it: the connector refuses to start if a coin is not listed (an
+# unknown coin closes the ENTIRE WebSocket with no error frame, taking every other
+# subscription with it), and it makes the feed and the per-coin tick_size/lot_size
+# observable without a bot attached.
+#
+# Names are the venue's own, case-sensitive: the canonical perp dex takes a bare coin
+# (BTC, not BTCUSDT), and a HIP-3 builder dex takes its prefixed name (test:ABC).
+coins = ["BTC", "ETH"]
+
+# --- What the bot must register -------------------------------------------------------
+#
+# Hyperliquid publishes NO tick size. A price is legal if it has at most
+# (6 - szDecimals) decimals and at most 5 significant figures, so the finest legal grid
+# is derived from szDecimals alone:
+#
+#   tick_size = 10^-(6 - szDecimals)      lot_size = 10^-szDecimals
+#
+# The connector logs both per coin at subscribe time ("Resolved a Hyperliquid
+# instrument"). The BOT declares them when it builds its Instrument, and nothing in the
+# Connector trait lets this backend see or correct the bot's values. Copy the logged
+# numbers — getting either wrong is silent, and NOT self-correcting:
+#
+#   * a coarser tick_size collapses two price levels into one in the connector's own
+#     fused depth, so the bot quotes off a book that is wrong by a level;
+#   * a coarser lot_size makes every level below it vanish before the bot sees it
+#     (measured: 3 of 10 events dropped for BTC with lot_size = 0.001), and it does not
+#     come back — a level below the bot's own lot is not representable in its book at
+#     all, however many times the venue re-sends it.
+#
+# Measured on testnet 2026-07-28:
+#   BTC (szDecimals 5): tick_size = 0.1     lot_size = 0.00001
+#   ETH (szDecimals 4): tick_size = 0.01    lot_size = 0.0001
+#
+# --- Not configurable in Phase 1 ------------------------------------------------------
+#
+# There are no keys here, by design. Order submission, signing, the account address and
+# the API-wallet key arrive in Phase 2; see docs/design-hyperliquid-connector.md §5.7.
+# When they do, the key belongs OUTSIDE this file and outside git.

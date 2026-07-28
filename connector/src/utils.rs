@@ -198,6 +198,22 @@ impl Default for ExponentialBackoff {
     }
 }
 
+impl ExponentialBackoff {
+    /// A ladder bounded by `min_delay`..`max_delay`, doubling in between.
+    ///
+    /// The defaults (100 ms..60 s) are not right for every venue: Hyperliquid sits behind
+    /// a CDN that drops sockets roughly nine times a day and recovers in about 1.2 s, so
+    /// reconnecting sooner than a second only spends rate limit, and waiting a minute
+    /// leaves the feed dark far longer than the outage.
+    pub fn with_bounds(min_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            min_delay,
+            max_delay: Some(max_delay),
+            ..Default::default()
+        }
+    }
+}
+
 impl BackoffStrategy for ExponentialBackoff {
     fn backoff(&mut self) -> Duration {
         if let Some(reset_interval) = self.reset_interval
@@ -392,6 +408,22 @@ mod tests {
             backoff.backoff();
         }
         assert_eq!(backoff.backoff(), backoff.max_delay.unwrap());
+    }
+
+    /// The bounds a caller asks for are the bounds it gets: the first delay is the floor,
+    /// the ladder doubles, and it never exceeds the ceiling.
+    #[test]
+    fn test_backoff_with_bounds() {
+        let mut backoff =
+            ExponentialBackoff::with_bounds(Duration::from_secs(1), Duration::from_secs(30));
+
+        assert_eq!(backoff.backoff(), Duration::from_secs(1));
+        assert_eq!(backoff.backoff(), Duration::from_secs(2));
+        assert_eq!(backoff.backoff(), Duration::from_secs(4));
+        for _ in 0..10 {
+            backoff.backoff();
+        }
+        assert_eq!(backoff.backoff(), Duration::from_secs(30));
     }
 
     #[test]
