@@ -1,0 +1,14 @@
+[Unit]
+# Alert hook: fired by OnFailure= of any hft-collector unit. The instance
+# name is the full name of the unit that failed:
+#   OnFailure=hft-collector-alert@%n.service
+# Delivery channel and credentials live in /opt/hft-collector/etc/alert.env
+# (root:600, operator-authored, never in git). See deploy/alert.sh.
+Description=Telegram alert for a failed unit (%i)
+
+[Service]
+Type=oneshot
+# The failed unit's name arrives as the instance. alert.sh rate-limits per
+# unit (1/5min via /run stamps) and never exits non-zero: an alert unit that
+# itself fails and re-alerts would be a loop.
+ExecStart=/opt/hft-collector/current/bin/alert.sh %i
