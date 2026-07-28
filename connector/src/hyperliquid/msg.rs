@@ -1,11 +1,18 @@
-//! Wire types for the Hyperliquid public WebSocket.
+//! Wire types for the Hyperliquid WebSockets, public and private.
 //!
 //! Every inbound frame is `{"channel": <name>, "data": <payload>}` — except the keepalive
 //! reply, which is `{"channel":"pong"}` with no `data` at all. That single exception is
 //! why this parses in two steps (channel first, payload second) instead of deriving one
 //! tagged enum: a `#[serde(tag = "channel", content = "data")]` enum rejects the pong.
+//!
+//! The private half ([`OrderUpdate`], [`UserFills`], [`map_order_status`]) is separated
+//! only by which socket carries it; the parsing rules are the same, and so is the reason
+//! they are pinned by fixtures — a field the venue renames shows up downstream as an
+//! account that simply never seems to trade.
 
+use hftbacktest::types::Status;
 use serde::Deserialize;
+use tracing::{error, warn};
 
 use crate::{hyperliquid::HyperliquidError, utils::from_str_to_f64};
 
@@ -72,12 +79,109 @@ impl Trade {
     }
 }
 
+/// One order as `orderUpdates` describes it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderState {
+    pub coin: String,
+    /// `"B"` a bid, `"A"` an ask.
+    pub side: String,
+    #[serde(deserialize_with = "from_str_to_f64")]
+    pub limit_px: f64,
+    /// Remaining size. Zero on a terminal update.
+    #[serde(deserialize_with = "from_str_to_f64")]
+    pub sz: f64,
+    /// Original size, so a partial fill is computable without the fill stream.
+    #[serde(default, deserialize_with = "from_str_to_f64")]
+    pub orig_sz: f64,
+    pub oid: u64,
+    /// The client id this connector set, if this order is one of ours. `null` for an order
+    /// placed by a human or another system on the same account — those are ignored rather
+    /// than treated as an unknown-order error (design note §5.4).
+    #[serde(default)]
+    pub cloid: Option<String>,
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+impl OrderState {
+    pub fn is_buy(&self) -> bool {
+        self.side != "A"
+    }
+}
+
+/// One `orderUpdates` entry: an order plus the status it just reached.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderUpdate {
+    pub order: OrderState,
+    pub status: String,
+    /// Venue time of the transition, milliseconds. The ordering key — updates can arrive
+    /// out of order and a stale one must not overwrite a newer state.
+    #[serde(default)]
+    pub status_timestamp: i64,
+}
+
+/// One execution from `userFills`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFill {
+    pub coin: String,
+    /// **Our** side, not the aggressor's: `"B"` bought, `"A"` sold.
+    pub side: String,
+    #[serde(deserialize_with = "from_str_to_f64")]
+    pub px: f64,
+    #[serde(deserialize_with = "from_str_to_f64")]
+    pub sz: f64,
+    pub time: i64,
+    pub oid: u64,
+    /// The venue's fill id — a JSON **number**, unlike the public `trades` feed's, and the
+    /// only way to tell a replayed fill from a new one.
+    pub tid: u64,
+    #[serde(default)]
+    pub cloid: Option<String>,
+    /// Signed position *before* this fill. Present on every fill, and the only in-band
+    /// anchor for the position the account actually holds.
+    #[serde(default, deserialize_with = "from_str_to_f64")]
+    pub start_position: f64,
+}
+
+impl UserFill {
+    pub fn is_buy(&self) -> bool {
+        self.side != "A"
+    }
+
+    /// The signed size this fill moved the position by.
+    pub fn signed_size(&self) -> f64 {
+        if self.is_buy() { self.sz } else { -self.sz }
+    }
+}
+
+/// The `userFills` payload.
+///
+/// **Not a bare array**, which is the shape the public `trades` channel uses and the shape
+/// a reader coming from that code expects. `isSnapshot` marks the replay the venue sends on
+/// every subscribe — see [`crate::hyperliquid::private_stream`] for why it must be consumed
+/// but not double-applied.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFills {
+    #[serde(default)]
+    pub is_snapshot: bool,
+    #[serde(default)]
+    pub user: String,
+    pub fills: Vec<UserFill>,
+}
+
 /// A parsed inbound frame.
 #[derive(Debug)]
 pub enum Frame {
     Bbo(Bbo),
     L2Book(L2Book),
     Trades(Vec<Trade>),
+    /// Order lifecycle. Authoritative for status (design note §5.5).
+    OrderUpdates(Vec<OrderUpdate>),
+    UserFills(UserFills),
     /// The echoed subscription, as text — the only confirmation the venue understood it.
     SubscriptionResponse(String),
     Pong,
@@ -85,6 +189,54 @@ pub enum Frame {
     Error(String),
     /// A channel this backend does not handle, by name.
     Other(String),
+}
+
+/// The venue's status string as an order status, and whether it is the last word.
+///
+/// **Unknown means terminal.** Hyperliquid documents around thirty status strings and
+/// **adds to the set over time** — Hummingbot shipped a production bug precisely by
+/// hardcoding the list and then meeting `perpMarginRejected`. An unrecognised status
+/// cannot be assumed to mean "still resting": that is how a bot ends up quoting against
+/// orders that no longer exist, which `AGENTS.md` §1.1 rules out. It is mapped to
+/// `Status::Expired`, dropped from the order manager, and logged at `error!`.
+///
+/// The suffix rules below are what keep that path rare rather than routine: every
+/// `…Canceled` and every `…Rejected` the venue invents is classified correctly without a
+/// code change, and only a genuinely new *kind* of status reaches the catch-all.
+pub fn map_order_status(raw: &str) -> Status {
+    match raw {
+        // Still live.
+        "open" => Status::New,
+        // A trigger order that has become a live limit order. Not submitted by this
+        // backend, but documented as live, so it must not be treated as terminal.
+        "triggered" => Status::New,
+        "filled" => Status::Filled,
+        "canceled" | "cancelled" => Status::Canceled,
+        "rejected" => Status::Rejected,
+        other => {
+            // The venue's own naming convention, used rather than a list that will go
+            // stale: `marginCanceled`, `vaultWithdrawalCanceled`, `siblingFilledCanceled`,
+            // `openInterestCapCanceled`, `scheduledCancel`, …
+            if other.ends_with("Canceled")
+                || other.ends_with("Cancelled")
+                || other == "scheduledCancel"
+            {
+                warn!(status = %other, "Hyperliquid cancelled an order for a reason this backend does not name individually.");
+                Status::Canceled
+            } else if other.ends_with("Rejected") {
+                warn!(status = %other, "Hyperliquid rejected an order for a reason this backend does not name individually.");
+                Status::Rejected
+            } else {
+                error!(
+                    status = %other,
+                    "An unrecognised Hyperliquid order status; treating the order as gone. \
+                     Assuming it still rests is how a bot quotes against orders that do not \
+                     exist."
+                );
+                Status::Expired
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -114,6 +266,14 @@ pub fn parse_frame(text: &str) -> Result<Frame, HyperliquidError> {
         "bbo" => Frame::Bbo(serde_json::from_value(data()?)?),
         "l2Book" => Frame::L2Book(serde_json::from_value(data()?)?),
         "trades" => Frame::Trades(serde_json::from_value(data()?)?),
+        // The venue sends either an array or a single update; both have been reported in
+        // production, and the single form would otherwise be a parse failure — i.e. an
+        // order lifecycle transition dropped on the floor.
+        "orderUpdates" => Frame::OrderUpdates(match data()? {
+            value @ serde_json::Value::Array(_) => serde_json::from_value(value)?,
+            single => vec![serde_json::from_value(single)?],
+        }),
+        "userFills" => Frame::UserFills(serde_json::from_value(data()?)?),
         "subscriptionResponse" => Frame::SubscriptionResponse(data()?.to_string()),
         "pong" => Frame::Pong,
         "error" => Frame::Error(match data()? {
@@ -135,7 +295,7 @@ mod tests {
             SUBSCRIPTION_RESPONSE,
             TRADES_BTC_REPLAY,
         },
-        msg::{Frame, parse_frame},
+        msg::{Frame, map_order_status, parse_frame},
     };
 
     #[test]
@@ -248,5 +408,181 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error() {
         assert!(parse_frame("{not json").is_err());
+    }
+
+    // --- Private stream ------------------------------------------------------------
+
+    #[test]
+    fn an_order_update_carries_the_order_its_status_and_when() {
+        use crate::hyperliquid::fixtures::{ORDER_UPDATE_CANCELED, ORDER_UPDATE_OPEN};
+
+        let Frame::OrderUpdates(updates) = parse_frame(ORDER_UPDATE_OPEN).unwrap() else {
+            panic!("expected an orderUpdates frame");
+        };
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, "open");
+        assert_eq!(updates[0].status_timestamp, 1785261289146);
+        let order = &updates[0].order;
+        assert_eq!(order.coin, "BTC");
+        // A real venue id is past `u32`; anything narrower silently truncates it.
+        assert_eq!(order.oid, 57118842019);
+        assert_eq!(order.limit_px, 31795.0);
+        assert_eq!(order.sz, 0.00037);
+        assert_eq!(order.orig_sz, 0.00037);
+        assert!(order.is_buy());
+        assert_eq!(
+            order.cloid.as_deref(),
+            Some("0xa1f0cddc17303d07f3fd128d5b35071d")
+        );
+
+        // **A terminal update does not zero `sz`.** Measured: a fully unfilled order that
+        // was cancelled still reports its whole size, and only `statusTimestamp` moves.
+        // Inferring execution from `origSz - sz` therefore works — and a reader who assumed
+        // the documented-looking opposite would have called this order fully filled.
+        let Frame::OrderUpdates(updates) = parse_frame(ORDER_UPDATE_CANCELED).unwrap() else {
+            panic!("expected an orderUpdates frame");
+        };
+        assert_eq!(updates[0].order.sz, 0.00037);
+        assert_eq!(updates[0].order.orig_sz, 0.00037);
+        assert_eq!(updates[0].status, "canceled");
+        assert_eq!(
+            updates[0].order.timestamp, 1785261289146,
+            "creation, unchanged"
+        );
+        assert_eq!(updates[0].status_timestamp, 1785261290665, "the transition");
+    }
+
+    /// The venue sends either an array or a single object. A parser that only reads the
+    /// array form treats the other as malformed — and an `orderUpdates` frame dropped is
+    /// an order lifecycle transition the bot never learns about.
+    #[test]
+    fn a_single_order_update_parses_as_readily_as_an_array() {
+        let single = r#"{"channel":"orderUpdates","data":{"order":{"coin":"ETH","side":"A","limitPx":"2000.5","sz":"1.5","oid":7,"origSz":"1.5","cloid":null,"timestamp":1},"status":"open","statusTimestamp":2}}"#;
+        let Frame::OrderUpdates(updates) = parse_frame(single).unwrap() else {
+            panic!("expected an orderUpdates frame");
+        };
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].order.oid, 7);
+        assert!(!updates[0].order.is_buy());
+        // An order placed by a human or another system has no client id, and must survive
+        // parsing so it can be *ignored* rather than reported as an unknown order.
+        assert!(updates[0].order.cloid.is_none());
+    }
+
+    /// **`userFills` is an object, not an array.** The public `trades` channel is an array,
+    /// so a parser written from that one rejects every fill this account ever makes — and
+    /// the symptom is an account that appears never to trade.
+    #[test]
+    fn user_fills_is_an_object_carrying_the_snapshot_flag() {
+        use crate::hyperliquid::fixtures::{
+            USER_FILLS_ACK,
+            USER_FILLS_EMPTY_SNAPSHOT,
+            USER_FILLS_INCREMENT,
+        };
+
+        // The ack the venue answers a `userFills` subscribe with. It echoes fields the
+        // request never carried (`aggregateByTime`), so an ack matched by exact equality
+        // against what was sent would never match.
+        let Frame::SubscriptionResponse(ack) = parse_frame(USER_FILLS_ACK).unwrap() else {
+            panic!("expected a subscriptionResponse frame");
+        };
+        assert!(ack.contains("aggregateByTime"), "{ack}");
+
+        let Frame::UserFills(fills) = parse_frame(USER_FILLS_EMPTY_SNAPSHOT).unwrap() else {
+            panic!("expected a userFills frame");
+        };
+        assert!(fills.is_snapshot, "the subscribe replay must be marked");
+        assert!(fills.fills.is_empty());
+        // The venue lowercases the address it echoes; comparisons must not be exact.
+        assert_eq!(fills.user, fills.user.to_lowercase());
+
+        let Frame::UserFills(fills) = parse_frame(USER_FILLS_INCREMENT).unwrap() else {
+            panic!("expected a userFills frame");
+        };
+        assert!(!fills.is_snapshot);
+        let fill = &fills.fills[0];
+        assert_eq!(fill.coin, "BTC");
+        assert_eq!(fill.oid, 57118842019);
+        // A JSON number, not a string — unlike almost every other quantity on this venue.
+        assert_eq!(fill.tid, 123456789);
+        assert_eq!(fill.px, 31795.0);
+        assert_eq!(fill.signed_size(), 0.00016);
+        assert_eq!(fill.start_position, 0.0);
+
+        // `side` here is *ours*, so a sell is a negative move in the position.
+        let sold = r#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0x1","fills":[{"coin":"BTC","px":"1.0","sz":"2.0","side":"A","time":1,"oid":2,"tid":3,"startPosition":"5.0"}]}}"#;
+        let Frame::UserFills(fills) = parse_frame(sold).unwrap() else {
+            panic!("expected a userFills frame");
+        };
+        assert_eq!(fills.fills[0].signed_size(), -2.0);
+    }
+
+    /// **The Hummingbot bug, pinned.** The venue documents around thirty status strings and
+    /// keeps adding to them; hardcoding the list shipped a production failure when
+    /// `perpMarginRejected` appeared. The suffix rules classify the whole family, and
+    /// anything genuinely new is terminal rather than optimistically "still resting".
+    #[test]
+    fn every_status_family_maps_and_an_invented_one_is_terminal() {
+        use hftbacktest::types::Status;
+
+        assert_eq!(map_order_status("open"), Status::New);
+        assert_eq!(map_order_status("filled"), Status::Filled);
+        assert_eq!(map_order_status("canceled"), Status::Canceled);
+        assert_eq!(map_order_status("cancelled"), Status::Canceled);
+        assert_eq!(map_order_status("rejected"), Status::Rejected);
+
+        // Documented in the venue's list today, and none of them are named individually
+        // above — the suffix is what classifies them.
+        for cancelled in [
+            "marginCanceled",
+            "vaultWithdrawalCanceled",
+            "openInterestCapCanceled",
+            "selfTradeCanceled",
+            "reduceOnlyCanceled",
+            "siblingFilledCanceled",
+            "delistedCanceled",
+            "liquidatedCanceled",
+            "scheduledCancel",
+        ] {
+            assert_eq!(map_order_status(cancelled), Status::Canceled, "{cancelled}");
+        }
+        for rejected in [
+            "tickRejected",
+            "minTradeNtlRejected",
+            "perpMarginRejected",
+            "reduceOnlyRejected",
+            "badAloPxRejected",
+            "iocCancelRejected",
+            "badTriggerPxRejected",
+            "marketOrderNoLiquidityRejected",
+            "oracleRejected",
+            "perpMaxPositionRejected",
+        ] {
+            assert_eq!(map_order_status(rejected), Status::Rejected, "{rejected}");
+        }
+
+        // A trigger order becoming live is documented as *still resting*, so it must not be
+        // swept up as terminal — that would drop a live order from the manager.
+        assert_eq!(map_order_status("triggered"), Status::New);
+
+        // …and a status nobody has seen before is assumed gone, not assumed alive.
+        for invented in ["somethingEntirelyNew", "", "OPEN", "Filled"] {
+            let status = map_order_status(invented);
+            assert_eq!(status, Status::Expired, "{invented:?}");
+            assert!(
+                !hftbacktest::types::Order::new(
+                    1,
+                    1,
+                    1.0,
+                    1.0,
+                    hftbacktest::types::Side::Buy,
+                    hftbacktest::types::OrdType::Limit,
+                    hftbacktest::types::TimeInForce::GTC,
+                )
+                .active()
+                    || status != Status::New,
+                "{invented:?} must not leave the order active"
+            );
+        }
     }
 }

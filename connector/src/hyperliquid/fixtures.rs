@@ -38,6 +38,77 @@ pub const PONG: &str = r#"{"channel":"pong"}"#;
 /// unknown *coin* instead closes the socket with no frame at all.
 pub const ERROR_FRAME: &str = r#"{"channel":"error","data":"Error parsing JSON into valid websocket request: {\"method\": \"subscribe\", \"subscription\": {\"type\": \"noSuchType\", \"coin\": \"BTC\"}}"}"#;
 
+// --- Private stream -------------------------------------------------------------------
+//
+// Captured from `wss://api.hyperliquid-testnet.xyz/ws` on 2026-07-28 against the master
+// account in `~/.config/hftbacktest-connector/hl-testnet.toml`.
+//
+// **One field is not verbatim: the `user` address.** It has been replaced throughout with
+// the well-known Hardhat account #1, `0x7099…79c8`, the same public test vector `signing.rs`
+// builds on. An address is public on-chain and not a secret, so this is not a leak — but
+// `connector/` is written to be upstreamable, and a fixture committed to a public repository
+// should not name somebody's trading account. Nothing else is edited, and no key material
+// appears anywhere here. The properties the fixtures exist to pin — the object envelope, the
+// lowercased echo, `tid` as a number — are untouched by the substitution.
+
+/// The `userFills` frame the venue sends **on every subscribe**, verbatim.
+///
+/// Two things it pins that a hand-written sample would not. It is an **object**, not the
+/// bare array the public `trades` channel uses — a parser written from that one silently
+/// rejects every fill. And the venue **lowercases the address** it echoes, so any
+/// comparison against a configured address has to be case-insensitive.
+pub const USER_FILLS_EMPTY_SNAPSHOT: &str = r#"{"channel":"userFills","data":{"isSnapshot":true,"user":"0x70997970c51812dc3a010c7d01b50e0d17dc79c8","fills":[]}}"#;
+
+/// The subscription acknowledgement for `userFills`. Note `aggregateByTime`, which the
+/// venue adds to the echo even though the request did not carry it.
+pub const USER_FILLS_ACK: &str = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"userFills","user":"0x70997970c51812dc3a010c7d01b50e0d17dc79c8","aggregateByTime":false}}}"#;
+
+/// An `orderUpdates` frame for a resting post-only bid — **captured**, from the round trip
+/// in `smoke.rs` on 2026-07-28.
+///
+/// A real `oid` is a 64-bit number well past `u32` (57 118 842 019 here), and `limitPx`
+/// carries a trailing `.0` that the price never had. The client id is this connector's own,
+/// prefix `a1f0`.
+pub const ORDER_UPDATE_OPEN: &str = r#"{"channel":"orderUpdates","data":[{"order":{"coin":"BTC","side":"B","limitPx":"31795.0","sz":"0.00037","oid":57118842019,"timestamp":1785261289146,"origSz":"0.00037","cloid":"0xa1f0cddc17303d07f3fd128d5b35071d"},"status":"open","statusTimestamp":1785261289146}]}"#;
+
+/// The same order cancelled, 1.5 s later. Also a capture.
+///
+/// **`sz` does not drop to zero on a terminal update** — it stays at the unfilled remainder,
+/// and `timestamp` stays at the order's creation while `statusTimestamp` moves. Guessing
+/// the opposite (as the documentation reads) would have made a cancelled order look fully
+/// filled to anything that inferred execution from `origSz - sz`.
+pub const ORDER_UPDATE_CANCELED: &str = r#"{"channel":"orderUpdates","data":[{"order":{"coin":"BTC","side":"B","limitPx":"31795.0","sz":"0.00037","oid":57118842019,"timestamp":1785261289146,"origSz":"0.00037","cloid":"0xa1f0cddc17303d07f3fd128d5b35071d"},"status":"canceled","statusTimestamp":1785261290665}]}"#;
+
+/// A `userFills` increment. `tid` is a JSON **number**, and `side` is *our* side, not the
+/// aggressor's.
+///
+/// **Shape from the venue's documentation, not a capture.** The smoke round trip quotes far
+/// from the market on purpose, so no order of this connector's has ever filled; the
+/// envelope around it (`isSnapshot`, `user`, `fills`) is a capture and the entries are not.
+/// Replace them the first time one fills.
+pub const USER_FILLS_INCREMENT: &str = r#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0x70997970c51812dc3a010c7d01b50e0d17dc79c8","fills":[{"coin":"BTC","px":"31795.0","sz":"0.00016","side":"B","time":1785261290000,"startPosition":"0.0","dir":"Open Long","closedPnl":"0.0","hash":"0x0000000000000000000000000000000000000000000000000000000000000000","oid":57118842019,"crossed":false,"fee":"0.0","tid":123456789,"cloid":"0xa1f0cddc17303d07f3fd128d5b35071d","feeToken":"USDC"}]}}"#;
+
+/// `POST /info {"type":"clearinghouseState","user":…}` for an account with no perp margin,
+/// verbatim from testnet on 2026-07-28. An account that has never traded a perp has an
+/// **empty** `assetPositions`, so "no entry" must read as "flat", not as "unknown".
+pub const CLEARINGHOUSE_STATE_FLAT: &str = r#"{"marginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMarginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[],"time":1785259956738}"#;
+
+/// The same endpoint for an account holding a short. `szi` is **signed** — negative is
+/// short — which is the whole reason no side field is needed.
+///
+/// Shape from the venue's documentation; the testnet account has never held a position.
+pub const CLEARINGHOUSE_STATE_POSITIONS: &str = r#"{"marginSummary":{"accountValue":"1000.0","totalNtlPos":"200.0","totalRawUsd":"1200.0","totalMarginUsed":"20.0"},"crossMaintenanceMarginUsed":"10.0","withdrawable":"980.0","assetPositions":[{"type":"oneWay","position":{"coin":"BTC","szi":"-0.00032","leverage":{"type":"cross","value":20},"entryPx":"63500.0","positionValue":"20.3","unrealizedPnl":"0.1","returnOnEquity":"0.01","liquidationPx":"120000.0","marginUsed":"1.0","maxLeverage":40}},{"type":"oneWay","position":{"coin":"ETH","szi":"1.5","leverage":{"type":"cross","value":10},"entryPx":"2000.0","positionValue":"3000.0","unrealizedPnl":"0.0","returnOnEquity":"0.0","liquidationPx":null,"marginUsed":"300.0","maxLeverage":25}}],"time":1785259956739}"#;
+
+/// `POST /info {"type":"openOrders","user":…}` — the reconciliation source after a
+/// reconnect, since `orderUpdates` gaps are unrecoverable from the stream itself.
+///
+/// Both are verbatim testnet captures from 2026-07-28. `frontendOpenOrders` **does** echo
+/// the `cloid` — measured, not assumed — which is what makes it the endpoint this backend
+/// asks. Reconciliation still keys on `oid`, because `openOrders` does not echo it and a
+/// venue that stopped would otherwise expire every live order.
+pub const OPEN_ORDERS_EMPTY: &str = "[]";
+pub const OPEN_ORDERS_ONE: &str = r#"[{"coin":"BTC","limitPx":"31795.0","oid":57118842019,"side":"B","sz":"0.00037","timestamp":1785261289146,"origSz":"0.00037","cloid":"0xa1f0cddc17303d07f3fd128d5b35071d"}]"#;
+
 /// Four entries of the canonical (no-prefix) perp universe, from `POST /info {"type":"meta"}`.
 ///
 /// `szDecimals` is the only field this backend needs: it fixes both the lot size and the

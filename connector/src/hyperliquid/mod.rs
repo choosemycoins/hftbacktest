@@ -1,12 +1,14 @@
-//! Hyperliquid perpetuals backend — **Phase 1: public market data only**.
+//! Hyperliquid perpetuals backend: market data, and the order path.
 //!
-//! What this backend does today: subscribes to `bbo`, `l2Book` and `trades` for every
-//! registered coin, and turns them into `LiveEvent::Feed` events for the bot. It signs
-//! nothing, holds no key, and rejects every order request (see [`Hyperliquid::submit`]).
+//! Subscribes to `bbo`, `l2Book` and `trades` for every registered coin and turns them into
+//! `LiveEvent::Feed` events; with an API wallet configured it also signs and submits orders,
+//! follows them on `orderUpdates` / `userFills`, and reconciles against the venue on every
+//! connect. **Without credentials it runs exactly as market data and refuses every order**,
+//! which is a supported way to deploy it and the reason the key is optional.
 //!
 //! Design: [`docs/design-hyperliquid-connector.md`](../../../docs/design-hyperliquid-connector.md).
 //!
-//! The two facts that shape the whole module:
+//! Four facts shape the whole module, and each of them fails silently:
 //!
 //! 1. **Hyperliquid has no incremental depth channel.** Every `l2Book` message is a
 //!    complete top-N snapshot with no sequence number, and `LiveBot` silently discards
@@ -17,6 +19,11 @@
 //!    no error frame and no close reason, taking every other subscription with it.
 //!    Measured against testnet on 2026-07-28. Coins are therefore validated against
 //!    `/info meta` before a subscribe frame is ever written — [`rest`].
+//! 3. **Actions are signed by the API wallet; every query and subscription uses the master
+//!    account.** Asking with the agent's address is accepted and returns nothing, which is
+//!    indistinguishable from an account that never trades — [`private_stream`].
+//! 4. **Six different signing mistakes produce one venue message**, and it names none of
+//!    them: "User or API Wallet 0x… does not exist" — [`signing`].
 
 use std::{
     collections::HashSet,
@@ -28,19 +35,32 @@ use hftbacktest::types::{ErrorKind, LiveError, LiveEvent, Order, Status, Value};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
-    hyperliquid::public_stream::PublicStream,
+    hyperliquid::{
+        exchange::ExchangeClient,
+        ordermanager::{OrderManager, SharedOrderManager},
+        private_stream::{ConnectPolicy, PrivateStream, SharedInstruments},
+        public_stream::PublicStream,
+        signing::{NonceSource, Signer},
+    },
 };
 
 pub mod depth;
+pub mod exchange;
 #[cfg(test)]
 mod fixtures;
 pub mod msg;
+pub mod normalize;
+pub mod ordermanager;
+pub mod private_stream;
 pub mod public_stream;
 pub mod rest;
+pub mod signing;
+#[cfg(test)]
+mod smoke;
 pub mod trades;
 
 /// Hyperliquid's perp price rule: a price may carry at most `MAX_DECIMALS - szDecimals`
@@ -69,8 +89,32 @@ pub enum HyperliquidError {
     UniverseUnavailable(String),
     #[error("ResolveTimeout: the coin universe did not arrive within {0:?}")]
     ResolveTimeout(std::time::Duration),
-    #[error("OrderNotSupported: this backend is market-data only (Phase 1)")]
+    #[error("OrderNotSupported: no API wallet is configured, so this backend is market-data only")]
     OrderNotSupported,
+    /// The key material could not be read or is not a key. Never carries the value.
+    #[error("Credentials: {0}")]
+    Credentials(String),
+    /// The signature could not be produced, or disagreed with its own key on recovery.
+    #[error("Signing: {0}")]
+    Signing(String),
+    /// The request cannot be turned into something the venue would accept.
+    #[error("InvalidOrder: {0}")]
+    InvalidOrder(String),
+    #[error("OrderNotFound: {0}")]
+    OrderNotFound(String),
+    /// The venue refused the request, in its own words. **Includes a `200 ok` whose nested
+    /// per-order status was an error** — see `exchange::parse_exchange_response`.
+    ///
+    /// A *verdict*: the order does not exist, and the bot is told so.
+    #[error("ExchangeRejected: {0}")]
+    ExchangeRejected(String),
+    /// The venue answered in a way that does not say whether the action was carried out —
+    /// a `5xx` from the edge, a `408`, a body that is not the venue's.
+    ///
+    /// **Not a verdict.** The order may be resting right now, so it is kept and
+    /// reconciliation settles it (design note §11.7).
+    #[error("ExchangeUnavailable: {0}")]
+    ExchangeUnavailable(String),
     #[error("InvalidPxQty: {0}")]
     InvalidPxQty(#[from] ParseFloatError),
     #[error("Serde: {0}")]
@@ -123,6 +167,16 @@ impl HyperliquidError {
     /// to nothing.
     pub fn is_listing_verdict(&self) -> bool {
         matches!(self, Self::UnknownSymbol(_) | Self::UniverseError(_))
+    }
+
+    /// Whether the **matching engine** decided against this request, as opposed to the
+    /// request not having reached it or its answer having been lost.
+    ///
+    /// The order path branches on exactly this: a verdict expires the order back to the bot
+    /// and frees its `order_id`; anything else keeps the order, because it may be resting
+    /// and a re-quote on top of it is real duplicated exposure (design note §11.7).
+    pub fn is_venue_verdict(&self) -> bool {
+        matches!(self, Self::ExchangeRejected(_))
     }
 }
 
@@ -186,15 +240,185 @@ pub struct Config {
     /// without a bot attached.
     #[serde(default)]
     pub coins: Vec<String>,
+
+    // --- Order path. Absent means market data only. ------------------------------------
+    /// Path to the credentials file — **never** the key itself.
+    ///
+    /// Keeping key material out of this file is the point: this one is committed, copied
+    /// into deployment repositories and pasted into issues. The credentials file lives
+    /// outside git at mode 600 and carries two TOML keys, named exactly as the venue's own
+    /// tooling names them:
+    ///
+    /// ```toml
+    /// api_wallet_private_key = "0x…"   # the API wallet; signs actions
+    /// master_account_address = "0x…"   # owns the positions; keys every query
+    /// ```
+    ///
+    /// Overridden by the `HYPERLIQUID_CREDENTIALS` environment variable, which is how a
+    /// deployment points one config at different accounts. Absent from both, the backend
+    /// runs exactly as Phase 1 did: market data, and every order refused.
+    #[serde(default)]
+    pub credentials_path: Option<String>,
+
+    /// Which network the phantom-agent signature claims. **Must agree with the URLs above.**
+    ///
+    /// It is not derived from them because a URL is a string a deployment can point
+    /// anywhere — through a proxy, a relay, a local rehearsal harness — and guessing the
+    /// network from it would be wrong exactly when it matters. Getting it wrong produces a
+    /// valid signature for the other network, which the venue reports as an API wallet that
+    /// does not exist.
+    #[serde(default)]
+    pub is_mainnet: bool,
+
+    /// Four hex characters stamped into the high nibbles of every client order id.
+    ///
+    /// The venue's `cloid` is a fixed 128-bit value, so a readable prefix is not available
+    /// (design note §5.4). This is what lets the connector tell its own orders from a
+    /// human's on the same account — and therefore what stops it from reporting them as
+    /// unknown orders, or cancelling them.
+    #[serde(default = "default_order_prefix")]
+    pub order_prefix: String,
+
+    /// What to do about orders already resting when the account stream connects.
+    /// See [`ConnectPolicy`]; the default reconciles rather than cancels.
+    #[serde(default)]
+    pub connect_policy: ConnectPolicy,
+
+    /// The master account address, for cross-checking the credentials file.
+    ///
+    /// Optional, and worth setting. A credentials file pointing at a different account than
+    /// the deployment expects fails in the most confusing way available: orders sign and
+    /// rest correctly, while `orderUpdates`, `userFills` and every position query describe
+    /// somebody else. Set this and a mismatch is one line at startup instead.
+    #[serde(default)]
+    pub account_address: Option<String>,
+}
+
+fn default_order_prefix() -> String {
+    // Hexadecimal, because it becomes the high nibbles of a 128-bit client id. The obvious
+    // mnemonic choices are not: `hf01` contains no valid hex digit at all, and a
+    // non-hex prefix makes every `cloid` malformed, which the venue answers with an HTTP
+    // 422 on every order.
+    "a1f0".to_string()
+}
+
+/// The API wallet key and the account it acts for, read from outside git.
+#[derive(Deserialize)]
+pub struct Credentials {
+    /// The API wallet ("agent wallet") private key. Signs actions, and nothing else.
+    pub api_wallet_private_key: String,
+    /// The account that owns the positions. Keys **every** subscription and `/info` query;
+    /// asking with the API wallet's address returns an empty answer, not an error.
+    pub master_account_address: String,
+}
+
+/// Environment variable that overrides `credentials_path`.
+pub const CREDENTIALS_ENV: &str = "HYPERLIQUID_CREDENTIALS";
+
+impl Config {
+    /// Where the credentials should be read from, if anywhere.
+    pub fn credentials_source(&self, env: Option<String>) -> Option<String> {
+        env.filter(|path| !path.trim().is_empty())
+            .or_else(|| self.credentials_path.clone())
+            .filter(|path| !path.trim().is_empty())
+    }
+}
+
+/// Reads and checks the credentials.
+///
+/// The consistency check is not ceremony. If `account_address` is configured and disagrees
+/// with the credentials file, the connector would sign with a key belonging to one account
+/// and watch another — orders would rest and their fills would never arrive. Refusing at
+/// startup makes that a line in the log rather than a silent half-working day.
+pub fn load_credentials(
+    path: &str,
+    expected_account: Option<&str>,
+) -> Result<Credentials, HyperliquidError> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        HyperliquidError::Credentials(format!("could not read the credentials at {path}: {error}"))
+    })?;
+    let credentials: Credentials = toml::from_str(&text).map_err(|_| {
+        // **The parse error is deliberately dropped.** `toml::de::Error` renders the
+        // offending source line, and in this file that line is a private key — so quoting
+        // it writes the key into the log, and into whatever ships the log onward. Measured
+        // against a file with the key present and the account missing: the error contained
+        // the whole `api_wallet_private_key` assignment. The two field names below are the
+        // entire diagnosis anyway.
+        HyperliquidError::Credentials(format!(
+            "the credentials at {path} could not be parsed; they need exactly two quoted \
+             strings, `api_wallet_private_key` and `master_account_address` (the parser's \
+             own message is withheld because it would quote the key)"
+        ))
+    })?;
+    let account = credentials.master_account_address.trim();
+    // Shape, before anything uses it. Hyperliquid does **not** reject a `user` it cannot
+    // parse — it answers with an empty result, which is exactly what a flat account looks
+    // like, so a typo here is silence rather than an error for the life of the deployment.
+    if !is_evm_address(account) {
+        return Err(HyperliquidError::Credentials(format!(
+            "master_account_address in {path} is not an address: it must be 0x followed by \
+             40 hexadecimal characters, and the venue answers a query for anything else \
+             with an empty result rather than an error — got {account:?}"
+        )));
+    }
+    if let Some(expected) = expected_account
+        && !expected.trim().eq_ignore_ascii_case(account)
+    {
+        return Err(HyperliquidError::Credentials(format!(
+            "the configured account_address {expected} is not the credentials file's \
+             master_account_address; signing would act for one account while every \
+             subscription watched another"
+        )));
+    }
+    Ok(credentials)
+}
+
+/// Whether a string is an EVM address: `0x` and exactly 40 hexadecimal characters.
+///
+/// Compared as bytes so that a 40-*byte* string carrying multi-byte characters cannot be
+/// mistaken for 40 hex digits.
+fn is_evm_address(text: &str) -> bool {
+    text.strip_prefix("0x")
+        .is_some_and(|body| body.len() == 40 && body.as_bytes().iter().all(u8::is_ascii_hexdigit))
+}
+
+/// Refuses the one identity mistake this venue punishes in silence.
+///
+/// Actions are signed by the API wallet; **state is read for the master account**. Give the
+/// API wallet's own address as the master and every subscription is accepted and
+/// acknowledged and then produces nothing, while `clearinghouseState` answers with an empty
+/// `assetPositions` — which this backend reads as *flat*, deliberately, because that is what
+/// an account that has never traded a perp really does answer. The result is a bot that
+/// quotes against a permanently flat position while fills accumulate on the venue, with
+/// nothing in any log to say why.
+///
+/// Both addresses are known at build time, so the pair is checked rather than the operator
+/// being asked to notice.
+fn check_account_identity(
+    account_address: &str,
+    agent_address: &str,
+) -> Result<(), HyperliquidError> {
+    if account_address
+        .trim()
+        .eq_ignore_ascii_case(agent_address.trim())
+    {
+        return Err(HyperliquidError::Credentials(format!(
+            "master_account_address is the API wallet's own address ({agent_address}). \
+             Subscriptions and position queries keyed by the API wallet are accepted and \
+             return nothing at all, so the connector would report a permanently flat \
+             account while orders filled. Use the address of the account that owns the \
+             positions — the one that approved this API wallet."
+        )));
+    }
+    Ok(())
 }
 
 type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
 
-/// Phase 1 has no order path, so there are never any orders to report.
+/// What a connector without credentials reports: nothing, because it has nothing.
 ///
-/// Deliberately not a stub that pretends: [`Hyperliquid::submit`] and
-/// [`Hyperliquid::cancel`] reject every request with [`ErrorKind::OrderError`], so an
-/// empty order list is the truth rather than a placeholder.
+/// Deliberately not a stub that pretends. With no API wallet configured, [`Hyperliquid`]
+/// refuses every order with [`ErrorKind::OrderError`], so an empty list is the truth.
 #[derive(Default)]
 pub struct NoOrders;
 
@@ -204,11 +428,21 @@ impl GetOrders for NoOrders {
     }
 }
 
+/// The order path, present only when an API wallet is configured.
+struct Trading {
+    order_manager: SharedOrderManager,
+    exchange: Arc<ExchangeClient>,
+    account_address: String,
+    agent_address: String,
+}
+
 pub struct Hyperliquid {
     config: Config,
     symbols: SharedSymbolSet,
     symbol_tx: Sender<String>,
-    order_manager: Arc<Mutex<NoOrders>>,
+    instruments: SharedInstruments,
+    trading: Option<Trading>,
+    no_orders: Arc<Mutex<NoOrders>>,
 }
 
 impl ConnectorBuilder for Hyperliquid {
@@ -224,11 +458,69 @@ impl ConnectorBuilder for Hyperliquid {
                 set.insert(coin.clone());
             }
         }
+
+        let trading = match config.credentials_source(std::env::var(CREDENTIALS_ENV).ok()) {
+            Some(path) => {
+                let credentials = load_credentials(&path, config.account_address.as_deref())?;
+                let signer = Arc::new(Signer::from_hex(
+                    &credentials.api_wallet_private_key,
+                    config.is_mainnet,
+                )?);
+                let order_manager = Arc::new(Mutex::new(OrderManager::new(&config.order_prefix)?));
+                let agent_address = signer.address();
+                let account_address = credentials.master_account_address.trim().to_lowercase();
+                check_account_identity(&account_address, &agent_address)?;
+                if config.coins.is_empty() {
+                    // The registration race, made visible. `run_receive_task` publishes
+                    // `RegisterInstrument` — and `run_publish_task` answers it with
+                    // `SnapshotComplete` — before `Connector::register` has even woken this
+                    // backend, and the position a registering bot is handed is whatever the
+                    // publish task has already cached. With no coins configured there is
+                    // nothing to reconcile before the first registration, so that cache is
+                    // empty and the bot starts at a position of zero until the
+                    // registration's own reconciliation lands (`AGENTS.md` §4.4).
+                    warn!(
+                        "No coins are configured while the Hyperliquid order path is armed. \
+                         The first bot to register may be told the account is flat before \
+                         the connector has asked the venue. List the traded coins in \
+                         `coins` so the account is reconciled before any bot attaches."
+                    );
+                }
+                info!(
+                    network = if config.is_mainnet { "mainnet" } else { "testnet" },
+                    %agent_address,
+                    %account_address,
+                    credentials = %path,
+                    "Hyperliquid order path armed."
+                );
+                Some(Trading {
+                    exchange: Arc::new(ExchangeClient::new(
+                        &config.rest_url,
+                        signer,
+                        Arc::new(NonceSource::new()),
+                    )),
+                    order_manager,
+                    account_address,
+                    agent_address,
+                })
+            }
+            None => {
+                warn!(
+                    "No Hyperliquid credentials are configured ({CREDENTIALS_ENV} or \
+                     credentials_path); this connector serves market data and will refuse \
+                     every order."
+                );
+                None
+            }
+        };
+
         Ok(Hyperliquid {
             config,
             symbols,
             symbol_tx,
-            order_manager: Arc::new(Mutex::new(NoOrders)),
+            instruments: Default::default(),
+            trading,
+            no_orders: Arc::new(Mutex::new(NoOrders)),
         })
     }
 }
@@ -253,35 +545,114 @@ impl Connector for Hyperliquid {
     }
 
     fn order_manager(&self) -> Arc<Mutex<dyn GetOrders + Send + 'static>> {
-        self.order_manager.clone()
+        match &self.trading {
+            Some(trading) => trading.order_manager.clone(),
+            None => self.no_orders.clone(),
+        }
     }
 
     fn run(&mut self, ev_tx: UnboundedSender<PublishEvent>) {
-        let mut stream = PublicStream::new(
+        let mut public = PublicStream::new(
             self.config.public_url.clone(),
             self.config.rest_url.clone(),
             self.config.l2_book,
             self.symbols.clone(),
             self.symbol_tx.subscribe(),
-            ev_tx,
+            self.instruments.clone(),
+            ev_tx.clone(),
         );
         tokio::spawn(async move {
-            stream.run().await;
+            public.run().await;
+        });
+
+        let Some(trading) = &self.trading else {
+            return;
+        };
+
+        // The agent-approval probe, before anything is signed. An unapproved API wallet
+        // produces a well-formed signature and the venue answers every single order with
+        // "User or API Wallet 0x… does not exist" — which reads as a bad key, or a bad
+        // chain id, or a bad hash, and is none of those. One question at startup replaces
+        // that whole search.
+        let rest_url = self.config.rest_url.clone();
+        let account = trading.account_address.clone();
+        let agent = trading.agent_address.clone();
+        let probe_tx = ev_tx.clone();
+        tokio::spawn(async move {
+            match rest::agent_is_approved(&rest_url, &account, &agent).await {
+                Ok(true) => {
+                    info!(%agent, %account, "Hyperliquid lists this API wallet as approved.")
+                }
+                Ok(false) => {
+                    let error = HyperliquidError::Credentials(format!(
+                        "Hyperliquid does not list {agent} as an approved API wallet for \
+                         {account}. Every order will be refused with \"User or API Wallet \
+                         does not exist\". Approve the agent in the Hyperliquid UI (API \
+                         section); it cannot be done with the agent key itself."
+                    ));
+                    error!(%agent, %account, "The Hyperliquid API wallet is not approved for this account.");
+                    publish_error(&probe_tx, ErrorKind::CriticalConnectionError, &error);
+                }
+                Err(error) => {
+                    // Not fatal: the venue may simply be unreachable this second, and the
+                    // order path is allowed to find out for itself.
+                    warn!(
+                        ?error,
+                        "Couldn't check whether the Hyperliquid API wallet is approved."
+                    );
+                }
+            }
+        });
+
+        let mut private = PrivateStream::new(
+            self.config.public_url.clone(),
+            self.config.rest_url.clone(),
+            trading.account_address.clone(),
+            trading.order_manager.clone(),
+            self.symbols.clone(),
+            self.symbol_tx.subscribe(),
+            ev_tx,
+            trading.exchange.clone(),
+            self.instruments.clone(),
+            self.config.connect_policy,
+        );
+        tokio::spawn(async move {
+            private.run().await;
         });
     }
 
     fn submit(&self, symbol: String, order: Order, ev_tx: UnboundedSender<PublishEvent>) {
-        reject_order(&symbol, &order, ev_tx);
+        match &self.trading {
+            Some(trading) => private_stream::submit_order(
+                symbol,
+                order,
+                trading.order_manager.clone(),
+                trading.exchange.clone(),
+                self.instruments.clone(),
+                ev_tx,
+            ),
+            None => reject_order(&symbol, &order, ev_tx),
+        }
     }
 
     fn cancel(&self, symbol: String, order: Order, ev_tx: UnboundedSender<PublishEvent>) {
-        reject_order(&symbol, &order, ev_tx);
+        match &self.trading {
+            Some(trading) => private_stream::cancel_order(
+                symbol,
+                order,
+                trading.order_manager.clone(),
+                trading.exchange.clone(),
+                self.instruments.clone(),
+                ev_tx,
+            ),
+            None => reject_order(&symbol, &order, ev_tx),
+        }
     }
 }
 
 /// Fails an order request loudly, and takes the order back out of the bot's state.
 ///
-/// Phase 1 carries no signer and no order manager. Answering `Ok` and dropping the request
+/// Reached only when no API wallet is configured — the market-data-only deployment. Answering `Ok` and dropping the request
 /// would leave the bot waiting for a response that can never arrive — the "hide a critical
 /// error behind success" failure `AGENTS.md` §1.1 rules out.
 ///
@@ -298,7 +669,7 @@ fn reject_order(symbol: &str, order: &Order, ev_tx: UnboundedSender<PublishEvent
     error!(
         %symbol,
         order_id = order.order_id,
-        "The Hyperliquid backend is market-data only (Phase 1); the order was rejected."
+        "No Hyperliquid API wallet is configured; the order was rejected."
     );
     let mut order = order.clone();
     order.req = Status::None;
@@ -355,6 +726,10 @@ mod tests {
             L2BookMode,
             MAX_ERROR_BYTES,
             TRUNCATION_MARK,
+            check_account_identity,
+            load_credentials,
+            ordermanager::OrderManager,
+            private_stream::ConnectPolicy,
             reject_order,
         },
     };
@@ -387,6 +762,194 @@ mod tests {
         );
         assert!(config.rest_url.contains("testnet"), "{}", config.rest_url);
         assert!(!config.coins.is_empty());
+
+        // The order path's fields, too — and the example must not put a first run on
+        // mainnet, must not carry a key, and must default to the policy that does not
+        // cancel live orders on a transient reconnect.
+        assert!(!config.is_mainnet);
+        assert_eq!(config.connect_policy, ConnectPolicy::Reconcile);
+        assert!(
+            config.credentials_path.is_none(),
+            "the shipped example must not point at anyone's key file"
+        );
+        assert!(
+            OrderManager::new(&config.order_prefix).is_ok(),
+            "the example's order_prefix must be a usable one: {}",
+            config.order_prefix
+        );
+        // The example may *describe* the credentials file — it has to — but no live line of
+        // it may assign key material. Commented documentation is fine; an assignment is
+        // what someone copies without reading.
+        let raw = include_str!("../../examples/hyperliquid.toml");
+        for line in raw.lines() {
+            let line = line.trim();
+            assert!(
+                line.starts_with('#') || !line.starts_with("api_wallet_private_key"),
+                "the example must document the credentials file without being one: {line}"
+            );
+        }
+    }
+
+    /// The environment wins over the file, so one committed config can serve several
+    /// accounts; an empty value is not a value.
+    #[test]
+    fn the_environment_overrides_the_configured_credentials_path() {
+        let config: Config = toml::from_str(
+            r#"
+            public_url = "wss://api.hyperliquid-testnet.xyz/ws"
+            rest_url = "https://api.hyperliquid-testnet.xyz"
+            credentials_path = "/from/config.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials_source(None).as_deref(),
+            Some("/from/config.toml")
+        );
+        assert_eq!(
+            config
+                .credentials_source(Some("/from/env.toml".into()))
+                .as_deref(),
+            Some("/from/env.toml")
+        );
+        assert_eq!(
+            config.credentials_source(Some("  ".into())).as_deref(),
+            Some("/from/config.toml"),
+            "an empty environment variable is not an answer"
+        );
+
+        // With neither, there is no order path at all — and that is a supported way to run.
+        let market_data_only: Config = toml::from_str(
+            r#"
+            public_url = "wss://api.hyperliquid-testnet.xyz/ws"
+            rest_url = "https://api.hyperliquid-testnet.xyz"
+            "#,
+        )
+        .unwrap();
+        assert!(market_data_only.credentials_source(None).is_none());
+        assert!(
+            Hyperliquid::build_from(
+                r#"
+            public_url = "wss://api.hyperliquid-testnet.xyz/ws"
+            rest_url = "https://api.hyperliquid-testnet.xyz"
+            "#,
+            )
+            .is_ok()
+        );
+    }
+
+    /// **A credentials file for the wrong account is the worst available failure.** Orders
+    /// sign and rest correctly while `orderUpdates`, `userFills` and every position query
+    /// describe somebody else — so the connector looks healthy and the bot never learns
+    /// about a single fill. Refusing at startup makes it one line instead of a day.
+    #[test]
+    fn credentials_for_a_different_account_are_refused_at_startup() {
+        let dir = std::env::temp_dir().join("hl-credentials-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.toml");
+        std::fs::write(
+            &path,
+            "api_wallet_private_key = \"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae7\
+             84d7bf4f2ff80\"\nmaster_account_address = \"0x70997970C51812dc3A010C7d01b50e0d17\
+             dc79C8\"\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+
+        // The account it really is: accepted, and case-insensitively.
+        load_credentials(path, Some("0x70997970c51812dc3a010c7d01b50e0d17dc79c8")).unwrap();
+        load_credentials(path, None).unwrap();
+
+        // `Credentials` deliberately has no `Debug` — it holds a private key — so the
+        // error is taken out by hand rather than with `unwrap_err`.
+        let Err(error) = load_credentials(path, Some("0x0000000000000000000000000000000000000001"))
+        else {
+            panic!("credentials for another account must be refused");
+        };
+        let error = error.to_string();
+        assert!(error.contains("account_address"), "{error}");
+        // The refusal must not quote the file — it holds a private key.
+        assert!(!error.contains("ac0974"), "{error}");
+    }
+
+    /// **The one documented Hyperliquid identity mistake, refused at startup.** Subscribing
+    /// `orderUpdates`/`userFills` with the API wallet's own address is accepted,
+    /// acknowledged, and produces nothing at all; every position query answers empty, which
+    /// this backend reads as flat *by design*. The bot then quotes for ever against a
+    /// permanently flat book of its own while real fills accumulate on the venue, with no
+    /// error anywhere. Both addresses are in hand at build time, so the pair is checked.
+    #[test]
+    fn the_api_wallets_own_address_is_not_accepted_as_the_master_account() {
+        // The Hardhat key used throughout these tests, and the address it derives.
+        let agent = "0xf39fd6e51aad88f6f4ce6ab8827279cffFb92266";
+
+        let Err(error) = check_account_identity(agent, agent) else {
+            panic!("the agent's own address must not be usable as the master account");
+        };
+        let error = error.to_string();
+        assert!(error.contains("API wallet"), "{error}");
+        // Case is not a defence: the venue lowercases what it echoes.
+        assert!(check_account_identity(&agent.to_lowercase(), agent).is_err());
+        assert!(
+            check_account_identity("0x70997970c51812dc3a010c7d01b50e0d17dc79c8", agent).is_ok()
+        );
+    }
+
+    /// An address the venue cannot answer for is refused where it is read. Hyperliquid does
+    /// not reject a malformed `user`: it answers with an empty result, which is
+    /// indistinguishable from an account that holds nothing.
+    #[test]
+    fn a_master_account_address_that_is_not_an_address_is_refused() {
+        let dir = std::env::temp_dir().join("hl-credentials-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+        for bad in [
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c", // 39 hex: one short
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c83", // 41 hex: one long
+            "70997970c51812dc3a010c7d01b50e0d17dc79c8",  // no 0x
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79cg", // not hexadecimal
+            "",
+        ] {
+            let path = dir.join("malformed.toml");
+            std::fs::write(
+                &path,
+                format!("api_wallet_private_key = \"{key}\"\nmaster_account_address = \"{bad}\"\n"),
+            )
+            .unwrap();
+            let Err(error) = load_credentials(path.to_str().unwrap(), None) else {
+                panic!("{bad:?} is not an address and must be refused");
+            };
+            let error = error.to_string();
+            assert!(error.contains("master_account_address"), "{error}");
+            assert!(
+                !error.contains("ac0974"),
+                "the key must never be quoted: {error}"
+            );
+        }
+    }
+
+    /// A credentials file that is missing or malformed is refused where it is read, and the
+    /// message never echoes the contents.
+    #[test]
+    fn an_unreadable_credentials_file_is_refused_without_quoting_it() {
+        let Err(error) = load_credentials("/nonexistent/hl.toml", None) else {
+            panic!("a missing credentials file must be refused");
+        };
+        let error = error.to_string();
+        assert!(error.contains("/nonexistent/hl.toml"), "{error}");
+
+        let dir = std::env::temp_dir().join("hl-credentials-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broken.toml");
+        std::fs::write(&path, "api_wallet_private_key = \"0xdeadbeef\"\n").unwrap();
+        let Err(error) = load_credentials(path.to_str().unwrap(), None) else {
+            panic!("a credentials file without an account must be refused");
+        };
+        let error = error.to_string();
+        assert!(error.contains("master_account_address"), "{error}");
+        assert!(!error.contains("deadbeef"), "{error}");
     }
 
     /// The 5-level, ~0.54 s cadence is the only one fast enough to quote on; the 20-level

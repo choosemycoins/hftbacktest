@@ -56,16 +56,16 @@ use crate::{
 };
 
 /// A dial that has not completed by now is not going to.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// No frame of any kind for this long means the socket is gone, whatever it claims.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often the idle detector looks.
-const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// Application-level keepalive. The venue drops a connection after 60 s of silence, and
 /// its liveness protocol is `{"method":"ping"}` → `{"channel":"pong"}`, not RFC6455 pings.
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A write that has not been accepted by now means the write half is wedged.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The whole coin-resolution round trip, however many perp dexes it has to ask about.
 ///
 /// It is awaited from inside the read loop, so while it is pending nothing else in that
@@ -76,17 +76,17 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// — which costs ~1.2 s on this venue and is retried with everything re-derived.
 const RESOLVE_BUDGET: Duration = Duration::from_secs(20);
 /// Reconnect ladder. Measured recovery after a CDN drop is ~1.2 s, so the floor is 1 s.
-const BACKOFF_MIN: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
+pub(crate) const BACKOFF_MIN: Duration = Duration::from_secs(1);
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How often the feed counters are logged.
-const COUNTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const COUNTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Share of a reporting interval's frames that may be refused before the feed is reported
 /// as degraded rather than merely counted.
 const REFUSED_RATE_ALARM: f64 = 0.05;
 /// Below this many frames in an interval the share is noise.
 const REFUSED_RATE_MIN_FRAMES: u64 = 20;
 /// The keepalive the venue understands.
-const PING_FRAME: &str = r#"{"method":"ping"}"#;
+pub(crate) const PING_FRAME: &str = r#"{"method":"ping"}"#;
 
 /// What has been observed since the connector started.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -286,6 +286,13 @@ impl MarketState {
                 Vec::new()
             }
             Frame::Pong => Vec::new(),
+            // Account channels, on the wrong socket. The private stream owns them; seeing
+            // one here would mean a subscription was written to the public connection,
+            // which is worth saying rather than silently dropping.
+            Frame::OrderUpdates(_) | Frame::UserFills(_) => {
+                warn!("An account frame arrived on the Hyperliquid public stream.");
+                Vec::new()
+            }
             Frame::Other(channel) => {
                 warn!(%channel, "Ignoring an unhandled Hyperliquid channel.");
                 Vec::new()
@@ -369,6 +376,14 @@ pub struct PublicStream {
     /// stays authoritative for *what to subscribe*; the payload is used only to decide
     /// whose book to restate, and a lost payload degrades to restating all of them.
     symbol_rx: Receiver<String>,
+    /// Coins resolved against the venue's universe, shared with the order path.
+    ///
+    /// Resolution has to happen here — subscribing to an unlisted coin closes the socket,
+    /// so this stream must ask before it subscribes — and the order path needs the same two
+    /// answers: `szDecimals` for the price grid, and the universe index for the `a` field.
+    /// Publishing them here rather than asking twice keeps one `/info` round trip per
+    /// connect instead of two, and keeps the two halves from disagreeing about a coin.
+    instruments: crate::hyperliquid::private_stream::SharedInstruments,
     ev_tx: UnboundedSender<PublishEvent>,
     state: MarketState,
 }
@@ -380,6 +395,7 @@ impl PublicStream {
         l2_book: L2BookMode,
         symbols: Arc<Mutex<HashSet<String>>>,
         symbol_rx: Receiver<String>,
+        instruments: crate::hyperliquid::private_stream::SharedInstruments,
         ev_tx: UnboundedSender<PublishEvent>,
     ) -> Self {
         Self {
@@ -388,6 +404,7 @@ impl PublicStream {
             l2_book,
             symbols,
             symbol_rx,
+            instruments,
             ev_tx,
             state: MarketState::default(),
         }
@@ -443,6 +460,10 @@ impl PublicStream {
         counter_log.reset();
         let mut last_frame = Instant::now();
         let mut last_counts = self.state.counts();
+        // A closed broadcast answers instantly and for ever, so the arm has to stop being
+        // polled: leaving it in place spins this loop at full tilt for the life of the
+        // connection, burning a core and delaying every other task on the runtime.
+        let mut registrations_closed = false;
 
         loop {
             select! {
@@ -462,7 +483,7 @@ impl PublicStream {
                     let counts = self.state.counts();
                     self.report(&mut last_counts, counts);
                 }
-                registered = self.symbol_rx.recv() => {
+                registered = self.symbol_rx.recv(), if !registrations_closed => {
                     match registered {
                         Ok(coin) => {
                             // A bot registering an instrument gets a *fresh* fused depth in
@@ -483,7 +504,8 @@ impl PublicStream {
                         }
                         Err(RecvError::Closed) => {
                             // Every sender is gone, so no new instrument can be registered.
-                            // The existing subscriptions stay up.
+                            // The existing subscriptions stay up; this arm stops being polled.
+                            registrations_closed = true;
                         }
                     }
                 }
@@ -598,6 +620,14 @@ impl PublicStream {
         }
 
         self.state.track(&resolved);
+        // Published for the order path before the subscribe, so a coin is never subscribable
+        // but un-orderable.
+        {
+            let mut instruments = self.instruments.lock().unwrap();
+            for info in &resolved {
+                instruments.insert(info.wire.clone(), info.clone());
+            }
+        }
         for frame in subscription_frames(&resolved, self.l2_book) {
             send(write, Message::Text(frame.into())).await?;
         }
@@ -667,7 +697,7 @@ impl PublicStream {
 
 /// The local receive time in nanoseconds. `0` means the clock could not be read, which
 /// [`DepthMirror`] reads as "no reference to sanity-check the venue's time against".
-fn local_now() -> i64 {
+pub(crate) fn local_now() -> i64 {
     Utc::now().timestamp_nanos_opt().unwrap_or(0)
 }
 
@@ -675,7 +705,7 @@ fn local_now() -> i64 {
 ///
 /// Unconditionally bounded: a wedged write half is silent, and an unbounded `send` on one
 /// simply never returns — fifteen hours, once, on this venue.
-async fn send<S>(write: &mut S, message: Message) -> Result<(), HyperliquidError>
+pub(crate) async fn send<S>(write: &mut S, message: Message) -> Result<(), HyperliquidError>
 where
     S: SinkExt<Message> + Unpin,
     HyperliquidError: From<S::Error>,
@@ -739,6 +769,7 @@ mod tests {
             wire: wire.to_string(),
             dex: crate::hyperliquid::rest::dex_of(wire).to_string(),
             sz_decimals,
+            asset_index: Some(0),
         }
     }
 
@@ -791,6 +822,7 @@ mod tests {
                 L2BookMode::Fast,
                 Arc::new(Mutex::new(set(registered))),
                 symbol_rx,
+                Default::default(),
                 ev_tx,
             ),
             ev_rx,

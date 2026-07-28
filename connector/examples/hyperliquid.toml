@@ -74,3 +74,89 @@ coins = ["BTC", "ETH"]
 # There are no keys here, by design. Order submission, signing, the account address and
 # the API-wallet key arrive in Phase 2; see docs/design-hyperliquid-connector.md §5.7.
 # When they do, the key belongs OUTSIDE this file and outside git.
+
+# --- Order path -----------------------------------------------------------------------
+#
+# Everything below is OPTIONAL. With no credentials configured the connector behaves
+# exactly as before: it serves market data and refuses every order with
+# ErrorKind::OrderError, saying so once at startup.
+
+# Path to the credentials file. NEVER put the key in this file — this one is committed,
+# copied into deployment repos and pasted into issues.
+#
+# The credentials file lives outside git at mode 600 and holds exactly two keys, named as
+# Hyperliquid's own tooling names them:
+#
+#   api_wallet_private_key = "0x<64 hex>"   # the API wallet ("agent wallet"); signs actions
+#   master_account_address = "0x<40 hex>"   # owns the positions; keys every query
+#
+# The environment variable HYPERLIQUID_CREDENTIALS overrides this, which is how one config
+# serves several accounts.
+#
+# THE ASYMMETRY THAT CATCHES EVERYONE: actions are signed by the API wallet, but every
+# state query and both private subscriptions use the MASTER address. Subscribing with the
+# agent's address is accepted, acknowledged, and returns nothing — an account that appears
+# never to trade.
+#
+# The API wallet must be approved by the master account in the Hyperliquid UI (API
+# section). It cannot be approved with the agent key itself. Without approval every order
+# comes back "User or API Wallet 0x… does not exist", which reads like a bad key and is
+# not one; the connector probes `extraAgents` at startup and says so explicitly instead.
+#
+# credentials_path = "/home/you/.config/hftbacktest-connector/hl-testnet.toml"
+
+# Which network the phantom-agent signature claims. MUST agree with the URLs above.
+#
+# Deliberately not derived from them: a URL can point at a proxy or a rehearsal harness,
+# and guessing would be wrong exactly when it matters. The EIP-712 chainId is 1337 on BOTH
+# networks — this flag is the only thing that distinguishes them, and getting it wrong
+# yields a valid signature for an address the venue has never heard of.
+is_mainnet = false
+
+# Four hex characters stamped into the high nibbles of every client order id.
+#
+# Hyperliquid's cloid is a fixed 128-bit value (0x + exactly 32 hex characters), so unlike
+# Bybit's orderLinkId it cannot carry readable text. This prefix is how the connector tells
+# its own orders from a human's on the same account — orders whose prefix does not match are
+# IGNORED, not reported as unknown and not cancelled. Give each connector process its own.
+#
+# It must be four HEXADECIMAL characters: a readable choice like "hf01" contains no valid
+# hex digit and makes every cloid malformed, which the venue answers with an HTTP 422 on
+# every single order.
+order_prefix = "a1f0"
+
+# What to do about orders already resting when the account stream connects.
+#
+#   "reconcile"  — ask the venue what is resting and adopt the answer (DEFAULT)
+#   "cancel_all" — cancel everything for the registered coins and start clean, which is
+#                  what the Bybit backend does unconditionally
+#
+# The default differs from Bybit's behaviour on purpose. Hyperliquid never cancels on
+# disconnect, its resting orders survive restarts and API-wallet expiry, and this venue
+# drops roughly nine sockets a day per connection — so cancelling on every reconnect turns
+# a transient blip into a round trip through an empty book, and spends address-based
+# rate-limit budget that only traded volume replenishes.
+#
+# Choose "cancel_all" when a restart must be guaranteed free of orders from the previous
+# run (the myhft deployment shape); choose "reconcile" when quotes should survive a blip.
+connect_policy = "reconcile"
+
+# The master account address, cross-checked against the credentials file. Optional and
+# worth setting: a credentials file pointing at a different account fails in the most
+# confusing way available — orders sign and rest correctly while every position and fill
+# describes somebody else. Set it and a mismatch is one line at startup.
+#
+# account_address = "0x0000000000000000000000000000000000000000"
+
+# --- Not implemented in this phase ----------------------------------------------------
+#
+# * scheduleCancel (the dead-man's switch, design note §5.11). Hyperliquid has no
+#   cancel-on-disconnect, so a connector that dies holding quotes leaves them resting until
+#   something else removes them. Arming it needs the 10-triggers-per-UTC-day cap respected
+#   and a testnet rehearsal, and is deliberately not guessed at here.
+# * Rate-limit budget tracking (§5.9). The address-based limit is 1 request per 1 USDC of
+#   traded volume with a 10,000-request initial buffer; a quoting bot that does not fill
+#   spends budget it never replenishes, and at exhaustion the venue serves one request per
+#   ten seconds. Nothing here counts it yet.
+# * Order modify/amend. `Connector` has no `modify` method and `LiveBot::modify` is
+#   `todo!()`, so cancel + submit is the only path.

@@ -32,6 +32,18 @@ pub struct SymbolInfo {
     pub dex: String,
     /// Decimal places allowed in a size. Fixes both the lot size and the price grid.
     pub sz_decimals: u32,
+    /// The `a` field of an order action: this coin's index in `meta.universe`.
+    ///
+    /// `None` for a coin on a HIP-3 builder dex. Their asset ids are
+    /// `100000 + dex_index * 10000 + universe_index`, and `dex_index` comes from a
+    /// `perpDexs` request this backend does not make — so rather than guess an index that
+    /// would address **a different coin entirely**, orders on those coins are refused with
+    /// a legible reason and their market data keeps flowing.
+    ///
+    /// The index is also why it is resolved at run time and never cached across networks:
+    /// testnet and mainnet number their universes differently, and a delisting reshuffles
+    /// both.
+    pub asset_index: Option<u32>,
 }
 
 impl SymbolInfo {
@@ -103,11 +115,12 @@ pub fn match_universes(
                 ))
             })?;
 
-        let entry = entries
+        let found = entries
             .iter()
-            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(symbol.as_str()));
+            .enumerate()
+            .find(|(_, e)| e.get("name").and_then(|n| n.as_str()) == Some(symbol.as_str()));
 
-        let Some(entry) = entry else {
+        let Some((universe_index, entry)) = found else {
             // Point at the likely mistake rather than just refusing. The two common ones
             // are a quote suffix carried over from another venue (BTCUSDT) and a
             // double-prefixed builder-dex coin.
@@ -172,6 +185,7 @@ pub fn match_universes(
             wire: symbol.clone(),
             dex: dex.to_string(),
             sz_decimals,
+            asset_index: dex.is_empty().then_some(universe_index as u32),
         });
     }
     Ok(out)
@@ -288,12 +302,235 @@ pub async fn resolve_symbols(
     Ok((resolved, rejected))
 }
 
+/// One order the venue says is resting, as far as reconciliation cares.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenOrder {
+    pub coin: String,
+    /// The venue's own id. Present in every `/info` open-order shape, which is why
+    /// reconciliation keys on it rather than on the client id.
+    pub oid: u64,
+    /// The client id, when the endpoint returns one. `openOrders` does not, and
+    /// `frontendOpenOrders` does — so this being `None` says nothing about ownership.
+    pub cloid: Option<String>,
+}
+
+/// Reads `frontendOpenOrders` (or `openOrders`) into the shape reconciliation needs.
+///
+/// Tolerant on purpose: an entry without a usable `oid` is skipped rather than failing the
+/// whole list, because losing the list entirely is what causes a connector to expire live
+/// orders it should have kept.
+pub fn parse_open_orders(value: &serde_json::Value) -> Vec<OpenOrder> {
+    value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(OpenOrder {
+                        coin: entry.get("coin")?.as_str()?.to_string(),
+                        oid: entry.get("oid")?.as_u64()?,
+                        cloid: entry
+                            .get("cloid")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The account's signed position per coin, from `clearinghouseState`.
+///
+/// `szi` is **signed** — negative is short — so there is no side field to misread. A coin
+/// with no entry is flat: an account that has never traded a perp has an empty
+/// `assetPositions`, and reading that as "unknown" would leave a bot without a position at
+/// all.
+pub fn parse_positions(value: &serde_json::Value) -> (Vec<(String, f64)>, i64) {
+    let time = value.get("time").and_then(|t| t.as_i64()).unwrap_or(0);
+    let positions = value
+        .get("assetPositions")
+        .and_then(|p| p.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let position = entry.get("position")?;
+                    let coin = position.get("coin")?.as_str()?.to_string();
+                    let szi = position.get("szi")?;
+                    let qty = match szi {
+                        serde_json::Value::String(text) => text.parse().ok()?,
+                        serde_json::Value::Number(number) => number.as_f64()?,
+                        _ => return None,
+                    };
+                    Some((coin, qty))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (positions, time)
+}
+
+/// `POST /info` with an arbitrary body, bounded.
+async fn info(
+    rest_url: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, HyperliquidError> {
+    let client = reqwest::Client::builder().timeout(INFO_TIMEOUT).build()?;
+    let response = client
+        .post(format!("{rest_url}/info"))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(HyperliquidError::UniverseUnavailable(format!(
+            "/info answered HTTP {status}: {}",
+            text.trim()
+        )));
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// The orders the venue says are resting for `user`.
+///
+/// **`frontendOpenOrders`, not `openOrders`**: the two carry the same orders, and only this
+/// one echoes the `cloid`. That matters because a client id is how this backend tells its
+/// own orders from a human's on the same account — but reconciliation deliberately does not
+/// *depend* on it (see `OrderManager::reconcile`), so a venue that stops returning it
+/// degrades rather than expiring live orders.
+///
+/// `user` is the **master account address**. Asking with the API wallet's address returns an
+/// empty list rather than an error, which reads exactly like a flat account.
+pub async fn open_orders(rest_url: &str, user: &str) -> Result<Vec<OpenOrder>, HyperliquidError> {
+    let value = info(
+        rest_url,
+        serde_json::json!({ "type": "frontendOpenOrders", "user": user }),
+    )
+    .await?;
+    Ok(parse_open_orders(&value))
+}
+
+/// The account's positions, and the venue time they were read at.
+pub async fn positions(
+    rest_url: &str,
+    user: &str,
+) -> Result<(Vec<(String, f64)>, i64), HyperliquidError> {
+    let value = info(
+        rest_url,
+        serde_json::json!({ "type": "clearinghouseState", "user": user }),
+    )
+    .await?;
+    Ok(parse_positions(&value))
+}
+
+/// Whether the venue lists `agent` as an approved API wallet for `master`.
+///
+/// The startup probe. An unapproved agent signs perfectly well and every order comes back
+/// as `"User or API Wallet 0x… does not exist"` — a message that reads like a bad key and
+/// is not one. Asking first turns that into one legible line at startup.
+pub async fn agent_is_approved(
+    rest_url: &str,
+    master: &str,
+    agent: &str,
+) -> Result<bool, HyperliquidError> {
+    let value = info(
+        rest_url,
+        serde_json::json!({ "type": "extraAgents", "user": master }),
+    )
+    .await?;
+    let agent = agent.to_lowercase();
+    Ok(value
+        .as_array()
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("address")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|address| address.eq_ignore_ascii_case(&agent))
+            })
+        })
+        .unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hyperliquid::{
-        fixtures::{META_CANONICAL, META_DEX_TEST, META_DEX_UNIT},
-        rest::{SymbolInfo, dex_of, is_unknown_dex, match_universes},
+        fixtures::{
+            CLEARINGHOUSE_STATE_FLAT,
+            CLEARINGHOUSE_STATE_POSITIONS,
+            META_CANONICAL,
+            META_DEX_TEST,
+            META_DEX_UNIT,
+            OPEN_ORDERS_EMPTY,
+            OPEN_ORDERS_ONE,
+        },
+        rest::{
+            OpenOrder,
+            SymbolInfo,
+            dex_of,
+            is_unknown_dex,
+            match_universes,
+            parse_open_orders,
+            parse_positions,
+        },
     };
+
+    fn json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The reconciliation source. `oid` is mandatory — it is what an order is matched on —
+    /// and the client id is a bonus that `openOrders` does not supply.
+    #[test]
+    fn open_orders_are_read_by_venue_id_with_the_client_id_optional() {
+        assert!(parse_open_orders(&json(OPEN_ORDERS_EMPTY)).is_empty());
+
+        assert_eq!(
+            parse_open_orders(&json(OPEN_ORDERS_ONE)),
+            vec![OpenOrder {
+                coin: "BTC".into(),
+                oid: 57118842019,
+                cloid: Some("0xa1f0cddc17303d07f3fd128d5b35071d".into()),
+            }]
+        );
+
+        // `openOrders` omits the client id entirely; the entry must still be usable.
+        let without = json(
+            r#"[{"coin":"BTC","limitPx":"31700.0","oid":7,"side":"B","sz":"0.001","timestamp":1}]"#,
+        );
+        assert_eq!(parse_open_orders(&without)[0].cloid, None);
+        assert_eq!(parse_open_orders(&without)[0].oid, 7);
+
+        // An entry the venue sends in a shape this backend cannot read is skipped, not
+        // fatal: losing the whole list is what makes a connector expire live orders.
+        let partly_broken = json(r#"[{"coin":"BTC"},{"coin":"ETH","oid":9}]"#);
+        assert_eq!(parse_open_orders(&partly_broken).len(), 1);
+        assert_eq!(parse_open_orders(&json("null")).len(), 0);
+    }
+
+    /// **An empty `assetPositions` means flat, not unknown.** A testnet account that has
+    /// never touched a perp answers exactly that, verbatim; reading it as "no information"
+    /// would leave the bot with no position at all.
+    #[test]
+    fn an_account_with_no_positions_reads_as_flat_not_as_unknown() {
+        let (positions, time) = parse_positions(&json(CLEARINGHOUSE_STATE_FLAT));
+        assert!(positions.is_empty());
+        assert_eq!(time, 1785259956738);
+    }
+
+    /// `szi` is signed, so a short is a negative quantity and there is no side field to
+    /// misread — which is exactly the field Bybit's backend has to `panic!` on.
+    #[test]
+    fn a_position_is_signed_and_needs_no_side_field() {
+        let (positions, time) = parse_positions(&json(CLEARINGHOUSE_STATE_POSITIONS));
+        assert_eq!(
+            positions,
+            vec![("BTC".to_string(), -0.00032), ("ETH".to_string(), 1.5)]
+        );
+        assert_eq!(time, 1785259956739);
+    }
 
     fn universes(entries: &[(&str, &str)]) -> std::collections::HashMap<String, serde_json::Value> {
         entries
@@ -323,6 +560,7 @@ mod tests {
                 wire: "X".into(),
                 dex: String::new(),
                 sz_decimals,
+                asset_index: Some(0),
             };
             assert!(
                 (info.tick_size() - tick).abs() < tick * 1e-9,

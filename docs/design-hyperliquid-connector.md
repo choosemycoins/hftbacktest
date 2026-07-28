@@ -1,15 +1,19 @@
 # Design: Hyperliquid connector
 
-Status: **Phase 1 (public market data) implemented**; Phases 2–5 still draft
-Date: 2026-07-25, Phase 1 built and measured 2026-07-28
+Status: **Phases 1–3 implemented** (public market data, signing, the order path); Phases 4–5
+still draft — reconciliation is built, `scheduleCancel` and rate-limit budgeting are not
+Date: 2026-07-25; Phase 1 built and measured 2026-07-28, Phase 2 the same day
 Scope: a new `hyperliquid` backend in the `connector/` crate (market data + order management)
 Related: [`snapshot-complete-marker.md`](snapshot-complete-marker.md), `AGENTS.md` §4 (codebase traps)
 
 **What exists in the tree today** is `connector/src/hyperliquid/`: config, universe
-resolution, the public WebSocket, snapshot→delta synthesis, the trade-replay guard, and the
-reconnect policy. It holds no key and **rejects every order** with `ErrorKind::OrderError`.
-§10 records what the build changed about this document; read it before trusting §5.2's
-first formulation.
+resolution, the public WebSocket, snapshot→delta synthesis, the trade-replay guard, the
+reconnect policy, and — with an API wallet configured — signing, order submit and cancel,
+the account stream, and reconciliation on every connect. Without credentials it still holds
+no key and refuses every order, which is a supported way to deploy it.
+
+§10 and §11 record what the build changed about this document. Read them before trusting
+§5.2's first formulation or §5.3's, both of which are superseded.
 
 API facts in this document were verified on **2026-07-25**, several by live measurement
 against mainnet. Hyperliquid's docs were stale in at least four places at that date, so
@@ -449,7 +453,10 @@ pre-existing trap in `AGENTS.md` §4.4; Hyperliquid inherits it rather than intr
 
 Consequence: the reconciliation below makes the *connector's* view correct, and because a
 connector process starts before any bot registers, a cold start does produce an honest
-marker. But **after a reconnect the bot has no signal at all** — fail-closed on
+marker. **(Corrected in §11.13 №8: only when `coins` is configured. Registration handling is
+asynchronous and the marker is emitted before it runs, so with no coins to reconcile at
+startup the first bot is answered with no position at all.)** But **after a reconnect the bot
+has no signal at all** — fail-closed on
 `ConnectionInterrupted` remains the consumer's job (supervisor restart), exactly as
 RFC-A v2 specifies. Making the marker reconnect-aware needs a `snapshot_ready` reset and a
 change to when `main.rs` emits it; that is a protocol change to be scoped separately, not
@@ -905,3 +912,299 @@ Also in this pass: `SubscriptionTracker::reset` was deleted. It had exactly one 
 production never took, and a change that hoisted the tracker out of `connect` would have kept
 it green. The test now drives `apply_resolution` through a recording sink and models a
 reconnect the way `connect` does it, with a fresh tracker.
+
+---
+
+## 11. Phase 2 as built (2026-07-28)
+
+Phase 2 is the order path: `signing.rs`, `normalize.rs`, `exchange.rs`, `ordermanager.rs`,
+`private_stream.rs`, plus the account half of `msg.rs`/`rest.rs` and an `#[ignore]`d testnet
+harness in `smoke.rs`. 138 tests, up from 74. As in §10, where this section and the earlier
+text disagree, **the build is right and this section says so**.
+
+### 11.1 Layout, against §6
+
+`sign.rs` is **`signing.rs`**, and two modules §6 does not list were separated out because
+each is a distinct source of silent failure:
+
+* **`normalize.rs`** — the outgoing price/size grid (§5.3). It is not signing and not order
+  management, and it is the only place where "the bot asked for X and the venue rested Y"
+  can be decided.
+* **`exchange.rs`** — the action structs and `/exchange` response semantics. The structs
+  live apart from the signer because **their field order is protocol**, and that warning
+  belongs where the fields are.
+
+### 11.2 Golden vectors come from the official Python SDK
+
+§7 asks for them and they are the highest-value tests here. They were generated with
+`hyperliquid-python-sdk` (`utils/signing.py`) against the Hardhat key: msgpack bytes,
+`connection_id`, the EIP-712 domain separator, both networks' signing hashes, and `r/s/v`.
+
+**The red step was run and is worth recording**, because a golden vector that cannot fail is
+worthless. Three naive mistakes were installed deliberately — hashing the msgpack before
+concatenating, "correcting" `chainId` to 42161, and keeping a trailing `.0` — and exactly
+seven tests failed, all of them the oracle-backed ones. The two self-consistency tests
+(determinism, local recovery) stayed green, which is the correct discrimination: they cannot
+see a wrong-but-consistent implementation, and that is precisely why the vectors exist.
+
+### 11.3 `hashing_string` **refuses** what the Rust SDK rounds
+
+The two official SDKs disagree, measured against both: a value needing more than eight
+decimals is silently rounded by the Rust SDK (`0.123456789` → `"0.12345679"`) and raises in
+the Python one. Silent rounding means the venue rests a size or price the bot never asked
+for, with nothing anywhere reporting it, so this takes the Python behaviour and
+`hashing_string` returns a `Result`. Normalisation puts everything on a ≤6-decimal grid
+first, so the refusal guards an unreachable case — and a non-zero count of it means
+normalisation is wrong, not the venue.
+
+(The same two SDKs also disagree about `-0.0`: Rust `"0"`, Python `"-0"`. This follows Rust;
+the submit path refuses non-positive numbers long before.)
+
+### 11.4 Rounding direction: toward passive. §5.3 left it open
+
+§5.3 fixes the mechanism and not the direction, so it is chosen here: **a buy rounds down, a
+sell rounds up.** The consumer quotes, often post-only; rounding a buy *up* moves it toward
+the touch, turning an intended maker order into a taker or into an `Alo` the venue rejects
+outright (`badAloPxRejected`). Rounding toward passive can only make an order less likely to
+fill, which is the direction §1.1 asks a venue adapter to err in. It is the opposite of what
+`fundarb` does, and deliberately so — that code wants IOC fills. A taker-first strategy on
+this backend should say so rather than inherit this by accident.
+
+A price already on the venue's grid is returned **unchanged**. That needs a tolerance, not
+just a `floor`: `63460.1 * 10.0` is `634601.0000000001`, and a bare floor would move every
+legal price by a tick, on every order, in silence.
+
+### 11.5 The five-significant-figure rule, asked directly
+
+Open at §5.3 and settled by measurement (testnet, 2026-07-28,
+`smoke::the_significant_figure_rule_is_what_the_venue_enforces`):
+
+```text
+  six figures   12345.6  ->  Error("Price must be divisible by tick size. asset=3")
+ five figures     12345  ->  Error("Order price cannot be more than 80% away …")
+```
+
+`12345.6` has one decimal, which BTC's `szDecimals = 5` permits, and six significant figures,
+which the venue does not — and it calls the composite rule a "tick size" despite publishing
+none. The five-figure form cleared price validation entirely. So the strict reading is
+correct: five significant figures always, `123456` → `123460`, effective tick 10 above
+100 000. The documentation's "integer prices are always allowed" is **wrong**.
+
+**A second rule surfaced and is deliberately not implemented: a price may not be more than
+80 % from the reference price.** It depends on a reference the connector cannot see, it
+rejects with a clear message, and guessing at it would refuse orders the venue would take.
+Recorded because it is the first thing a "test order far from the market" hits.
+
+### 11.6 Reconciliation keys on `oid`, not on the client id
+
+§5.10 says re-query `openOrders`. The endpoint is **`frontendOpenOrders`**, because it is
+the one that echoes `cloid` (verified: it did) — but reconciliation deliberately does not
+*depend* on that.
+
+The failure being avoided: if the venue stopped returning `cloid`, a cloid-keyed reconcile
+would find none of its orders in the response and expire **all** of them, telling the bot it
+is flat while live orders rest — and the bot would re-quote on top of them. So an order is
+matched on the venue's `oid`, which every open-order shape carries, and the client id is only
+consulted for an order that has no `oid` yet *and* only when the response carried client ids
+at all. An order still in flight is never expired.
+
+### 11.7 A transport failure is not a rejection
+
+The two are handled differently on purpose, and the asymmetry is the point:
+
+* **Venue rejection** — definitive. The order is expired back to the bot, which frees the
+  `order_id` and clears the `Status::New` that `LiveBot::submit_order` inserts before the
+  request leaves.
+* **Transport failure** — *not* definitive. The order may be resting right now. Expiring it
+  would invite a re-quote on top of a live order: real, duplicated exposure. So it is kept,
+  the error is reported, and reconciliation settles it later — it has no `oid`, so it is
+  expired only on positive evidence.
+
+### 11.8 Position comes from the venue's own arithmetic
+
+Every `userFill` carries `startPosition`, so the position after it is
+`startPosition + signedSize` — **absolute**, not an increment onto a local counter. A fill
+this connector never saw therefore corrects itself on the next one instead of leaving a
+permanent offset. `clearinghouseState` anchors it on every connect, and a coin with no entry
+is **flat**: an account that has never traded a perp answers with an empty `assetPositions`,
+and reading that as "unknown" would leave the bot with no position at all.
+
+A fill on an order this connector did not place still moves the account's position, and is
+published. Only the *order* half is skipped for a foreign `cloid`.
+
+### 11.9 `cancel_all_on_connect` is `connect_policy`, and defaults to reconcile
+
+§5.10 asked for `cancel_all_on_connect = false`. Built as
+`connect_policy = "reconcile" | "cancel_all"` — a two-valued name rather than a negated
+boolean, because "cancel_all_on_connect = false" reads as an absence of policy rather than a
+choice. The default is `reconcile`, which differs from Bybit's unconditional cancel; §5.10's
+reasoning holds. `cancel_all` exists because it is what makes a `myhft` restart provably free
+of orders from the previous run.
+
+### 11.10 Four things the build found that no review would have
+
+* **A 28-character client id.** `(32 - 4) / 8` is 3, so a `u32` loop produced 24 hex
+  characters of randomness instead of 28, and every `cloid` was 28 long. Hyperliquid answers
+  any length but 32 with an HTTP 422 — i.e. *every order silently unsendable*. Caught by the
+  test that asserts the width, before it ever reached the venue.
+* **The credentials error printed the private key.** `toml::de::Error` renders the offending
+  source line, and in that file the line is `api_wallet_private_key = "0x…"`. A malformed
+  credentials file would have written the key into the log and into whatever ships the log
+  onward. The parser's message is now dropped entirely; the two field names are the whole
+  diagnosis anyway.
+* **`order_prefix = "hf01"` contains no hexadecimal digit.** The obvious mnemonic default
+  makes every client id malformed. It is now validated at construction and the default is
+  `a1f0`.
+* **A terminal `orderUpdates` does not zero `sz`.** A fully unfilled order that was
+  cancelled still reports its whole size, with only `statusTimestamp` moving. The fixture
+  originally guessed the opposite; anything inferring execution from `origSz - sz` would
+  have called that order fully filled.
+
+### 11.11 Smoke, on testnet
+
+`smoke.rs`, 2026-07-28, against the testnet account in the credentials file, BTC (`asset_index = 3`,
+`szDecimals = 5`, tick `0.1`, lot `1e-5`):
+
+| step | elapsed | result |
+|---|---|---|
+| `extraAgents` approval probe | — | `true` |
+| submit `Alo` bid, 31795 × 0.00037 (mid 63590.5) | **741.8 ms** | `Resting { oid: 57118842019 }` |
+| `orderUpdates` `open` | **744.7 ms** | 2.9 ms after the REST answer |
+| `frontendOpenOrders` | — | lists the order, `cloid` echoed |
+| `cancelByCloid` | **1081.9 ms** from submit | `Success` |
+| `orderUpdates` `canceled` | **1132.4 ms** | 50 ms after the REST answer |
+| `frontendOpenOrders`, `clearinghouseState` after | — | empty, flat |
+
+The `orderUpdates` ack arriving ~3 ms after the REST response is worth noting: the WebSocket
+is not meaningfully slower than the HTTP answer, which is what makes "the REST 200 is
+transport-only, `orderUpdates` is authoritative" a cheap rule to follow rather than an
+expensive one.
+
+**Open question 5 answered, partly.** `orderUpdates` sends **nothing** on subscribe for an
+account with no open orders — measured directly. Whether it replays existing open orders is
+still unmeasured; the design assumes not and re-queries, which is correct either way.
+
+### 11.12 Deliberately not built
+
+* **`scheduleCancel`, the dead-man's switch (§5.11).** Hyperliquid has no
+  cancel-on-disconnect, so a connector that dies holding quotes leaves them resting. Arming
+  it needs the 10-triggers-per-UTC-day cap respected and its own testnet rehearsal; guessing
+  is worse than the documented absence. **This is the largest remaining safety gap** and
+  should be the next thing built.
+* **Rate-limit budget tracking (§5.9).** Nothing counts requests against the
+  1-per-1-USDC-traded address limit or its 10 000-request buffer. A quoting bot that does not
+  fill spends budget it never replenishes, and exhaustion means one request per ten seconds —
+  indistinguishable from being down. Open question 3 is still open, and is now the one that
+  decides whether this venue suits a grid strategy at all.
+* **Batched orders and `batchModify`.** One order per action. §5.9 prefers `batchModify`
+  over cancel-then-place for exactly the budget reason above; it belongs with the budget
+  work, not before it.
+* **HIP-3 builder-dex orders.** Their asset ids are
+  `100000 + dex_index * 10000 + universe_index` and `dex_index` needs a `perpDexs` request
+  this backend does not make. Rather than guess an index that would address **a different
+  coin**, orders on those coins are refused with a legible reason — and their market data
+  keeps flowing.
+* **The WS `post` transport (§5.6).** REST only, as §5.6 planned. The signed payload is
+  byte-identical, so this stays a late-binding choice.
+
+### 11.13 What the adversarial review changed (2026-07-28, same day)
+
+Phase 2 was reviewed against this note and the code before anything ran in anger. Eleven
+findings survived verification and were fixed; each one is a divergence from what §11.1–11.12
+above claimed, so it is recorded here rather than left to be rediscovered. 149 tests, up
+from 138.
+
+**1. `cancel_all` cancelled nothing after a restart — the one case it exists for.** The sweep
+was built from `OrderManager::orders()`, this process's own map, which is empty in a freshly
+started connector; it then returned before writing anything to the venue. §11.9's guarantee
+("a `myhft` restart provably free of orders from the previous run") was therefore false in
+exactly the sequence it names, and since Hyperliquid has no cancel-on-disconnect the previous
+run's grid stays live while the bot quotes a new one on top of it. The sweep now asks
+`frontendOpenOrders` and cancels by `oid` — a new `cancel` action (`{"a","o"}`, short field
+names, unlike `cancelByCloid`'s `{"asset","cloid"}`) whose msgpack bytes are pinned against an
+independently computed oracle. It also reaches orders placed by hand in the UI, which is what
+"start clean" means and what Bybit's venue-side `cancel_all_orders` does.
+
+**2. A failed cancel was reported to the bot as `Status::Canceled`.** The old sweep logged the
+POST error and then marked every order cancelled locally regardless, and never looked at the
+per-item `statuses` under a `200 ok`. Now: a transport failure or a rejection leaves local
+state untouched (the orders may still be resting), and only cancels the venue confirmed
+one-for-one are taken out and published. An answer whose length does not match the request
+confirms nothing — the mapping is positional.
+
+**3. A `5xx` was treated as a venue verdict.** `parse_exchange_response` turned *every* non-2xx
+into `ExchangeRejected`, which `submit_order` treats as definitive and expires. But this venue
+sits behind an edge that drops about nine sockets a day, and a `502`/`503`/`504` is the
+ambiguous case by definition — the request may have been executed and the answer lost.
+`5xx`, `408`, `425` and an unreadable `200` body now raise `ExchangeUnavailable`, which is not
+a verdict and keeps the order; `429` deliberately stays a verdict, because a throttled request
+never reaches the matching engine. The branch is `HyperliquidError::is_venue_verdict`, so the
+rule lives in one place instead of in a `match` arm's pattern.
+
+**4. Two venue clocks were compared as one.** `apply_fill` advanced `order.exch_timestamp`
+from `userFills.time`, and `apply_order_update`'s out-of-order guard then compared
+`statusTimestamp` against it. They are independent clocks for the same match, so a terminal
+update stamped a millisecond earlier than the fill was silently dropped and the order stayed
+live for ever. The lifecycle watermark is now its own field, fed only by `orderUpdates`, while
+`order.exch_timestamp` still moves monotonically — `LiveBot::process_event` drops an order
+update older than its own copy, so it must never rewind.
+
+**5. Reconciliation expired orders that were still in flight**, contradicting §11.6's "an
+order still in flight is never expired". The old test was `!open_cloids.is_empty()`, a property
+of the response as a whole: any *other* order carrying a `cloid` made an unacknowledged
+order's absence look like evidence about it. Each order now records when its `/exchange`
+request finished, and `reconcile` takes the moment the query **went out**; an order is judged
+only if its request settled before that. This closes the concurrent-submit race too — a
+snapshot assembled before an acknowledgement says nothing about the order it predates.
+
+**6. The previous run's orders were structurally invisible.** The "foreign order" warning
+counted `!is_ours(cloid)`, and `is_ours` tests the configured prefix — which is configuration,
+not process identity, so a restart's own orphans passed as ours and were counted as zero. The
+predicate is now `OrderManager::tracks`, "does this process know this order", and the log line
+says which case it is. `is_ours` keeps its narrower job: may this process act on a lifecycle
+update.
+
+**7. The master account address was never validated and never checked against the agent's.**
+This is the identity mistake the venue punishes in silence: subscribe `orderUpdates`/`userFills`
+with the API wallet's address and they are accepted, acknowledged, and produce nothing, while
+`clearinghouseState` answers empty — which this backend reads as *flat*, by design. The bot
+then quotes against a permanently flat position while fills accumulate. `load_credentials` now
+requires `0x` + 40 hex (the venue does not reject a malformed `user`; it answers empty), and
+`build_from` refuses a master address equal to the agent's.
+
+**8. §5.10's "a cold start does produce an honest marker" is not true unconditionally**, and
+`private_stream`'s module doc repeated it. `run_receive_task` publishes `RegisterInstrument` —
+and the publish task answers it with `SnapshotComplete` — before `Connector::register` wakes
+this backend, and registration handling here is a broadcast wake plus a REST round trip. The
+position a registering bot receives is whatever the publish task has cached, and that cache is
+filled by an earlier reconciliation, which publishes for the coins in the connector's own
+`coins`. With `coins` unset (it is optional) the first registration is answered with no
+position at all. Both texts are corrected, and the connector now warns at startup when the
+order path is armed with no coins configured. Gating the marker itself needs a `snapshot_ready`
+reset and a change to when `main.rs` emits it — the protocol change §5.10 already scopes out.
+
+**9. A registration swept every symbol, not the registered one.** Under `cancel_all` a second
+bot attaching, or an instrument added late (§10.9 supports this deliberately), wiped the first
+instrument's resting grid. Registration now sweeps only the coin that arrived, as Bybit's
+registration branch does; the all-symbols sweep is confined to connect — which is also where
+the policy was missing entirely — and to a lagged broadcast, where nothing says which coin it
+was and leaving one unswept is the worse error under this policy.
+
+**10. Nothing re-asked the venue on a healthy connection.** An `orderUpdates` frame lost on a
+socket that stays up left `req` at `Status::New` for ever, recoverable only by a disconnect. A
+five-minute reconciliation timer now bounds that, and the `/exchange` acknowledgement clears
+`req` itself. `/info` is metered per IP rather than against the address-based order budget
+(§5.9), so this does not compete with quoting.
+
+**11. Two smaller ones.** `is_ours` sliced venue-supplied text at byte 4 — a 32-*byte* client id
+whose fifth byte is inside a multi-byte character panics, and a panic here is `exit(1)`
+(`AGENTS.md` §4.7); it is now a byte comparison that requires ASCII hex. And a closed
+registration broadcast left a `select!` arm that completes instantly for ever, spinning the
+loop at full tilt; both streams now stop polling it (Phase 1's `public_stream` had the same
+shape and is fixed with it).
+
+**Not code, but recorded:** the fixtures' `user` field was the operator's real testnet account.
+It is replaced throughout with the well-known Hardhat account #1 that `signing.rs` already
+uses. `connector/` is written to be upstreamable and a committed fixture should not name a
+trading account; nothing else in the captures is edited, and the properties they pin are
+untouched.

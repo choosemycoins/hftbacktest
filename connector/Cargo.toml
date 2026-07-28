@@ -41,3 +41,6 @@ ed25519-dalek = { version = "2.2.0", features = [
 ] }
 base64 = "0.22.1"
 serde_qs = "0.15.0"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = "0.10"
+rmp-serde = "1.3"
