@@ -1,0 +1,91 @@
+[Unit]
+# Yesterday's data-quality gate, run once a day by hft-collector-gate@.timer.
+#
+# The instance token is an INSTANCE SET:
+#   systemctl enable --now hft-collector-gate@all.timer       every instance here
+#   systemctl enable --now hft-collector-gate@bybit.timer     just that one
+#
+# `all` is the normal choice. The per-instance form exists because a thin feed
+# may need a different schedule (see the rotation note in gate-run.sh).
+Description=Daily data-quality gate for hft-collector recordings (%i)
+Documentation=file:///opt/hft-collector/current/README.md
+
+# A red day exits 1, which lands this unit in `failed` — that is the whole
+# mechanism, and this is the half that makes anyone hear about it.
+# `systemctl list-units --failed` shows it; so does Telegram, seconds later.
+#
+# Wired UNCONDITIONALLY, exactly as hft-collector@.service wires its copy: on a
+# host without /opt/hft-collector/etc/alert.env the hook logs "alert not sent"
+# and exits 0, so an unconfigured deployment loses nothing and a configured one
+# cannot forget. A gate whose whole output is a `failed` unit is worth very
+# little if the failure is only visible to someone who thought to look.
+OnFailure=hft-collector-alert@%n.service
+
+# Not ordered against hft-collector@*.service on purpose. The gate reads
+# yesterday's finalized files; whether today's recording is up has no bearing on
+# it, and an ordering dependency would only give a stopped collector a way to
+# stop the audit as well.
+After=time-sync.target
+Wants=time-sync.target
+
+# It reads the recordings, so the volume has to be mounted. Without this a gate
+# run during a failed mount would check an empty directory on the root
+# filesystem and report a clean, entirely fictional green.
+RequiresMountsFor=/opt/hft-collector/data
+
+[Service]
+Type=oneshot
+
+User=hftcollector
+Group=hftcollector
+WorkingDirectory=/opt/hft-collector
+
+Environment=COLLECTOR_HOME=/opt/hft-collector/current
+ExecStart=/opt/hft-collector/current/bin/gate-run.sh %i
+
+# It competes with the recording for two vCPUs.
+#
+# A day is gigabytes of gzip and the gate decodes every byte of it, on a box
+# whose only real job is to not fall behind — and on a burstable instance that
+# CPU is metered (see the `{"_collector":"cpu"}` steal gauge, which exists
+# because credit exhaustion looks exactly like a venue flood). So the gate is
+# made to yield: Nice=19 is roughly a twentieth of the scheduler weight of the
+# collector whenever both want to run, which is precisely the contended case.
+#
+# IOSchedulingClass=idle is the same idea for the disk, and is honoured only
+# under BFQ — it is silently ignored under mq-deadline or `none`, which most
+# cloud volumes use. Nice is the one that always applies; this is belt to its
+# braces, not a substitute.
+#
+# No IOSchedulingPriority beside it, deliberately: the idle class takes no
+# priority argument — the kernel ignores the datum for IOPRIO_CLASS_IDLE, and
+# systemd accepts the setting anyway, so writing one here would be a line that
+# reads as tuning and does nothing. Priority applies to best-effort and
+# realtime only.
+#
+# A hard ceiling is available if a gate run is ever seen to hurt a recording,
+# but it is deliberately not the default: a capped gate takes longer while
+# holding the page cache, and Nice already yields everything the collector asks
+# for. Add it per host with a drop-in:
+#   systemctl edit hft-collector-gate@all.service   # [Service] CPUQuota=50%
+Nice=19
+IOSchedulingClass=idle
+
+# Generous, because Nice=19 means "whenever the collector is idle" and a quiet
+# hour is not guaranteed. A gate that genuinely needs more than an hour on a
+# day's recording is itself a finding — the day is far larger than the measured
+# 3-5 GB, or the host is being throttled.
+TimeoutStartSec=3600
+
+# It writes gate/<day>.{txt,json} into each instance's data directory and
+# nothing else. If COLLECTOR_DATA_DIR points outside the tree, add it here the
+# same way hft-collector@.service documents.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/hft-collector/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hft-collector-gate-%i

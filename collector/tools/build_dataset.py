@@ -220,6 +220,32 @@ def intersect(a: tuple[int, int], b: tuple[int, int]) -> Window:
     return Window(max(int(a[0]), int(b[0])), min(int(a[1]), int(b[1])))
 
 
+def union_coverage(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    """Coverage of two recordings of the SAME venue, taken together.
+
+    The hull, because either socket being up is enough: that is the whole
+    premise of recording the signal twice. Two sockets to one venue were
+    measured dropping at uncorrelated times, so the stretch only one of them
+    covered is still covered.
+
+    Disjoint intervals are refused rather than hulled. The gap between them is
+    the one stretch **neither** socket recorded, and an interval spanning it
+    would claim coverage nothing has — the exact opposite of what the union is
+    for. In practice both recordings run all day and overlap by hours; two that
+    do not are two different recordings, not a redundant pair.
+    """
+    a0, a1, b0, b1 = int(a[0]), int(a[1]), int(b[0]), int(b[1])
+    if a0 > b1 or b0 > a1:
+        dark = (a1, b0) if a1 < b0 else (b1, a0)
+        raise BuildError(
+            'the two signal recordings do not overlap: [%d, %d] and [%d, %d]. '
+            'Nothing recorded [%d, %d], so the union of the two is not one '
+            'interval and a window across it would claim coverage both were '
+            'dark for.' % (a0, a1, b0, b1, dark[0], dark[1])
+        )
+    return min(a0, b0), max(a1, b1)
+
+
 def _fmt_coverages(coverages) -> str:
     if isinstance(coverages, dict):
         items = list(coverages.items())
@@ -327,7 +353,8 @@ def symbol_coverage(
         report: dict,
         venue: str,
         symbol: str,
-) -> tuple[tuple[int, int], dict]:
+        allow_empty: bool = False,
+) -> tuple[Optional[tuple[int, int]], dict]:
     """Coverage of the ONE symbol being built, and its per-day breakdown.
 
     The venue-level number is a union over every symbol and every required
@@ -341,6 +368,14 @@ def symbol_coverage(
     the symbol is live (max of the firsts, min of the lasts). Across days it is
     a union: consecutive days of one recording are contiguous, and a missing day
     inside the window is refused separately.
+
+    ``allow_empty`` returns ``(None, per_day)`` instead of refusing when the
+    report knows the symbol but found no usable interval for it. Only the signal
+    side passes it, and only when a **second** recording of that venue is given:
+    a socket that was down all day is then not a refusal, because the other one
+    covers it. The other two refusals — a symbol the report never checked, and a
+    report with no per-symbol coverage at all — are unaffected either way: those
+    are "we do not know", which no second recording can answer.
     """
     entry = _venue(report, venue)
     days = entry.get('days') or {}
@@ -387,6 +422,8 @@ def symbol_coverage(
             % (venue, name)
         )
     if first is None or last is None:
+        if allow_empty:
+            return None, per_day
         raise BuildError(
             'quality report: venue %r symbol %r has no interval in which every '
             'required stream is live (per day: %s). There is nothing to build '
@@ -410,6 +447,112 @@ def require_symbol_days(
             'the signal) missing is not something to build over.'
             % (', '.join(days), venue, symbol, ', '.join(broken))
         )
+
+
+def require_signal_days(
+        per_day_a: dict,
+        per_day_b: Optional[dict],
+        days: Sequence[str],
+        symbol: str,
+) -> None:
+    """Every day inside the window must be usable by at least ONE signal recording.
+
+    The union's rule, applied to whole days: a day the primary lost entirely is
+    not a hole if the secondary recorded it. Only a day **both** were dark for
+    is a refusal — which is the same sentence :func:`union_coverage` enforces at
+    the edges.
+
+    With no secondary this is exactly :func:`require_symbol_days`.
+    """
+    def usable(per_day, day):
+        return per_day.get(day, (None, None))[0] is not None
+
+    broken = [
+        d for d in days
+        if not usable(per_day_a, d) and not (per_day_b and usable(per_day_b, d))
+    ]
+    if broken:
+        raise BuildError(
+            'the window covers days %s but %s %s has no interval on %s in which '
+            'every required stream is live%s. A stretch with the signal missing '
+            'is not something to build over.'
+            % (', '.join(days), SIGNAL_VENUE, symbol, ', '.join(broken),
+               ' in either recording' if per_day_b else '')
+        )
+
+
+def require_one_clock(union_stats: dict, max_signal_age_ns: int) -> None:
+    """The two signal recordings must have been timed by the same clock.
+
+    ``earliest local_ts wins`` reads as "the socket that was up" only while both
+    sockets stamp their frames against one clock. Put the second recording on a
+    second host whose clock is behind and it wins **every** update the two share,
+    so the whole signal's timeline moves by the skew — and nothing else in the
+    build notices, because a skewed recording that also recovers a few frames
+    looks exactly like a healthy one. Since mode A selects "the last row with
+    ``local_ts <= now``", that is a latency error injected into every decision
+    the backtest makes.
+
+    The budget is ``--max-signal-age-ms`` rather than a constant of its own: that
+    is already this dataset's statement of how stale a signal row may be before
+    it must not be traded on. Two recordings that disagree about *when* by more
+    than that entire window are not two views of one timeline, whatever else is
+    true of them. Below it the measured offset is still written to the manifest,
+    because a few milliseconds is the ordinary difference in receive latency
+    between two sockets and is worth being able to see.
+
+    Refused rather than warned, like every other "the data is not what it claims"
+    check here. The fix is a recording made on the host the primary is on, or a
+    measured correction applied deliberately — not a build that carries the skew
+    into every row.
+
+    **Its own blind spot is said out loud**, because it is where the check is
+    otherwise quietest. There is nothing to measure when the two recordings share
+    no update id, and for one venue and one symbol over one window that cannot
+    happen while both were recording — two sockets to the same venue receive the
+    same book updates. It means one of them has no frame inside the window at
+    all. Which one decides whether anything else notices: a silent SECONDARY
+    leaves ``recovered_rows == 0``, which :func:`build` already warns about, but a
+    silent PRIMARY leaves ``recovered_rows == rows`` and every coverage number
+    looking healthy while the secondary supplies the whole signal on a clock
+    nothing checked.
+
+    Warned and not refused, unlike the skew above, because a socket down for a
+    whole window is the case the union was built for — the day-level half of it
+    is legal by construction (``build`` accepts a day only one recording has).
+    The warning is the difference between resting on one recording deliberately
+    and doing it by accident.
+    """
+    offset = union_stats.get('clock_offset_ns')
+    if offset is None:
+        if union_stats.get('recovered_rows', 0) > 0:
+            _warn(
+                'the two signal recordings share no update id, so nothing checked '
+                'their clocks against each other — and the secondary supplied %d '
+                'of the %d signal rows. Two sockets to one venue and one symbol '
+                'see the same book updates, so no shared id means the primary has '
+                'no frame inside this window: the signal rests on the second '
+                'recording alone, on its receive clock. Legal, and what the union '
+                'is for — but if it was not meant, build from the recording that '
+                'has the data as the primary.'
+                % (union_stats.get('recovered_rows', 0), union_stats.get('rows', 0))
+            )
+        return
+    if abs(offset) < max_signal_age_ns:
+        return
+    raise BuildError(
+        'the two signal recordings were not timed by the same clock: over the '
+        '%d update ids both of them saw, the secondary\'s receive time runs '
+        '%+.3f s against the primary\'s, past the %.3f s --max-signal-age-ms '
+        'budget. On one host that difference is socket latency and is '
+        'milliseconds; this is a second clock. The union keeps the earliest '
+        'local_ts per update id, so the secondary would win every shared update '
+        'and move the whole signal timeline by that amount, silently — mode A '
+        'reads "the last row with local_ts <= now", so it would land in every '
+        'decision the backtest makes.'
+        % (union_stats.get('shared_update_ids', 0), offset / NS_PER_SEC,
+           max_signal_age_ns / NS_PER_SEC)
+    )
 
 
 def _verdict_word(word) -> Optional[str]:
@@ -1023,28 +1166,21 @@ def convert_hl_day(
 # ---------------------------------------------------------------------------
 
 
-def build_signal(
+def iter_book_ticker(
         paths: Sequence[Path],
         symbol: str,
         window: Window,
-        clock_correction_ns: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build the mode-A signal array from raw ``@bookTicker`` frames.
+) -> Iterator[tuple[int, Optional[int], tuple, Path, int]]:
+    """Yield the in-window ``@bookTicker`` frames of one recording.
 
-    The design doc calls for ``(N, 5)`` — ``local_ts, bid_px, bid_qty, ask_px,
-    ask_qty``. It is returned split instead: ``ts`` is ``int64 (N,)`` and
-    ``values`` is ``float64 (N, 4)`` with the columns of :data:`SIGNAL_COLUMNS`.
-    One matrix would force the timestamps through float64, where 1.8e18 ns
-    quantises to 256 ns — the arrival order of two frames 100 ns apart would be
-    lost, and with it the "last row with local_ts <= current_timestamp" rule.
+    ``(local_ts, update_id, (b, B, a, A), path, line_no)``. ``update_id`` is the
+    venue's ``u`` and is ``None`` when the frame carried none — which only the
+    union path has to care about.
 
-    Sorting is stable, so frames sharing a ``local_ts`` keep their arrival
-    order and the *last* of them is the one the rule selects.
+    Shared by the one-recording and the two-recording builders so that "what
+    counts as a signal frame" is decided once. The two differ in what they do
+    with the frames, not in which frames they are.
     """
-    # `array` rather than a list: a day of @bookTicker is millions of frames, and
-    # 8 bytes per number instead of a boxed Python object keeps this in memory.
-    ts_list = array('q')
-    values = array('d')
     want = symbol.upper()
     for path in paths:
         for rec in iter_records(path):
@@ -1064,12 +1200,22 @@ def build_signal(
                 continue
             if not window.contains(rec.local_ts):
                 continue
-            ts_list.append(rec.local_ts)
-            values.extend((
-                float(data['b']), float(data['B']),
-                float(data['a']), float(data['A']),
-            ))
+            update_id = data.get('u')
+            yield (
+                rec.local_ts,
+                None if update_id is None else int(update_id),
+                (float(data['b']), float(data['B']), float(data['a']), float(data['A'])),
+                path,
+                rec.line_no,
+            )
 
+
+def _to_arrays(
+        ts_list: array,
+        values: array,
+        clock_correction_ns: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sort by ``local_ts`` and apply the clock correction, exactly once."""
     ts = np.frombuffer(ts_list, dtype=np.int64)
     vals = np.frombuffer(values, dtype=np.float64).reshape(-1, len(SIGNAL_COLUMNS))
     if len(ts):
@@ -1084,6 +1230,194 @@ def build_signal(
         ts = np.empty(0, dtype=np.int64)
         vals = np.empty((0, len(SIGNAL_COLUMNS)), dtype=np.float64)
     return ts, vals
+
+
+def build_signal(
+        paths: Sequence[Path],
+        symbol: str,
+        window: Window,
+        clock_correction_ns: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the mode-A signal array from ONE recording's ``@bookTicker`` frames.
+
+    The design doc calls for ``(N, 5)`` — ``local_ts, bid_px, bid_qty, ask_px,
+    ask_qty``. It is returned split instead: ``ts`` is ``int64 (N,)`` and
+    ``values`` is ``float64 (N, 4)`` with the columns of :data:`SIGNAL_COLUMNS`.
+    One matrix would force the timestamps through float64, where 1.8e18 ns
+    quantises to 256 ns — the arrival order of two frames 100 ns apart would be
+    lost, and with it the "last row with local_ts <= current_timestamp" rule.
+
+    Sorting is stable, so frames sharing a ``local_ts`` keep their arrival
+    order and the *last* of them is the one the rule selects.
+
+    **No deduplication happens here**, deliberately. One socket's stream is what
+    the venue sent it; collapsing repeated update ids would silently change
+    every dataset built before the union existed, and there is no second
+    recording to justify it against. Deduplicating is what
+    :func:`build_signal_union` is, and it is entered only when a second
+    recording is given.
+    """
+    ts_list = array('q')
+    values = array('d')
+    for local_ts, _u, row, _path, _line in iter_book_ticker(paths, symbol, window):
+        ts_list.append(local_ts)
+        values.extend(row)
+    return _to_arrays(ts_list, values, clock_correction_ns)
+
+
+def build_signal_union(
+        sources: Sequence[tuple[str, Sequence[Path]]],
+        symbol: str,
+        window: Window,
+        clock_correction_ns: int = 0,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Build the signal from TWO independent recordings of the same venue.
+
+    Measured on the recording hosts: one Binance USD-M socket loses 0.2-0.4% of
+    the day to reconnects, in clusters of 0.5-0.8s, 10-19 times a day — and two
+    sockets to the same venue drop at **uncorrelated** times. So a second
+    recording of the same symbol covers the first one's holes, and the signal is
+    the union of the two. (Hyperliquid is deliberately not duplicated: its
+    losses are already mitigated by the 30-trade replay and the ``bbo`` fusion.)
+
+    **The key is the venue's own ``u``**, the order-book update id, and not the
+    receive timestamp: the same update arrives on the two sockets at different
+    instants, so timestamps cannot match it and prices cannot either — a quiet
+    market repeats them. A frame with no ``u`` is a refusal rather than a guess:
+    keeping it double-counts an update the other socket also has, dropping it
+    loses one only this socket saw, and both are silent.
+
+    **The earliest ``local_ts`` per ``u`` wins**, which is the point of the
+    exercise: the recovering socket is the one that was up. The consequence is
+    stated rather than hidden — the resulting ``local_ts`` column mixes the
+    receive clocks of two sockets. That is sound **only** because both recordings
+    are made on one host against one clock, which is the same argument the design
+    document makes for comparing venues at all. That assumption is no longer
+    taken on trust: ``stats['clock_offset_ns']`` is the median of ``ts_secondary
+    - ts_primary`` over the update ids both recordings saw, which on one host is
+    the difference in receive latency between two sockets and on two hosts is
+    their skew. The caller decides what is too much (:func:`build`, against
+    ``--max-signal-age-ms``); measuring it is this function's job because this is
+    where the pairs are.
+
+    A ``u`` that carries **two different books** is a refusal, for the same
+    reason a missing ``u`` is. One book update has one best bid and ask, and both
+    sockets receive the same bytes for it, so a disagreement means the key does
+    not identify what it is assumed to — a matching engine that restarted its
+    counter mid-window is the realistic way. Keeping one of the two would drop
+    the other from the dataset with nothing counting it: ``rows``,
+    ``recovered_rows`` and every coverage number would stay plausible.
+
+    Returns ``(ts, values, stats)``; ``stats`` is what the manifest records.
+    """
+    if len(sources) < 2:
+        raise BuildError('build_signal_union needs two recordings, got %d' % len(sources))
+
+    # u -> (local_ts, row, source_label, seen_mask). One dict pass rather than a
+    # merge of two sorted streams: a day is a few million frames, and neither
+    # recording is guaranteed sorted across a restart-appended gzip member.
+    #
+    # `seen_mask` is one bit per source: which recordings carried this update id.
+    # It is why there is no `{label: set(update_ids)}` beside this dict — at a
+    # million ids per socket those sets are ~50 MB on top of what `best` already
+    # holds, and everything they were kept for (`update_ids`, `exclusive`,
+    # `primary_only_rows`) is a count over the masks. `build_signal` states the
+    # same discipline for the same reason.
+    best: dict[int, tuple[int, tuple, str, int]] = {}
+    stats: dict = {'sources': {}}
+    bits = {label: 1 << i for i, (label, _paths) in enumerate(sources)}
+    primary = sources[0][0]
+    # `array` rather than a list for the same reason the rows are: one entry per
+    # update id the two recordings share, which is millions on a real day.
+    offsets = array('q')
+
+    for label, paths in sources:
+        bit = bits[label]
+        frames = 0
+        for local_ts, u, row, path, line_no in iter_book_ticker(paths, symbol, window):
+            if u is None:
+                raise BuildError(
+                    '%s line %d: a @bookTicker frame with no update id `u`. The '
+                    'two-recording union deduplicates on it, and a frame without '
+                    'one can be neither matched against the other recording nor '
+                    'dropped: keeping it double-counts an update the other socket '
+                    'also has, and dropping it loses one only this socket saw.'
+                    % (path, line_no)
+                )
+            frames += 1
+            previous = best.get(u)
+            if previous is not None:
+                if previous[1] != row:
+                    raise BuildError(
+                        '%s line %d: update id %d describes a different book here '
+                        '(bid %s x %s / ask %s x %s) than it does in the %s '
+                        'recording (bid %s x %s / ask %s x %s). One book update '
+                        'has one best bid and ask, so `u` is not identifying what '
+                        'the union deduplicates on — a matching engine that '
+                        'restarted its counter inside this window is the usual '
+                        'reason. Deduplicating anyway would drop one of the two '
+                        'books and count nothing: rows, recovered_rows and every '
+                        'coverage number would still look right. Narrow the '
+                        'window to one side of the restart.'
+                        % ((path, line_no, u) + row + (previous[2],) + previous[1])
+                    )
+                mask = previous[3]
+                if label != primary and previous[2] == primary and not mask & bit:
+                    # Both saw this update, and this is the first time this
+                    # recording says so — a socket repeating a frame is one
+                    # shared id, not two. On one host the difference is socket
+                    # latency; on two it also carries the skew between clocks.
+                    offsets.append(local_ts - previous[0])
+                if local_ts < previous[0]:
+                    best[u] = (local_ts, row, label, mask | bit)
+                elif not mask & bit:
+                    best[u] = previous[:3] + (mask | bit,)
+            else:
+                best[u] = (local_ts, row, label, bit)
+        stats['sources'][label] = {'frames': frames}
+
+    stats['shared_update_ids'] = len(offsets)
+    # The median, not the mean: a reconnect burst on either socket is a cluster
+    # of large one-sided differences, and a mean would report the burst rather
+    # than the clocks.
+    stats['clock_offset_ns'] = (
+        None if not offsets
+        else int(round(float(np.median(np.frombuffer(offsets, dtype=np.int64)))))
+    )
+
+    # One pass over the masks, then arithmetic on the handful of distinct values
+    # they can take — two sources give three. The per-id work stays two counter
+    # bumps, which is what a set of ids per source was costing megabytes to do.
+    contributed = {label: 0 for label, _paths in sources}
+    by_mask: dict[int, int] = {}
+    for _local_ts, _row, winner, mask in best.values():
+        contributed[winner] += 1
+        by_mask[mask] = by_mask.get(mask, 0) + 1
+    for label, bit in bits.items():
+        # `exclusive` is the frames only this socket has — the recovery, seen
+        # from each side. `contributed` is the frames it also timed, which is
+        # larger: it wins every update it happened to receive first.
+        stats['sources'][label]['update_ids'] = sum(
+            n for mask, n in by_mask.items() if mask & bit)
+        stats['sources'][label]['exclusive'] = by_mask.get(bit, 0)
+        stats['sources'][label]['contributed'] = contributed[label]
+
+    ts_list = array('q')
+    values = array('d')
+    for _u, (local_ts, row, _label, _mask) in best.items():
+        ts_list.append(local_ts)
+        values.extend(row)
+    ts, vals = _to_arrays(ts_list, values, clock_correction_ns)
+
+    stats['rows'] = int(len(ts))
+    # The update ids the primary saw — the deduplicated primary, which is the
+    # basis the union is built on and so the number the recovery is measured
+    # against. Not what `build_signal` on the primary alone would return: that
+    # deliberately does not deduplicate, so an exactly repeated frame there is
+    # two rows and here is one.
+    stats['primary_only_rows'] = stats['sources'][primary]['update_ids']
+    stats['recovered_rows'] = stats['rows'] - stats['primary_only_rows']
+    return ts, vals, stats
 
 
 # ---------------------------------------------------------------------------
@@ -1250,6 +1584,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help='Hyperliquid wire name of the executing instrument, e.g. BTC.')
     p.add_argument('--binance-symbol', required=True,
                    help='binancefuturesum symbol of the signal instrument, e.g. BTCUSDT.')
+    p.add_argument('--binance-report-b', type=Path, default=None,
+                   help='A SECOND Phase 2 report whose binancefuturesum entry is '
+                        'an independent recording of the same symbol on the same '
+                        'venue. The signal is then the union of the two, '
+                        'deduplicated by the venue update id `u`, which covers '
+                        'the reconnect holes of either socket. A separate report '
+                        'because quality_report.py takes one directory per venue '
+                        'per report. The secondary is ADDITIVE ONLY: its verdict '
+                        'is recorded, never enforced.')
     p.add_argument('--out-dir', required=True, type=Path)
     p.add_argument('--book-mode', choices=sorted(BOOK_MODE_LEVELS), default='slow',
                    help='Which depth stream to convert: one l2Book cadence, or '
@@ -1320,6 +1663,10 @@ def _rebuild_cmd(args: argparse.Namespace, num_levels: int, max_hl_book_age_ms: 
     # rebuild would record 'cli' for something the sidecar decided.
     if args.tick_size is not None and args.lot_size is not None:
         cmd += ['--tick-size', repr(tick_size), '--lot-size', repr(lot_size)]
+    # Without this a rebuild would silently produce the primary socket alone —
+    # a different, smaller signal from the same manifest.
+    if args.binance_report_b is not None:
+        cmd += ['--binance-report-b', str(Path(args.binance_report_b).resolve())]
     return cmd
 
 
@@ -1392,19 +1739,67 @@ def build(args: argparse.Namespace,
     hl_venue_cov = venue_coverage(report, HL_VENUE)
     bn_venue_cov = venue_coverage(report, SIGNAL_VENUE)
 
+    # --- the second signal recording, if there is one -----------------------
+    # Gated separately from the primary and on purpose. The window, the day set
+    # and the required-stream gate all come from the PRIMARY report: a red
+    # primary still refuses the build. The secondary can only ever ADD frames to
+    # a signal the primary already justified, so a fault in it subtracts nothing
+    # — it is reported and recorded, never enforced. That also keeps the failure
+    # mode benign: the worst a broken secondary can do is contribute nothing.
+    report_b_path = bn_dir_b = bn_cov_b = None
+    report_b = None
+    bn_per_day_b: dict = {}
+    verdict_b = None
+    if args.binance_report_b is not None:
+        report_b_path = Path(args.binance_report_b).resolve()
+        report_b = load_quality_report(report_b_path)
+        bn_dir_b = venue_data_dir(report_b, SIGNAL_VENUE, report_b_path)
+        if bn_dir_b == bn_dir:
+            raise BuildError(
+                'both signal reports point at the same directory (%s). Two '
+                'recordings of one socket are not a redundant pair: every frame '
+                'would match itself, and the union would report a coverage it '
+                'does not have.' % bn_dir
+            )
+        bn_cov_b, bn_per_day_b = symbol_coverage(report_b, SIGNAL_VENUE,
+                                                 args.binance_symbol, allow_empty=True)
+        verdict_b, reasons_b, _outside_b = worst_verdict(report_b, (SIGNAL_VENUE,))
+        if verdict_b != 'green':
+            _warn('the secondary signal recording is %s (%s). It is additive only '
+                  '— recorded in the manifest, not enforced.'
+                  % (verdict_b, '; '.join(reasons_b) or 'no reason given'))
+
     # --- 3.1 window = intersection -----------------------------------------
     # Of the two SYMBOLS being built, not of the two venues: see
-    # `symbol_coverage`.
+    # `symbol_coverage`. With a second signal recording the signal side is the
+    # UNION of the two — either socket being up is coverage — while the traded
+    # side is unchanged.
     hl_cov, hl_per_day = symbol_coverage(report, HL_VENUE, args.hl_symbol)
-    bn_cov, bn_per_day = symbol_coverage(report, SIGNAL_VENUE, args.binance_symbol)
-    window = intersect(hl_cov, bn_cov)
+    bn_cov, bn_per_day = symbol_coverage(report, SIGNAL_VENUE, args.binance_symbol,
+                                         allow_empty=args.binance_report_b is not None)
+    if args.binance_report_b is None:
+        signal_cov = bn_cov
+    elif bn_cov is None and bn_cov_b is None:
+        raise BuildError(
+            'neither signal recording has an interval in which every required '
+            'stream is live (primary %s, secondary %s). Two dark sockets are '
+            'still no signal.' % (bn_dir, bn_dir_b)
+        )
+    elif bn_cov is None or bn_cov_b is None:
+        # One socket recorded nothing usable over the days checked. Legal — that
+        # is what the second recording is for — and the union is then just the
+        # one that was up.
+        signal_cov = bn_cov or bn_cov_b
+    else:
+        signal_cov = union_coverage(bn_cov, bn_cov_b)
+    window = intersect(hl_cov, signal_cov)
     min_window_ns = int(args.min_window_hours * NS_PER_HOUR)
     require_window(window, {'%s/%s' % (HL_VENUE, args.hl_symbol): hl_cov,
-                            '%s/%s' % (SIGNAL_VENUE, args.binance_symbol): bn_cov},
+                            '%s/%s' % (SIGNAL_VENUE, args.binance_symbol): signal_cov},
                    min_window_ns)
     days = window.days()
     require_symbol_days(hl_per_day, days, HL_VENUE, args.hl_symbol)
-    require_symbol_days(bn_per_day, days, SIGNAL_VENUE, args.binance_symbol)
+    require_signal_days(bn_per_day, bn_per_day_b or None, days, args.binance_symbol)
     _step('window [%d, %d] = %s .. %s (%.3f h), days: %s'
           % (window.start_ns, window.end_ns, _utc_str(window.start_ns),
              _utc_str(window.end_ns), window.duration_ns / NS_PER_HOUR, ', '.join(days)))
@@ -1425,12 +1820,14 @@ def build(args: argparse.Namespace,
 
     hl_files = find_day_files(hl_dir, args.hl_symbol, days)
     bn_files = find_day_files(bn_dir, args.binance_symbol, days)
+    bn_files_b = ([] if bn_dir_b is None
+                  else find_day_files(bn_dir_b, args.binance_symbol, days))
     if not hl_files:
         raise BuildError(
             'no Hyperliquid recordings for %r in %s on days %s'
             % (args.hl_symbol, hl_dir, ', '.join(days))
         )
-    if not bn_files:
+    if not bn_files and not bn_files_b:
         raise BuildError(
             'no %s recordings for %r in %s on days %s'
             % (SIGNAL_VENUE, args.binance_symbol, bn_dir, ', '.join(days))
@@ -1439,19 +1836,39 @@ def build(args: argparse.Namespace,
     # runtime: it contradicts the coverage the report claimed. Mode A also
     # requires the signal to span the window on both sides, so the check is
     # symmetric.
-    for label, symbol, found in ((HL_VENUE, args.hl_symbol, hl_files),
-                                 (SIGNAL_VENUE, args.binance_symbol, bn_files)):
-        missing = [d for d in days if d not in {day for day, _ in found}]
+    signal_days = {day for day, _ in bn_files} | {day for day, _ in bn_files_b}
+    for label, symbol, present in ((HL_VENUE, args.hl_symbol, {d for d, _ in hl_files}),
+                                   (SIGNAL_VENUE, args.binance_symbol, signal_days)):
+        missing = [d for d in days if d not in present]
         if missing:
             raise BuildError(
-                'the window covers days %s but %s %s has no recording for %s. A '
+                'the window covers days %s but %s %s has no recording for %s%s. A '
                 'hole the size of a day is not something to build over, and the '
                 'quality report claimed coverage across it.'
-                % (', '.join(days), label, symbol, ', '.join(missing))
+                % (', '.join(days), label, symbol, ', '.join(missing),
+                   ' in either recording'
+                   if label == SIGNAL_VENUE and bn_dir_b is not None else '')
             )
+    # A day only one of the two signal recordings has is legal — that is what the
+    # union is for — but it is worth saying, because it is also what a socket
+    # that was down all day looks like.
+    if bn_dir_b is not None:
+        for name, found in (('primary', bn_files), ('secondary', bn_files_b)):
+            absent = [d for d in days if d not in {day for day, _ in found}]
+            if absent:
+                _warn('the %s signal recording has no file for %s; those days rest '
+                      'on the other recording alone' % (name, ', '.join(absent)))
 
     hl_meta_files, hl_meta = load_venue_meta(hl_dir, HL_VENUE, window.end_ns)
     bn_meta_files, bn_meta = load_venue_meta(bn_dir, SIGNAL_VENUE, window.end_ns)
+    bn_meta_files_b: list = []
+    bn_meta_b: list = []
+    if bn_dir_b is not None:
+        # Read for the same reason the primary's is: the manifest records which
+        # collector build produced each recording, and "the same venue" is not
+        # "the same binary" — the two sockets may have been started on different
+        # days from different releases.
+        bn_meta_files_b, bn_meta_b = load_venue_meta(bn_dir_b, SIGNAL_VENUE, window.end_ns)
 
     # --- 3.2 time policy: raw check BEFORE conversion -----------------------
     _step('checking the time policy on %d raw Hyperliquid file(s)' % len(hl_files))
@@ -1520,9 +1937,33 @@ def build(args: argparse.Namespace,
         raise BuildError('no Hyperliquid day produced any rows inside the window')
 
     # --- signal array -------------------------------------------------------
-    _step('building the signal array from %d %s file(s)' % (len(bn_files), SIGNAL_VENUE))
-    ts, values = build_signal([p for _d, p in bn_files], args.binance_symbol, window,
-                              args.clock_correction_ns)
+    if bn_dir_b is None:
+        _step('building the signal array from %d %s file(s)' % (len(bn_files), SIGNAL_VENUE))
+        ts, values = build_signal([p for _d, p in bn_files], args.binance_symbol, window,
+                                  args.clock_correction_ns)
+        union_stats = None
+    else:
+        _step('building the signal array from the union of %d + %d %s file(s)'
+              % (len(bn_files), len(bn_files_b), SIGNAL_VENUE))
+        ts, values, union_stats = build_signal_union(
+            [('primary', [p for _d, p in bn_files]),
+             ('secondary', [p for _d, p in bn_files_b])],
+            args.binance_symbol, window, args.clock_correction_ns,
+        )
+        _step('signal union: %d rows, %d recovered by the second recording '
+              '(primary alone: %d)'
+              % (union_stats['rows'], union_stats['recovered_rows'],
+                 union_stats['primary_only_rows']))
+        require_one_clock(union_stats, int(args.max_signal_age_ms) * NS_PER_MS)
+        if union_stats['recovered_rows'] == 0:
+            # Not a refusal: a fully redundant pair is the healthy outcome on a
+            # day neither socket dropped. It is still worth a line, because a
+            # secondary that recorded nothing at all looks exactly the same.
+            _warn('the secondary signal recording recovered no frames the primary '
+                  'did not already have (it contributed %d of %d rows). Either '
+                  'nothing was lost, or that recording is not what it should be.'
+                  % (union_stats['sources']['secondary']['contributed'],
+                     union_stats['rows']))
     if len(ts) == 0:
         raise BuildError(
             'no %s @bookTicker frames for %r inside the window. The signal is the '
@@ -1593,11 +2034,31 @@ def build(args: argparse.Namespace,
                 'data_dir': str(bn_dir),
                 'data': [file_fingerprint(p, day) for day, p in bn_files],
                 'meta': [file_fingerprint(p) for p in bn_meta_files],
+                'role': 'signal, primary recording',
             },
+            **({} if bn_dir_b is None else {
+                # A separate key rather than more files under the venue's: the
+                # two are independent recordings, and a reader has to be able to
+                # tell which fingerprint came from which socket.
+                SIGNAL_VENUE + '_secondary': {
+                    'data_dir': str(bn_dir_b),
+                    'data': [file_fingerprint(p, day) for day, p in bn_files_b],
+                    'meta': [file_fingerprint(p) for p in bn_meta_files_b],
+                    'role': 'signal union, additive only',
+                    'quality_report': {
+                        **file_fingerprint(report_b_path),
+                        'schema': REPORT_SCHEMA,
+                        'verdict': verdict_b,
+                        'enforced': False,
+                    },
+                },
+            }),
         },
         'collector': {
             HL_VENUE: collector_provenance(hl_meta),
             SIGNAL_VENUE: collector_provenance(bn_meta),
+            **({} if bn_dir_b is None
+               else {SIGNAL_VENUE + '_secondary': collector_provenance(bn_meta_b)}),
         },
         'converter': converter_identity(
             book_mode=args.book_mode,
@@ -1639,8 +2100,20 @@ def build(args: argparse.Namespace,
             'coverage': {
                 HL_VENUE: {'first_local_ts': hl_cov[0], 'last_local_ts': hl_cov[1],
                            'symbol': args.hl_symbol.lower(), 'scale': 'raw'},
-                SIGNAL_VENUE: {'first_local_ts': bn_cov[0], 'last_local_ts': bn_cov[1],
-                               'symbol': args.binance_symbol.lower(), 'scale': 'raw'},
+                # The coverage the window was actually intersected against: with
+                # a second recording that is the UNION of the two sockets, and
+                # each one's own interval is beside it.
+                SIGNAL_VENUE: {
+                    'first_local_ts': signal_cov[0], 'last_local_ts': signal_cov[1],
+                    'symbol': args.binance_symbol.lower(), 'scale': 'raw',
+                    **({} if bn_dir_b is None else {
+                        'kind': 'union of two recordings',
+                        'primary': None if bn_cov is None else
+                        {'first_local_ts': bn_cov[0], 'last_local_ts': bn_cov[1]},
+                        'secondary': None if bn_cov_b is None else
+                        {'first_local_ts': bn_cov_b[0], 'last_local_ts': bn_cov_b[1]},
+                    }),
+                },
             },
             'venue_coverage': {
                 HL_VENUE: {'first_local_ts': hl_venue_cov[0],
@@ -1700,6 +2173,62 @@ def build(args: argparse.Namespace,
                               'the last in arrival order (the sort is stable)',
             'freshness_rule': 'no row within max_signal_age_ns => do not trade '
                               '(same code path as "no signal yet")',
+            'union': {'enabled': False} if union_stats is None else {
+                'enabled': True,
+                'dedup_key': 'u',
+                'dedup_note': 'the venue order-book update id. Not the receive '
+                              'timestamp (the two sockets see one update at '
+                              'different instants) and not the prices (a quiet '
+                              'market repeats them). A frame without `u` refuses '
+                              'the build rather than being guessed at.',
+                'tie_break': 'earliest local_ts wins — the socket that was up is '
+                             'the one that timed the row',
+                'rows': union_stats['rows'],
+                'primary_only_rows': union_stats['primary_only_rows'],
+                'recovered_rows': union_stats['recovered_rows'],
+                'shared_update_ids': union_stats['shared_update_ids'],
+                'clock_offset_ns': union_stats['clock_offset_ns'],
+                'clock_offset_note': 'median of (secondary receive time - primary '
+                                     'receive time) over the update ids both '
+                                     'recordings saw. On one host that is the '
+                                     'difference in socket receive latency; a '
+                                     'second clock shows up here as an offset, '
+                                     'and one past max_signal_age_ns refuses the '
+                                     'build (see require_one_clock). null means '
+                                     'the two recordings share no update id, so '
+                                     'nothing measured them against each other',
+                'sources': union_stats['sources'],
+                'sources_note': '`exclusive` is the update ids only that recording '
+                                'has — the recovery seen from each side; '
+                                '`contributed` is the rows it also timed, which is '
+                                'larger because it wins every update it received '
+                                'first',
+                'primary': {'data_dir': str(bn_dir), 'gate': 'enforced'},
+                'secondary': {
+                    'data_dir': str(bn_dir_b),
+                    'quality_report': str(report_b_path),
+                    'verdict': verdict_b,
+                    'gate': 'reported, not enforced',
+                    'note': 'additive only: the window, the day set and the '
+                            'required-stream gate all come from the primary '
+                            'report, so a red primary still refuses the build and '
+                            'a red secondary cannot. The secondary can only add '
+                            'frames to a signal the primary already justified.',
+                },
+                'why': 'one Binance USD-M socket loses 0.2-0.4% of the day to '
+                       'reconnects, in clusters of 0.5-0.8s, 10-19 times a day, '
+                       'and two sockets to the same venue drop at uncorrelated '
+                       'times. Hyperliquid is deliberately NOT duplicated: its '
+                       'losses are already mitigated by the 30-trade replay and '
+                       'the bbo fusion.',
+                'local_ts_note': 'ts therefore mixes the receive clocks of two '
+                                 'sockets. Sound because both recordings are made '
+                                 'on ONE host against one clock — the same '
+                                 'same-host argument the design document makes for '
+                                 'comparing venues at all. Two hosts would need '
+                                 'their skew measured first, and nothing here can '
+                                 'check that they were not.',
+            },
         },
         'snapshots': snapshots,
         'backtest_defaults': {

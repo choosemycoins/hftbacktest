@@ -9,11 +9,15 @@
 # Layout under /opt/hft-collector:
 #   current -> releases/<tag>/     symlink, swapped atomically
 #   releases/<tag>/
-#     bin/{collector,collector-run.sh,rollback.sh}
-#     etc/{hft-collector@.service,instance.env.example}
+#     bin/{collector,collector-run.sh,rollback.sh,gate-run.sh,alert.sh}
+#     etc/{hft-collector@.service,hft-collector-gate@.service,
+#          hft-collector-gate@.timer,hft-collector-alert@.service,
+#          instance.env.example,alert.env.example}
+#     tools/quality_report.py      the gate's only dependency; stdlib-only
 #     README.md
 #     RELEASE
 #   etc/<instance>.env             operator-authored, never touched here
+#   etc/alert.env                  operator-authored, root:600, see alert.sh
 #   data/                          recorded .gz, never touched here
 #   .previous                      rollback target
 #
@@ -167,6 +171,38 @@ for f in bin/collector bin/collector-run.sh bin/rollback.sh etc/hft-collector@.s
         exit 2
     fi
 done
+# The daily gate is optional in the tarball rather than required, so this
+# script still installs a release built before it existed. A release that has
+# it gets the units refreshed below; one that does not is left alone, and the
+# timer an operator already enabled keeps running the previous release's copy
+# through `current/`.
+GATE_FILES=(bin/gate-run.sh tools/quality_report.py
+            etc/hft-collector-gate@.service etc/hft-collector-gate@.timer)
+HAS_GATE=1
+for f in "${GATE_FILES[@]}"; do
+    [[ -f "${TMP}/${f}" ]] || HAS_GATE=0
+done
+if [[ "${HAS_GATE}" -eq 0 ]]; then
+    echo "NOTE: this tarball carries no daily quality gate (bin/gate-run.sh +"
+    echo "      tools/quality_report.py). Nothing is removed; an enabled timer"
+    echo "      keeps running whatever the previous release installed."
+fi
+# The alert hook, on the same optional terms. Loud rather than silent when it
+# is absent: every unit shipped here carries OnFailure=hft-collector-alert@%n
+# unconditionally, so a release without it leaves those units naming a hook
+# systemd cannot resolve — and the symptom is that nothing alerts, which is
+# indistinguishable from nothing failing.
+ALERT_FILES=(bin/alert.sh etc/hft-collector-alert@.service etc/alert.env.example)
+HAS_ALERT=1
+for f in "${ALERT_FILES[@]}"; do
+    [[ -f "${TMP}/${f}" ]] || HAS_ALERT=0
+done
+if [[ "${HAS_ALERT}" -eq 0 ]]; then
+    echo "WARNING: this tarball carries no alert hook (bin/alert.sh +"
+    echo "         etc/hft-collector-alert@.service). The units' OnFailure= will"
+    echo "         not resolve unless a previous release installed it, and a"
+    echo "         failed collector will then be visible only in systemctl."
+fi
 
 # Cross-check the binary against the manifest. A tarball whose bin/ was staged
 # from a stale target/ dir is the classic way to deploy code you did not build.
@@ -284,14 +320,43 @@ mv -T "${TMP}" "${NEW_RELEASE}"
 # Published: stop the EXIT trap from deleting what is now the live release.
 trap - EXIT
 
-# Keep a copy of the template where an operator will look for it.
+# Keep a copy of the templates where an operator will look for them. Only the
+# `.example` files: the real <instance>.env and alert.env are operator-authored
+# and this script never touches them.
 if [[ -f "${NEW_RELEASE}/etc/instance.env.example" ]]; then
     install -m 644 "${NEW_RELEASE}/etc/instance.env.example" "${ETC_DIR}/instance.env.example"
+fi
+if [[ -f "${NEW_RELEASE}/etc/alert.env.example" ]]; then
+    install -m 644 "${NEW_RELEASE}/etc/alert.env.example" "${ETC_DIR}/alert.env.example"
 fi
 
 if ! cmp -s "${NEW_RELEASE}/etc/hft-collector@.service" "${UNIT_FILE}" 2>/dev/null; then
     echo "==> Updating ${UNIT_FILE}"
     install -m 644 "${NEW_RELEASE}/etc/hft-collector@.service" "${UNIT_FILE}"
+fi
+
+# The gate's units, on the same terms. They are installed but never enabled
+# here: install.sh does not start things nobody asked for, exactly as it
+# refuses to start an enabled-but-stopped collector instance. Enabling is one
+# command and it is in the README.
+if [[ "${HAS_GATE}" -eq 1 ]]; then
+    for unit in hft-collector-gate@.service hft-collector-gate@.timer; do
+        if ! cmp -s "${NEW_RELEASE}/etc/${unit}" "/etc/systemd/system/${unit}" 2>/dev/null; then
+            echo "==> Updating /etc/systemd/system/${unit}"
+            install -m 644 "${NEW_RELEASE}/etc/${unit}" "/etc/systemd/system/${unit}"
+        fi
+    done
+fi
+
+# The alert unit, likewise. This one is not "enabled" at all — it is an
+# OnFailure target, activated by the units that name it — so installing the
+# file is the whole of wiring it up.
+if [[ "${HAS_ALERT}" -eq 1 ]]; then
+    unit=hft-collector-alert@.service
+    if ! cmp -s "${NEW_RELEASE}/etc/${unit}" "/etc/systemd/system/${unit}" 2>/dev/null; then
+        echo "==> Updating /etc/systemd/system/${unit}"
+        install -m 644 "${NEW_RELEASE}/etc/${unit}" "/etc/systemd/system/${unit}"
+    fi
 fi
 
 PREV_TARGET=""
@@ -381,6 +446,15 @@ if [[ "${#CONFIGURED[@]}" -eq 0 ]]; then
     echo "  sudo cp ${ETC_DIR}/instance.env.example ${ETC_DIR}/hyperliquid.env"
     echo "  sudo \$EDITOR ${ETC_DIR}/hyperliquid.env"
     echo "  sudo systemctl enable --now hft-collector@hyperliquid"
+fi
+if [[ "${HAS_GATE}" -eq 1 ]]; then
+    GATE_ENABLED="$(systemctl is-enabled 'hft-collector-gate@all.timer' 2>/dev/null || true)"
+    if [[ "${GATE_ENABLED}" != enabled* ]]; then
+        echo ""
+        echo "The daily quality gate is installed but not enabled. It checks"
+        echo "yesterday's recordings at 00:35 UTC and fails the unit on a red day:"
+        echo "  sudo systemctl enable --now hft-collector-gate@all.timer"
+    fi
 fi
 echo ""
 echo "Logs:  journalctl -u 'hft-collector@*' -f"

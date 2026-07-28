@@ -469,11 +469,11 @@ deflate sync point but no member trailer, so a reader still rejects the file
 until the member is closed at shutdown. Measured over a 12-minute run, a
 gzipped meta stream stayed at 10 bytes on disk the whole time and materialised
 only on exit — no use for diagnosing a live problem, and lost entirely to a
-SIGKILL. It does not need compressing either: the three minutely
-[host gauges](#host-gauges-clock-and-per-symbol-liveness) dominate its steady
-state at ~420–490 bytes a minute — `disk` ~112 B, `clock` ~129 B, `liveness`
-~180 B for thirteen symbols, measured 2026-07-28 — which is ~0.6 MB a day
-against 22 MB a day for one Hyperliquid coin. Lifecycle records add to that only
+SIGKILL. It does not need compressing either: the four minutely
+[host gauges](#host-gauges-clock-cpu-and-per-symbol-liveness) dominate its steady
+state at ~530–600 bytes a minute — `disk` ~112 B, `clock` ~129 B, `cpu` ~110 B,
+`liveness` ~180 B for thirteen symbols, measured 2026-07-28 — which is ~0.8 MB
+a day against 22 MB a day for one Hyperliquid coin. Lifecycle records add to that only
 when something happens. The different extension also keeps it out of the
 `*_<date>.gz` wildcards that feed the converters.
 
@@ -557,13 +557,13 @@ so on those three venues the `_collector` records are the only account of the
 session there is.
 
 Alongside those events the sidecar carries the collector's **gauges** —
-`disk`, `clock` and `liveness`, all written on one minute timer, plus
+`disk`, `clock`, `cpu` and `liveness`, all written on one minute timer, plus
 `universe` once at startup on Hyperliquid and Lighter. They are measurements of the host,
 not events in the recording's life, and the difference is load-bearing: a
 minutely gauge lands inside every hole longer than a minute whatever caused it,
 so `quality_report.py` refuses to let one explain a gap. See
 [Running out of space](#running-out-of-space) and
-[Host gauges](#host-gauges-clock-and-per-symbol-liveness).
+[Host gauges](#host-gauges-clock-cpu-and-per-symbol-liveness).
 
 This is what turns an unexplained gap into a diagnosable one. A recording made
 against a deliberately invalid symbol now reads:
@@ -1028,6 +1028,156 @@ WebSocket reconnects, and both deploy and rollback restart. There is no
 zero-gap path: two processes writing the same file would interleave gzip
 members from different streams.
 
+### Taking finished days off the host
+
+Nothing on the host prunes anything, by design — the collector stops rather
+than overwrite. A full USD-M symbol set burns 3-5 GB a day against a 53 GB
+volume, so something has to move the data, and that something is
+`deploy/offload.sh`. It runs **from the operator machine**:
+
+```bash
+deploy/offload.sh --host user@box --target ~/marketdata --dry-run
+deploy/offload.sh --host user@box --target ~/marketdata
+```
+
+Per instance directory, in this order: list the host's finalized files → sha256
+**on the host** → rsync here → sha256 **here** and compare → `gzip -t` every
+`.gz` that arrived → *only then* `rm` on the host. Nothing is deleted that was
+not just verified byte for byte, and a `.gz` that copies perfectly but will not
+decode is left on the host and reported.
+
+Three things it will not do:
+
+* **Touch today's files.** Finalized means "older than the day the HOST says it
+  is", asked over ssh rather than assumed — the host's clock is what names the
+  files, and a guess an hour either side of midnight deletes one that is still
+  open. The date rule is asserted a second time immediately before the delete,
+  because that is the one irreversible step.
+* **Touch a name it does not recognise.** Three shapes are known —
+  `<symbol>_<day>.gz`, `_meta_<exchange>_<day>.jsonl`, `gate/<day>.{txt,json}`
+  — and everything else is left alone and counted. The same allowlist is what
+  keeps the remote commands safe: only `[A-Za-z0-9._-]` and a literal `gate/`
+  ever reach a remote shell.
+* **Delete the gate reports.** They are copied and left: kilobytes against
+  gigabytes, and a day whose data has gone is exactly when its report is worth
+  having on the box beside the journal.
+
+It is idempotent. Interrupt it anywhere and run it again — rsync re-copies
+nothing it already has, verification always runs from scratch, and a file
+already removed is simply not listed. `--keep-on-host` copies and verifies
+without deleting; `--instances a,b` narrows it. `--dry-run` prints the plan and
+the byte count.
+
+### The daily quality gate
+
+`quality_report.py` answers the one question the collector process cannot
+answer about itself — *did we actually get everything we asked for, and is it
+readable?* — and the gate timer runs it on the host every night so the answer
+arrives while yesterday can still be acted on.
+
+```bash
+sudo systemctl enable --now hft-collector-gate@all.timer
+systemctl list-timers 'hft-collector-gate@*'
+```
+
+At **00:35 UTC** it checks **yesterday** for every instance data directory on
+the host and writes the report next to the data:
+
+```
+/opt/hft-collector/data/<instance>/gate/<YYYYMMDD>.txt     the operator's view
+/opt/hft-collector/data/<instance>/gate/<YYYYMMDD>.json    quality-report-v1
+```
+
+A **red day exits non-zero**, which lands `hft-collector-gate@<set>.service` in
+`failed` — visible in `systemctl list-units --failed` and the hook any
+`OnFailure=` alerting hangs off, the same signal the collector's own
+fail-closed paths produce. The findings are echoed into the journal too, so a
+notification does not have to be followed by an ssh session to learn what it
+said. The instance token is a *set*: `all` is every instance here, or name one.
+
+Two things worth knowing before you enable it:
+
+* **It competes with the recording for two vCPUs.** A day is gigabytes of gzip
+  and the gate decodes every byte, on a box whose only job is to not fall
+  behind — and on a burstable instance that CPU is metered. So it is run at
+  `Nice=19` with idle I/O priority: whenever the collector and the gate both
+  want the CPU, the collector gets it and the gate simply takes longer. That is
+  the intended trade; a late report costs nothing and a dropped frame is gone.
+  A hard `CPUQuota=` is available as a drop-in and is deliberately not the
+  default.
+* **One report per directory, not one per host.** `quality_report.py` takes one
+  directory per venue and refuses two of the same venue in one run — which is
+  exactly the configuration a duplicated USD-M recording creates (see the
+  signal union below). One run per directory sidesteps that, makes "next to the
+  data" well defined, and produces the per-instance JSON that
+  `build_dataset.py --binance-report-b` consumes directly.
+
+A caveat the timer cannot design away: files rotate **lazily**, so yesterday's
+`.gz` gets its gzip trailer on the first write after midnight. A liquid feed
+rotates within milliseconds and never notices; a symbol thin enough to go from
+23:59 to 00:35 without a print still has an unterminated member when the gate
+looks, and an unterminated member on a finalized day is corruption as far as
+the report is concerned. Move that instance's timer later with a drop-in rather
+than learning to ignore a red.
+
+### Recording the signal twice
+
+Measured on the hosts: one Binance USD-M socket loses **0.2-0.4% of the day**
+to reconnects, in clusters of 0.5-0.8 s, 10-19 times a day — and two sockets to
+the same venue drop at **uncorrelated** times. So the signal is worth recording
+twice, as two ordinary instances with different names and different data
+directories, and joining them offline:
+
+```bash
+build_dataset.py --quality-report combined.json \
+    --binance-report-b /data/um_b/gate/20260728.json \
+    --hl-symbol BTC --binance-symbol BTCUSDT --out-dir dataset/
+```
+
+The signal array is then the **union** of both recordings' `@bookTicker`
+frames, deduplicated by the venue's own update id `u`, keeping the earliest
+`local_ts` for each — the recovering socket is the one that was up. Coverage is
+the union of the two intervals and a gap survives only where **both** were
+dark. The manifest records both inputs, each source's contribution, and how
+many frames the union recovered.
+
+Hyperliquid is deliberately **not** duplicated: its reconnect losses are
+already mitigated by the 30-trade replay and the `bbo` fusion.
+
+The secondary is **additive only**: the window, the day set and the
+required-stream gate all come from the primary report, so a red primary still
+refuses the build and a red secondary cannot.
+
+Two things the union checks rather than assumes, because both fail silently:
+
+* **One clock.** "Earliest `local_ts` wins" reads as *the socket that was up*
+  only while both sockets stamp their frames against the same clock. Put the
+  second recording on a second host whose clock is behind and it wins **every**
+  update the two share, moving the whole signal timeline by the skew — and a
+  skewed recording that also recovers a few frames looks exactly like a healthy
+  one. So the build measures it: the median of *secondary receive time −
+  primary receive time* over the update ids both recordings saw. On one host
+  that is the difference in socket receive latency, single-digit milliseconds;
+  it is written to the manifest as `signal.union.clock_offset_ns` either way,
+  and one larger than the whole `--max-signal-age-ms` freshness window refuses
+  the build. Mode A selects *the last row with `local_ts <= now`*, so a skew
+  carried into the dataset lands in every decision the backtest makes. When the
+  two recordings share **no** update id there is nothing to measure it with, and
+  that is said out loud rather than passed: two sockets to one venue and one
+  symbol see the same book updates, so it means the *primary* has no frame
+  inside the window and the signal rests on the second recording alone. Legal —
+  it is what the union is for — but until the warning existed it was also the
+  one shape in which every number stayed healthy: `clock_offset_ns` null,
+  `recovered_rows == rows`, `primary_only_rows` zero.
+* **One `u`, one book.** The dedup key is only sound while one update id means
+  one book state. Where it does not — a matching engine that restarted its
+  counter inside the window is the realistic way — the dict would keep whichever
+  frame arrived first and the other simply would not be in the dataset, with
+  `rows`, `recovered_rows` and every coverage number still looking right. Two
+  frames claiming one `u` with different prices therefore refuse the build; two
+  claiming it with the *same* prices are the ordinary case and are just
+  deduplicated.
+
 ### Falling behind
 
 The two internal hand-offs are bounded (`src/queue.rs`), and since they fail for
@@ -1173,26 +1323,80 @@ host or the network.
 - a partially accepted subscription — indistinguishable from a full one here.
 
 "One symbol of ten that stopped" used to be on that list. It is now the
-[per-symbol liveness gauge](#host-gauges-clock-and-per-symbol-liveness) below,
+[per-symbol liveness gauge](#host-gauges-clock-cpu-and-per-symbol-liveness) below,
 which warns but deliberately does not stop the collector.
 
 Answering *did we get everything we asked for* is an offline report over
 finished files, not a decision this process can make about itself.
 
-### Host gauges: clock and per-symbol liveness
+### Host gauges: clock, CPU and per-symbol liveness
 
-Two measurements written to the sidecar on the **same one-minute timer as the
+Three measurements written to the sidecar on the **same one-minute timer as the
 disk gauge**, for the same reason: a recording that carries its own history
 needs no metrics agent, and `_meta` is the one file an operator can tail live.
-Neither ever stops the collector.
+None of them ever stops the collector.
 
 | Record | Says | Warns when |
 |---|---|---|
 | `{"_collector":"clock", …}` | `sync`, `est_error_us`, `max_error_us`, `offset_us`, `freq_ppm` | the kernel reports `STA_UNSYNC`, or `max_error_us` > 4 000 000 |
+| `{"_collector":"cpu", …}` | `steal_pct`, `user_pct`, `system_pct`, `idle_pct` over the last minute | `steal_pct` > 10 |
 | `{"_collector":"liveness", …}` | `threshold_s`, and `ages_s` — seconds since anything was recorded, per symbol | one symbol's age passes `--liveness-timeout-s` |
 
-Both warnings are **edge-triggered**: once when the fault starts, once when it
-clears. A fault that lasts hours is one line in the journal, not sixty an hour.
+All three warnings are **edge-triggered**: once when the fault starts, once
+when it clears. A fault that lasts hours is one line in the journal, not sixty
+an hour.
+
+#### CPU, and how much of it the hypervisor took
+
+The collector's failure mode is always the same sentence — *the writer cannot
+keep up* — and it has two completely different causes. Either the venue is
+sending more than this process can gzip, or **the host is not being given the
+CPU it thinks it has**. From inside the process those are indistinguishable:
+the queue fills, `queue_overflow` is written, the run ends, and every other
+gauge reads the same in both cases.
+
+The recording boxes are burstable (t4-class), where the second cause is not
+hypothetical. Such an instance is entitled to a baseline fraction of a vCPU and
+banks credits while it stays under it; spend the credits and the hypervisor
+throttles it back to that baseline, accounting the difference as `steal`. So
+the failure that looks most like "the venue flooded us" is the one the venue
+had no part in, and the only witness is a counter in `/proc/stat`.
+
+The four numbers are deltas over the minute, not averages since boot, and they
+**sum to 100** — `nice` is folded into user, `irq`/`softirq` into system, and
+`iowait` into idle, so an operator who reads three of them can name the fourth.
+`guest` is not added to the total: Linux already counts it inside `user`, and
+double-counting it would inflate the denominator and quietly shrink the one
+number this gauge is for.
+
+The **10% steal threshold** sits between two measured ends. Ordinary shared
+tenancy costs a fraction of a percent, so anything inside that band would fire
+on healthy hosts. A burstable instance out of credits is capped at a 10-40%
+baseline, so a process that wants a whole vCPU is handed back 60-90% — the
+fault does not arrive gently at 12%, it arrives as most of the machine. 10% is
+an order of magnitude above the noise and well below the fault, and it fires
+*early*: at 10% the collector is still keeping up, so the warning arrives while
+there is time to resize or shed a symbol, rather than alongside the
+`queue_overflow` it was supposed to explain.
+
+Nothing here ever stops the collector. A throttled host is the one failure the
+collector can do nothing about, and exiting over it would take the recording
+down for the duration of a hypervisor's mood.
+
+Off Linux there is no `/proc/stat`, so the record is
+`{"_collector":"cpu","unsupported":true,"platform":"macos"}` rather than a
+host with no steal — and the first sample of any run records
+`{"first_sample":true}`, because cumulative counters have nothing to subtract
+from yet and a zeroed reading there would open every recording with a minute of
+"no steal" that was never measured.
+
+**What an operator does.** `journalctl` says *"this host is not getting the CPU
+it asked for"*. Check the instance's CPU credit balance; if it is at zero the
+answer is a larger instance or fewer symbols, not a restart. Cross-check
+`grep '"_collector":"cpu"' _meta_*.jsonl` against the same minutes in the
+sidecar's `disk` and queue records — steal high and idle low at the moment the
+queue filled is the throttling case, and steal near zero with idle near zero is
+genuinely too much data for this box.
 
 #### Clock discipline
 

@@ -1318,8 +1318,8 @@ def merge_session_config(records) -> Optional[dict]:
 
 
 #: The collector's **gauges** — `_collector` records that are measurements
-#: rather than events in the recording's life. Three are written on the same
-#: one-minute timer (`main.rs`, the `gauges.tick()` arm: `disk`, `clock`,
+#: rather than events in the recording's life. Four are written on the same
+#: one-minute timer (`main.rs`, the `gauges.tick()` arm: `disk`, `clock`, `cpu`,
 #: `liveness`) and `universe` once at startup.
 #:
 #: Named as a set for two reasons. They are known records, so nothing may treat
@@ -1328,7 +1328,14 @@ def merge_session_config(records) -> Optional[dict]:
 #: one of them may ever join `_EXPLANATORY` below; the assertion that they do
 #: not is a test, because the rule is easy to break by adding a name to the
 #: wrong tuple.
-_GAUGES = ("disk", "clock", "liveness", "universe")
+#:
+#: `cpu` is the one that most looks like it belongs in the other tuple. It
+#: carries `steal_pct`, and steal at 80% really is why the writer fell behind —
+#: but it is written every minute whether or not anything was stolen, so it
+#: lands inside every hole longer than a minute exactly as `disk` does.
+#: Annotating a gap "explained by cpu" would state only that a minute passed.
+#: The number in the record is the evidence; reading it is the investigation.
+_GAUGES = ("disk", "clock", "cpu", "liveness", "universe")
 
 #: The collector's **lifecycle** records — the ones that say something happened
 #: to the recording — most conclusive first. A restart (`session_start`) explains

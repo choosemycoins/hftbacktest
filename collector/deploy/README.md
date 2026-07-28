@@ -45,7 +45,11 @@ sudo $EDITOR /opt/hft-collector/etc/alert.env
 
 # 3. Запуск: имя инстанса = имя env-файла
 sudo systemctl enable --now hft-collector@<instance>
-sudo systemctl enable --now hft-collector-gate@daily.timer
+# Токен таймера — это НАБОР ИНСТАНСОВ, а не расписание: `all` = все инстансы
+# хоста, либо имя одного env-файла. Любое другое слово (`daily`) gate-run.sh
+# примет за имя инстанса, не найдёт его директорию данных и будет падать с
+# кодом 2 каждую ночь.
+sudo systemctl enable --now hft-collector-gate@all.timer
 
 # 4. Проверка (см. «Диагностика» ниже)
 journalctl -u 'hft-collector@*' -f
@@ -112,7 +116,7 @@ sudo systemd-run --unit=alert-selftest \
 
 ## Ежедневный гейт и вывоз данных
 
-- **Гейт**: `hft-collector-gate@daily.timer` в 00:35 UTC гоняет
+- **Гейт**: `hft-collector-gate@all.timer` в 00:35 UTC гоняет
   `tools/quality_report.py` по вчерашнему дню всех инстансов (nice/ionice —
   не конкурирует с записью), кладёт отчёт в `data/gate/`, на красном дне
   уходит в `failed` (⇒ алерт) и бьёт `/fail` в healthchecks; на зелёном —

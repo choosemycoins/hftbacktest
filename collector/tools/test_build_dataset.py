@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import json
 import sys
+import tracemalloc
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,16 +85,23 @@ def hl_bbo(coin, time_ms, bid_px, ask_px):
     })
 
 
-def binance_book_ticker(symbol, ts_ms, bid_px, bid_qty, ask_px, ask_qty):
-    return json.dumps({
-        'stream': f'{symbol.lower()}@bookTicker',
-        'data': {
-            'e': 'bookTicker', 'u': 1, 's': symbol.upper(),
-            'b': str(bid_px), 'B': str(bid_qty),
-            'a': str(ask_px), 'A': str(ask_qty),
-            'T': ts_ms, 'E': ts_ms,
-        },
-    })
+def binance_book_ticker(symbol, ts_ms, bid_px, bid_qty, ask_px, ask_qty, u=1,
+                        drop_update_id=False):
+    """One ``@bookTicker`` frame.
+
+    ``u`` is the venue's order-book update id and the key the two-socket union
+    deduplicates on; ``drop_update_id`` writes the frame without it, which is
+    what a recording the union cannot be built from looks like.
+    """
+    data = {
+        'e': 'bookTicker', 'u': u, 's': symbol.upper(),
+        'b': str(bid_px), 'B': str(bid_qty),
+        'a': str(ask_px), 'A': str(ask_qty),
+        'T': ts_ms, 'E': ts_ms,
+    }
+    if drop_update_id:
+        del data['u']
+    return json.dumps({'stream': f'{symbol.lower()}@bookTicker', 'data': data})
 
 
 def binance_trade(symbol, ts_ms, px, qty):
@@ -156,12 +164,24 @@ def hl_day_lines(day_start, *, n=6, base_ms=None, latency_ns=200 * MS, fast=Fals
 
 
 def bn_day_lines(day_start, *, n=6, base_ms=None, latency_ns=5 * MS):
+    """A plain day of ``@bookTicker`` + ``@trade`` for one symbol.
+
+    ``u`` is keyed off the exchange millisecond rather than left at the default,
+    so every frame here carries a distinct update id and two days of this fixture
+    never reuse one. The venue's own ids behave that way — ``u`` is the order
+    book update id, so one value describes exactly one book — and a fixture that
+    gave six different books the same id would be asserting the one thing
+    :func:`build_signal_union` refuses to build over. The ids are far away from
+    the small ones :func:`bn_union_lines` uses, which is what lets the two
+    generators appear in one build without claiming to describe the same update.
+    """
     base_ms = base_ms if base_ms is not None else day_start // MS
     out = []
     for i in range(n):
         exch_ms = base_ms + i * 1000
         local = exch_ms * MS + latency_ns
-        out.append((local, binance_book_ticker('BTCUSDT', exch_ms, 100 + i, 1, 101 + i, 2)))
+        out.append((local, binance_book_ticker('BTCUSDT', exch_ms, 100 + i, 1, 101 + i, 2,
+                                               u=exch_ms)))
         out.append((local + 1000, binance_trade('BTCUSDT', exch_ms, 100 + i, 0.1)))
     return out
 
@@ -973,6 +993,571 @@ def test_empty_signal_is_refused(dataset):
     with pytest.raises(SystemExit) as e:
         bd.main(base_argv(ds), convert_fn=conv, snapshot_fn=FakeSnapshotter())
     assert e.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# the signal union: two independent recordings of the same venue
+# ---------------------------------------------------------------------------
+#
+# Measured on the recording hosts: a single Binance USD-M socket loses 0.2-0.4%
+# of the day to reconnects, in clusters of 0.5-0.8s, 10-19 times a day — and two
+# sockets to the SAME venue drop at uncorrelated times. So a second recording of
+# the same symbol covers the first one's holes, and the union of the two is the
+# signal. Hyperliquid is deliberately not duplicated: its losses are already
+# mitigated by the 30-trade replay and the bbo fusion.
+
+
+def bn_union_lines(day_start, ids, *, latency_ns=5 * MS, symbol='BTCUSDT'):
+    """``@bookTicker`` frames carrying exactly the given update ids.
+
+    The exchange time is keyed off ``u`` rather than off the loop index, so the
+    same ``u`` in two recordings describes the same venue update — which is what
+    makes deduplicating on it meaningful. ``latency_ns`` is the socket's receive
+    delay, and the whole point of the union is that the two differ.
+    """
+    out = []
+    for u in ids:
+        exch_ms = day_start // MS + u * 1000
+        out.append((
+            exch_ms * MS + latency_ns,
+            binance_book_ticker(symbol, exch_ms, 100 + u, 1, 101 + u, 2, u=u),
+        ))
+    return out
+
+
+def make_signal_report(path, bn_dir, cov, *, verdict='green', days=None,
+                       symbol='btcusdt'):
+    """A Phase-2 report over the secondary signal recording alone.
+
+    One venue, because that is what `quality_report.py` produces for one
+    instance directory: it refuses two directories of the same venue in one
+    report ("one venue per report entry"), which is exactly the situation two
+    USD-M recordings on one host create.
+    """
+    days = days or {DAY0: {'verdict': 'green'}}
+    out = {}
+    for day, entry in days.items():
+        entry = dict(entry)
+        entry.setdefault('issues', [])
+        entry.setdefault('symbols', {symbol: symbol_entry(cov[0], cov[1], ('bookTicker',))})
+        out[day] = entry
+    path.write_text(json.dumps({
+        'schema': 'quality-report-v1',
+        'verdict': verdict,
+        'venues': {
+            'binancefuturesum': {
+                'data_dir': str(bn_dir),
+                'exchange_as_recorded': None,
+                'coverage': {'first_local_ts': cov[0], 'last_local_ts': cov[1]},
+                'days': out,
+            },
+        },
+    }))
+    return path
+
+
+def add_secondary(ds, lines, *, verdict='green', days=None, day=DAY0):
+    """Give the dataset a second USD-M recording of the same symbol."""
+    bn_dir_b = ds['root'] / 'bn_b'
+    write_gz(bn_dir_b / f'btcusdt_{day}.gz', lines)
+    write_meta(bn_dir_b / f'_meta_binancefuturesum_{day}.jsonl', [
+        (DAY0_START, session_start('binancefuturesum', ['BTCUSDT'], commit='b0b0b0b')),
+    ])
+    report_b = make_signal_report(
+        ds['root'] / 'report_b.json', bn_dir_b,
+        (min(t for t, _ in lines), max(t for t, _ in lines)),
+        verdict=verdict, days=days,
+    )
+    ds['bn_dir_b'] = bn_dir_b
+    ds['report_b'] = report_b
+    return ds
+
+
+def test_union_coverage_takes_the_hull_of_two_overlapping_recordings():
+    assert bd.union_coverage((10, 20), (15, 30)) == (10, 30)
+    assert bd.union_coverage((15, 30), (10, 20)) == (10, 30)
+    # One recording entirely inside the other adds nothing and takes nothing.
+    assert bd.union_coverage((10, 40), (20, 30)) == (10, 40)
+
+
+def test_union_coverage_refuses_a_stretch_where_both_were_dark():
+    """Two disjoint intervals are not one interval.
+
+    The hull would claim coverage over the hole between them, which is the one
+    stretch neither socket recorded — the exact opposite of what the union is
+    for.
+    """
+    with pytest.raises(bd.BuildError) as e:
+        bd.union_coverage((10, 20), (30, 40))
+    assert 'both' in str(e.value).lower()
+    assert '20' in str(e.value) and '30' in str(e.value)
+
+
+def test_union_dedups_by_update_id_and_keeps_the_earliest_receive(tmp_path):
+    """The same venue update arrives on both sockets; it is one row, timed by
+    whichever socket saw it first. Keeping both would double every frame."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2, 3], latency_ns=9 * MS))
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2, 3], latency_ns=4 * MS))
+
+    ts, values, stats = bd.build_signal_union(
+        [('primary', [a]), ('secondary', [b])], 'BTCUSDT', bd.Window(0, 2 ** 62))
+
+    assert len(ts) == 3, 'the same update id was kept twice'
+    assert list(np.diff(ts)) == [NS, NS]
+    # 4 ms, not 9 ms: socket B saw all three first.
+    assert int(ts[0]) == (DAY0_START // MS + 1000) * MS + 4 * MS
+    assert stats['sources']['secondary']['contributed'] == 3
+    assert stats['sources']['primary']['contributed'] == 0
+    assert stats['recovered_rows'] == 0, 'B recovered nothing A did not have'
+
+
+def test_the_union_fills_a_hole_in_one_recording_from_the_other(tmp_path):
+    """The whole point: socket A's reconnect gap is covered by socket B."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 4, 5]))          # 2 and 3 lost
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2, 3, 4, 5]))
+
+    ts, values, stats = bd.build_signal_union(
+        [('primary', [a]), ('secondary', [b])], 'BTCUSDT', bd.Window(0, 2 ** 62))
+
+    assert len(ts) == 5
+    assert stats['rows'] == 5
+    assert stats['primary_only_rows'] == 3, 'A alone would have produced three rows'
+    assert stats['recovered_rows'] == 2, 'the union recovered the two frames A lost'
+    assert stats['sources']['secondary']['exclusive'] == 2
+    assert stats['sources']['primary']['exclusive'] == 0
+    # The recovered rows carry the recovering socket's prices, in order.
+    assert list(values[:, 0]) == [101.0, 102.0, 103.0, 104.0, 105.0]
+
+
+def test_a_hole_in_both_recordings_stays_a_hole(tmp_path):
+    """The union recovers what one socket missed, not what neither saw."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 4]))
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 4]))
+
+    ts, _, stats = bd.build_signal_union(
+        [('primary', [a]), ('secondary', [b])], 'BTCUSDT', bd.Window(0, 2 ** 62))
+
+    assert len(ts) == 2
+    assert stats['recovered_rows'] == 0
+    # 1 -> 4 is a three-second hole in the union, exactly as it is in both.
+    assert int(ts[1]) - int(ts[0]) == 3 * NS
+
+
+def test_the_union_refuses_a_frame_without_an_update_id(tmp_path):
+    """Fail closed. Without the key a frame can be neither matched nor dropped:
+    keeping it double-counts an update the other socket also has, and dropping
+    it loses one only this socket saw."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2]))
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz', [
+        (DAY0_START + NS, binance_book_ticker('BTCUSDT', DAY0_START // MS, 1, 1, 2, 1,
+                                              drop_update_id=True)),
+    ])
+
+    with pytest.raises(bd.BuildError) as e:
+        bd.build_signal_union([('primary', [a]), ('secondary', [b])], 'BTCUSDT',
+                              bd.Window(0, 2 ** 62))
+    assert 'u' in str(e.value)
+    assert str(b) in str(e.value), 'the refusal has to name the file and line'
+
+
+def test_a_single_recording_is_not_deduplicated(tmp_path):
+    """Behaviour of the one-recording build is untouched.
+
+    `build_signal` never had a dedup and must not gain one: a repeated update id
+    inside one recording is the venue's business, and collapsing rows would
+    silently change every dataset built so far.
+    """
+    path = write_gz(tmp_path / f'btcusdt_{DAY0}.gz', [
+        (DAY0_START + i * NS,
+         binance_book_ticker('BTCUSDT', (DAY0_START + i * NS) // MS, i, 1, i + 1, 1, u=7))
+        for i in range(3)
+    ])
+    ts, _ = bd.build_signal([path], 'BTCUSDT', bd.Window(0, 2 ** 62))
+    assert len(ts) == 3
+
+
+def test_the_union_keeps_no_per_source_set_of_update_ids(tmp_path):
+    """The union has to hold `build_signal`'s memory discipline.
+
+    `build_signal` is written around `array('q')`/`array('d')` for a stated
+    reason — "a day of @bookTicker is millions of frames, and 8 bytes per number
+    instead of a boxed Python object keeps this in memory" — and the union is on
+    the same data. The easy way to lose it is a `{label: set(update_ids)}` beside
+    the `u -> best` dict, which at a million ids per socket is tens of megabytes
+    buying what one bit per source inside `best` already answers.
+
+    The budget is a measurement, not a target: on this machine (CPython 3.13,
+    50 000 shared ids) the two sets cost 601 bytes per update id and one bit in
+    `best` costs 455. 560 sits between them, nearer the version that is wrong. A
+    future CPython that moves container sizes may need the number re-measured —
+    but a jump back towards 600 is per-id containers returning, not the
+    allocator drifting.
+    """
+    n = 50_000
+    ids = range(1, n + 1)
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, ids, latency_ns=9 * MS))
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, ids, latency_ns=4 * MS))
+
+    tracemalloc.start()
+    try:
+        _ts, _values, stats = bd.build_signal_union(
+            [('primary', [a]), ('secondary', [b])], 'BTCUSDT', bd.Window(0, 2 ** 62))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert stats['rows'] == n, 'the fixture has to be the size the budget assumes'
+    assert peak / n < 560, (
+        'the union costs %.0f bytes per update id; a per-source set of ids is '
+        'the usual reason' % (peak / n)
+    )
+
+
+def test_the_union_widens_the_window_to_what_either_socket_covered(dataset, tmp_path):
+    """B was up before A was, so the buildable window starts earlier."""
+    ds = dataset
+    early = bn_union_lines(DAY0_START, [1, 2, 3, 4, 5, 6])
+    add_secondary(ds, early)
+    # A starts a second after B does.
+    a_cov = (early[1][0], early[-1][0])
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]), a_cov)
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY0}.gz', early[1:])
+
+    conv = FakeConverter()
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=conv)
+
+    assert m['window']['raw_start_ns'] == early[0][0], \
+        'the window ignored the coverage only the second socket had'
+
+
+def test_a_day_missing_from_one_signal_recording_is_covered_by_the_other(dataset):
+    """A whole day absent from A is not a refusal when B recorded it."""
+    ds = dataset
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3]))
+    # A recorded nothing at all that day; only its file for the day is gone.
+    (ds['bn_dir'] / f'btcusdt_{DAY0}.gz').unlink()
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (ds['bn_lines'][0][0], ds['bn_lines'][-1][0]),
+                bn_days={DAY0: {'verdict': 'green',
+                                'symbols': {'btcusdt': {'coverage': {
+                                    'first_local_ts': None, 'last_local_ts': None,
+                                    'required_streams': ['bookTicker']}}}}})
+
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert m['signal']['rows'] == 3
+    assert m['signal']['union']['sources']['secondary']['exclusive'] == 3
+
+
+def test_a_red_secondary_recording_does_not_block_the_build(dataset):
+    """Additive only. The secondary can only ever add frames, so a fault in it
+    subtracts nothing from what the primary already justified."""
+    ds = dataset
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3]), verdict='red',
+                  days={DAY0: {'verdict': 'red'}})
+
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert m['signal']['union']['secondary']['verdict'] == 'red'
+    assert m['quality_report']['verdict'] == 'green', \
+        "the secondary's verdict must not become the build's"
+
+
+def test_a_red_primary_recording_still_blocks_with_a_secondary_present(dataset):
+    """The required-stream gate stays per recording, and the primary is the one
+    the window and the day set come from."""
+    ds = dataset
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3]))
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (ds['bn_lines'][0][0], ds['bn_lines'][-1][0]),
+                bn_days={DAY0: {'verdict': 'red'}})
+
+    with pytest.raises(bd.BuildError) as e:
+        bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert 'red' in str(e.value)
+
+
+def test_the_same_recording_twice_is_refused(dataset):
+    """Two reports pointing at one directory is an operator error, and a silent
+    one: every frame would match itself and the union would report perfect
+    redundancy it does not have."""
+    ds = dataset
+    make_signal_report(ds['root'] / 'report_b.json', ds['bn_dir'],
+                       (ds['bn_lines'][0][0], ds['bn_lines'][-1][0]))
+
+    with pytest.raises(bd.BuildError) as e:
+        bd.build(bd.parse_args(base_argv(ds)
+                               + ['--binance-report-b', str(ds['root'] / 'report_b.json')]),
+                 convert_fn=FakeConverter())
+    assert 'same directory' in str(e.value)
+
+
+def test_the_manifest_records_both_signal_inputs_and_the_recovery(dataset):
+    ds = dataset
+    # Update ids 1..5: the `dataset` fixture's Hyperliquid day ends at +5.2s and
+    # the window is its intersection with the signal, so a sixth second would
+    # fall outside it and never reach the union at all.
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3, 4, 5]))
+    # A lost update 3.
+    a_lines = bn_union_lines(DAY0_START, [1, 2, 4, 5], latency_ns=9 * MS)
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY0}.gz', a_lines)
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (a_lines[0][0], a_lines[-1][0]))
+
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+
+    union = m['signal']['union']
+    assert union['enabled'] is True
+    assert union['dedup_key'] == 'u'
+    assert union['rows'] == 5
+    assert union['primary_only_rows'] == 4
+    assert union['recovered_rows'] == 1
+    assert union['sources']['secondary']['exclusive'] == 1
+    # Both recordings are fingerprinted, and the manifest names which is which.
+    assert m['inputs']['binancefuturesum']['data'][0]['sha256']
+    assert m['inputs']['binancefuturesum_secondary']['data'][0]['sha256']
+    assert m['inputs']['binancefuturesum_secondary']['data_dir'] == str(ds['bn_dir_b'])
+    assert m['inputs']['binancefuturesum_secondary']['role'] == 'signal union, additive only'
+    # The mixed receive clock is stated rather than left for a reader to notice.
+    assert 'clock' in union['local_ts_note']
+    # And the rebuild reproduces the union rather than the primary alone.
+    assert '--binance-report-b' in m['rebuild_cmd']
+
+
+def test_a_secondary_that_contributed_nothing_warns_but_builds(dataset, capsys):
+    """A second socket that recovered nothing is worth saying out loud — it is
+    either redundant or broken — but it is not a reason to refuse."""
+    ds = dataset
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3]))
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY0}.gz', bn_union_lines(DAY0_START, [1, 2, 3]))
+    a_lines = bn_union_lines(DAY0_START, [1, 2, 3])
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (a_lines[0][0], a_lines[-1][0]))
+
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert m['signal']['union']['recovered_rows'] == 0
+    assert 'recovered no' in capsys.readouterr().err
+
+
+# --- one update id, two different books -------------------------------------
+#
+# The dedup key is the venue's `u`, so the union is only sound while one `u`
+# means one book state. Where it does not — a matching engine restarted and the
+# counter began again, a window spanning the restart, a file that is not what it
+# is thought to be — the dict keeps whichever frame arrived first and the other
+# simply is not in the dataset. Nothing counts it: `rows`, `recovered_rows` and
+# every coverage number stay plausible. That is the one failure of this design
+# that cannot be seen afterwards, so it is refused when it happens.
+
+
+def test_the_union_refuses_one_update_id_that_carries_two_different_books(tmp_path):
+    """The same `u` from the two sockets with different prices is a
+    contradiction: one book update has one best bid and ask, and both sockets
+    receive the same bytes for it. Keeping either is picking one at random."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz', [
+        (DAY0_START + 9 * MS,
+         binance_book_ticker('BTCUSDT', DAY0_START // MS, 100, 1, 101, 2, u=7)),
+    ])
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz', [
+        (DAY0_START + 4 * MS,
+         binance_book_ticker('BTCUSDT', DAY0_START // MS, 555, 1, 999, 2, u=7)),
+    ])
+    with pytest.raises(bd.BuildError) as e:
+        bd.build_signal_union([('primary', [a]), ('secondary', [b])], 'BTCUSDT',
+                              bd.Window(0, 2 ** 62))
+    assert 'update id 7' in str(e.value)
+
+
+def test_a_reused_update_id_inside_one_recording_is_refused(tmp_path):
+    """The realistic shape of it: `u` is per symbol and restarts when the
+    venue's matching engine does, so a window spanning a restart has one id
+    describing two book states minutes apart. The single-recording builder never
+    saw this because it does not deduplicate; the union collapses them to one
+    row and reports nothing."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz', [
+        (DAY0_START + 1 * MS,
+         binance_book_ticker('BTCUSDT', DAY0_START // MS, 100, 1, 101, 2, u=5)),
+        (DAY0_START + 100 * NS,
+         binance_book_ticker('BTCUSDT', (DAY0_START + 100 * NS) // MS, 200, 1, 201, 2, u=5)),
+    ])
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz', [
+        (DAY0_START + 2 * MS,
+         binance_book_ticker('BTCUSDT', DAY0_START // MS, 100, 1, 101, 2, u=6)),
+    ])
+    # The single-recording path is unchanged: both rows survive there.
+    assert len(bd.build_signal([a], 'BTCUSDT', bd.Window(0, 2 ** 62))[0]) == 2
+    with pytest.raises(bd.BuildError) as e:
+        bd.build_signal_union([('primary', [a]), ('secondary', [b])], 'BTCUSDT',
+                              bd.Window(0, 2 ** 62))
+    assert 'update id 5' in str(e.value)
+
+
+def test_the_same_book_under_the_same_update_id_is_simply_deduplicated(tmp_path):
+    """The ordinary case, which must not be caught by the check above: both
+    sockets saw the update, so the two frames agree and one row comes out."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2], latency_ns=9 * MS))
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2], latency_ns=4 * MS))
+    ts, _v, stats = bd.build_signal_union([('primary', [a]), ('secondary', [b])],
+                                          'BTCUSDT', bd.Window(0, 2 ** 62))
+    assert len(ts) == 2
+    assert stats['rows'] == 2
+
+
+# --- the two recordings' clocks ---------------------------------------------
+#
+# `earliest local_ts wins` is only "the socket that was up" while both sockets
+# time their frames against ONE clock. Put the second recording on a second host
+# whose clock is behind and it wins every update they share, and the whole
+# signal's timeline moves by the skew — silently, because a skewed recording
+# that also recovers a few frames looks exactly like a healthy one.
+#
+# The ids both recordings saw are the measurement: on one host their receive
+# times differ by socket latency, which is milliseconds and centred near zero.
+
+
+def test_the_union_measures_the_offset_between_the_two_recordings_clocks(tmp_path):
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2, 3, 4, 5], latency_ns=9 * MS))
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2, 3, 4, 5], latency_ns=9 * MS - 2 * NS))
+    _ts, _v, stats = bd.build_signal_union([('primary', [a]), ('secondary', [b])],
+                                           'BTCUSDT', bd.Window(0, 2 ** 62))
+    assert stats['shared_update_ids'] == 5
+    assert stats['clock_offset_ns'] == -2 * NS, \
+        'the measured offset is the secondary minus the primary, over shared ids'
+
+
+def test_a_secondary_recorded_against_another_clock_refuses_the_build(dataset):
+    """End to end: B is 2 s behind and also recovers a frame, so nothing else
+    in the build notices. The budget is `--max-signal-age-ms`: two sockets that
+    disagree about `now` by more than the whole freshness window are not two
+    views of one timeline."""
+    ds = dataset
+    primary = bn_union_lines(DAY0_START, [1, 2, 3, 4], latency_ns=9 * MS)
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY0}.gz', primary)
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (primary[0][0], primary[-1][0]))
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3, 4, 5],
+                                     latency_ns=9 * MS - 2 * NS))
+
+    with pytest.raises(bd.BuildError) as e:
+        bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert 'clock' in str(e.value)
+
+
+def test_two_sockets_on_one_host_are_not_read_as_a_skewed_clock(dataset):
+    """The guard must not fire on what it is built to allow: one host, two
+    sockets, a few milliseconds of receive latency between them."""
+    ds = dataset
+    primary = bn_union_lines(DAY0_START, [1, 2, 3, 4], latency_ns=9 * MS)
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY0}.gz', primary)
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (primary[0][0], primary[-1][0]))
+    add_secondary(ds, bn_union_lines(DAY0_START, [1, 2, 3, 4, 5], latency_ns=4 * MS))
+
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert m['signal']['union']['clock_offset_ns'] == -5 * MS
+    assert m['signal']['union']['recovered_rows'] == 1
+
+
+def test_a_repeated_frame_is_not_a_second_shared_update_id(tmp_path):
+    """`shared_update_ids` is the ids BOTH recordings saw, so one id can count
+    once however many times a socket repeats its frame. It is the denominator of
+    the clock measurement and it is quoted in the refusal, so an inflated one
+    reads as more evidence than there is."""
+    a = write_gz(tmp_path / 'a' / f'btcusdt_{DAY0}.gz',
+                 bn_union_lines(DAY0_START, [1, 2], latency_ns=4 * MS))
+    # The secondary sends update 1 twice, both later than the primary's copy.
+    b_lines = bn_union_lines(DAY0_START, [1, 2], latency_ns=9 * MS)
+    b = write_gz(tmp_path / 'b' / f'btcusdt_{DAY0}.gz', [b_lines[0]] + b_lines)
+
+    _ts, _v, stats = bd.build_signal_union([('primary', [a]), ('secondary', [b])],
+                                           'BTCUSDT', bd.Window(0, 2 ** 62))
+    assert stats['sources']['secondary']['frames'] == 3
+    assert stats['shared_update_ids'] == 2
+    assert stats['clock_offset_ns'] == 5 * MS
+
+
+# --- the clock check's own blind spot ---------------------------------------
+#
+# `clock_offset_ns` is None exactly when the two recordings share no update id.
+# For one venue and one symbol over one window that cannot happen while both
+# were recording — two sockets to Binance see the same book updates — so it
+# means one of them has no frame inside the window at all. Whether anything
+# else notices depends on which one: a silent SECONDARY leaves
+# `recovered_rows == 0` and the existing warning fires, but a silent PRIMARY
+# leaves `recovered_rows == rows` and every number looking healthy while the
+# second recording supplies the whole signal on a clock nothing checked.
+#
+# Said rather than refused: a socket down for a whole window is the case the
+# union was built for, and the day-level half of it is legal by construction.
+
+
+def test_no_shared_update_id_with_the_secondary_in_the_signal_is_reported(capsys):
+    bd.require_one_clock({'clock_offset_ns': None, 'shared_update_ids': 0,
+                          'rows': 4, 'primary_only_rows': 0, 'recovered_rows': 4},
+                         500 * MS)
+    err = capsys.readouterr().err
+    assert 'no update id' in err
+    assert 'clocks' in err
+
+
+def test_no_shared_update_id_is_silent_while_the_secondary_added_nothing(capsys):
+    """The other half: a secondary that put no row in the signal cannot have put
+    its clock there either, and `build`'s "recovered no frames" warning is
+    already the one that speaks."""
+    bd.require_one_clock({'clock_offset_ns': None, 'shared_update_ids': 0,
+                          'rows': 4, 'primary_only_rows': 4, 'recovered_rows': 0},
+                         500 * MS)
+    assert capsys.readouterr().err == ''
+
+
+def test_a_primary_with_no_signal_frames_in_the_window_is_reported(dataset, capsys):
+    """End to end, and the shape it really takes: the report says the primary's
+    bookTicker was live all day — that is a liveness gauge, not a promise about
+    the file — while the recording holds no bookTicker frame the window covers.
+    The build then rests entirely on the second socket. Before this it was
+    silent: `recovered_rows == rows` and `clock_offset_ns is None`, so the
+    "recovered no frames" warning and the clock check both passed."""
+    ds = dataset
+    b_lines = bn_union_lines(DAY0_START, [1, 2, 3, 4, 5])
+    add_secondary(ds, b_lines)
+    # Trades only: a real file, a real day, and nothing `iter_book_ticker` yields.
+    write_gz(ds['bn_dir'] / f'btcusdt_{DAY0}.gz',
+             [(t, binance_trade('BTCUSDT', t // MS, 100, 0.1)) for t, _ in b_lines])
+    make_report(ds['report'], ds['hl_dir'], ds['bn_dir'],
+                (ds['hl_lines'][0][0], ds['hl_lines'][-1][0]),
+                (b_lines[0][0], b_lines[-1][0]))
+
+    m = bd.build(bd.parse_args(base_argv(ds) + ['--binance-report-b', str(ds['report_b'])]),
+                 convert_fn=FakeConverter())
+    assert m['signal']['union']['shared_update_ids'] == 0
+    assert m['signal']['union']['primary_only_rows'] == 0
+    assert 'no update id' in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

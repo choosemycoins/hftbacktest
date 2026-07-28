@@ -1,0 +1,38 @@
+[Unit]
+# Fires hft-collector-gate@%i.service once a day.
+#
+#   sudo systemctl enable --now hft-collector-gate@all.timer
+#   systemctl list-timers 'hft-collector-gate@*'
+Description=Daily data-quality gate for hft-collector recordings (%i)
+Documentation=file:///opt/hft-collector/current/README.md
+
+[Timer]
+# 00:35 UTC: after midnight, so yesterday is finalized, and far enough past it
+# that the lazy rotation has happened. Files get their gzip trailer on the first
+# write after midnight (`file.rs`), which on a live feed is milliseconds — 35
+# minutes is margin for a feed that is merely slow, not for one that is silent.
+# gate-run.sh documents what a genuinely thin symbol does to this and how to
+# move it.
+#
+# UTC explicitly, and not by accident: every file is named by a UTC date, so a
+# timer in local time would check the wrong day for half the year in most
+# places.
+OnCalendar=*-*-* 00:35:00 UTC
+
+# Staggers the instances of this template against each other. They read the same
+# disk and compete with the same collector for the same two vCPUs, so starting
+# them all on the same second is the one avoidable way to make the gate hurt the
+# recording. The reports name the day they cover, so landing a few minutes later
+# changes nothing about them.
+RandomizedDelaySec=300
+AccuracySec=1min
+
+# A host that was down or rebooting at 00:35 still runs the gate when it comes
+# back. It then checks the day BEFORE THAT RUN, so a host down for a whole day
+# leaves that day unchecked rather than checked late — re-run it by hand:
+#   sudo -u hftcollector GATE_DAY=20260728 \
+#       /opt/hft-collector/current/bin/gate-run.sh all
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -70,13 +70,30 @@ fi
 
 echo ""
 echo "==> Staging release"
-mkdir -p "${BUILD_DIR}/bin" "${BUILD_DIR}/etc"
+mkdir -p "${BUILD_DIR}/bin" "${BUILD_DIR}/etc" "${BUILD_DIR}/tools"
 install -m 755 "${BIN}"                                 "${BUILD_DIR}/bin/collector"
 install -m 755 "${DEPLOY_DIR}/collector-run.sh"         "${BUILD_DIR}/bin/collector-run.sh"
+install -m 755 "${DEPLOY_DIR}/gate-run.sh"              "${BUILD_DIR}/bin/gate-run.sh"
 install -m 755 "${DEPLOY_DIR}/rollback.sh"              "${BUILD_DIR}/bin/rollback.sh"
 install -m 644 "${DEPLOY_DIR}/hft-collector@.service"   "${BUILD_DIR}/etc/hft-collector@.service"
+install -m 644 "${DEPLOY_DIR}/hft-collector-gate@.service" "${BUILD_DIR}/etc/hft-collector-gate@.service"
+install -m 644 "${DEPLOY_DIR}/hft-collector-gate@.timer" "${BUILD_DIR}/etc/hft-collector-gate@.timer"
 install -m 644 "${DEPLOY_DIR}/instance.env.example"     "${BUILD_DIR}/etc/instance.env.example"
 install -m 644 "${REPO_ROOT}/collector/README.md"       "${BUILD_DIR}/README.md"
+
+# The alert hook — see the note in build-release.sh. Every unit carries
+# OnFailure=hft-collector-alert@%n unconditionally and that unit runs
+# current/bin/alert.sh, so leaving these out ships units naming a hook that
+# does not exist.
+install -m 755 "${DEPLOY_DIR}/alert.sh"                 "${BUILD_DIR}/bin/alert.sh"
+install -m 644 "${DEPLOY_DIR}/hft-collector-alert@.service" "${BUILD_DIR}/etc/hft-collector-alert@.service"
+install -m 644 "${DEPLOY_DIR}/alert.env.example"        "${BUILD_DIR}/etc/alert.env.example"
+
+# The offline quality report, run on the host by the daily gate timer. Only
+# this one tool travels: it is stdlib-only and runs under any python3, while
+# build_dataset.py and backtest_first.py need numpy and belong on the machine
+# that assembles datasets rather than on the box that records them.
+install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/tools/quality_report.py"
 
 # A cross-built binary cannot be executed here, so `binary_version` is left
 # unknown on purpose. install.sh treats that as "cannot cross-check" rather

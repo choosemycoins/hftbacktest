@@ -10,10 +10,25 @@
 # Output: /tmp/hft-collector-release-<tag>.tar.gz containing
 #   bin/collector
 #   bin/collector-run.sh
+#   bin/gate-run.sh                 daily quality gate, run by the timer below
+#   bin/alert.sh                    OnFailure hook; ExecStart of the alert unit
+#   bin/rollback.sh                 so a rollback needs nothing but /opt
 #   etc/hft-collector@.service
+#   etc/hft-collector-gate@.service
+#   etc/hft-collector-gate@.timer
+#   etc/hft-collector-alert@.service
 #   etc/instance.env.example
+#   etc/alert.env.example
+#   tools/quality_report.py         the gate's only dependency; stdlib-only
 #   README.md
-#   RELEASE            (manifest read by install.sh)
+#   RELEASE                         (manifest read by install.sh)
+#
+# Keep this list in step with the `install -m` block below — it is the one place
+# an operator reads to know what a release contains. install.sh requires
+# bin/{collector,collector-run.sh,rollback.sh} and etc/hft-collector@.service,
+# and treats the gate set and the alert set as optional (a tarball without
+# either installs, and says so). cross-build-linux.sh stages exactly the same
+# set.
 
 set -euo pipefail
 
@@ -62,12 +77,36 @@ fi
 
 echo ""
 echo "==> Staging release"
-mkdir -p "${BUILD_DIR}/bin" "${BUILD_DIR}/etc"
+mkdir -p "${BUILD_DIR}/bin" "${BUILD_DIR}/etc" "${BUILD_DIR}/tools"
 install -m 755 "${BIN}"                                   "${BUILD_DIR}/bin/collector"
 install -m 755 "${DEPLOY_DIR}/collector-run.sh"           "${BUILD_DIR}/bin/collector-run.sh"
+install -m 755 "${DEPLOY_DIR}/gate-run.sh"                "${BUILD_DIR}/bin/gate-run.sh"
 install -m 644 "${DEPLOY_DIR}/hft-collector@.service"     "${BUILD_DIR}/etc/hft-collector@.service"
+install -m 644 "${DEPLOY_DIR}/hft-collector-gate@.service" "${BUILD_DIR}/etc/hft-collector-gate@.service"
+install -m 644 "${DEPLOY_DIR}/hft-collector-gate@.timer"  "${BUILD_DIR}/etc/hft-collector-gate@.timer"
 install -m 644 "${DEPLOY_DIR}/instance.env.example"       "${BUILD_DIR}/etc/instance.env.example"
 install -m 644 "${REPO_ROOT}/collector/README.md"         "${BUILD_DIR}/README.md"
+
+# The alert hook. Every unit here carries OnFailure=hft-collector-alert@%n
+# unconditionally, and that unit's ExecStart is current/bin/alert.sh — so a
+# release without these three ships units naming a hook that does not exist,
+# and the failure is exactly the one nobody sees: nothing alerts, and nothing
+# says nothing alerted. alert.env.example travels because the README's install
+# step copies it out of current/etc/; the credentials themselves are
+# operator-authored and never in git.
+install -m 755 "${DEPLOY_DIR}/alert.sh"                   "${BUILD_DIR}/bin/alert.sh"
+install -m 644 "${DEPLOY_DIR}/hft-collector-alert@.service" "${BUILD_DIR}/etc/hft-collector-alert@.service"
+install -m 644 "${DEPLOY_DIR}/alert.env.example"          "${BUILD_DIR}/etc/alert.env.example"
+
+# The offline quality report, which the daily gate timer runs on the host.
+#
+# Only this one tool travels. It is stdlib-only by design and runs under any
+# python3 the distribution ships, which is what makes an on-host gate possible
+# at all; `build_dataset.py` and `backtest_first.py` need numpy and belong on
+# the machine that assembles datasets, not on the box whose job is to record.
+# Shipping them would put a dependency on the recording host that nothing there
+# can satisfy.
+install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/tools/quality_report.py"
 
 # Ship rollback.sh inside the release so a rollback is possible from a host
 # that has nothing but /opt — the operator should never need the source repo

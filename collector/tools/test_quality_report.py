@@ -2872,8 +2872,17 @@ def test_a_host_gauge_inside_a_gap_does_not_explain_it(tmp_path, record):
 def test_every_host_gauge_is_named_and_none_of_them_explains_anything():
     """`_GAUGES` is documentation with a test on it: the whole set of
     `_collector` records that are measurements rather than events, and the
-    assertion that not one of them is allowed to account for a gap."""
-    for gauge in ("disk", "clock", "liveness", "universe"):
+    assertion that not one of them is allowed to account for a gap.
+
+    `cpu` is the sharpest case for the second half. It is the gauge most likely
+    to be *about* a gap — steal at 80% is exactly why the writer fell behind —
+    and it still must not annotate one: it is written every minute regardless,
+    so it lands inside every hole longer than a minute whether or not the host
+    was throttled. The evidence is the number in the record, read by whoever is
+    investigating; an automatic "explained by cpu" would close the
+    investigation instead of informing it.
+    """
+    for gauge in ("disk", "clock", "cpu", "liveness", "universe"):
         assert gauge in qr._GAUGES
         assert gauge not in qr._EXPLANATORY
 

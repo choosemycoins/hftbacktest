@@ -18,6 +18,7 @@ mod binancefuturescm;
 mod binancefuturesum;
 mod bybit;
 mod clock;
+mod cpu;
 mod disk;
 mod error;
 mod file;
@@ -228,6 +229,28 @@ fn log_clock_alarm(alarm: Option<clock::Alarm>) {
              be rejected downstream"
         ),
         Some(clock::Alarm::Cleared) => info!("the host clock is disciplined again"),
+        None => {}
+    }
+}
+
+/// Reports a change in how much CPU the host is actually being given.
+///
+/// One function for the same reason [`log_clock_alarm`] is one: the gauge is
+/// consulted at startup and once a minute after, and the two must say the same
+/// thing.
+fn log_cpu_alarm(alarm: Option<cpu::Alarm>) {
+    match alarm {
+        // Not fatal, and deliberately so. A throttled host is the one failure
+        // the collector can do nothing about, and exiting over it would take
+        // the recording down for the duration of a hypervisor's mood. The
+        // warning exists so the `queue_overflow` that may follow is read as
+        // "this box ran out of CPU" rather than as "the venue flooded us".
+        Some(cpu::Alarm::Raised(reason)) => warn!(
+            %reason,
+            "this host is not getting the CPU it asked for; a writer that falls behind now \
+             is the instance being throttled, not the venue"
+        ),
+        Some(cpu::Alarm::Cleared) => info!("the host is getting its CPU again"),
         None => {}
     }
 }
@@ -578,13 +601,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut shutdown = Shutdown::new()?;
 
-    // One timer for all three gauges. Disk is sampled rather than checked per
+    // One timer for all four gauges. Disk is sampled rather than checked per
     // write because a statvfs on the hot path would be a syscall per message,
     // and a minute is far shorter than the time it takes to consume the 5 GB
-    // default floor at the observed ~20 MB/day/symbol. The clock and liveness
-    // gauges share it rather than bringing timers of their own: they are the
-    // same kind of thing — a measurement of the host, not an event — and one
-    // tick keeps a minute's three records together in the sidecar.
+    // default floor at the observed ~20 MB/day/symbol. The clock, CPU and
+    // liveness gauges share it rather than bringing timers of their own: they
+    // are the same kind of thing — a measurement of the host, not an event —
+    // and one tick keeps a minute's four records together in the sidecar.
     let mut gauges = tokio::time::interval(Duration::from_secs(60));
     gauges.tick().await; // the first tick is immediate; startup already checked
 
@@ -641,6 +664,39 @@ async fn main() -> Result<(), anyhow::Error> {
         log_clock_alarm(clock_gauge.observe(&at_startup));
     }
 
+    // Is the hypervisor giving this host the CPU it thinks it has? Sampled on
+    // the same tick, because the failure it explains — the writer falling
+    // behind — is indistinguishable from a venue flood without it, and the
+    // recording boxes are burstable instances where running out of CPU credits
+    // is an ordinary Tuesday. See `cpu.rs`.
+    //
+    // Primed here rather than left to the first tick. The counters are
+    // cumulative since boot, so the first sample can only ever establish a
+    // baseline; taking it now means the first *measured* minute is the first
+    // tick a minute from now, instead of the second one two minutes in.
+    let mut cpu_gauge = cpu::CpuGauge::new();
+    {
+        let (reading, _) = cpu_gauge.observe(&cpu::sample());
+        match &reading {
+            // Expected off Linux, and not a warning: the record says
+            // `unsupported` rather than claiming a host with no steal.
+            cpu::Reading::Unsupported => info!(
+                platform = std::env::consts::OS,
+                "no /proc/stat here; cpu utilisation will be recorded as unsupported"
+            ),
+            cpu::Reading::Unavailable(error) => warn!(%error, "couldn't read cpu utilisation"),
+            // Spelled out rather than caught with `_`, so a variant added later
+            // has to be considered here instead of silently reading as "armed".
+            // `Interval` cannot occur on the first sample; it is grouped because
+            // it would mean the same thing if it ever did.
+            cpu::Reading::FirstSample | cpu::Reading::Interval(_) => info!(
+                steal_warn_pct = cpu::STEAL_WARN_PCT,
+                "cpu gauge armed; the first measured interval lands on the next tick"
+            ),
+        }
+        write_meta(&mut writer, cpu::record(&reading));
+    }
+
     // The per-symbol half of the stall watchdog. Seeded with the requested
     // symbols so one that never arrives is caught, not just one that stops.
     let liveness_timeout_s = args
@@ -675,16 +731,20 @@ async fn main() -> Result<(), anyhow::Error> {
                 break;
             }
             _ = gauges.tick() => {
-                // The two host gauges first, then disk. Disk is the only one of
-                // the three that can end the recording, and a minute whose
-                // clock and liveness readings were dropped because the disk ran
-                // out is a minute of missing evidence about the very moment
-                // things went wrong.
+                // The three host gauges first, then disk. Disk is the only one
+                // of the four that can end the recording, and a minute whose
+                // clock, CPU and liveness readings were dropped because the
+                // disk ran out is a minute of missing evidence about the very
+                // moment things went wrong.
                 let (clock_record, clock_alarm) = clock_gauge.tick();
                 write_meta(&mut writer, clock_record);
                 // Edge-triggered inside the gauge, so this is once per fault
                 // and not once a minute for as long as one lasts.
                 log_clock_alarm(clock_alarm);
+
+                let (cpu_record, cpu_alarm) = cpu_gauge.tick();
+                write_meta(&mut writer, cpu_record);
+                log_cpu_alarm(cpu_alarm);
 
                 let (liveness_record, went) = liveness_gauge.sample();
                 write_meta(&mut writer, liveness_record);
