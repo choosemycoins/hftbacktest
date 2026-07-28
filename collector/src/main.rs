@@ -8,7 +8,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     file::Writer,
-    queue::{WRITER_HOP, WRITER_QUEUE_CAPACITY},
+    queue::{POLLER_HOP, POLLER_QUEUE_CAPACITY, WRITER_HOP, WRITER_QUEUE_CAPACITY},
+    watchdog::Source,
 };
 
 mod backoff;
@@ -278,7 +279,21 @@ async fn main() -> Result<(), anyhow::Error> {
     // channel is how a producer that has no error path of its own (the
     // detached REST snapshot tasks) reaches this loop.
     let (fatal_tx, mut fatal_rx) = queue::fatal_channel();
-    let (writer_tx, mut writer_rx) = queue::bounded(WRITER_HOP, WRITER_QUEUE_CAPACITY, fatal_tx);
+    let (writer_tx, mut writer_rx) =
+        queue::bounded(WRITER_HOP, WRITER_QUEUE_CAPACITY, fatal_tx.clone());
+
+    // The collector's own periodic output travels its own hop. Not for capacity
+    // — see `POLLER_QUEUE_CAPACITY` — but because once two records are in one
+    // queue nothing tells them apart, and `main` has to: a `premiumIndex`
+    // element is filed under `BTCUSDT` exactly as a `bookTicker` frame is, and
+    // only one of the two means the venue is still sending. The hop is the
+    // distinction, and it is consumed by an arm that does not pet the stall
+    // watchdog.
+    let (poller_tx, mut poller_rx) = queue::bounded(POLLER_HOP, POLLER_QUEUE_CAPACITY, fatal_tx);
+    // `Option` so the backends that have no poller release the sender in one
+    // place instead of every arm remembering to. A retained clone here would
+    // hold the hop open for ever, exactly as one of `writer_tx` would.
+    let mut poller_tx = Some(poller_tx);
 
     // Open the recording with a record of what produced it. The scoped clone
     // is dropped immediately: keeping a sender alive here would stop
@@ -329,6 +344,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 streams,
                 args.symbols,
                 writer_tx,
+                // The one backend with a producer of its own. Nothing else
+                // takes this, so for every other exchange the hop is closed
+                // before the loop starts and its arm never fires.
+                poller_tx.take().expect("the poller hop is claimed once"),
             ))
         }
         "binancefuturescm" => {
@@ -409,6 +428,13 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
+    // `None` means the arm above took it, i.e. this backend has a poller.
+    // Whatever is left is dropped rather than held: a sender kept here would
+    // hold the hop open for ever, and the arm in the loop below would wait on a
+    // channel nothing can ever send to.
+    let has_poller = poller_tx.is_none();
+    drop(poller_tx);
+
     let mut shutdown = Shutdown::new()?;
     let mut writer = Writer::new(&args.path, &args.exchange);
 
@@ -427,9 +453,19 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         info!(
             minutes = args.stall_timeout_min,
-            "stall watchdog armed on total silence"
+            // Named in the same line as the guard it qualifies. On a backend
+            // with a poller the watchdog is armed against the *feed* going
+            // silent and not against the process going silent, and an operator
+            // reading the journal after an outage needs to know which.
+            poller = has_poller,
+            "stall watchdog armed on total silence from the venue"
         );
     }
+
+    // Disarms the poller arm once its hop closes: for the backends that never
+    // claimed it that is immediately, and a closed channel resolves `recv()`
+    // straight away, which without the guard would spin this loop at full tilt.
+    let mut poller_open = has_poller;
 
     // Distinguishes "asked to stop" from "stopped because recording broke".
     // Exiting 0 in both cases would make an unrecordable host look healthy:
@@ -534,13 +570,35 @@ async fn main() -> Result<(), anyhow::Error> {
                 fatal = Some(anyhow!(report.reason));
                 break;
             }
+            r = poller_rx.recv(), if poller_open => match r {
+                Some((recv_time, symbol, data)) => {
+                    // Offered to the watchdog exactly as the venue arm's record
+                    // is, and refused there rather than withheld here: the rule
+                    // about what counts as life belongs in one place, with a
+                    // test on it, not in whether a call site remembered to make
+                    // a call. `Source::Collector` says the collector produced
+                    // this on a timer of its own, so it is evidence the timer is
+                    // running and none at all about the venue — see
+                    // `watchdog::Source` for what conflating the two measured.
+                    watchdog.record_write(Source::Collector, &symbol);
+                    if let Err(error) = writer.write(recv_time, symbol, data) {
+                        error!(?error, "write error");
+                        fatal = Some(error);
+                        break;
+                    }
+                }
+                // The poller has gone, which on this backend means the
+                // collection task has ended; `writer_rx` reports that, and
+                // reporting it twice would only race the better message.
+                None => poller_open = false,
+            },
             r = writer_rx.recv() => match r {
                 Some((recv_time, symbol, data)) => {
                     // Counted here, as the record leaves the queue for the
                     // writer, and never where it was enqueued: messages piling
                     // up behind a stalled writer must not read as life. A write
                     // that then fails ends the loop anyway.
-                    watchdog.record_write(&symbol);
+                    watchdog.record_write(Source::Venue, &symbol);
                     if let Err(error) = writer.write(recv_time, symbol, data) {
                         error!(?error, "write error");
                         fatal = Some(error);
@@ -566,7 +624,13 @@ async fn main() -> Result<(), anyhow::Error> {
     // paths that is the last data the collector ever captured. Write it before
     // the files are closed rather than letting the channel be destroyed with
     // it — see `drain_backlog` for why this is bounded.
+    // Both hops: the promise `queue.rs` makes — a record reported as accepted
+    // is never dropped — is made by `Tx::send`, so it covers whichever hop the
+    // sender belonged to. The poller hop is drained second because it is the
+    // smaller and the less urgent of the two.
     let recovered = drain_backlog(&mut writer_rx, |(recv_time, symbol, data)| {
+        writer.write(recv_time, symbol, data)
+    }) + drain_backlog(&mut poller_rx, |(recv_time, symbol, data)| {
         writer.write(recv_time, symbol, data)
     });
     if recovered > 0 {

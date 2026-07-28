@@ -133,6 +133,12 @@ _SECOND_PRODUCER = {
         "its frame straight to the writer, skipping the socket hop that WS "
         "frames queue through first"
     ),
+    "premiumIndex": (
+        "the premium-index poller is one such producer: it runs on its own "
+        "timer beside the socket loop (binancefuturesum/mod.rs) and hands each "
+        "element straight to the writer, skipping the socket hop that WS frames "
+        "queue through first"
+    ),
 }
 
 #: Said of an inversion between two streams that share the one producer.
@@ -302,10 +308,12 @@ def canonical_exchange(exchange: str) -> str:
 #: throttled `l2Book` feeds. They take the same K=10:
 #:
 #:   * `activeAssetCtx`  1.018s x 10  (n=292 over 300s, Hyperliquid mainnet)
-#:   * `markPriceUpdate` 1.000s x 10  (n=298 over 300s, Binance COIN-M; the
-#:                       USD-M stream is the same event at the same documented
-#:                       1s cadence — see `binancefuturesum::STREAMS` for why it
-#:                       could not be captured from here)
+#:   * `markPriceUpdate` 1.000s x 10  (n=298 over 300s, Binance COIN-M. USD-M
+#:                       is no longer subscribed to this stream at all — the
+#:                       venue stopped serving the whole markPrice class there,
+#:                       measured 2026-07-28 from two network paths — but the
+#:                       limit still applies to any UM day recorded while it
+#:                       was, and to COIN-M, which serves it today)
 #:
 #: Both are written as a round 10s rather than as the cadence x 10 to the
 #: decimal. Five minutes of each measures a median well and a tail not at all
@@ -314,10 +322,22 @@ def canonical_exchange(exchange: str) -> str:
 #: precision that was never observed; 10x a 1/s heartbeat is eight times that
 #: worst interval either way.
 #:
-#: Note what this makes them: at 10s they are the tightest cadence check on
-#: either socket — finer than Binance's 30s guesses and than `bbo`'s 14s. That
-#: is the point. A periodic feed is the one channel whose silence means
-#: something without a second opinion.
+#: `premiumIndex` is the third periodic feed and the one exception to "measured":
+#: it is not a venue stream at all but the collector's own REST poller, whose
+#: 10s period is a constant in `binancefuturesum::PREMIUM_INDEX_INTERVAL`. It
+#: takes the same K=10, which is 100s. That K is doing different work here —
+#: with the cadence exact by construction the only jitter is a skipped cycle, and
+#: a poll that fails is ordinary and deliberately costs one sample (see the error
+#: policy on `poll_premium_index`). 100s is nine consecutive failures: past any
+#: single venue hiccup, and a third of the 30 failures at which the collector
+#: writes `poller_degraded` to the sidecar, so the two signals report in order
+#: rather than racing.
+#:
+#: Note what this makes the periodic feeds: at 10s (and 100s for a 10s poller,
+#: the same ten periods) they are the tightest cadence checks on either socket —
+#: finer than Binance's 30s guesses and than `bbo`'s 14s. That is the point. A
+#: periodic feed is the one channel whose silence means something without a
+#: second opinion.
 MAX_GAP_NS = {
     (HYPERLIQUID, "l2Book_slow"): 54 * SEC_NS,
     (HYPERLIQUID, "l2Book_fast"): 5_400_000_000,
@@ -328,6 +348,7 @@ MAX_GAP_NS = {
     (BINANCE, "depthUpdate"): 30 * SEC_NS,
     (BINANCE, "trade"): 120 * SEC_NS,
     (BINANCE, "markPriceUpdate"): 10 * SEC_NS,
+    (BINANCE, "premiumIndex"): 100 * SEC_NS,
     (BYBIT, "orderbook"): 30 * SEC_NS,
     (BYBIT, "publicTrade"): 120 * SEC_NS,
 }
@@ -477,14 +498,27 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
         # tradable asset and the `pu` check above loses its input — but the
         # backtest itself does not read them.
         #
-        # `@markPrice@1s` is the Binance half of the index/funding pair: `i` is
-        # the Binance index, its own spot basket. Informational for the same
-        # reason, and with one more of its own — the venue acks a stream it then
-        # never serves, so its absence is not always something the recording
-        # could have done anything about.
-        return Expected(
-            ("bookTicker",), ("trade", "depthUpdate"), None, ("markPriceUpdate",)
-        )
+        # Both venues' index/funding data is informational: it is not order
+        # flow, mode A does not read it, and it was added to the collector after
+        # recordings had already been made. It reaches the two of them by
+        # different routes, which is the whole of the difference below.
+        #
+        # `markPriceUpdate` is COIN-M's, and still live there (measured
+        # 2026-07-28). It is listed for USD-M too even though USD-M no longer
+        # subscribes: days recorded while it did exist, the venue could start
+        # serving the class again, and the frame routing was kept for exactly
+        # that case. Listed, it is checked if it turns up; unlisted, it would be
+        # an `unclassified_frame` warning instead.
+        #
+        # `premiumIndex` is USD-M's, and USD-M's only: the venue stopped serving
+        # the markPrice class on fstream entirely, so the collector polls
+        # `GET /fapi/v1/premiumIndex` instead. COIN-M has no such poller, and
+        # listing it there would say a COIN-M recording could have contained
+        # something it never can.
+        informational = ("markPriceUpdate",)
+        if exchange == "binancefuturesum":
+            informational = ("markPriceUpdate", "premiumIndex")
+        return Expected(("bookTicker",), ("trade", "depthUpdate"), None, informational)
 
     if exchange == "bybit":
         # Bybit is not part of the mode-A dataset, so nothing it does can make
@@ -661,6 +695,19 @@ class FileScan:
         }
 
 
+#: The keys a `GET /fapi/v1/premiumIndex` element must all carry to be one.
+#:
+#: Four of the eight the venue sends (captured 2026-07-28: `symbol`, `markPrice`,
+#: `indexPrice`, `estimatedSettlePrice`, `lastFundingRate`, `interestRate`,
+#: `nextFundingTime`, `time`). Not all eight, so that the venue adding or
+#: retiring a field does not silently turn the whole feed into
+#: `unclassified_frame`; not one or two, so that no other bare object in these
+#: files can collide with it.
+_PREMIUM_INDEX_KEYS = frozenset(
+    {"symbol", "markPrice", "indexPrice", "lastFundingRate"}
+)
+
+
 def classify(family: str, obj: dict) -> Optional[str]:
     """The stream a recorded frame belongs to, or `None` if unrecognised.
 
@@ -670,14 +717,31 @@ def classify(family: str, obj: dict) -> Optional[str]:
     Bybit's topic string is `orderbook.<depth>.<symbol>` / `publicTrade.<symbol>`
     (`collector/src/bybit/mod.rs` routes on its last segment).
 
-    The two index/funding feeds need no rule of their own and deliberately do
-    not get one: Hyperliquid's `activeAssetCtx` names itself in `channel`, and
-    Binance's `markPriceUpdate` in `data.e`, so both fall out of the rules above
-    as streams in their own right — including the dex-prefixed `xyz:GOLD` form,
-    whose coin only ever appears in the payload the routing already keyed on.
-    Pinned by `test_the_index_and_funding_frames_classify_as_their_own_streams`
-    over frames captured from mainnet, because "happens to work" is one
-    whitelist away from a whole feed being counted as `unclassified_frame`.
+    The two WebSocket index/funding feeds need no rule of their own and
+    deliberately do not get one: Hyperliquid's `activeAssetCtx` names itself in
+    `channel`, and Binance's `markPriceUpdate` in `data.e`, so both fall out of
+    the rules above as streams in their own right — including the dex-prefixed
+    `xyz:GOLD` form, whose coin only ever appears in the payload the routing
+    already keyed on. Pinned by
+    `test_the_index_and_funding_frames_classify_as_their_own_streams` over frames
+    captured from mainnet, because "happens to work" is one whitelist away from
+    a whole feed being counted as `unclassified_frame`.
+
+    `premiumIndex` is the one that does need a rule, because it answers to
+    nothing the existing ones read. USD-M stopped serving the markPrice class of
+    public streams (measured 2026-07-28 from two independent network paths), so
+    its index and funding data now arrive over REST from the collector's own
+    poller and are written as the venue's array elements, verbatim: no
+    combined-stream envelope, so no `data` and no `e`, and the symbol under
+    `symbol` rather than `s`.
+
+    The discriminator is structural rather than semantic, on purpose.
+    `markPriceUpdate` carries a mark price, an index price and a funding rate
+    too — the same three quantities under one-letter names — so "looks like
+    index data" would relabel the whole COIN-M feed. What actually separates
+    them is that a WS frame names its event in `e` and a REST element does not,
+    and that the four keys required here are the venue's own spellings, which no
+    stream envelope uses.
     """
     if family == HYPERLIQUID:
         channel = obj.get("channel")
@@ -696,6 +760,8 @@ def classify(family: str, obj: dict) -> Optional[str]:
         # (`binancefuturesum/mod.rs`); the converter recognises it the same way.
         if "lastUpdateId" in obj:
             return "depthSnapshot"
+        if not _PREMIUM_INDEX_KEYS - obj.keys() and "e" not in obj:
+            return "premiumIndex"
         return None
 
     if family == BYBIT:
@@ -840,16 +906,20 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
       through `pump`, so they hold; `@markPrice@1s` is a stream of the same
       combined-stream URL (`binancefutures{um,cm}::STREAMS`), which is also why
       it carries no `pu` chain to check and never enters `_track_sequence`.
-      `depthSnapshot` is the exception worth knowing about: each one
-      is fetched by its own detached `tokio::spawn`, so two in flight could in
-      principle be stamped and enqueued out of order. The window is the few
-      instructions between `Utc::now()` and `send`, and the fetches are
-      throttled to 100/min, so it stays red: at that separation a real step
-      backwards is a clock, not a race.
+      Two exceptions are worth knowing about, and both hold *within* their own
+      stream for reasons of their own. `depthSnapshot`: each one is fetched by
+      its own detached `tokio::spawn`, so two in flight could in principle be
+      stamped and enqueued out of order — the window is the few instructions
+      between `Utc::now()` and `send`, and the fetches are throttled to 100/min,
+      so it stays red, because at that separation a real step backwards is a
+      clock, not a race. `premiumIndex` (USD-M only): one poller awaiting each
+      response before the next tick, so two polls cannot overtake each other at
+      all.
 
     *Between two streams* it holds exactly where the venue has one producer,
-    which is everywhere in the list above except `depthSnapshot` — so the
-    tolerance is granted on the mechanism, not on the venue and not on the size:
+    which is everywhere in the list above except `depthSnapshot` and
+    `premiumIndex` — so the tolerance is granted on the mechanism, not on the
+    venue and not on the size:
     `_SECOND_PRODUCER` has to name one of the two streams before
     `CROSS_STREAM_TOLERANCE_NS` is consulted at all. A step backwards between
     two Hyperliquid cadences, or between `bookTicker` and `trade`, is red at a

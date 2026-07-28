@@ -6,7 +6,11 @@
 //! it is indistinguishable from a quiet market. These records are the
 //! collector's own account of the session, and every backend writes the same
 //! five of them through the constructors here so that one parser reads all five
-//! venues.
+//! venues. [`poller_degraded`] is the sixth and the exception: only a backend
+//! that runs a REST poller writes it. It is constructed here regardless,
+//! because the point of this module is that the sidecar has one vocabulary — a
+//! record spelled locally inside one backend is one the offline report does not
+//! know to look for.
 //!
 //! ## Why they travel the venue's own hop
 //!
@@ -129,6 +133,42 @@ pub fn stream_ended(connected_for_ms: u64) -> Value {
     )
 }
 
+/// A REST poller has been failing for long enough that its feed is missing.
+///
+/// The five records above are written by every backend; this one is written by
+/// whichever backend runs a poller (today: `binancefuturesum`'s `premiumIndex`).
+/// It is here anyway, because the vocabulary the sidecar is read with is what
+/// this module is for, and a record spelled locally in one backend is a record
+/// the offline gate does not know to look for.
+///
+/// It exists because a poller's failures are deliberately **not** fatal — the
+/// data is auxiliary and ending a recording over it would be out of all
+/// proportion — which leaves the journal as the only other account of them, and
+/// the journal is not what an offline report reads. Raised once per outage:
+/// at a ten-second cadence, a record per failure would be a sidecar nobody
+/// finishes reading, and one nobody reads is one that explains nothing.
+///
+/// `interval_s` is not decoration. A count of consecutive failures says how
+/// long the feed has been missing only once the period between them is known,
+/// and the period is a constant in the backend rather than anything the record
+/// would otherwise carry.
+pub fn poller_degraded(
+    poller: &str,
+    consecutive_failures: u32,
+    interval_s: u64,
+    error: &str,
+) -> Value {
+    record(
+        "poller_degraded",
+        serde_json::json!({
+            "poller": poller,
+            "consecutive_failures": consecutive_failures,
+            "interval_s": interval_s,
+            "error": error,
+        }),
+    )
+}
+
 /// How a connection ended when nothing errored.
 ///
 /// The read loops have two such exits and they mean opposite things, so
@@ -187,10 +227,33 @@ mod tests {
             (disconnected("reset", 1194), "disconnected"),
             (dial_failed("connection refused", 12), "dial_failed"),
             (stream_ended(7), "stream_ended"),
+            (
+                poller_degraded("premiumIndex", 30, 10, "operation timed out"),
+                "poller_degraded",
+            ),
         ] {
             assert!(is_record(&value), "{value}");
             assert_eq!(value[TAG], event, "{value}");
         }
+    }
+
+    /// A poller that has been failing for minutes is invisible everywhere else.
+    ///
+    /// Its failures are warnings by design — auxiliary data must not be able to
+    /// end a recording — so the journal is the only other place they appear, and
+    /// a journal is not what the offline gate reads. The record has to carry
+    /// enough to act on without one: which poller, how long it has been down,
+    /// and what the venue last said.
+    #[test]
+    fn a_degraded_poller_reports_what_is_needed_to_act_on_it() {
+        let degraded = poller_degraded("premiumIndex", 30, 10, "operation timed out");
+        assert_eq!(degraded["poller"], "premiumIndex");
+        assert_eq!(degraded["consecutive_failures"], 30);
+        assert_eq!(
+            degraded["interval_s"], 10,
+            "30 failures means nothing without the period they were spaced by"
+        );
+        assert_eq!(degraded["error"], "operation timed out");
     }
 
     /// A hand-off that refuses a frame stops the read loop, which reaches

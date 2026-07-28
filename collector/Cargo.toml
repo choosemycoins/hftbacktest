@@ -9,7 +9,14 @@ edition = "2024"
 chrono = "0.4.42"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["full"] }
-serde_json = "1.0.145"
+# `raw_value` for `serde_json::value::RawValue`. The collector's contract is
+# that a recorded line is the payload exactly as the venue sent it, and the
+# `premiumIndex` poller is the one place a payload is taken out of a larger
+# response rather than off the wire whole. Without `RawValue` the element would
+# have to go through `Value` and back, and `serde_json::Map` is a `BTreeMap` —
+# the keys would come out sorted, so the file would hold something no venue
+# ever sent. No new crate; the feature is serde_json's own.
+serde_json = { version = "1.0.145", features = ["raw_value"] }
 futures-util = "0.3.31"
 # rustls, not native-tls. `native-tls` pulls in `openssl-sys`, which needs a
 # target sysroot and therefore cannot be cross-compiled from macOS — the

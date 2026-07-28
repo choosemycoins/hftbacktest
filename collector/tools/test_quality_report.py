@@ -2064,7 +2064,9 @@ def test_an_absent_index_feed_is_a_fact_and_never_a_warning(tmp_path):
     hl_sym = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]
     um_sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
     assert hl_sym["missing_informational"] == ["activeAssetCtx"]
-    assert um_sym["missing_informational"] == ["markPriceUpdate"]
+    # Both of USD-M's: the WS stream it no longer subscribes to (the venue
+    # stopped serving that class) and the REST poller that replaced it.
+    assert um_sym["missing_informational"] == ["markPriceUpdate", "premiumIndex"]
     assert hl_sym["missing_optional"] == []
     assert um_sym["missing_optional"] == []
     assert hl_sym["missing_required"] == []
@@ -2094,7 +2096,7 @@ def test_a_symbol_with_no_file_at_all_still_lists_its_informational_streams(tmp_
     assert code == 1, "the symbol has no bookTicker, which mode A does require"
     sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["ethusdt"]
     assert sym["missing_required"] == ["bookTicker"]
-    assert sym["missing_informational"] == ["markPriceUpdate"]
+    assert sym["missing_informational"] == ["markPriceUpdate", "premiumIndex"]
 
 
 def test_the_index_feeds_have_no_sequence_chain_and_leave_the_depth_one_alone(tmp_path):
@@ -2203,3 +2205,273 @@ def test_an_index_frame_out_of_order_against_another_stream_is_red(tmp_path, ven
         i["detail"] for i in issues_of(report, venue) if i["check"] == "interleave_excess"
     )
     assert "no second producer" in detail
+
+
+# --------------------------------------------------------------------------
+# premiumIndex: the REST poller that replaced the UM mark-price stream
+#
+# Measured 2026-07-28 from two independent network paths: `fstream.binance.com`
+# serves no member of the markPrice class of public streams — `@markPrice@1s`,
+# `@markPrice`, `!markPrice@arr`, `!markPrice@arr@1s`, `@indexPrice@1s` all
+# delivered zero frames while `@trade` and `!bookTicker` delivered 802 in eight
+# seconds on the same socket. COIN-M's `dstream` still serves them.
+#
+# So USD-M's index and funding data now come from a REST poller
+# (`binancefuturesum::PREMIUM_INDEX_INTERVAL`) which writes the venue's own
+# array elements, verbatim, into the symbol files. That makes them a frame
+# shape this report has never seen, written by a producer it has never had on
+# this venue's WS-only path.
+# --------------------------------------------------------------------------
+
+#: One element of `GET /fapi/v1/premiumIndex`, captured verbatim from
+#: `fapi.binance.com` on 2026-07-28. Kept as the raw line for the same reason
+#: the COIN-M mark-price fixture is: what has to classify is the bytes the venue
+#: sends, and the collector writes them through untouched (`RawValue`, so not
+#: even the key order changes).
+UM_PREMIUM_INDEX_CAPTURED = (
+    '{"symbol":"BTCUSDT","markPrice":"63466.95207971",'
+    '"indexPrice":"63494.85043478","estimatedSettlePrice":"63524.24373551",'
+    '"lastFundingRate":"0.00005166","interestRate":"0.00010000",'
+    '"nextFundingTime":1785254400000,"time":1785244313000}'
+)
+
+#: The poller's period. Its cadence is a constant in the collector rather than
+#: anything the venue imposes, so unlike every other entry in `MAX_GAP_NS` this
+#: one is not a measurement — it is the interval the recorder was built with.
+PREMIUM_INDEX_INTERVAL_NS = 10 * SEC
+
+#: And the same K=10 the other periodic feeds take: 100s is nine consecutive
+#: failed polls, which is well past a venue hiccup and still a third of the
+#: `poller_degraded` threshold, so the two signals do not race each other.
+PREMIUM_INDEX_LIMIT_NS = 100 * SEC
+
+
+def um_premium_index(symbol, ts, mark="63466.95207971"):
+    """A `premiumIndex` element as the poller files it: bare, no envelope."""
+    return {
+        "symbol": symbol,
+        "markPrice": mark,
+        "indexPrice": "63494.85043478",
+        "estimatedSettlePrice": "63524.24373551",
+        "lastFundingRate": "0.00005166",
+        "interestRate": "0.00010000",
+        "nextFundingTime": 1_785_254_400_000,
+        "time": ms_of(ts),
+    }
+
+
+def premium_index_day(tmp_path, name, gap_ns, meta_extra=()):
+    """A one-symbol UM day whose premium-index feed has a single hole."""
+    d = tmp_path / name
+    d.mkdir()
+    start, end = ns(0), ns(0) + gap_ns
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (start, um_book_ticker("BTCUSDT", start)),
+            (start, um_trade("BTCUSDT", start)),
+            (start, um_depth("BTCUSDT", start, u=100, pu=99)),
+            (start, um_premium_index("BTCUSDT", start)),
+            (end, um_premium_index("BTCUSDT", end)),
+        ],
+    )
+    write_meta(
+        d,
+        "binancefuturesum",
+        DAY,
+        [(ns(0), session_start("binancefuturesum", ["BTCUSDT"])), *meta_extra],
+    )
+    return d, "btcusdt"
+
+
+def test_a_premium_index_element_classifies_as_its_own_stream():
+    """The one frame shape here that no existing rule could have reached.
+
+    Every other Binance line is either a combined-stream envelope keyed on
+    `data.e` or the REST depth snapshot keyed on `lastUpdateId`. A premium-index
+    element is neither: no envelope, no `e`, and its symbol is under `symbol`
+    rather than `s`. Left unclassified it would be a yellow `unclassified_frame`
+    on every UM day recorded from now on, and the feed would be invisible to
+    every check in this report.
+    """
+    assert qr.classify(qr.BINANCE, json.loads(UM_PREMIUM_INDEX_CAPTURED)) == "premiumIndex"
+    assert qr.classify(qr.BINANCE, um_premium_index("ETHUSDT", ns(0))) == "premiumIndex"
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(um_book_ticker("BTCUSDT", ns(0))), "bookTicker"),
+        (json.dumps(um_mark_price("BTCUSDT", ns(0))), "markPriceUpdate"),
+        (CM_MARK_PRICE_CAPTURED, "markPriceUpdate"),
+        ('{"lastUpdateId":1,"E":1,"T":1,"bids":[],"asks":[]}', "depthSnapshot"),
+    ],
+)
+def test_the_premium_index_rule_does_not_swallow_the_frames_beside_it(raw, stream):
+    """A discriminator, not a catch-all.
+
+    `markPriceUpdate` is the trap: it carries a mark price, an index price and a
+    funding rate too — the same three quantities under one-letter names — so a
+    rule that keyed on "looks like index data" would relabel the whole COIN-M
+    feed. What actually separates them is structural and not semantic: the WS
+    frames name their event in `e` and their symbol in `s`, and the REST element
+    has neither.
+    """
+    assert qr.classify(qr.BINANCE, json.loads(raw)) == stream
+
+
+def test_the_premium_index_feed_has_a_cadence_expectation():
+    """Without an entry it is never checked for holes at all — the wrong default.
+
+    The poller is periodic by construction: it fires on a timer whether or not
+    anything moved, so its silence is evidence on its own and needs no liveness
+    witness, exactly like the other periodic feeds here.
+    """
+    assert qr.MAX_GAP_NS[(qr.BINANCE, "premiumIndex")] == PREMIUM_INDEX_LIMIT_NS
+    assert qr.gap_limit(qr.BINANCE, "premiumIndex") == PREMIUM_INDEX_LIMIT_NS
+    assert PREMIUM_INDEX_LIMIT_NS == 10 * PREMIUM_INDEX_INTERVAL_NS
+
+
+def test_a_premium_index_gap_of_exactly_the_limit_is_not_flagged_and_one_more_ns_is(tmp_path):
+    """Pins the limit to the nanosecond, the way the other cadences are pinned."""
+    for label, gap_ns, expected in (
+        ("at", PREMIUM_INDEX_LIMIT_NS, 0),
+        ("over", PREMIUM_INDEX_LIMIT_NS + 1, 1),
+    ):
+        d, sym = premium_index_day(tmp_path, f"um-pi-{label}", gap_ns)
+        out = tmp_path / f"r-pi-{label}.json"
+        _, report = run(d, out=out)
+        stat = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"][sym]["streams"]
+        assert stat["premiumIndex"]["gap_count"] == expected, (label, gap_ns)
+
+
+def test_the_premium_index_poller_is_a_second_producer(tmp_path):
+    """It skips the socket hop, so it can legally be written ahead of WS frames.
+
+    This is the depth-snapshot situation again and it is now the common case
+    rather than the rare one: the poller hands its elements **straight to the
+    writer** while every WS frame queues through the socket hop first, so a
+    premium-index line stamped later can reach the file before a book tick
+    stamped earlier. Eight thousand polls a day against a hop that holds up to
+    204.8ms of frames — without an entry in `_SECOND_PRODUCER` a healthy UM
+    recording would go red on `interleave_excess`, and red is a hard build
+    refusal in `build_dataset.py`.
+    """
+    assert "premiumIndex" in qr._SECOND_PRODUCER
+
+    d = tmp_path / "um-pi-interleave"
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            # The poll landed first even though the tick below was stamped
+            # earlier: it never entered the socket hop.
+            (base + 2 * MS, um_premium_index("BTCUSDT", base + 2 * MS)),
+            (base + MS, um_book_ticker("BTCUSDT", base + MS)),
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "binancefuturesum")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"] is None
+    assert symbol["monotonic_violation"] is None
+    assert symbol["interleave_inversion"]["previous_stream"] == "premiumIndex"
+
+    detail = next(
+        i for i in issues_of(report, "binancefuturesum") if i["check"] == "interleave_inversion"
+    )["detail"]
+    assert "premiumIndex" in detail and "producer" in detail
+
+
+def test_a_premium_index_stream_going_backwards_within_itself_is_red(tmp_path):
+    """One poller, one timer, one hand-off: within the stream there is no race.
+
+    Two polls cannot overtake each other — the loop awaits each one before the
+    next tick — so a step backwards here is a clock or two recordings in one
+    file, the same as every other stream this report holds to that rule.
+    """
+    d, _ = premium_index_day(tmp_path, "um-pi-backwards", 5 * SEC)
+    path = next(d.glob(f"*_{DAY}.gz"))
+    late = ns(5) - MS
+    write_gz(path, [(late, um_premium_index("BTCUSDT", late))], append=True)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "monotonicity" in checks_of(report, "binancefuturesum", severity="red")
+
+
+def test_premium_index_frames_leave_the_depth_sequence_chain_alone(tmp_path):
+    """No `u`, no `pu`, no chain of its own — and no effect on the one that exists.
+
+    The element carries `symbol` rather than `s`, so a tracker keyed on the
+    symbol instead of on the stream would see every poll break the depth chain
+    and the report would claim a lost-frame gap every ten seconds.
+    """
+    d = tmp_path / "um-pi-sequence"
+    d.mkdir()
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (ns(0), um_book_ticker("BTCUSDT", ns(0))),
+            (ns(0), um_depth("BTCUSDT", ns(0), u=100, pu=99)),
+            (ns(1), um_premium_index("BTCUSDT", ns(1))),
+            (ns(2), um_depth("BTCUSDT", ns(2), u=101, pu=100)),
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0, issues_of(report, "binancefuturesum")
+    assert "sequence_gap" not in checks_of(report, "binancefuturesum")
+    sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert set(sym["sequence_breaks"]) == {"depthUpdate"}
+
+
+def test_only_the_usd_m_backend_expects_a_premium_index_feed():
+    """COIN-M has no poller: its mark-price stream is alive and still recorded.
+
+    Listing `premiumIndex` for COIN-M would cost nothing in verdicts — an absent
+    informational stream raises nothing — but `missing_informational` is read as
+    a statement about what the recording could have contained, and for COIN-M
+    the answer is "never this".
+    """
+    um = qr.expected_streams("mode-a-v1", "binancefuturesum", {})
+    cm = qr.expected_streams("mode-a-v1", "binancefuturescm", {})
+
+    assert "premiumIndex" in um.informational
+    assert "premiumIndex" not in cm.informational
+    assert "markPriceUpdate" in cm.informational, (
+        "dstream.binance.com still serves it, measured 2026-07-28"
+    )
+    assert "markPriceUpdate" in um.informational, (
+        "the routing survives the subscription being dropped; if fstream ever "
+        "serves the class again the frames must be checked, not unclassified"
+    )
+    # Neither venue's index data is ever load-bearing for mode A.
+    for expected in (um, cm):
+        assert expected.required == ("bookTicker",)
+        assert "premiumIndex" not in expected.required + expected.optional
+
+
+def test_an_absent_premium_index_feed_is_a_fact_and_never_a_warning(tmp_path):
+    """Every UM day recorded before 2026-07-28 lacks it, and no rerun can fix that."""
+    um = um_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(um, out=out)
+
+    assert code == 0
+    assert checks_of(report, "binancefuturesum") == []
+    sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert "premiumIndex" in sym["missing_informational"]
+    assert sym["missing_optional"] == []
+    assert sym["missing_required"] == []
+    assert "premiumIndex" not in sym["coverage"]["required_streams"]

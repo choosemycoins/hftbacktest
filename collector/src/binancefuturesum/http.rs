@@ -21,7 +21,41 @@ use crate::{
 };
 
 /// The combined-stream endpoint; the streams themselves go in the query.
-const WS_URL: &str = "wss://fstream.binance.com/stream";
+///
+/// The `/public` segment is load-bearing. Binance split fstream into routed
+/// classes on 2026-03-06 — `/public` (bookTicker, depth), `/market`
+/// (aggTrade, markPrice, kline, ...), `/private` (user data) — and an
+/// UNROUTED connection has been a degraded alias of `/public` since the
+/// legacy decommission date, 2026-04-23: subscriptions to another class are
+/// acked and then never served, with no error anywhere. That is exactly how
+/// the `@markPrice@1s` entry sat silent in this backend's stream list
+/// (measured 2026-07-28; see the note on [`super::STREAMS`]). The legacy
+/// alias itself lives on borrowed time, so this dials the routed path our
+/// stream classes actually belong to.
+const WS_URL: &str = "wss://fstream.binance.com/public/stream";
+
+/// Builds the combined-stream dial URL. Extracted so the routed path is
+/// pinned by a test — an unrouted URL fails exactly like a typo'd stream
+/// name: the venue acks it and serves nothing.
+pub(crate) fn ws_url(streams: &[String]) -> String {
+    format!("{WS_URL}?streams={}", streams.join("/"))
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::ws_url;
+
+    #[test]
+    fn the_dial_url_uses_the_routed_public_path() {
+        let url = ws_url(&["btcusdt@trade".to_string(), "btcusdt@depth@0ms".to_string()]);
+        assert!(
+            url.starts_with("wss://fstream.binance.com/public/stream?streams="),
+            "unrouted fstream URLs are a degraded legacy alias of /public and \
+             silently drop every non-public stream class; got {url}"
+        );
+        assert!(url.ends_with("btcusdt@trade/btcusdt@depth@0ms"));
+    }
+}
 
 pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
     // `exchangeInfo` is a multi-megabyte response fetched once, so this is
@@ -69,6 +103,37 @@ pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error
         .header("Accept", "application/json")
         .send()
         .await?
+        .text()
+        .await
+}
+
+/// Fetches the venue's premium-index snapshot for **every** symbol at once.
+///
+/// No `symbol` parameter on purpose: the endpoint then answers one array
+/// covering the whole venue (851 elements, 188 KB — measured 2026-07-28), and
+/// the caller keeps the ones it records. That is one request per cycle however
+/// many symbols an instance carries, against `symbol`-at-a-time's one request
+/// each. Binance weighs the unfiltered call at 10 and the filtered one at 1, so
+/// the crossover is ten symbols; below that this trades a little weight for a
+/// constant request rate, which is the thing a rate limit actually punishes.
+///
+/// Returns the body as text, not as a parsed document: the caller writes the
+/// venue's own bytes into the recording and must not re-encode them on the way.
+pub async fn fetch_premium_index() -> Result<String, reqwest::Error> {
+    // A premium-index sample is superseded by the next one, so a request still
+    // outstanding when the next poll is due has nothing left to contribute —
+    // hence the timeout IS the period. Failing at that point also keeps the
+    // consecutive-failure counter honest: one skipped cycle, one failure.
+    const PREMIUM_INDEX_TIMEOUT: Duration = super::PREMIUM_INDEX_INTERVAL;
+
+    reqwest::Client::builder()
+        .timeout(PREMIUM_INDEX_TIMEOUT)
+        .build()?
+        .get("https://fapi.binance.com/fapi/v1/premiumIndex")
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
         .text()
         .await
 }
@@ -174,7 +239,7 @@ pub async fn keep_connection(streams: Vec<String>, symbol_list: Vec<String>, ws_
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let url = format!("{WS_URL}?streams={}", streams_.join("/"));
+        let url = ws_url(&streams_);
 
         // Binance subscribes through the URL rather than a subscribe frame, so
         // the venue never acks anything and this is the only account of what

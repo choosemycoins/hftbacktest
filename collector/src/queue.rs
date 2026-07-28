@@ -194,10 +194,36 @@ pub mod burst {
     }
 }
 
+/// Capacity of the REST poller → writer hand-off, **in messages**.
+///
+/// A hop of its own rather than a share of [`WRITER_QUEUE_CAPACITY`], and the
+/// reason is not throughput — it is that `main` has to be able to tell a record
+/// the venue sent from one the collector produced on a timer, and the two are
+/// identical once they are in a queue: same type, same stream name (the poller
+/// files under `BTCUSDT`, exactly as the WebSocket frames do), same file. The
+/// hop they arrive on is the distinction. `main` pets the stall watchdog from
+/// the venue arm and not from this one — see `watchdog::Source`, and the
+/// measurement in it for what happens when the two are conflated.
+///
+/// Sized for the one producer there is: `binancefuturesum` files at most one
+/// element per recorded symbol per [`binancefuturesum::PREMIUM_INDEX_INTERVAL`],
+/// so 1024 is more than eighty cycles of a twelve-symbol instance, or one cycle
+/// of an instance carrying every symbol the venue lists (851, measured
+/// 2026-07-28) with room over. At a few hundred bytes an element that is well
+/// under a megabyte. It cannot fill for the reason the writer hop can: filling
+/// needs the writer to have stopped, and at six records a minute per symbol the
+/// writer hop reaches its own bound first by orders of magnitude. The bound is
+/// here so that the `full => fatal` policy holds on every hop without exception,
+/// not because this one is expected to be reached.
+///
+/// [`binancefuturesum::PREMIUM_INDEX_INTERVAL`]: crate::binancefuturesum::PREMIUM_INDEX_INTERVAL
+pub const POLLER_QUEUE_CAPACITY: usize = 1024;
+
 /// Hop names, used in the fatal message so an operator can tell which of the
-/// two stalled without reading the code.
+/// three stalled without reading the code.
 pub const WS_HOP: &str = "websocket->parser";
 pub const WRITER_HOP: &str = "parser->writer";
+pub const POLLER_HOP: &str = "poller->writer";
 
 /// A record on its way to the writer: when it arrived, which stream it belongs
 /// to, and the payload exactly as the venue sent it.

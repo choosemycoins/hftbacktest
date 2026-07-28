@@ -19,7 +19,10 @@ fn main() {
     // + index against HEAD and ignores untracked files, so stray local
     // artefacts (.idea/, scratch scripts) do not flip a reproducible build to
     // "dirty". Exit 0 = clean, 1 = tracked diff, anything else = git error.
-    let dirty = match Command::new("git").args(["diff", "--quiet", "HEAD"]).status() {
+    let dirty = match Command::new("git")
+        .args(["diff", "--quiet", "HEAD"])
+        .status()
+    {
         Ok(s) if s.success() => "clean",
         Ok(s) if s.code() == Some(1) => "dirty",
         _ => "unknown",

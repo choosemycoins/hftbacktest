@@ -31,12 +31,40 @@
 //! neither of them reaches is a writer wedged in a syscall: `main` never
 //! returns to the select loop, so this arm is never polled either, and only an
 //! external watchdog (systemd `WatchdogSec`) gets the process out of it.
+//!
+//! And it is driven by writes **the venue caused**. See [`Source`]: a record the
+//! collector produced on a timer of its own says nothing about whether the feed
+//! is still arriving, and counting one would disarm this guard on the backend
+//! that has such a producer.
 
 use std::time::Duration;
 
 use tokio::time::{Instant, sleep_until};
 
 use crate::file::META_STREAM;
+
+/// What caused a record, and therefore whether it vouches for the feed.
+///
+/// The distinction exists because not every line in a symbol file comes off a
+/// socket. `binancefuturesum` polls `GET /fapi/v1/premiumIndex` on a timer of
+/// its own and files each element under the symbol it names, exactly as a
+/// WebSocket frame is filed — the two are indistinguishable by stream name, by
+/// filename and by shape of hand-off.
+///
+/// They must not be indistinguishable **here**. A poller keeps running when the
+/// socket is dead: measured 2026-07-28 with `fstream` blackholed, a USD-M
+/// instance survived past a one-minute stall timeout having recorded nothing
+/// but index samples, and would have done so indefinitely with systemd
+/// reporting it healthy. Counting only [`Source::Venue`] is what keeps "nothing
+/// is reaching disk" meaning "the feed has stopped" rather than "even the timer
+/// has stopped".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// A venue feed produced it. This is what the recording is.
+    Venue,
+    /// The collector produced it beside the feed, on a schedule of its own.
+    Collector,
+}
 
 /// Stops the collector when nothing at all is reaching disk.
 pub struct StallWatchdog {
@@ -73,8 +101,13 @@ impl StallWatchdog {
     /// `main`'s own `_meta` records — the minutely disk gauge and the two
     /// terminal ones — never arrive here at all: they are written straight to
     /// the `Writer`, bypassing the queue this counts records off.
-    pub fn record_write(&mut self, stream: &str) {
-        if stream != META_STREAM {
+    ///
+    /// [`Source::Collector`] records do not count either, and for the same
+    /// reason one step further out: a record the collector produced on its own
+    /// timer is evidence that the timer is running, not that the venue is still
+    /// sending. See [`Source`].
+    pub fn record_write(&mut self, source: Source, stream: &str) {
+        if source == Source::Venue && stream != META_STREAM {
             self.last_write = Instant::now();
         }
     }
@@ -151,7 +184,7 @@ mod tests {
                     panic!("tripped after {silence:?} while records were still arriving")
                 }
                 _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    watchdog.record_write("BTC");
+                    watchdog.record_write(Source::Venue, "BTC");
                 }
             }
         }
@@ -184,9 +217,9 @@ mod tests {
                     silence = watchdog.stalled() => return silence,
                     _ = retry.tick() => {
                         // One failed reconnect's worth of sidecar traffic.
-                        watchdog.record_write(META_STREAM);
-                        watchdog.record_write(META_STREAM);
-                        watchdog.record_write(META_STREAM);
+                        watchdog.record_write(Source::Venue, META_STREAM);
+                        watchdog.record_write(Source::Venue, META_STREAM);
+                        watchdog.record_write(Source::Venue, META_STREAM);
                     }
                 }
             }
@@ -203,6 +236,76 @@ mod tests {
             "tripped after {:?}, expected close to {TIMEOUT:?}",
             start.elapsed()
         );
+    }
+
+    /// The collector's own periodic output must not vouch for the venue's feed,
+    /// and the case that makes it load-bearing is `binancefuturesum`'s
+    /// `premiumIndex` poller.
+    ///
+    /// It writes into the **symbol** files, not the sidecar — that is the whole
+    /// design, the index and funding numbers belong beside the book they price
+    /// — so the `_meta` exclusion above does not reach it. And it runs on a
+    /// timer of its own, so it keeps writing with the socket dead. Measured
+    /// 2026-07-28 with `fstream` blackholed: a USD-M instance ran 120s past a
+    /// 60s stall timeout, having recorded twelve index samples and not one
+    /// frame, and would have kept going for as long as `fapi` answered. The
+    /// identical run with the poller filing nothing exited at exactly 60s.
+    ///
+    /// Bounded by a timeout for the same reason as the sidecar test below it:
+    /// without the exclusion this never fires, and under a paused clock a
+    /// `loop` would spin virtual time forwards for ever rather than fail.
+    #[tokio::test(start_paused = true)]
+    async fn the_collectors_own_records_do_not_count_as_life() {
+        let start = Instant::now();
+        let mut watchdog = StallWatchdog::new(TIMEOUT_MIN);
+        let mut poll = tokio::time::interval(Duration::from_secs(10));
+
+        let silence = tokio::time::timeout(TIMEOUT * 2, async {
+            loop {
+                select! {
+                    silence = watchdog.stalled() => return silence,
+                    _ = poll.tick() => {
+                        // One cycle of the poller, filed under the venue's own
+                        // spelling of two recorded symbols — the same stream
+                        // names the WebSocket frames would arrive under.
+                        watchdog.record_write(Source::Collector, "BTCUSDT");
+                        watchdog.record_write(Source::Collector, "ETHUSDT");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a working poller held the watchdog off while nothing was being recorded");
+
+        assert!(
+            silence >= TIMEOUT,
+            "tripped after only {silence:?} of silence"
+        );
+        assert!(
+            start.elapsed() < TIMEOUT * 2,
+            "tripped after {:?}, expected close to {TIMEOUT:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The other half of it: the exclusion must be about provenance, not about
+    /// the stream name. The poller files under exactly the names the socket
+    /// files under, so a rule written against names would either count the
+    /// poller or stop counting the feed.
+    #[tokio::test(start_paused = true)]
+    async fn a_venue_frame_under_the_same_stream_name_does_count() {
+        let mut watchdog = StallWatchdog::new(TIMEOUT_MIN);
+
+        for _ in 0..(TIMEOUT_MIN * 3) {
+            select! {
+                silence = watchdog.stalled() => {
+                    panic!("tripped after {silence:?} while the venue was still sending")
+                }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    watchdog.record_write(Source::Venue, "BTCUSDT");
+                }
+            }
+        }
     }
 
     /// A nonsensical timeout must be inert, not a panic. The release profile

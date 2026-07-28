@@ -58,11 +58,18 @@ exactly these streams.
 
 | `<exchange>` | Streams / topics recorded |
 |---|---|
-| `binancefutures`, `binancefuturesum` | `@trade`, `@bookTicker`, `@depth@0ms`, `@markPrice@1s` |
+| `binancefutures`, `binancefuturesum` | `@trade`, `@bookTicker`, `@depth@0ms`, **+ REST `premiumIndex` every 10 s** |
 | `binancefuturescm` | `@trade`, `@bookTicker`, `@depth@0ms`, `@markPrice@1s` |
 | `binance`, `binancespot` | `@trade`, `@bookTicker`, `@depth@100ms` |
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
 | `hyperliquid` | `trades`, `bbo`, `activeAssetCtx`, `l2Book` × `{--hl-l2-modes}` |
+
+USD-M is the odd row: it carries no `@markPrice@1s`, because **that class
+lives on fstream's routed `/market` path** (Binance split fstream into
+`/public`/`/market`/`/private` on 2026-03-06; the collector dials `/public`,
+and reaching `/market` would mean a second socket with its own lifecycle) —
+see [Index, oracle and funding](#index-oracle-and-funding). COIN-M's `dstream`
+has not migrated yet, still serves it unrouted, and keeps it.
 
 Two venues take a flag because their defaults are load-bearing:
 
@@ -102,15 +109,16 @@ Output filenames are lowercased regardless of what you pass in.
 
 ### Index, oracle and funding
 
-Two of those streams are not order flow. `@markPrice@1s` on Binance futures and
-`activeAssetCtx` on Hyperliquid are recorded because **they carry the spot
-basket each venue's funding is priced against** — the one thing about a
-perpetual that its own book and tape cannot tell you afterwards:
+Some of what is recorded is not order flow. Each venue's index basket, mark
+price and funding rate are recorded because **they carry the spot basket that
+venue's funding is priced against** — the one thing about a perpetual that its
+own book and tape cannot tell you afterwards:
 
-| Venue | Stream | The field that matters | Also carries |
+| Venue | Source | The field that matters | Also carries |
 |---|---|---|---|
-| Binance UM / CM | `<symbol>@markPrice@1s` | `i` — the Binance index, aggregated across its constituent spot exchanges | `p` mark price, `r` funding rate, `T` next funding time |
-| Hyperliquid | `activeAssetCtx` | `ctx.oraclePx` — Hyperliquid's own spot basket, the direct input to its funding calculation | `ctx.markPx`, `ctx.midPx`, `ctx.premium`, `ctx.funding`, `ctx.openInterest` |
+| Binance USD-M | **REST** `GET /fapi/v1/premiumIndex`, polled every 10 s | `indexPrice` — the Binance index, aggregated across its constituent spot exchanges | `markPrice`, `lastFundingRate`, `estimatedSettlePrice`, `interestRate`, `nextFundingTime` |
+| Binance COIN-M | WS `<symbol>@markPrice@1s` | `i` — the same index | `p` mark price, `r` funding rate, `T` next funding time |
+| Hyperliquid | WS `activeAssetCtx` | `ctx.oraclePx` — Hyperliquid's own spot basket, the direct input to its funding calculation | `ctx.markPx`, `ctx.midPx`, `ctx.premium`, `ctx.funding`, `ctx.openInterest` |
 
 Recording the constituent spot books instead would cost orders of magnitude
 more and still only approximate what the venue actually used. These are the
@@ -134,19 +142,80 @@ and all (`{"type":"activeAssetCtx","coin":"xyz:GOLD"}`), so a builder-dex
 instrument's context lands in the same file as its book. Verified against
 mainnet.
 
-**The USD-M row above is COIN-M's number.** `fstream.binance.com` served only
-`@trade`, `@bookTicker` and `@depth@0ms` from the vantage point these
-measurements were taken from: on one connection carrying thousands of book
-ticks, `@aggTrade`, `@kline_1m`, `@forceOrder`, `@miniTicker` and
-`@markPrice@1s` all delivered exactly zero. `@aggTrade` returning nothing while
-`@trade` returns hundreds is not a plausible property of the venue, so the
-pattern points at that network path rather than at the stream names.
-`dstream.binance.com` served every one of them, so COIN-M is what could be
-measured; USD-M's documented cadence is the same 1 s. The two payloads are the
-same event with the same `i`/`r`/`T` fields, COIN-M adding `ap` and `st`. If a
-USD-M recording contains no `markPriceUpdate` at all, suspect the path before
-the code — and note that Binance acks a stream name it will never serve, so
-there is no error to look for. See [Known limitations](#known-limitations).
+#### USD-M: the markPrice class moved behind the routed `/market` path, so it is polled instead
+
+Binance split `fstream` into routed connection classes on 2026-03-06 —
+`/public` (bookTicker, depth), `/market` (aggTrade, markPrice, kline, ...),
+`/private` (user data) — and since the legacy decommission date, 2026-04-23,
+an unrouted connection is a degraded alias of `/public`: a `/market`-class
+subscription is acked and then never served, with no error anywhere.
+**Measured 2026-07-28, from a Tokyo host and a filtered local path
+independently, before the docs explained it:** `<symbol>@markPrice@1s`,
+`<symbol>@markPrice`, `!markPrice@arr`, `!markPrice@arr@1s` and
+`<symbol>@indexPrice@1s` each delivered **zero** frames, on the same connection
+and in the same eight seconds that `<symbol>@trade` and `!bookTicker` delivered
+**802**. Two independent network paths agreeing rules out the vantage point,
+which an earlier single-path measurement could not. `dstream.binance.com`
+(COIN-M) served `markPriceUpdate` throughout, which is why the sibling backend
+keeps its stream and this one does not.
+
+`@markPrice@1s` sat in the USD-M stream list for part of that day, subscribed
+and silent: acked by the venue, no frames, no error, nothing in the recording
+and nothing in the logs. Harmless, useless, and actively misleading in the list
+— it read as evidence that index and funding data were being recorded.
+
+So USD-M polls instead:
+
+- **`GET /fapi/v1/premiumIndex` with no `symbol` parameter**, every 10 s. One
+  request covers the whole venue: 851 elements, 188 KB, measured 2026-07-28.
+  The elements for the recorded symbols are written into their symbol files
+  **verbatim** — the venue's own JSON object, key order and all — exactly as a
+  WebSocket frame would be. The rest are dropped.
+- **Ten seconds is a sampling choice**, not a cadence the venue imposes. The
+  underlying numbers move at 1/s and the funding rate itself every eight hours;
+  a basis series does not need per-second resolution.
+- **Ingress, not disk, is the cost.** The whole-venue response is fetched
+  whatever the symbol count, so this is ~1.6 GB/day of download regardless of
+  how many symbols an instance records, against ~2.1 MB/day/symbol of raw lines
+  written (~0.3 MB/day compressed, extrapolating the COIN-M ratio — the raw
+  figure is arithmetic, the compressed one is not yet measured). On a metered
+  link that ratio is the thing to look at, not the file sizes.
+- **A failed poll is a warning and a skipped cycle, never fatal.** This is
+  auxiliary data; ending a day of book and tape because a REST endpoint
+  returned 502 would be out of all proportion. Every other failure path in this
+  collector stops the process, and this one deliberately does not.
+- **But it is never silent.** After 30 consecutive failures — five minutes —
+  the sidecar gets one record, so the offline gate can see it:
+
+  ```json
+  {"_collector":"poller_degraded","poller":"premiumIndex",
+   "consecutive_failures":30,"interval_s":10,"error":"…"}
+  ```
+
+  Once per outage, not once per failure: at this cadence a record every ten
+  seconds would be a sidecar nobody finishes reading. A successful poll clears
+  the count and re-arms it, so a second outage is reported as a second outage.
+  Every individual failure is still a `WARN` in the journal.
+
+Handing the element to the writer is the one part that follows the ordinary
+fatal contract: a hand-off that cannot take a record means the recording has
+broken, and the collector stops with the files closed, exactly as everywhere
+else.
+
+One consequence for anything reading these files: the poller is a **second
+producer**. It writes straight to the writer while WebSocket frames queue
+through the socket hop first, so a `premiumIndex` line can be written ahead of a
+book tick stamped microseconds earlier. That is an interleave, not a defect, and
+the offline report knows it (`_SECOND_PRODUCER` in `tools/quality_report.py`) —
+it is the same situation the REST depth snapshot has always been in, but now at
+8640 writes a day instead of a dozen.
+
+The Python converter (`hftbacktest.data.utils.binancefutures`) skips these lines
+the same way it already skips the REST depth snapshots: at its default
+`combined_stream=True`, which is the correct setting for these files, a line
+with no `data` envelope is passed over without an event type being read out of
+it. Turning them into rows is not implemented — `opt='m'` converts a
+`markPriceUpdate` frame, i.e. COIN-M's.
 
 ### Hyperliquid symbol names
 
@@ -270,6 +339,7 @@ as the venues themselves:
 | `{"_collector":"queue_overflow", …}` | an internal hand-off filled up; the collector is stopping | all |
 | `{"_collector":"hand_off_closed", …}` | an internal hand-off lost its consumer, i.e. the collection task had already ended; the collector is stopping | all |
 | `{"_collector":"stalled", …}` | nothing was recorded for the whole watchdog window; the collector is stopping | all |
+| `{"_collector":"poller_degraded", …}` | a REST poller has failed `consecutive_failures` times running, `interval_s` apart, with `error`. The collector is **not** stopping — see below | binancefuturesum |
 | `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters | hyperliquid |
 | `{"channel":"error", …}` | venue rejections | hyperliquid |
 | `{"channel":"pong", …}` | liveness during a stretch with no market data | hyperliquid |
@@ -284,6 +354,14 @@ is why a failed dial is its own event rather than a `disconnected` reporting how
 long a DNS or TLS stall took. A refused internal hand-off writes no end-of-stream
 record at all: it would have to travel the hop that just refused a market-data
 frame, and `queue_overflow`/`hand_off_closed` already name it from the other end.
+
+`poller_degraded` is the one record that reports a fault the collector then
+carries on through. Every other `_collector` record above is either routine or
+terminal; this one says a feed is missing while the recording continues, because
+the feed in question is auxiliary and stopping over it would be out of all
+proportion (see [Index, oracle and funding](#index-oracle-and-funding)). It is
+written once per outage rather than once per failure, and a successful poll
+re-arms it.
 
 Binance acks nothing at all — the subscription is the URL it is dialled with —
 so on those three venues the `_collector` records are the only account of the
@@ -395,7 +473,7 @@ feed existed behave. **Genuine fusion of the two cadences is not implemented
 yet** — `bybit.convert_fused` plus `FuseMarketDepth` is the pattern it would
 follow.
 
-The index/funding streams are **skipped by every converter unless asked for**,
+The index/funding feeds are **skipped by every converter unless asked for**,
 so adding them changed no existing output. `binancefutures.convert` has a
 long-standing `opt` flag for exactly this stream, which until now had nothing to
 read:
@@ -405,7 +483,18 @@ from hftbacktest.data.utils import binancefutures
 
 # opt='m' turns each markPriceUpdate into three rows with custom event ids:
 #   100 = index price (the spot basket)   101 = mark price   102 = funding rate
-data = binancefutures.convert('btcusdt_20260728.gz', opt='m')
+data = binancefutures.convert('btcusd_perp_20260728.gz', opt='m')
+```
+
+**That is COIN-M only.** USD-M's index and funding data no longer arrives as
+`markPriceUpdate` at all — it is the REST poller's `premiumIndex` elements, a
+bare object with no `data` envelope, which `convert` passes over exactly as it
+passes over the REST depth snapshots. Nothing is lost and nothing breaks;
+`opt='m'` simply finds no rows in a USD-M file. Reading the poller's lines
+directly is a `zcat`-and-`json.loads` away:
+
+```bash
+zcat btcusdt_20260728.gz | grep '"indexPrice"' | head -1
 ```
 
 `hyperliquid.convert` has no equivalent yet: its loop handles `trades` and
@@ -599,8 +688,25 @@ every 5, meaning a `-mmin -5` check would have reported SOL dead while it was
 recording normally. It fails the other way too: a stalled collector keeps the
 mtime of its last flush.
 
-Check the sidecar instead. It is plain text flushed per record, so it is always
-current:
+**A thin symbol makes that much worse, and it caused a false alarm on
+2026-07-28.** The block is 48 KB *compressed*, and these feeds compress an
+order of magnitude, so the thinner the symbol the longer the interval: a quiet
+instrument trickling a few hundred bytes a second can leave its `.gz` mtime
+untouched for **~10 minutes** and still be recording every frame. "The file is
+not growing" is not "the collector is not recording" — at these compression
+ratios the two are barely related. Reading the file while it is open shows the
+same thing from the other side: only the blocks that have been flushed are
+there, so the tail of a live recording is always missing however healthy it is.
+
+What to check instead, in order:
+
+1. the journal — `journalctl -u hft-collector@<instance> -n 50`;
+2. the sidecar, below, which is flushed per record;
+3. the stall watchdog, which is the process's own answer to this question and
+   ends it if the answer is bad (see [Going silent](#going-silent)).
+
+Check the sidecar instead of the mtime. It is plain text flushed per record, so
+it is always current:
 
 ```bash
 # what this instance is doing right now
@@ -611,10 +717,12 @@ grep -c '"_collector":"disconnected"' .../_meta_hyperliquid_$(date -u +%Y%m%d).j
 ```
 
 For the data itself, growth over a window longer than the flush interval is the
-honest signal:
+honest signal — and `-mmin -10` is now the *floor* of that window, not a safe
+value, since a thin symbol has been seen going ten minutes between flushes.
+Give it real headroom:
 
 ```bash
-find /opt/hft-collector/data -name "*_$(date -u +%Y%m%d).gz" -mmin -10
+find /opt/hft-collector/data -name "*_$(date -u +%Y%m%d).gz" -mmin -20
 ```
 
 ### Capacity
@@ -640,12 +748,23 @@ These are quiet-period figures from one 12-minute window. `bbo` and `trades`
 are event-driven, so a volatile session costs several times more; size the
 volume with headroom.
 
-They also predate the index/funding streams. Add **2.4 MB/day per coin** for
-`activeAssetCtx` on Hyperliquid and **2.7 MB/day per symbol** for
-`@markPrice@1s` on either Binance futures venue — about a tenth of a
-Hyperliquid coin's total, and under 4% of a Bybit symbol's. Unlike everything
-else in the table those figures are flat: both feeds are periodic at 1/s and do
-not grow with volatility. See
+They also predate the index/funding feeds. Add:
+
+| Feed | Cost | Measured? |
+|---|---|---|
+| Hyperliquid `activeAssetCtx` | 2.4 MB/day/coin | yes, 2026-07-28 |
+| Binance COIN-M `@markPrice@1s` | 2.7 MB/day/symbol | yes, 2026-07-28 |
+| Binance USD-M `premiumIndex` poller | ~2.1 MB/day/symbol raw, ~0.3 MB/day compressed | raw is arithmetic; the ratio is extrapolated from the COIN-M row |
+
+About a tenth of a Hyperliquid coin's total, and under 4% of a Bybit symbol's.
+Unlike everything else in the table these figures are flat: every one of them is
+periodic and does not grow with volatility.
+
+The USD-M poller has a cost the others do not, and it is not on disk.
+`GET /fapi/v1/premiumIndex` is fetched **unfiltered** — one request covering all
+851 symbols, 188 KB — so it costs **~1.6 GB/day of ingress regardless of how
+many symbols the instance records**, five hundred times what it writes. On a
+metered or shared link that is the number that matters. See
 [Index, oracle and funding](#index-oracle-and-funding).
 
 How much more has since been measured, on Binance UM rather than these two
@@ -781,7 +900,38 @@ is the shipped `StartLimitBurst=10` / `StartLimitIntervalSec=3600`; the interval
 has to stay well above ten stall periods or the limit is never reached and the
 unit restarts for ever without ever failing.
 
-**What it does not catch**, and must not be mistaken for:
+**It counts what the venue sent, not what the process wrote.** The distinction
+did not exist until USD-M got a REST poller: every other line in a symbol file
+arrives because a socket delivered something, but a `premiumIndex` element
+arrives because a timer fired, and it is filed under `BTCUSDT` exactly as a
+`bookTicker` frame is. Counting one would have disarmed this guard outright —
+measured 2026-07-28 with `fstream` blackholed, a USD-M instance ran 120 s past a
+60 s stall timeout on index samples alone and would have run all day, with
+systemd reporting it healthy. So the poller's records travel a hop of their own
+(`queue::POLLER_HOP`) and the watchdog is fed from the venue hop only; see
+`watchdog::Source`. The samples are still written — they are data — they just do
+not vouch for anything.
+
+**Total silence now means more than it used to.** Every venue records at least
+one *periodic* feed — Hyperliquid's `activeAssetCtx` at 1/s, COIN-M's
+`@markPrice@1s` at 1/s — and those arrive whether or not the market moves and
+whether or not the book changes. So on Hyperliquid and Binance futures the
+watchdog tripping no longer means "the market went quiet"; it means the
+always-on feed died too, which narrows the diagnosis considerably:
+
+| Venue | What a trip rules out |
+|---|---|
+| `hyperliquid` | the `activeAssetCtx` subscription, on every coin at once — so the socket or the process, not one channel |
+| `binancefuturescm` | the same, via `markPriceUpdate` |
+| `binancefuturesum` | the socket. The `premiumIndex` poller is deliberately not counted, so a trip says the WebSocket stopped and says nothing about REST — check `_meta` for `poller_degraded` to learn whether the venue or this host was the problem |
+| `binance`, `binancespot`, `bybit` | nothing extra; these record order flow only, and a genuinely dead market still trips it |
+
+The USD-M row is the useful one, but for the opposite reason to the others: the
+two paths are reported separately on purpose. A trip with no `poller_degraded`
+beside it is a WebSocket fault with REST still answering; both together are the
+host or the network.
+
+**What it still does not catch**, and must not be mistaken for:
 
 - a dead depth stream while trades keep arriving, or the reverse;
 - one symbol of ten that stopped;
@@ -818,6 +968,24 @@ Worth knowing before you trust a dataset.
   commented out as `@@markPrice@1s`. The names now live in
   `binancefutures{um,cm}::STREAMS` with a test on their shape, because nothing
   at runtime will ever object.
+- **A stream name that exists but belongs to another connection class is not
+  an error either**, and that is the worse half. USD-M's whole markPrice class
+  behaves exactly like the typo above on a `/public` (or legacy unrouted)
+  connection: acked, silent, no error, indefinitely (measured 2026-07-28, and
+  then explained by Binance's 2026-03-06 routed-path split — see
+  [Index, oracle and funding](#index-oracle-and-funding)). There is no
+  subscription-level check that can catch it, so a feed disappearing from a
+  venue is only ever visible as its absence from a finished recording. That is
+  what `tools/quality_report.py` is for, and it is why an *informational* stream
+  absent from a day is recorded as a fact rather than raised as a warning:
+  neither the operator nor the collector could have done anything about it.
+- **A write is not evidence unless the venue caused it.** The stall watchdog
+  counts records off the venue hop only, because USD-M's REST poller writes into
+  the symbol files on a timer of its own and would otherwise have kept the
+  watchdog satisfied through a completely dead socket — measured, 120 s past a
+  60 s timeout and still going. Any future producer that is not a venue feed has
+  to travel `queue::POLLER_HOP` for the same reason; putting it on the writer
+  hop would silently disarm the guard again, and nothing would say so.
 - **Symbol validation is Hyperliquid-only.** There it is on by default and
   refuses to start on an unknown coin, because one bad name closes the whole
   WebSocket and takes every valid subscription with it. Bybit and Binance have
