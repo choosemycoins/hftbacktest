@@ -15,7 +15,10 @@ use hftbacktest::{
 };
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender};
+use tokio::{
+    sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender},
+    task::JoinHandle,
+};
 use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, warn};
 
@@ -24,7 +27,7 @@ use crate::{
         ordermanager::{OrderManager, SharedOrderManager},
         rest::BinanceFuturesClient,
     },
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     utils::{ExponentialBackoff, Retry},
 };
 
@@ -365,4 +368,25 @@ impl Connector for BinanceFutures {
             }
         });
     }
+
+    /// **Not implemented for this backend.** A sweep here would have to reach the venue's
+    /// `DELETE /fapi/v1/allOpenOrders` and reconcile what came back; until it is written,
+    /// orders left by a dead bot stay resting and this says so rather than pretending.
+    fn sweep(
+        &self,
+        symbols: Vec<String>,
+        reason: SweepReason,
+        _tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<()>> {
+        warn!(
+            ?reason,
+            ?symbols,
+            "The Binance Futures backend does not implement a sweep, so these orders are \
+             left resting on the venue."
+        );
+        None
+    }
+
+    /// **Not implemented for this backend.** See `Bybit::shutdown`.
+    fn shutdown(&mut self) {}
 }

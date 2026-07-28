@@ -34,15 +34,18 @@ use std::{
 use hftbacktest::types::{ErrorKind, LiveError, LiveEvent, Order, Status, Value};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender};
+use tokio::{
+    sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender},
+    task::JoinHandle,
+};
 use tracing::{error, info, warn};
 
 use crate::{
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     hyperliquid::{
         exchange::ExchangeClient,
         ordermanager::{OrderManager, SharedOrderManager},
-        private_stream::{ConnectPolicy, PrivateStream, SharedInstruments},
+        private_stream::{ConnectPolicy, PrivateStream, SharedInstruments, Sweeper},
         public_stream::PublicStream,
         signing::{NonceSource, Signer},
     },
@@ -443,6 +446,14 @@ pub struct Hyperliquid {
     instruments: SharedInstruments,
     trading: Option<Trading>,
     no_orders: Arc<Mutex<NoOrders>>,
+    /// The stream tasks, kept so an orderly stop can end them.
+    ///
+    /// Aborting is what drops the `PublishEvent` senders those tasks own, and dropping every
+    /// sender is what lets the publish task see its channel close and stop last instead of
+    /// first (`connector/src/supervision.rs`). Aborting at an arbitrary await point is
+    /// acceptable *because* it only happens when the process is stopping — and the shutdown
+    /// sweep is a separate task holding its own sender, so it is not cancelled with them.
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl ConnectorBuilder for Hyperliquid {
@@ -521,6 +532,7 @@ impl ConnectorBuilder for Hyperliquid {
             instruments: Default::default(),
             trading,
             no_orders: Arc::new(Mutex::new(NoOrders)),
+            tasks: Vec::new(),
         })
     }
 }
@@ -561,9 +573,9 @@ impl Connector for Hyperliquid {
             self.instruments.clone(),
             ev_tx.clone(),
         );
-        tokio::spawn(async move {
+        self.tasks.push(tokio::spawn(async move {
             public.run().await;
-        });
+        }));
 
         let Some(trading) = &self.trading else {
             return;
@@ -578,7 +590,7 @@ impl Connector for Hyperliquid {
         let account = trading.account_address.clone();
         let agent = trading.agent_address.clone();
         let probe_tx = ev_tx.clone();
-        tokio::spawn(async move {
+        self.tasks.push(tokio::spawn(async move {
             match rest::agent_is_approved(&rest_url, &account, &agent).await {
                 Ok(true) => {
                     info!(%agent, %account, "Hyperliquid lists this API wallet as approved.")
@@ -602,7 +614,7 @@ impl Connector for Hyperliquid {
                     );
                 }
             }
-        });
+        }));
 
         let mut private = PrivateStream::new(
             self.config.public_url.clone(),
@@ -616,9 +628,9 @@ impl Connector for Hyperliquid {
             self.instruments.clone(),
             self.config.connect_policy,
         );
-        tokio::spawn(async move {
+        self.tasks.push(tokio::spawn(async move {
             private.run().await;
-        });
+        }));
     }
 
     fn submit(&self, symbol: String, order: Order, ev_tx: UnboundedSender<PublishEvent>) {
@@ -647,6 +659,64 @@ impl Connector for Hyperliquid {
             ),
             None => reject_order(&symbol, &order, ev_tx),
         }
+    }
+
+    /// Cancels what the **venue** holds for `symbols`, exactly as a `cancel_all` connect
+    /// does — the same [`Sweeper`], so there is one implementation of "clear this coin" and
+    /// not two that drift.
+    ///
+    /// The venue's own open-order list is the source, not this connector's map, and that
+    /// matters most here: the orders a dead bot left may have been placed by a previous run
+    /// of this process, and a sweep built from `orders()` would cancel none of them.
+    ///
+    /// `ev_tx` is moved into the task and dropped when it finishes, and the task is returned
+    /// so that an orderly stop can wait for it: the drain's deadline is not the sweep's
+    /// budget, and while it was, a stop could exit 0 having cancelled part of a grid.
+    fn sweep(
+        &self,
+        symbols: Vec<String>,
+        reason: SweepReason,
+        ev_tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<()>> {
+        let Some(trading) = &self.trading else {
+            info!(
+                ?reason,
+                "No Hyperliquid API wallet is configured, so this connector has nothing \
+                 resting to sweep."
+            );
+            return None;
+        };
+        info!(
+            ?reason,
+            bot_id = ?reason.bot_id(),
+            ?symbols,
+            "Sweeping Hyperliquid's open orders."
+        );
+        let sweeper = Sweeper::new(
+            self.config.rest_url.clone(),
+            trading.account_address.clone(),
+            trading.order_manager.clone(),
+            trading.exchange.clone(),
+            self.instruments.clone(),
+            ev_tx,
+        );
+        Some(tokio::spawn(async move {
+            sweeper.sweep_symbols(&symbols).await;
+            info!(?reason, "Finished sweeping Hyperliquid's open orders.");
+        }))
+    }
+
+    /// Ends the stream tasks, so their senders are dropped and the publish task can see the
+    /// channel close. See [`Hyperliquid::tasks`].
+    fn shutdown(&mut self) {
+        let count = self.tasks.len();
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        info!(
+            tasks = count,
+            "Wound down the Hyperliquid streams for an orderly stop."
+        );
     }
 }
 

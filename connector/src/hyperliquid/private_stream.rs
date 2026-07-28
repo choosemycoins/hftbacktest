@@ -162,9 +162,10 @@ pub struct PrivateStream {
     symbols: SharedSymbolSet,
     symbol_rx: Receiver<String>,
     ev_tx: UnboundedSender<PublishEvent>,
-    exchange: Arc<ExchangeClient>,
-    instruments: SharedInstruments,
     policy: ConnectPolicy,
+    /// Cancelling resting orders. Owns the `ExchangeClient` and the resolved instruments,
+    /// which is why this struct no longer holds either.
+    sweeper: Sweeper,
 }
 
 impl PrivateStream {
@@ -182,6 +183,14 @@ impl PrivateStream {
         policy: ConnectPolicy,
     ) -> Self {
         Self {
+            sweeper: Sweeper::new(
+                rest_url.clone(),
+                account_address.clone(),
+                order_manager.clone(),
+                exchange.clone(),
+                instruments.clone(),
+                ev_tx.clone(),
+            ),
             ws_url,
             rest_url,
             account_address,
@@ -189,8 +198,6 @@ impl PrivateStream {
             symbols,
             symbol_rx,
             ev_tx,
-            exchange,
-            instruments,
             policy,
         }
     }
@@ -335,7 +342,7 @@ impl PrivateStream {
                 // branch does it. Sweeping every registered coin here would cancel the
                 // resting grid of a bot that has been quoting for hours because a *second*
                 // bot attached — or because one instrument was added late.
-                Some(symbol) => self.sweep(symbol).await,
+                Some(symbol) => self.sweeper.sweep(symbol).await,
                 // Nothing says which coin this was, and under a policy whose whole purpose
                 // is "the venue holds nothing from before", leaving one unswept is the worse
                 // of the two errors.
@@ -421,8 +428,149 @@ impl PrivateStream {
     /// Sweeps every coin registered so far. What a `cancel_all` connect does.
     async fn cancel_all_registered(&self) {
         let symbols: Vec<String> = self.symbols.lock().unwrap().iter().cloned().collect();
+        self.sweeper.sweep_symbols(&symbols).await;
+    }
+
+    fn handle(&mut self, text: &str) {
+        let frame = match parse_frame(text) {
+            Ok(frame) => frame,
+            Err(error) => {
+                error!(?error, %text, "Couldn't parse a Hyperliquid account frame.");
+                return;
+            }
+        };
+        match frame {
+            Frame::OrderUpdates(updates) => self.on_order_updates(&updates),
+            Frame::UserFills(fills) => self.on_user_fills(&fills),
+            Frame::SubscriptionResponse(ack) => {
+                info!(subscription = %ack, "Hyperliquid acknowledged an account subscription.");
+            }
+            Frame::Error(message) => {
+                error!(%message, "Hyperliquid reported an error on the account stream.");
+            }
+            Frame::Pong => {}
+            other => {
+                warn!(
+                    ?other,
+                    "Ignoring an unexpected frame on the Hyperliquid account stream."
+                );
+            }
+        }
+    }
+
+    fn on_order_updates(&self, updates: &[OrderUpdate]) {
+        for update in updates {
+            let applied = self
+                .order_manager
+                .lock()
+                .unwrap()
+                .apply_order_update(update);
+            match applied {
+                Some(OrderExt { symbol, order, .. }) => self.publish_order(symbol, order),
+                // Not ours, or already terminal, or stale. All three are ordinary and none
+                // of them is an error: the account is shared with a human and a UI.
+                None => debug!(
+                    coin = %update.order.coin,
+                    status = %update.status,
+                    "An orderUpdates entry this connector does not act on."
+                ),
+            }
+        }
+    }
+
+    fn on_user_fills(&self, fills: &UserFills) {
+        if fills.is_snapshot {
+            // Not a warning: the venue does this on every subscribe, by design. It is worth
+            // a line because the count is the only evidence the deduplication is working.
+            info!(
+                fills = fills.fills.len(),
+                "Hyperliquid replayed the account's fill history on subscribe."
+            );
+        }
+        for fill in &fills.fills {
+            let disposition = self.order_manager.lock().unwrap().apply_fill(fill);
+            match disposition {
+                FillDisposition::Replay => {}
+                FillDisposition::Applied {
+                    symbol,
+                    order,
+                    position,
+                    exch_ts,
+                } => {
+                    if let Some(order) = order {
+                        self.publish_order(symbol.clone(), order);
+                    }
+                    // Published even for a fill on an order this connector did not place:
+                    // it is still the account's position, and the bot trades against it.
+                    self.publish_position(symbol, position, exch_ts);
+                }
+            }
+        }
+    }
+
+    fn publish_order(&self, symbol: String, order: Order) {
+        self.ev_tx
+            .send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
+            .unwrap();
+    }
+
+    fn publish_position(&self, symbol: String, qty: f64, exch_ts: i64) {
+        self.ev_tx
+            .send(PublishEvent::LiveEvent(LiveEvent::Position {
+                symbol,
+                qty,
+                exch_ts,
+            }))
+            .unwrap();
+    }
+}
+
+/// Cancelling this connector's resting orders, reachable from **outside** the account
+/// stream's task.
+///
+/// It used to live on [`PrivateStream`], which meant the only thing that could ask for a
+/// sweep was the stream's own connect. That is fine for the connect policy and useless for
+/// the two cases this connector actually loses money in: a bot that died with orders resting
+/// (`SweepReason::BotDied`) and a connector that is stopping with the same
+/// (`SweepReason::ConnectorStopping`). Both are noticed by the generic supervision layer,
+/// which holds no `PrivateStream` and never will.
+///
+/// Everything it needs is already an `Arc` or a `String`, so `Hyperliquid` can build one on
+/// demand and hand it to a task. The stream holds one too, and calls the same code.
+#[derive(Clone)]
+pub struct Sweeper {
+    rest_url: String,
+    /// The **master** account. Every `/info` query uses it.
+    account_address: String,
+    order_manager: SharedOrderManager,
+    exchange: Arc<ExchangeClient>,
+    instruments: SharedInstruments,
+    ev_tx: UnboundedSender<PublishEvent>,
+}
+
+impl Sweeper {
+    pub fn new(
+        rest_url: String,
+        account_address: String,
+        order_manager: SharedOrderManager,
+        exchange: Arc<ExchangeClient>,
+        instruments: SharedInstruments,
+        ev_tx: UnboundedSender<PublishEvent>,
+    ) -> Self {
+        Self {
+            rest_url,
+            account_address,
+            order_manager,
+            exchange,
+            instruments,
+            ev_tx,
+        }
+    }
+
+    /// Sweeps each symbol in turn.
+    pub async fn sweep_symbols(&self, symbols: &[String]) {
         for symbol in symbols {
-            self.sweep(&symbol).await;
+            self.sweep(symbol).await;
         }
     }
 
@@ -545,96 +693,9 @@ impl PrivateStream {
         }
     }
 
-    fn handle(&mut self, text: &str) {
-        let frame = match parse_frame(text) {
-            Ok(frame) => frame,
-            Err(error) => {
-                error!(?error, %text, "Couldn't parse a Hyperliquid account frame.");
-                return;
-            }
-        };
-        match frame {
-            Frame::OrderUpdates(updates) => self.on_order_updates(&updates),
-            Frame::UserFills(fills) => self.on_user_fills(&fills),
-            Frame::SubscriptionResponse(ack) => {
-                info!(subscription = %ack, "Hyperliquid acknowledged an account subscription.");
-            }
-            Frame::Error(message) => {
-                error!(%message, "Hyperliquid reported an error on the account stream.");
-            }
-            Frame::Pong => {}
-            other => {
-                warn!(
-                    ?other,
-                    "Ignoring an unexpected frame on the Hyperliquid account stream."
-                );
-            }
-        }
-    }
-
-    fn on_order_updates(&self, updates: &[OrderUpdate]) {
-        for update in updates {
-            let applied = self
-                .order_manager
-                .lock()
-                .unwrap()
-                .apply_order_update(update);
-            match applied {
-                Some(OrderExt { symbol, order, .. }) => self.publish_order(symbol, order),
-                // Not ours, or already terminal, or stale. All three are ordinary and none
-                // of them is an error: the account is shared with a human and a UI.
-                None => debug!(
-                    coin = %update.order.coin,
-                    status = %update.status,
-                    "An orderUpdates entry this connector does not act on."
-                ),
-            }
-        }
-    }
-
-    fn on_user_fills(&self, fills: &UserFills) {
-        if fills.is_snapshot {
-            // Not a warning: the venue does this on every subscribe, by design. It is worth
-            // a line because the count is the only evidence the deduplication is working.
-            info!(
-                fills = fills.fills.len(),
-                "Hyperliquid replayed the account's fill history on subscribe."
-            );
-        }
-        for fill in &fills.fills {
-            let disposition = self.order_manager.lock().unwrap().apply_fill(fill);
-            match disposition {
-                FillDisposition::Replay => {}
-                FillDisposition::Applied {
-                    symbol,
-                    order,
-                    position,
-                    exch_ts,
-                } => {
-                    if let Some(order) = order {
-                        self.publish_order(symbol.clone(), order);
-                    }
-                    // Published even for a fill on an order this connector did not place:
-                    // it is still the account's position, and the bot trades against it.
-                    self.publish_position(symbol, position, exch_ts);
-                }
-            }
-        }
-    }
-
     fn publish_order(&self, symbol: String, order: Order) {
         self.ev_tx
             .send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
-            .unwrap();
-    }
-
-    fn publish_position(&self, symbol: String, qty: f64, exch_ts: i64) {
-        self.ev_tx
-            .send(PublishEvent::LiveEvent(LiveEvent::Position {
-                symbol,
-                qty,
-                exch_ts,
-            }))
             .unwrap();
     }
 }
@@ -875,7 +936,11 @@ pub fn cancel_order(
 ///
 /// Order matters: `LiveBot`'s error handler may abort the `elapse`, so the state has to be
 /// clean before it runs.
-fn expire_and_report(
+///
+/// `pub(crate)` so that `supervision`'s test of the supervisor contract can drive a real send
+/// site rather than a stand-in — see `an_unexpected_publish_task_death_still_panics_a_
+/// production_sender`.
+pub(crate) fn expire_and_report(
     symbol: &str,
     order: Order,
     error: &HyperliquidError,
@@ -970,6 +1035,38 @@ mod tests {
             "the sweep is keyed on the venue's own order ids"
         );
         assert!(cancels_for(&venue, "SOL", 0).is_empty());
+    }
+
+    /// **A sweep is account-wide for the coin, and cannot be anything else.** The venue lists
+    /// open orders by account; nothing in an `OpenOrder` says which bot asked for it, because
+    /// `Connector::submit` is never told a bot id. So there is no such operation as
+    /// "cancel bot 7's BTC orders" — asking for BTC cancels everything the account has on
+    /// BTC, including a second bot's live grid.
+    ///
+    /// That is why `supervision::BotRegistry::take_dead` refuses to hand a dead bot's symbol
+    /// to a sweep while another bot is still quoting it. This test is the other end of that
+    /// contract: if a future change ever makes cancels attributable, that refusal can be
+    /// revisited, and this is where it will show up.
+    #[test]
+    fn a_sweep_cancels_every_order_the_account_holds_on_that_coin() {
+        let venue = [
+            // This connector's, this run.
+            open("BTC", 201, Some("0xa1f0000000000000000000000000000a")),
+            // A second bot's, on the same account and the same coin.
+            open("BTC", 202, Some("0xb2e1000000000000000000000000000b")),
+            // A human's, from the UI.
+            open("BTC", 203, None),
+        ];
+
+        assert_eq!(
+            cancels_for(&venue, "BTC", 3)
+                .iter()
+                .map(|cancel| cancel.o)
+                .collect::<Vec<_>>(),
+            vec![201, 202, 203],
+            "every open order on the coin is cancelled: the sweep has no bot-level filter to \
+             apply, so its caller must not ask for a coin a live bot is quoting"
+        );
     }
 
     /// **Only a confirmed cancel may be reported as cancelled.** The venue answers per item

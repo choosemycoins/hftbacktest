@@ -15,7 +15,10 @@ use hftbacktest::{
 };
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender};
+use tokio::{
+    sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender},
+    task::JoinHandle,
+};
 use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, warn};
 
@@ -25,7 +28,7 @@ use crate::{
         ordermanager::{OrderManager, SharedOrderManager},
         rest::BinanceSpotClient,
     },
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     utils::{ExponentialBackoff, Retry},
 };
 
@@ -369,4 +372,23 @@ impl Connector for BinanceSpot {
             }
         });
     }
+
+    /// **Not implemented for this backend.** See `BinanceFutures::sweep`.
+    fn sweep(
+        &self,
+        symbols: Vec<String>,
+        reason: SweepReason,
+        _tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<()>> {
+        warn!(
+            ?reason,
+            ?symbols,
+            "The Binance Spot backend does not implement a sweep, so these orders are left \
+             resting on the venue."
+        );
+        None
+    }
+
+    /// **Not implemented for this backend.** See `Bybit::shutdown`.
+    fn shutdown(&mut self) {}
 }

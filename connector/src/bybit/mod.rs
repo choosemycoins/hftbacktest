@@ -7,8 +7,11 @@ use std::{
 use hftbacktest::types::{ErrorKind, LiveError, LiveEvent, Order, Value};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender};
-use tracing::error;
+use tokio::{
+    sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender},
+    task::JoinHandle,
+};
+use tracing::{error, warn};
 
 use crate::{
     bybit::{
@@ -17,7 +20,7 @@ use crate::{
         rest::BybitClient,
         trade_stream::OrderOp,
     },
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     utils::{ExponentialBackoff, Retry},
 };
 
@@ -377,4 +380,30 @@ impl Connector for Bybit {
             }
         }
     }
+
+    /// **Not implemented for this backend.** Its own semantics already cover the case this
+    /// exists for from a different direction: `private_stream.rs` calls the venue-side
+    /// `cancel_all_orders` on every subscribe acknowledgement and on every registration, so
+    /// a bot that dies and is restarted finds a clean venue. What it does not cover is the
+    /// window *between* the death and the restart — for that, this needs writing, and
+    /// writing it must not disturb the connect-time sweep that `myhft` depends on.
+    fn sweep(
+        &self,
+        symbols: Vec<String>,
+        reason: SweepReason,
+        _tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<()>> {
+        warn!(
+            ?reason,
+            ?symbols,
+            "The Bybit backend does not implement a sweep, so these orders are left resting. \
+             Its connect-time `cancel_all_orders` clears them when a bot next registers."
+        );
+        None
+    }
+
+    /// **Not implemented for this backend.** Its stream tasks are spawned without a handle
+    /// and loop for ever, so their `PublishEvent` senders live until the process does; the
+    /// orderly stop falls back to its grace deadline and still exits 0.
+    fn shutdown(&mut self) {}
 }

@@ -160,3 +160,69 @@ connect_policy = "reconcile"
 #   ten seconds. Nothing here counts it yet.
 # * Order modify/amend. `Connector` has no `modify` method and `LiveBot::modify` is
 #   `todo!()`, so cancel + submit is the only path.
+
+# --- Supervision (generic; every backend reads these from its own config file) ---------
+#
+# Read by `connector/src/supervision.rs`, not by the backend. Both sections are optional
+# and both default to the protective side.
+
+[shutdown]
+# Cancel the venue orders of every instrument a bot registered, when the connector stops
+# on SIGINT/SIGTERM.
+#
+# ON by default, and that is the fail-closed choice: a connector that is going away cannot
+# manage a resting order, so anything left behind is an unattended market maker until
+# something reconnects and reconciles. Measured on a live testnet session (design note
+# §11.14): a fill landed 3 s after a SIGINT and moved the position.
+#
+# Set false when the connector is restarted underneath a bot that keeps running and its
+# quotes should survive the gap.
+sweep_orders = true
+
+# How long the publish task waits for the backends' stream tasks to let go before it stops
+# anyway, in milliseconds.
+#
+# It does NOT bound the sweep — sweep_timeout_ms does, and the stop waits for the sweep
+# before this starts counting. It used to bound both, which meant a 5 s ceiling on a sweep
+# whose per-symbol allowance is 20 s: a stop could cancel half a grid and still report
+# success.
+#
+# What it costs is the stop time of a backend that never winds its streams down. Only
+# Hyperliquid implements `Connector::shutdown`; on bybit and the two Binance backends the
+# stream tasks loop for ever, so their senders never drop and every stop waits out this
+# deadline in full.
+grace_ms = 5000
+
+# How long the stop may spend cancelling before it gives up on the sweep, in milliseconds.
+#
+# The sweep is sequential over symbols and each one is several venue round trips — the
+# Hyperliquid backend allows itself up to 20 s per symbol — so raise this for many symbols
+# or a slow venue. It exists so a connector cannot hang on SIGTERM against an unreachable
+# venue.
+#
+# Running out is reported loudly AND EXITS NON-ZERO: whatever was not cancelled is still
+# resting on the venue with nothing managing it, which is the failure the sweep exists to
+# prevent, so it is not a clean stop however orderly the rest of it was.
+sweep_timeout_ms = 30000
+
+[bot_liveness]
+# Cancel a bot's orders when the bot stops heartbeating.
+#
+# A bot's orders outlive the bot, and between a bot's death and its supervisor's restart
+# nobody is managing them. `LiveBot` sends `LiveRequest::Heartbeat` from inside `elapse`,
+# so this notices a bot whose event loop has wedged as well as one whose process is gone.
+#
+# ON by default and safe to leave on: a bot is watched only after it has heartbeated at
+# least once, so a bot built before the heartbeat existed is never swept. The connector
+# stays up afterwards for the bot to reconnect to.
+enabled = true
+
+# Silence, in milliseconds, after which a heartbeating bot is presumed dead.
+#
+# What it must clear is the bot's HEARTBEAT INTERVAL (LiveBotBuilder::heartbeat_interval,
+# one second by default), not the duration of its `elapse` calls: a bot blocked waiting for
+# a feed or for its own order response caps each receive at that interval and keeps
+# reporting throughout, so a 60 s `wait_order_response` on a silent feed still heartbeats
+# 60 times. Ten seconds is an order of magnitude of headroom. Too short and a healthy but
+# slow bot has its orders cancelled underneath it.
+timeout_ms = 10000
