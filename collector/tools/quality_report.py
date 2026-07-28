@@ -1223,17 +1223,31 @@ def merge_session_config(records) -> Optional[dict]:
     }
 
 
+#: The collector's **gauges** — `_collector` records that are measurements
+#: rather than events in the recording's life. Three are written on the same
+#: one-minute timer (`main.rs`, the `gauges.tick()` arm: `disk`, `clock`,
+#: `liveness`) and `universe` once at startup.
+#:
+#: Named as a set for two reasons. They are known records, so nothing may treat
+#: one as unrecognised — a gauge the Rust side starts writing must not turn
+#: every recording yellow for the collector doing what it was asked to. And not
+#: one of them may ever join `_EXPLANATORY` below; the assertion that they do
+#: not is a test, because the rule is easy to break by adding a name to the
+#: wrong tuple.
+_GAUGES = ("disk", "clock", "liveness", "universe")
+
 #: The collector's **lifecycle** records — the ones that say something happened
 #: to the recording — most conclusive first. A restart (`session_start`) explains
 #: a hole as surely as a `disconnected` does.
 #:
 #: This tuple is also the whitelist: a `_collector` record whose name is not
-#: here explains nothing. That matters because the sidecar also carries records
-#: that are *measurements*, not events — `disk` is written on a one-minute timer
-#: (`main.rs`, `disk_check.tick()`) and `universe` once at startup. One disk
-#: gauge lands inside every hole longer than a minute no matter what caused it,
-#: so annotating a gap "explained by disk at ..." states only that a minute
-#: passed. It closed investigations that had not happened.
+#: here explains nothing. That matters because the sidecar also carries the
+#: `_GAUGES` above. One `disk` gauge lands inside every hole longer than a
+#: minute no matter what caused it, so annotating a gap "explained by disk
+#: at ..." states only that a minute passed. It closed investigations that had
+#: not happened. The `clock` gauge is the sharpest case of the same rule: an
+#: unsynchronised clock makes a hole's *measurement* doubtful, which is the
+#: opposite of accounting for the hole.
 #:
 #: Fail closed by omission: a `_collector` record added to the Rust side later
 #: will not explain anything until it is named here, and a new gauge silently
@@ -1250,6 +1264,15 @@ _EXPLANATORY = (
     "session_start",
     "subscribe",
     "connected",
+)
+
+# The two tuples must stay disjoint. A measurement that explains a gap is
+# exactly how the minutely disk gauge came to close investigations that had not
+# happened, and the tuples are adjacent — putting a name in the wrong one is a
+# one-line mistake. Checked on import rather than only in a test, so it also
+# holds for anything that imports this module without running the suite.
+assert not set(_GAUGES) & set(_EXPLANATORY), (
+    f"a gauge is listed as explanatory: {sorted(set(_GAUGES) & set(_EXPLANATORY))}"
 )
 
 
@@ -1303,6 +1326,100 @@ def explain_gap(gap: Gap, events) -> Optional[str]:
     # must stay that way: falling back to "whatever was in there" is how the
     # minutely disk gauge came to explain gaps.
     return None
+
+
+def clock_summary(records, day: str) -> Optional[dict]:
+    """What the `clock` gauge said during one UTC day, or `None` if it said
+    nothing.
+
+    The gauge is the kernel's own view of how well `CLOCK_REALTIME` was being
+    disciplined, sampled once a minute (`collector/src/clock.rs`). It exists
+    because the alternative was finding out at assembly time: on 2026-07-27 a
+    host came back from a reboot undisciplined, recorded a full day, and the
+    time policy rejected all of it on a 7.04 ms local-exchange skew.
+
+    Scoped to the day being checked even though sidecars are read across the
+    whole directory — `session_start` is per process, but a clock reading is
+    not, and one bad night must not annotate every day in the directory.
+
+    Three things are deliberately *not* done here.
+
+    A missing `sync` field does not count as unsynchronised: it is what an
+    unsupported platform and a failed syscall both write, and "we did not
+    measure it" is not "it was wrong". Nor does it count towards `samples`,
+    which is the denominator the note quotes — "2 of 4" reads as two healthy
+    readings, and a sample nobody took is not one of those.
+
+    No threshold on `max_error_us` is applied — the collector owns that number
+    (`clock::MAX_ERROR_WARN_US`) and duplicating it here would give two limits
+    that drift apart. A dataset manifest applying its own policy reads the
+    `_meta` records directly; what is summarised here is only what the note
+    needs.
+
+    And `worst_max_error_us` is scoped to the unsynchronised samples, not to the
+    day. `max_error` grows between every poll on a perfectly healthy clock, so a
+    day almost always holds a larger one outside the window — quoting that
+    inside a sentence about the window would attribute an ordinary excursion to
+    the fault.
+    """
+    start_ns, end_ns = day_bounds_ns(day)
+    samples = unsynced = 0
+    first_bad = last_bad = None
+    worst_max_error = None
+    for ts, rec in records:
+        # An undated sidecar line cannot be placed in a day at all. Counting one
+        # would let a record from any day annotate this one.
+        if rec.get("_collector") != "clock" or ts is None:
+            continue
+        if not (start_ns <= ts < end_ns):
+            continue
+        sync = rec.get("sync")
+        if not isinstance(sync, bool):
+            continue
+        samples += 1
+        if sync:
+            continue
+        unsynced += 1
+        max_error = rec.get("max_error_us")
+        if isinstance(max_error, int) and (
+            worst_max_error is None or max_error > worst_max_error
+        ):
+            worst_max_error = max_error
+        if first_bad is None or ts < first_bad:
+            first_bad = ts
+        if last_bad is None or ts > last_bad:
+            last_bad = ts
+    if samples == 0:
+        return None
+    return {
+        "samples": samples,
+        "unsynced_samples": unsynced,
+        "first_unsynced_ts": first_bad,
+        "last_unsynced_ts": last_bad,
+        "worst_max_error_us": worst_max_error,
+    }
+
+
+def clock_detail(clock: dict) -> str:
+    """The note an unsynchronised window gets.
+
+    Informational, and it says what it bears on rather than what it proves. The
+    recording is not corrupt and the venues' own timestamps are untouched; what
+    is in doubt is every `local_ts` stamped inside the window, which is what the
+    cadence, monotonicity and coverage checks are all measured in.
+    """
+    worst = clock["worst_max_error_us"]
+    worst_text = "" if worst is None else f", worst max_error in it {worst} us"
+    return (
+        f"the host clock was unsynchronised (STA_UNSYNC) for "
+        f"{clock['unsynced_samples']} of {clock['samples']} measured minutely "
+        f"sample(s), "
+        f"{iso(clock['first_unsynced_ts'])} .. {iso(clock['last_unsynced_ts'])}"
+        f"{worst_text}. local_ts inside that window is the host's own idea of "
+        f"the time, so any finding there — a cadence gap, a monotonicity step, "
+        f"the coverage bounds — may be the clock rather than the recording. The "
+        f"venue timestamps inside the payloads are unaffected"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +1533,14 @@ def check_day(
             meta_records.extend(read_meta(path))
     events = lifecycle_events(meta_records)
     config = merge_session_config(session_records_for_day(meta_records, day))
+
+    # Raised first so it is read before the findings it qualifies. Yellow and
+    # never red: the recording is not damaged, and which window a skewed clock
+    # invalidates is a policy the Phase 3 builder applies, not one this report
+    # decides.
+    clock = clock_summary(meta_records, day)
+    if clock is not None and clock["unsynced_samples"]:
+        issues.append(issue(YELLOW, "clock_unsynced", clock_detail(clock)))
 
     expected = None
     if config is None:

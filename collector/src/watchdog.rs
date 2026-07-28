@@ -16,9 +16,15 @@
 //! **total silence across every symbol and every stream**. It will not notice:
 //!
 //! * a dead depth stream while trades keep arriving — or the reverse;
-//! * one symbol out of ten that stopped;
 //! * one Hyperliquid cadence stopping while the other two continue;
 //! * a partially accepted subscription, which looks identical to a full one.
+//!
+//! "One symbol out of ten that stopped" was on that list until `liveness.rs`,
+//! which ages each symbol separately off the same [`Source`] and the same
+//! dequeue. It **warns** rather than stopping, because partial silence is
+//! ambiguous in a way total silence is not: a thin symbol in a quiet hour
+//! really can go a minute without a print, and ending a recording over that
+//! would trade one blind spot for a worse one.
 //!
 //! Completeness — did we get what we asked for, on every stream, all day — is
 //! Phase 2's offline report over finished files, not something this process can

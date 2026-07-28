@@ -2475,3 +2475,206 @@ def test_an_absent_premium_index_feed_is_a_fact_and_never_a_warning(tmp_path):
     assert sym["missing_optional"] == []
     assert sym["missing_required"] == []
     assert "premiumIndex" not in sym["coverage"]["required_streams"]
+
+
+# --------------------------------------------------------------------------
+# the collector's host gauges: clock discipline and per-symbol liveness
+# --------------------------------------------------------------------------
+
+
+def clock_ok(max_error_us=16_000, offset_us=-12.0):
+    return {
+        "_collector": "clock",
+        "sync": True,
+        "est_error_us": 400,
+        "max_error_us": max_error_us,
+        "offset_us": offset_us,
+        "freq_ppm": 13.0,
+    }
+
+
+def clock_unsynced(max_error_us=16_000_000):
+    return {
+        "_collector": "clock",
+        "sync": False,
+        "est_error_us": max_error_us,
+        "max_error_us": max_error_us,
+        "offset_us": 0.0,
+        "freq_ppm": 0.0,
+    }
+
+
+def liveness(ages, threshold_s=60):
+    return {"_collector": "liveness", "threshold_s": threshold_s, "ages_s": dict(ages)}
+
+
+def test_the_host_gauges_are_known_records_and_not_unclassified(tmp_path):
+    """A gauge the Rust side started writing must not become a finding by itself.
+
+    The sidecar is not classified the way a symbol file is, so nothing counts
+    these as `unclassified_frame` — this pins that, because the day they *were*
+    routed anywhere near the stream classifier every recording would go yellow
+    for the collector doing exactly what it was asked to.
+    """
+    d = hl_dir(
+        tmp_path,
+        extra_meta=[
+            (ns(60), clock_ok()),
+            (ns(60), liveness({"BTC": 0})),
+            (ns(120), clock_ok()),
+            (ns(120), liveness({"BTC": 1})),
+        ],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    assert checks_of(report, "hyperliquid") == [], (
+        "a healthy day with the host gauges recorded produced findings"
+    )
+
+
+def test_an_unsynchronised_clock_is_a_yellow_note_on_the_day(tmp_path):
+    """The 2026-07-27 incident: a host came back from a reboot undisciplined,
+    recorded a full day, and the skew was only found at assembly time.
+
+    Informational by design. The recording is not corrupt and the venue-side
+    timestamps are unaffected; what the note says is that every `local_ts` in
+    that window is the host's own idea of the time, so a finding inside it may
+    be the clock rather than the recording.
+    """
+    d = hl_dir(
+        tmp_path,
+        extra_meta=[
+            (ns(60), clock_unsynced()),
+            (ns(120), clock_unsynced()),
+            (ns(180), clock_ok()),
+        ],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    note = next(i for i in issues_of(report, "hyperliquid") if i["check"] == "clock_unsynced")
+    assert note["severity"] == "yellow"
+    assert code == 0, "an unsynchronised clock must annotate, not fail the day"
+    assert "2 of 3" in note["detail"], note["detail"]
+    assert qr.iso(ns(60)) in note["detail"], note["detail"]
+    assert qr.iso(ns(120)) in note["detail"], note["detail"]
+    assert "16000000" in note["detail"].replace(",", ""), note["detail"]
+
+
+def test_a_disciplined_clock_says_nothing(tmp_path):
+    """The gauge is written every minute of every recording. A note on a healthy
+    clock would put one on every day there is."""
+    d = hl_dir(tmp_path, extra_meta=[(ns(60), clock_ok()), (ns(120), clock_ok())])
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+
+    assert "clock_unsynced" not in checks_of(report, "hyperliquid")
+
+
+def test_a_clock_the_collector_could_not_measure_is_not_read_as_unsynchronised(tmp_path):
+    """`{"unsupported": true}` off Linux, and `{"error": …}` when the syscall
+    failed, both carry no `sync` field at all.
+
+    "We did not measure it" is not "it was wrong". Reading a missing `sync` as
+    false would yellow every recording made on a dev machine, and a warning
+    that is always there is one nobody reads.
+    """
+    d = hl_dir(
+        tmp_path,
+        extra_meta=[
+            (ns(60), {"_collector": "clock", "unsupported": True, "platform": "macos"}),
+            (ns(120), {"_collector": "clock", "error": "Bad address (os error 14)"}),
+        ],
+    )
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+
+    assert "clock_unsynced" not in checks_of(report, "hyperliquid")
+
+
+def test_an_unsynchronised_clock_on_another_day_does_not_annotate_this_one(tmp_path):
+    """Sidecars are read across the whole directory, because `session_start` is
+    per process. The clock note must still be scoped to the day being checked,
+    or one bad night would annotate every day in the directory."""
+    d = hl_dir(tmp_path, extra_meta=[(ns(86_400 + 60), clock_unsynced())])
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+
+    assert "clock_unsynced" not in checks_of(report, "hyperliquid")
+
+
+@pytest.mark.parametrize("record", [clock_ok(), clock_unsynced(), liveness({"BTC": 300})])
+def test_a_host_gauge_inside_a_gap_does_not_explain_it(tmp_path, record):
+    """Same rule as the disk gauge, for the same reason. These are written on a
+    one-minute timer, so one lands inside every hole longer than a minute
+    whatever caused it. An unsynchronised clock in particular explains nothing:
+    it makes the hole's measurement doubtful, which is the opposite of
+    accounting for it."""
+    d = hl_gapped_day(tmp_path, [(ns(30), record)])
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+
+    gaps = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]["streams"]["bbo"]["gaps"]
+    assert gaps[0]["explained_by"] is None
+
+
+def test_every_host_gauge_is_named_and_none_of_them_explains_anything():
+    """`_GAUGES` is documentation with a test on it: the whole set of
+    `_collector` records that are measurements rather than events, and the
+    assertion that not one of them is allowed to account for a gap."""
+    for gauge in ("disk", "clock", "liveness", "universe"):
+        assert gauge in qr._GAUGES
+        assert gauge not in qr._EXPLANATORY
+
+
+def test_the_note_reports_the_worst_error_inside_the_unsynchronised_window(tmp_path):
+    """The number in the note has to belong to the window the note is about.
+
+    `max_error` grows between every poll on a perfectly healthy clock, so a day
+    almost always holds a larger one somewhere outside the unsynchronised
+    stretch. Reporting the day's worst inside a sentence about that stretch
+    attributes an ordinary excursion to a fault, in a note whose whole purpose
+    is to be the evidence a dataset manifest quotes.
+    """
+    d = hl_dir(
+        tmp_path,
+        extra_meta=[
+            (ns(60), clock_unsynced(max_error_us=250_000)),
+            (ns(120), clock_ok(max_error_us=9_000_000)),
+        ],
+    )
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+
+    note = next(i for i in issues_of(report, "hyperliquid") if i["check"] == "clock_unsynced")
+    assert "250000" in note["detail"].replace(",", ""), note["detail"]
+    assert "9000000" not in note["detail"].replace(",", ""), (
+        f"an excursion measured while the clock was synchronised was reported "
+        f"as the worst error of the unsynchronised window: {note['detail']}"
+    )
+
+
+def test_samples_the_collector_could_not_measure_are_not_counted_as_healthy(tmp_path):
+    """`2 of 4` reads as two good samples when the other two were never
+    measured at all.
+
+    `{"unsupported": true}` and `{"error": …}` carry no `sync`, and the
+    denominator is what tells an operator how much of the day this note covers.
+    Counting an unmeasured sample there understates the fault.
+    """
+    d = hl_dir(
+        tmp_path,
+        extra_meta=[
+            (ns(60), clock_unsynced()),
+            (ns(120), clock_unsynced()),
+            (ns(180), {"_collector": "clock", "unsupported": True, "platform": "macos"}),
+            (ns(240), {"_collector": "clock", "error": "Bad address (os error 14)"}),
+        ],
+    )
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+
+    note = next(i for i in issues_of(report, "hyperliquid") if i["check"] == "clock_unsynced")
+    assert "2 of 2" in note["detail"], note["detail"]

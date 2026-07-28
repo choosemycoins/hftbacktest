@@ -74,6 +74,7 @@ fi
 OPTS=()
 [[ -n "${COLLECTOR_MIN_FREE_GB:-}" ]]  && OPTS+=(--min-free-gb "${COLLECTOR_MIN_FREE_GB}")
 [[ -n "${COLLECTOR_STALL_TIMEOUT_MIN:-}" ]] && OPTS+=(--stall-timeout-min "${COLLECTOR_STALL_TIMEOUT_MIN}")
+[[ -n "${COLLECTOR_LIVENESS_TIMEOUT_S:-}" ]] && OPTS+=(--liveness-timeout-s "${COLLECTOR_LIVENESS_TIMEOUT_S}")
 [[ -n "${COLLECTOR_BYBIT_DEPTHS:-}" ]] && OPTS+=(--bybit-depths "${COLLECTOR_BYBIT_DEPTHS}")
 [[ -n "${COLLECTOR_HL_L2_MODES:-}" ]]  && OPTS+=(--hl-l2-modes "${COLLECTOR_HL_L2_MODES}")
 if [[ "${COLLECTOR_NO_SYMBOL_CHECK:-0}" == "1" ]]; then

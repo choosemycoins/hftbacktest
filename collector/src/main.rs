@@ -17,10 +17,12 @@ mod binance;
 mod binancefuturescm;
 mod binancefuturesum;
 mod bybit;
+mod clock;
 mod disk;
 mod error;
 mod file;
 mod hyperliquid;
+mod liveness;
 mod lock;
 mod meta;
 mod pump;
@@ -102,10 +104,27 @@ struct Args {
     /// lower it once a real quiet-period gap has been measured.
     ///
     /// It only ever catches TOTAL silence: not a dead depth stream while trades
-    /// still arrive, not one symbol of ten that stopped, not one Hyperliquid
-    /// cadence out of three. Sidecar records do not count as data.
+    /// still arrive, not one Hyperliquid cadence out of three. Sidecar records
+    /// do not count as data. One symbol of ten that stopped is
+    /// `--liveness-timeout-s`, which warns rather than stopping.
     #[arg(long, default_value_t = 5)]
     stall_timeout_min: u64,
+
+    /// Warn when one symbol has recorded nothing for this many seconds. `0`
+    /// disables the warning; leave it unset to derive it from the venue.
+    ///
+    /// The per-symbol half of `--stall-timeout-min`, which only ever fires on
+    /// total silence and so cannot see one coin of ten going quiet. It never
+    /// stops the collector: partial silence is ambiguous where total silence is
+    /// not — a thin symbol in a quiet hour really can go a minute without a
+    /// print — so it warns, records, and leaves the decision to the operator.
+    ///
+    /// The default is derived from the slowest feed the venue serves per
+    /// symbol: 60s where a periodic ~1/s per-symbol feed exists (Hyperliquid's
+    /// `activeAssetCtx`, COIN-M's `@markPrice@1s`), 300s where the venue
+    /// records order flow only. See `liveness::default_threshold_s`.
+    #[arg(long)]
+    liveness_timeout_s: Option<u64>,
 
     /// Skip the startup check that every requested symbol exists on the venue.
     ///
@@ -160,6 +179,56 @@ fn drain_backlog(
         written += 1;
     }
     written
+}
+
+/// Writes one of `main`'s own records to the sidecar.
+///
+/// Straight to the `Writer` rather than through `writer_tx`, and that is not an
+/// optimisation: a sender held here would stop `writer_rx.recv()` ever
+/// returning `None`, which is how a dead collection task is noticed. The cost
+/// is that `_meta` is not ordered by `local_ts` while the queue has a backlog —
+/// see `meta.rs`, which documents the same trade for the same reason.
+///
+/// The result is discarded because every caller is either on its way out
+/// already or on a periodic tick whose failure the next write will raise
+/// anyway; a gauge must not be able to end a recording.
+///
+/// It also means none of these records can reach
+/// [`watchdog::StallWatchdog::record_write`]
+/// or [`liveness::LivenessGauge::record_write`], which is what keeps a gauge
+/// from vouching for a feed that has stopped — the trap `watchdog::Source`
+/// documents for the `premiumIndex` poller. Belt and braces: they are filed
+/// under [`file::META_STREAM`], which both of those exclude by name anyway, so
+/// routing this through `writer_tx` some day would break the ownership rule
+/// above long before it disarmed either guard.
+fn write_meta(writer: &mut Writer, record: serde_json::Value) {
+    let _ = writer.write(
+        Utc::now(),
+        file::META_STREAM.to_string(),
+        record.to_string(),
+    );
+}
+
+/// Reports a change in the host clock's discipline, and nothing when there was
+/// none.
+///
+/// One function because the gauge is consulted twice — once at startup and once
+/// a minute after — and the two must say the same thing. The alarm is
+/// edge-triggered inside [`clock::ClockGauge`], so whichever of the two sees the
+/// fault first is the one that reports it.
+fn log_clock_alarm(alarm: Option<clock::Alarm>) {
+    match alarm {
+        // Not fatal. The data is still worth having, and which window a skewed
+        // clock invalidates is a decision for the offline gate — not for a
+        // process that cannot see the day it is halfway through.
+        Some(clock::Alarm::Raised(reason)) => warn!(
+            %reason,
+            "the host clock is not disciplined; local timestamps in this recording may \
+             be rejected downstream"
+        ),
+        Some(clock::Alarm::Cleared) => info!("the host clock is disciplined again"),
+        None => {}
+    }
 }
 
 /// Reports free space, and refuses to continue below the floor.
@@ -322,6 +391,12 @@ async fn main() -> Result<(), anyhow::Error> {
         ))?;
     }
 
+    // Cloned before the backends take ownership. The per-symbol liveness gauge
+    // has to be seeded with what was ASKED for rather than with what arrives:
+    // a symbol whose subscription the venue silently dropped never reaches the
+    // writer at all, and that is the version of the fault worth catching.
+    let requested_symbols = args.symbols.clone();
+
     let collection_task = match args.exchange.as_str() {
         // Two spellings, one backend — but `session_start` above stamps
         // `args.exchange` verbatim, so the recording remembers which word the
@@ -438,11 +513,15 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut shutdown = Shutdown::new()?;
     let mut writer = Writer::new(&args.path, &args.exchange);
 
-    // Sampled rather than checked per write: a statvfs on the hot path would be
-    // a syscall per message. A minute is far shorter than the time it takes to
-    // consume the 5 GB default floor at the observed ~20 MB/day/symbol.
-    let mut disk_check = tokio::time::interval(Duration::from_secs(60));
-    disk_check.tick().await; // the first tick is immediate; startup already checked
+    // One timer for all three gauges. Disk is sampled rather than checked per
+    // write because a statvfs on the hot path would be a syscall per message,
+    // and a minute is far shorter than the time it takes to consume the 5 GB
+    // default floor at the observed ~20 MB/day/symbol. The clock and liveness
+    // gauges share it rather than bringing timers of their own: they are the
+    // same kind of thing — a measurement of the host, not an event — and one
+    // tick keeps a minute's three records together in the sidecar.
+    let mut gauges = tokio::time::interval(Duration::from_secs(60));
+    gauges.tick().await; // the first tick is immediate; startup already checked
 
     // The guard against silent nothing. Armed from here, so a venue that never
     // sends is caught even though not one record ever arrives — see
@@ -459,6 +538,57 @@ async fn main() -> Result<(), anyhow::Error> {
             // reading the journal after an outage needs to know which.
             poller = has_poller,
             "stall watchdog armed on total silence from the venue"
+        );
+    }
+
+    // Is the host clock being disciplined? Sampled on the same tick and written
+    // to the sidecar, so an undisciplined clock is visible in the minute it
+    // happens rather than at assembly time — and so a dataset built from these
+    // files can prove the clock over its own window instead of assuming it. See
+    // `clock.rs` for why this reads `adjtimex(2)` and not chrony.
+    let mut clock_gauge = clock::ClockGauge::new();
+    {
+        let at_startup = clock::sample();
+        match &at_startup {
+            clock::Sample::Kernel(d) => info!(
+                sync = d.synchronized,
+                max_error_us = d.max_error_us,
+                offset_us = d.offset_us,
+                freq_ppm = d.freq_ppm,
+                "clock discipline at startup"
+            ),
+            // Not a warning. It is the expected state off Linux, and the record
+            // says `unsupported` rather than claiming a healthy clock.
+            clock::Sample::Unsupported => info!(
+                platform = std::env::consts::OS,
+                "no adjtimex here; clock discipline will be recorded as unsupported"
+            ),
+            clock::Sample::Unavailable(error) => {
+                warn!(%error, "couldn't read clock discipline")
+            }
+        }
+        // Recorded and judged now rather than at the first tick a minute from
+        // now. The state this gauge exists for — a host that came back from a
+        // reboot with nothing disciplining its clock — is present from the
+        // first second, and a recording that starts and dies inside the minute
+        // would otherwise carry no clock evidence at all.
+        write_meta(&mut writer, clock::record(&at_startup));
+        log_clock_alarm(clock_gauge.observe(&at_startup));
+    }
+
+    // The per-symbol half of the stall watchdog. Seeded with the requested
+    // symbols so one that never arrives is caught, not just one that stops.
+    let liveness_timeout_s = args
+        .liveness_timeout_s
+        .unwrap_or_else(|| liveness::default_threshold_s(&args.exchange));
+    let mut liveness_gauge = liveness::LivenessGauge::new(liveness_timeout_s, &requested_symbols);
+    if liveness_timeout_s == 0 {
+        warn!("per-symbol liveness warning disabled; a single silent symbol will not be reported");
+    } else {
+        info!(
+            seconds = liveness_timeout_s,
+            derived = args.liveness_timeout_s.is_none(),
+            "per-symbol liveness armed"
         );
     }
 
@@ -479,41 +609,52 @@ async fn main() -> Result<(), anyhow::Error> {
                 info!(signal = sig, "shutdown signal received");
                 break;
             }
-            _ = disk_check.tick() => {
+            _ = gauges.tick() => {
+                // The two host gauges first, then disk. Disk is the only one of
+                // the three that can end the recording, and a minute whose
+                // clock and liveness readings were dropped because the disk ran
+                // out is a minute of missing evidence about the very moment
+                // things went wrong.
+                let (clock_record, clock_alarm) = clock_gauge.tick();
+                write_meta(&mut writer, clock_record);
+                // Edge-triggered inside the gauge, so this is once per fault
+                // and not once a minute for as long as one lasts.
+                log_clock_alarm(clock_alarm);
+
+                let (liveness_record, went) = liveness_gauge.sample();
+                write_meta(&mut writer, liveness_record);
+                for transition in went {
+                    match transition {
+                        liveness::Transition::WentQuiet { symbol, age_s } => warn!(
+                            %symbol,
+                            age_s,
+                            threshold_s = liveness_timeout_s,
+                            "nothing has been recorded for this symbol; the socket may be \
+                             up with its subscription silently gone"
+                        ),
+                        liveness::Transition::Resumed { symbol } => {
+                            info!(%symbol, "records are arriving for this symbol again")
+                        }
+                    }
+                }
+
                 match check_disk(&args.path, args.min_free_gb) {
                     Ok(free) => {
                         // Written to the sidecar, not just the log: it makes a
                         // recording carry its own capacity history, and it is
                         // the one file an operator can tail live.
-                        //
-                        // Straight to the writer rather than through
-                        // `writer_tx`: a sender held here would stop
-                        // `writer_rx.recv()` ever returning `None`, which is
-                        // how a dead collection task is noticed. The cost is
-                        // that `_meta` is not ordered by `local_ts` while the
-                        // queue has a backlog — see `meta.rs`.
-                        let _ = writer.write(
-                            Utc::now(),
-                            file::META_STREAM.to_string(),
-                            serde_json::json!({
-                                "_collector": "disk",
-                                "free_bytes": free,
-                                "path": args.path,
-                            })
-                            .to_string(),
-                        );
+                        write_meta(&mut writer, serde_json::json!({
+                            "_collector": "disk",
+                            "free_bytes": free,
+                            "path": args.path,
+                        }));
                     }
                     Err(error) => {
                         error!(%error, "stopping: not enough free disk space");
-                        let _ = writer.write(
-                            Utc::now(),
-                            file::META_STREAM.to_string(),
-                            serde_json::json!({
-                                "_collector": "disk_exhausted",
-                                "error": error.to_string(),
-                            })
-                            .to_string(),
-                        );
+                        write_meta(&mut writer, serde_json::json!({
+                            "_collector": "disk_exhausted",
+                            "error": error.to_string(),
+                        }));
                         fatal = Some(error);
                         break;
                     }
@@ -531,16 +672,11 @@ async fn main() -> Result<(), anyhow::Error> {
                     args.stall_timeout_min
                 );
                 error!(%error, "stopping: no data is reaching disk");
-                let _ = writer.write(
-                    Utc::now(),
-                    file::META_STREAM.to_string(),
-                    serde_json::json!({
-                        "_collector": "stalled",
-                        "silent_for_s": silence.as_secs(),
-                        "stall_timeout_min": args.stall_timeout_min,
-                    })
-                    .to_string(),
-                );
+                write_meta(&mut writer, serde_json::json!({
+                    "_collector": "stalled",
+                    "silent_for_s": silence.as_secs(),
+                    "stall_timeout_min": args.stall_timeout_min,
+                }));
                 fatal = Some(error);
                 break;
             }
@@ -558,15 +694,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 // filing that as an overflow would point Phase 2's gap
                 // attribution at a queue depth that was never reached.
                 error!(event = report.event, reason = report.reason, "stopping: a data hand-off failed");
-                let _ = writer.write(
-                    Utc::now(),
-                    file::META_STREAM.to_string(),
-                    serde_json::json!({
-                        "_collector": report.event,
-                        "error": &report.reason,
-                    })
-                    .to_string(),
-                );
+                write_meta(&mut writer, serde_json::json!({
+                    "_collector": report.event,
+                    "error": &report.reason,
+                }));
                 fatal = Some(anyhow!(report.reason));
                 break;
             }
@@ -581,6 +712,11 @@ async fn main() -> Result<(), anyhow::Error> {
                     // running and none at all about the venue — see
                     // `watchdog::Source` for what conflating the two measured.
                     watchdog.record_write(Source::Collector, &symbol);
+                    // Offered on the same terms and refused for the same
+                    // reason. A `premiumIndex` element is filed under `BTCUSDT`
+                    // exactly as a `bookTicker` frame is, so a gauge that took
+                    // it would report every symbol alive with the socket dead.
+                    liveness_gauge.record_write(Source::Collector, &symbol);
                     if let Err(error) = writer.write(recv_time, symbol, data) {
                         error!(?error, "write error");
                         fatal = Some(error);
@@ -599,6 +735,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     // up behind a stalled writer must not read as life. A write
                     // that then fails ends the loop anyway.
                     watchdog.record_write(Source::Venue, &symbol);
+                    liveness_gauge.record_write(Source::Venue, &symbol);
                     if let Err(error) = writer.write(recv_time, symbol, data) {
                         error!(?error, "write error");
                         fatal = Some(error);
