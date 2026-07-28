@@ -180,4 +180,27 @@ echo "gate-run: checked ${checked} instance(s) for ${DAY}"
 if [[ "${#red[@]}" -gt 0 ]]; then
     echo "gate-run: RED: ${red[*]}" >&2
 fi
+
+# Dead-man heartbeat (healthchecks.io). One successful ping a day attests, in a
+# single bit: host up, volume mounted, recording ran, yesterday validated. A
+# red day hits <url>/fail (instant alert) with the verdict as the body; a
+# could-not-run day sends NOTHING — silence is precisely the signal a dead-man
+# service exists to escalate, and pinging "ok" from a broken gate would defeat
+# it. Best-effort: delivery failure must not change the exit code the alert
+# hook keys on.
+ALERT_ENV=/opt/hft-collector/etc/alert.env
+if [[ -r "${ALERT_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    source "${ALERT_ENV}"
+    if [[ -n "${HEALTHCHECK_PING_URL:-}" ]]; then
+        case "${worst}" in
+            0) curl -fsS -m 10 --retry 2 -o /dev/null "${HEALTHCHECK_PING_URL}" \
+                   || echo "gate-run: heartbeat delivery failed (gate result unaffected)" >&2 ;;
+            1) curl -fsS -m 10 --retry 2 -o /dev/null \
+                   --data-raw "RED ${DAY}: ${red[*]}" "${HEALTHCHECK_PING_URL}/fail" \
+                   || echo "gate-run: fail-ping delivery failed (gate result unaffected)" >&2 ;;
+            *) echo "gate-run: gate could not run; withholding the heartbeat so the dead-man fires" >&2 ;;
+        esac
+    fi
+fi
 exit "${worst}"
