@@ -293,25 +293,27 @@ Bybit/Binance получили шов `serve(write, read)`: `connect` тольк
 
 ```bash
 cargo check --workspace --lib --bins
-cargo test  --workspace --lib --bins      # НЕ --all-targets, см. ниже
+cargo test  --workspace --lib --bins      # см. «Почему всё-таки --lib --bins» ниже
 cargo clippy --workspace --lib --bins
 cargo +nightly fmt                        # именно nightly, см. ниже
 ```
 
-**Почему не `--all-targets`.** Четыре примера в `hftbacktest/examples/` протухли относительно текущего API и **не компилируются**:
+**Примеры починены (2026-07-30) — `--all-targets` снова собирается.** Раньше четыре примера в `hftbacktest/examples/` были протухшими относительно текущего API, и `cargo test --workspace` падал на их сборке, **не запуская ни одного теста**. Это была ловушка: «тесты не собрались» легко принять за «тесты упали». Сейчас `cargo check --workspace --all-targets` зелёный, и этой ловушки больше нет.
 
-| Файл | Ошибка |
-|---|---|
-| `algo.rs` | `E0601: main function not found` — это модуль-хелпер, собираемый как example |
-| `logging_order_latency.rs` | `E0599: no function named builder for LiveBot` |
-| `gridtrading_live_bybit.rs` | `E0599: no method named run for LiveBot` |
-| `custom_evhandling.rs` | `E0599: no method named process_recv_order2 for Local` (сигнатура сменилась на `process_recv_order`) |
+Что было сделано (upstream-протухание, не форк-регрессия):
 
-Поскольку `cargo test --workspace` собирает и примеры, он падает на них и **не запускает ни одного теста**. Это ловушка: «тесты не собрались» легко принять за «тесты упали». Всегда сужай до `--lib --bins`, пока примеры не починены.
+| Файл | Была ошибка | Как починено |
+|---|---|---|
+| `algo.rs` | `E0601: main function not found` — модуль-хелпер, подхватываемый автодискавери как example | Переехал в `examples/common/algo.rs`; подкаталоги без `main.rs` cargo не автодискаверит. Шесть пользователей объявляют его как `#[path = "common/algo.rs"] mod algo;` |
+| `logging_order_latency.rs` | `E0599: no function named builder for LiveBot` | `LiveBotBuilder::new()` + `.register(Instrument::new(..))` |
+| `gridtrading_live_bybit.rs` | `E0599: no method named run for LiveBot` | Отдельного шага старта больше нет: бот драйвится циклом стратегии через `elapse` |
+| `custom_evhandling.rs` | `E0599: no method named process_recv_order2 for Local` | `process_recv_order_::<true, _>(..)` — хендлер включается const-генериком |
 
-Это upstream-протухание, а не форк-регрессия. Починить их — хорошая отдельная задача.
+**Почему всё-таки `--lib --bins` для рутинных прогонов.** Примеры не дают ни одного теста, а собираются заметно дольше. Узкий вариант — быстрее и ровно так же информативен. `--all-targets` имеет смысл гонять, когда трогаешь публичный API: именно примеры ловят его слом снаружи, и именно так они протухли в прошлый раз.
 
-- **Форматирование требует nightly.** Все опции в `rustfmt.toml` (`imports_layout`, `imports_granularity`, `group_imports`) — nightly-only. Stable rustfmt их молча игнорирует и выдаёт ~53 ложных диффа на весь репозиторий; `cargo fmt --check` на stable — **бесполезный сигнал**. На nightly реальных расхождений сейчас 5.
+Единственный `mod algo;` в дереве, который **не** переехал, — копия грида внутри `gridtrading_live_hyperliquid.rs`: она намеренно скопирована, а не расшарена (см. doc-комментарий там же).
+
+- **Форматирование требует nightly.** Все опции в `rustfmt.toml` (`imports_layout`, `imports_granularity`, `group_imports`) — nightly-only. Stable rustfmt их молча игнорирует и выдаёт ~53 ложных диффа на весь репозиторий; `cargo fmt --check` на stable — **бесполезный сигнал**. На nightly расхождений сейчас 0 (последнее, `fuse.rs`, снято 2026-07-30).
 - **`-D warnings` в этом репозитории недостижим.** Базовый уровень — ~89 предупреждений clippy/rustc (`result_large_err` ×22, `large_enum_variant` ×5, `dead_code`, `unused_variables` и т. д.). Требование к задаче — **не добавлять новых** предупреждений в тронутых файлах, а не обнулить счётчик.
 - `edition = "2024"`, MSRV `1.90` (объявлен только в `hftbacktest/Cargo.toml`). `rust-toolchain.toml` в репозитории **нет**.
 - Профиль для профилирования — `release-with-debug`.

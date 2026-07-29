@@ -12,6 +12,7 @@ use hftbacktest::{
 };
 use tracing::error;
 
+#[path = "common/algo.rs"]
 mod algo;
 
 const ORDER_PREFIX: &str = "prefix";

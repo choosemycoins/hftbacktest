@@ -11,6 +11,7 @@ use hftbacktest::{
 };
 use tracing::error;
 
+#[path = "common/algo.rs"]
 mod algo;
 
 const ORDER_PREFIX: &str = "prefix";
@@ -46,7 +47,8 @@ fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
         .build()
         .unwrap();
 
-    hbt.run().unwrap();
+    // There is no separate start step: `build` connects, and the strategy loop below drives
+    // the bot by calling `elapse`.
     hbt
 }
 

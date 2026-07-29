@@ -151,7 +151,7 @@ where
     Ok(false)
 }
 
-/// The grid from `examples/algo.rs`, kept deliberately close to it so the two can be
+/// The grid from `examples/common/algo.rs`, kept deliberately close to it so the two can be
 /// diffed, with the elapse interval taken as an argument instead of hardcoded at 100 ms.
 ///
 /// It is copied rather than shared because `algo.rs` is what the *backtest* examples run,

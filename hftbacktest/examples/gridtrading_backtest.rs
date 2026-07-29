@@ -18,6 +18,7 @@ use hftbacktest::{
     prelude::{ApplySnapshot, Bot, HashMapMarketDepth},
 };
 
+#[path = "common/algo.rs"]
 mod algo;
 
 fn prepare_backtest() -> Backtest<HashMapMarketDepth> {

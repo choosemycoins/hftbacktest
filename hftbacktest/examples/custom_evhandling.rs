@@ -21,7 +21,7 @@ use hftbacktest::{
         state::State,
     },
     depth::{HashMapMarketDepth, L2MarketDepth, MarketDepth},
-    prelude::{Bot, Event, OrdType, Order, OrderId, Side, StateValues, TimeInForce},
+    prelude::{Event, OrdType, Order, OrderId, Side, StateValues, TimeInForce},
 };
 
 /// Handling tick events and order response events through the event handler approach requires
@@ -141,11 +141,13 @@ where
         timestamp: i64,
         wait_resp_order_id: Option<OrderId>,
     ) -> Result<bool, BacktestError> {
-        let result = self
-            .local
-            .process_recv_order2(timestamp, wait_resp_order_id, |order| {
-                // todo: Implement logic for handling order response events.
-            })?;
+        // The const generic turns the handler on; `Local`'s own `Processor` impl calls this
+        // with `false` and an empty closure.
+        let result =
+            self.local
+                .process_recv_order_::<true, _>(timestamp, wait_resp_order_id, |_order| {
+                    // todo: Implement logic for handling order response events.
+                })?;
         Ok(result)
     }
 
