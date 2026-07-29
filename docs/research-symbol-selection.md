@@ -2,64 +2,64 @@
 
 Статус: Research note, 2026-07-29 — **скрин, не бэктест**
 Связано: `docs/design-multi-venue-collection.md` (режим A — каждому кандидату нужна UM-пара),
-`docs/design-hyperliquid-connector.md` §5.3 (5-significant-figures — источник тик-эффекта из §2.1)
+`docs/design-hyperliquid-connector.md` §5.3 (5 значащих цифр — источник тик-эффекта из §2.1)
 Постановка (заказчик): инструменты с живым потоком, но без Wintermute-класса профессионального
 маркет-мейкинга — «и чтобы не полтора бомжа в стакане».
 
-**Status: DRAFT. Nothing here is backtested.** This is a one-snapshot screen whose purpose is to pick
-*what to record*, not what to trade. The deploy decision comes after the recording run in §9.
+**Статус: ЧЕРНОВИК. Ничто здесь не бэктестировано.** Это скрин по одному снапшоту, задача которого —
+выбрать, *что записывать*, а не что торговать. Решение о деплое принимается после записи из §9.
 
-Date: 2026-07-29. Inputs: METRICS agent (`metrics.json`, 232 coins swept / 87 sampled) and
-MM-LANDSCAPE agent (`landscape.md`). Two additional measurements were derived here — see §2.
+Дата: 2026-07-29. Входы: агент METRICS (`metrics.json`, 232 монеты просмотрены / 87 отсэмплированы) и
+агент MM-LANDSCAPE (`landscape.md`). Два дополнительных измерения получены здесь — см. §2.
 
 ---
 
 ## 1. TL;DR
 
-**Shortlist (13).** Ranked: **VVV, JTO, GRAM, ZRO, PENDLE, AERO, CRV, NEAR, DOT, ONDO, KAITO, INJ, ETHFI**.
+**Шортлист (13).** По убыванию: **VVV, JTO, GRAM, ZRO, PENDLE, AERO, CRV, NEAR, DOT, ONDO, KAITO, INJ, ETHFI**.
 
-**Current set: 4 of 10 survive.** Keep **JTO, PENDLE, ONDO, INJ**. Drop **SUI, HYPE, xyz:GOLD, ENA**
-(all four are in professionally-pinned books; SUI/HYPE/xyz:GOLD are the three most saturated instruments
-in the entire sample). Park **SEI, TIA** — good book shape, no tape.
+**Текущий набор: выживают 4 из 10.** Оставить **JTO, PENDLE, ONDO, INJ**. Убрать **SUI, HYPE, xyz:GOLD, ENA**
+(все четыре — в стаканах, прижатых профессионалами; SUI/HYPE/xyz:GOLD — три самых насыщенных инструмента
+во всей выборке). Припарковать **SEI, TIA** — хорошая форма стакана, но нет ленты.
 
-**The finding that reorders everything:** the brief's `spread_bps >= 2` filter does not mean what it
-looks like. Hyperliquid quantises perp prices to 5 significant figures, so the *tick itself* is worth
-0.12–5.0 bps depending on the coin. Half the metrics agent's "wide spread" A_strict tier — PUMP, kPEPE,
-kSHIB, kBONK — is not wide at all: those books sit at **exactly one tick**, the tightest state the venue
-permits, with 5–13 professional orders stacked at the touch. Their bps number is a tick artifact.
-Conversely ZRO and DOT look tight at 1.94/1.96 bps but are **15–16 ticks wide** with a single $250 order
-at the touch. Spread in *ticks* is the saturation measure; spread in *bps* is the revenue measure. You
-need both, and the brief only had one.
+**Находка, которая переупорядочивает всё:** фильтр `spread_bps >= 2` из постановки означает не то, чем
+кажется. Hyperliquid квантует цены перпов до 5 значащих цифр, поэтому *сам тик* стоит 0.12–5.0 б.п. в
+зависимости от монеты. Половина «широкоспредового» яруса A_strict у METRICS-агента — PUMP, kPEPE,
+kSHIB, kBONK — вовсе не широкая: эти стаканы стоят **ровно в один тик**, самое узкое состояние, которое
+площадка вообще допускает, с 5–13 профессиональными ордерами, сложенными на лучшей цене. Их число в б.п. —
+артефакт тика. И наоборот: ZRO и DOT выглядят узкими на 1.94/1.96 б.п., но это **15–16 тиков** ширины с
+единственным ордером на $250 на лучшей цене. Спред в *тиках* — мера насыщенности; спред в *б.п.* — мера
+дохода. Нужны обе, а в постановке была только одна.
 
 ---
 
-## 2. What this synthesis adds to its inputs
+## 2. Что этот синтез добавляет к своим входам
 
-Two measurements not present in either input document.
+Два измерения, которых нет ни в одном из входных документов.
 
-### 2.1 Tick reconstruction → `spread_ticks`
+### 2.1 Реконструкция тика → `spread_ticks`
 
-HL perp prices allow at most 5 significant figures and at most `6 − szDecimals` decimals, so
+Цены перпов HL допускают максимум 5 значащих цифр и максимум `6 − szDecimals` знаков после запятой, поэтому
 
 ```
 tick = max(10^-(6 - szDecimals), 10^(floor(log10(px)) - 4))
 spread_ticks = spread_bps_median / (tick / px * 1e4)
 ```
 
-**Validation:** across all 87 sampled coins the resulting `spread_ticks` lands within 0.05 of an integer
-for **98.9%** of them, median deviation exactly **0.000**. A wrong tick model would not produce integers.
-This is strong evidence the reconstruction is right, but it is a reconstruction from documented price
-rules, not a field read from the API — confirm before it drives sizing.
+**Валидация:** по всем 87 отсэмплированным монетам получившийся `spread_ticks` попадает в пределы 0.05 от
+целого числа у **98.9%** из них, медианное отклонение — ровно **0.000**. Неверная модель тика целых чисел бы
+не дала. Это сильное свидетельство, что реконструкция верна, но это реконструкция из документированных
+правил цены, а не поле из API — перед тем как считать по ней размер позиции, подтверди.
 
-Why it matters: `spread_ticks == 1` means *nobody can quote tighter*. That is maximum maker competition
-by definition, and it is invisible in the bps column.
+Почему это важно: `spread_ticks == 1` означает, что *котировать уже некуда*. Это максимальная конкуренция
+мейкеров по определению, и в колонке б.п. её не видно.
 
-### 2.2 Touch-queue contention (measured, deliberately unscored)
+### 2.2 Конкуренция в очереди на лучшей цене (измерено, намеренно не в скоринге)
 
-The raw 20-level books carry `[price, size, n_orders]`. Median across the 7 samples of the order count
-and USD size resting at the best bid/ask:
+Сырые 20-уровневые стаканы несут `[price, size, n_orders]`. Медиана по 7 замерам числа ордеров и объёма
+в USD, стоящих на лучшем биде/аске:
 
-| | touch orders | touch USD |
+| | ордеров на таче | USD на таче |
 |---|---|---|
 | ETH | 23.0 | $121,651 |
 | BTC | 18.5 | $272,793 |
@@ -70,94 +70,101 @@ and USD size resting at the best bid/ask:
 | **xyz:GOLD** | **5.0** | **$16,354** |
 | **HYPE** | **2.5** | **$9,729** |
 | NEAR | 2.5 | $1,843 |
-| **shortlist (VVV, JTO, ZRO, AERO, DOT, INJ, CRV…)** | **1.0–2.0** | **$241–$589** |
+| **шортлист (VVV, JTO, ZRO, AERO, DOT, INJ, CRV…)** | **1.0–2.0** | **$241–$589** |
 
-In every shortlist book the front of the queue is **one or two orders of roughly $250**. That is the
-operational answer to "can a small passive grid ever be the best bid?" — here, yes; in PUMP or kPEPE, no.
+В каждом стакане шортлиста голова очереди — **один-два ордера примерно по $250**. Это и есть
+операционный ответ на вопрос «может ли маленький пассивный грид вообще быть лучшим бидом?» — здесь да;
+в PUMP или kPEPE — нет.
 
-This metric is **not** part of the score. It is held out as an independent check, and it corroborates the
-ranking without having influenced it.
+Эта метрика **не** входит в скор. Она удержана как независимая проверка — и она подтверждает ранжирование,
+не повлияв на него.
 
-### 2.3 HL-vs-Binance notional ratio (resolves an open question in `landscape.md`)
+### 2.3 Отношение оборота HL/Binance (закрывает открытый вопрос из `landscape.md`)
 
-`landscape.md` §6.7 names the Mode-A tension and says the best available mitigation is "prefer coins where
-HL volume is comparable to or exceeds the Binance perp" — but could not measure it. Fetched
-`fapi/v1/ticker/24hr`, closeTime **2026-07-28T22:32:04Z**, ten minutes after the HL snapshot at
-**22:21:56Z**, so the windows are directly comparable.
+`landscape.md` §6.7 называет напряжение режима A и говорит, что лучшая доступная митигация — «предпочитать
+монеты, где объём HL сопоставим с перпом Binance или превышает его», — но измерить это не смог. Забрал
+`fapi/v1/ticker/24hr`, closeTime **2026-07-28T22:32:04Z**, через десять минут после снапшота HL в
+**22:21:56Z**, так что окна прямо сопоставимы.
 
-Binance is **4×–40× larger than HL on almost every alt perp**. Range across the shortlist: HYPE 0.74
-(highest anywhere), VVV 0.38, GRAM 0.34, ZRO 0.23, CRV 0.19 … INJ 0.048, **DOT 0.036** (lowest in the
-shortlist), TIA 0.026 (lowest in the current set). Low ratio = HL is decisively the lagging venue =
-your resting quote is the designated stale liquidity for IOC arbitrageurs. This is scored at 12 points.
+Binance **в 4–40 раз больше HL почти по каждому альт-перпу**. Диапазон по шортлисту: HYPE 0.74
+(максимум вообще), VVV 0.38, GRAM 0.34, ZRO 0.23, CRV 0.19 … INJ 0.048, **DOT 0.036** (минимум в
+шортлисте), TIA 0.026 (минимум в текущем наборе). Низкое отношение = HL — решительно отстающая площадка =
+твоя пассивная котировка — назначенная протухшая ликвидность (stale liquidity) для IOC-арбитражёров.
+В скоре это весит 12 баллов.
 
 ---
 
-## 3. Methodology
+## 3. Методология
 
-### 3.1 Data provenance
+### 3.1 Происхождение данных
 
-| Item | Source | Timestamp | Reliability |
+| Что | Источник | Метка времени | Надёжность |
 |---|---|---|---|
-| volume / OI / funding / day return | HL `metaAndAssetCtxs` | 2026-07-28T22:21:56Z, single reading | point estimate |
-| spread, depth, touch queue | HL `l2Book`, **7 samples ~35 s apart over ~4 min** | same window | median of 7 |
-| Binance UM pair existence | `fapi/v1/exchangeInfo` | 2026-07-28 | reliable |
-| Binance UM 24h notional | `fapi/v1/ticker/24hr` | 2026-07-28T22:32:04Z | point estimate |
-| Lighter listings | Lighter `orderBooks` | 2026-07-28 | reliable, 227 books / 209 active |
-| MM landscape | published sources | research 2026-07-29 | **inferential — see §8.4** |
-| tick, spread_ticks, touch queue | derived here from the above | — | §2.1 validated |
+| объём / OI / фандинг / дневной ход | HL `metaAndAssetCtxs` | 2026-07-28T22:21:56Z, одно чтение | точечная оценка |
+| спред, глубина, очередь на таче | HL `l2Book`, **7 замеров с шагом ~35 с за ~4 мин** | то же окно | медиана 7 замеров |
+| существование UM-пары Binance | `fapi/v1/exchangeInfo` | 2026-07-28 | надёжно |
+| 24h-оборот Binance UM | `fapi/v1/ticker/24hr` | 2026-07-28T22:32:04Z | точечная оценка |
+| листинги Lighter | Lighter `orderBooks` | 2026-07-28 | надёжно, 227 стаканов / 209 активных |
+| MM-ландшафт | публичные источники | ресёрч 2026-07-29 | **выводное — см. §8.4** |
+| тик, spread_ticks, очередь на таче | выведено здесь из вышеперечисленного | — | §2.1 валидировано |
 
-Coverage: 232 canonical perps swept for volume/OI/funding; **87 sampled for book metrics** (top 85 by
-volume ∪ current set ∪ xyz:GOLD). 55 of the 232 carry an upstream `isDelisted` flag and were not sampled.
+Покрытие: 232 канонических перпа просмотрены по объёму/OI/фандингу; **87 отсэмплированы по метрикам
+стакана** (топ-85 по объёму ∪ текущий набор ∪ xyz:GOLD). 55 из 232 несут апстримный флаг `isDelisted`
+и не сэмплировались.
 
-### 3.2 Gates — and why each one
+### 3.2 Гейты — и зачем каждый
 
-A coin failing any gate is **demoted with the failing gate named**, never silently dropped.
+Монета, провалившая любой гейт, **понижается с указанием имени проваленного гейта**, а не выбрасывается
+молча.
 
-| Gate | Why |
+| Гейт | Зачем |
 |---|---|
-| `vol_usd >= $1M` | The "не полтора бомжа" floor. Relaxed from the brief's $5M because the sample day was abnormally quiet — only 33 of 232 coins cleared $3M. Under the brief's own $5M floor the shortlist would be 3 coins. |
-| `spread_bps_median >= 1.9` | HL base maker fee is 0.015%/side = **3.0 bps round trip**. Below ~2 bps the touch is not worth crossing the fee floor, and — more importantly — a sub-2 bps book is a book someone is working. 1.9 not 2.0 to avoid a knife-edge; CRV (1.881) and NEAR (1.808) are admitted as conditional and flagged. |
-| `spread_ticks >= 3` | §2.1. A 1–2 tick book is at or next to the venue minimum: maximum maker competition, long FIFO queues. This is the gate that removes PUMP/kPEPE/kSHIB/kBONK/ZEC. |
-| `depth_10bps_min_side >= $2,500` | The dead-book trap. CASHCAT posts $5.76M/day nominal volume with **$0** resting within 10 bps on either side. Nominal volume cannot catch that; this can. |
-| Binance UM pair exists | Mode-A signal feed. Only 3 of 87 sampled coins fail: xyz:GOLD, CASHCAT, and VINE (UM contract exists but status is `SETTLING`, i.e. being delisted). |
-| not hard-blacklisted | CME regulated futures listed **or** live US spot ETF. Both create a permanent professional hedging/creation-redemption loop. |
+| `vol_usd >= $1M` | Пол «не полтора бомжа». Ослаблен относительно $5M из постановки, потому что день выборки был аномально тихим — лишь 33 из 232 монет перешагнули $3M. С полом $5M из самой постановки шортлист состоял бы из 3 монет. |
+| `spread_bps_median >= 1.9` | Базовая мейкерская комиссия HL — 0.015% за сторону = **3.0 б.п. за круг**. Ниже ~2 б.п. лучшая цена не отбивает комиссионный пол, и — важнее — стакан уже 2 б.п. — это стакан, который кто-то делает. 1.9, а не 2.0 — чтобы не резать по лезвию; CRV (1.881) и NEAR (1.808) впущены как условные и помечены. |
+| `spread_ticks >= 3` | §2.1. Стакан в 1–2 тика — на минимуме площадки или рядом: максимальная конкуренция мейкеров, длинные FIFO-очереди. Именно этот гейт убирает PUMP/kPEPE/kSHIB/kBONK/ZEC. |
+| `depth_10bps_min_side >= $2,500` | Ловушка мёртвого стакана. CASHCAT показывает $5.76M/сутки номинального объёма при **$0** пассивной ликвидности в пределах 10 б.п. с обеих сторон. Номинальный объём такое не ловит; этот гейт ловит. |
+| UM-пара Binance существует | Сигнальный фид режима A. Проваливают лишь 3 из 87 отсэмплированных: xyz:GOLD, CASHCAT и VINE (UM-контракт существует, но в статусе `SETTLING`, т.е. делистится). |
+| не в жёстком чёрном списке | Листингованные регулируемые фьючерсы CME **или** живой US spot ETF. И то и другое создаёт постоянный профессиональный контур хеджирования / создания-погашения. |
 
-### 3.3 Score components (base 0–100)
+### 3.3 Компоненты скоринга (база 0–100)
 
-| Component | w | Shape | Rationale |
+| Компонента | w | Форма | Обоснование |
 |---|---|---|---|
-| `slack` = spread_ticks | 16 | 1→0.0, 5→0.70, 9–16→1.0, 22→0.85, 35+→decay | saturation. Decays at the top: 35+ ticks is a dead book, not a slack one. |
-| `spread` = spread_bps | 20 | 1.3→0.08, 1.9→0.30, 3–6→0.78–1.0, 14+→decay | revenue vs the 3.0 bps fee floor. Decays high: a 20 bps spread means nobody is there. |
-| `flow` = vol_usd | 17 | $0.5M→0, $5M–$60M→1.0, $150M→0.70, $400M→0.15 | the brief's $5–150M band, log-scaled, with a soft rather than hard cap. |
-| `hlshare` = HL/UM | 12 | 0.03→0.10, 0.15→0.60, 0.30+→0.90–1.0 | §2.3. Mode-A stale-liquidity exposure. |
-| `depth` = d10 min side | 12 | $1.5k→0.30, $8k–$60k→1.0, $150k→0.55, $400k→0.20 | two-sided: too little is a dead book, too much is a wall you queue behind. |
-| `vpd` = vol / d10 | 9 | 30→0.35, 300→1.0, 2500→0.60 | flow per unit of crowding. **Clamped to ≤30 where d10 < $1.5k** — a ratio built on an empty book is meaningless, not excellent. |
-| `vol` = day_abs_ret | 9 | 0.8%→0.30, 3–7%→1.0, 16%→0.25 | a grid needs traversal; too much is inventory risk. |
-| `oiv` = OI/vol | 5 | 1.5–5→1.0, 8→0.55, 12+→decay | positioning vs turnover. |
+| `slack` = spread_ticks | 16 | 1→0.0, 5→0.70, 9–16→1.0, 22→0.85, 35+→спад | насыщенность. Спад сверху: 35+ тиков — мёртвый стакан, а не свободный. |
+| `spread` = spread_bps | 20 | 1.3→0.08, 1.9→0.30, 3–6→0.78–1.0, 14+→спад | доход против комиссионного пола 3.0 б.п. Спад сверху: спред 20 б.п. значит, что там никого нет. |
+| `flow` = vol_usd | 17 | $0.5M→0, $5M–$60M→1.0, $150M→0.70, $400M→0.15 | полоса $5–150M из постановки, лог-шкала, с мягкой, а не жёсткой крышкой. |
+| `hlshare` = HL/UM | 12 | 0.03→0.10, 0.15→0.60, 0.30+→0.90–1.0 | §2.3. Экспозиция на протухшую ликвидность в режиме A. |
+| `depth` = d10 min side | 12 | $1.5k→0.30, $8k–$60k→1.0, $150k→0.55, $400k→0.20 | двусторонняя: слишком мало — мёртвый стакан, слишком много — стена, за которой стоишь в очереди. |
+| `vpd` = vol / d10 | 9 | 30→0.35, 300→1.0, 2500→0.60 | поток на единицу толкучки. **Зажат до ≤30 при d10 < $1.5k** — отношение, построенное на пустом стакане, бессмысленно, а не превосходно. |
+| `vol` = day_abs_ret | 9 | 0.8%→0.30, 3–7%→1.0, 16%→0.25 | гриду нужен проход по сетке; слишком много — инвентарный риск. |
+| `oiv` = OI/vol | 5 | 1.5–5→1.0, 8→0.55, 12+→спад | позиционирование против оборота. |
 
-### 3.4 Landscape adjustments (additive, −44 … +17)
+### 3.4 Поправки за ландшафт (аддитивные, −44 … +17)
 
-Deliberately capped well below the metric base, per `landscape.md`'s own caveat §6.2 that mandate
-evidence is *CEX-spot-shaped* and should be weighted below measured book behaviour.
+Намеренно ограничены заметно ниже метрической базы — по собственной оговорке `landscape.md` §6.2, что
+свидетельства о мандатах имеют *CEX-спотовую природу* и должны весить меньше измеренного поведения
+стакана.
 
-`−32` CME futures · `−30/−26` live US spot ETF · `−14` no UM pair · `−10` documented tier-1 mandate ·
-`−10` HIP-3 builder dex · `−8` cross-firm consensus set · `−8` ETF filed · `−7` inside 0–18mo mandate
-window · `−6` named in tier-1 supported set · `−4` TGE date unknown · `−4` recent foundation raise
-(re-arm risk) · `−3` low-confidence MM claim · `+3` Lighter listed · `+3` funding off the 1.00 bps/8h
-baseline · `+4` spread widened during sampling · `+4` retail catalyst · `+3/+6` mandate window expired.
+`−32` фьючерсы CME · `−30/−26` живой US spot ETF · `−14` нет UM-пары · `−10` документированный мандат
+tier-1 · `−10` HIP-3 builder dex · `−8` межфирменный консенсусный набор · `−8` поданная заявка на ETF ·
+`−7` внутри окна мандата 0–18 мес · `−6` назван в поддерживаемом наборе tier-1 · `−4` дата TGE неизвестна ·
+`−4` недавний раунд фонда (риск перезарядки мандата) · `−3` MM-утверждение низкой достоверности ·
+`+3` листингован на Lighter · `+3` фандинг вне базовой линии 1.00 б.п./8ч · `+4` спред расширился во время
+сэмплирования · `+4` розничный катализатор · `+3/+6` окно мандата истекло.
 
-**One correction to the input:** `landscape.md` is internally inconsistent on SUI — §4.2 omits it from
-the live-ETF list while §5 and the blacklist both cite 21Shares TSUI live on Nasdaq from 2026-02-24.
-Took the specific sourced claim. SUI therefore carries both CME and live-ETF penalties.
+**Одна поправка ко входу:** `landscape.md` внутренне противоречив по SUI — §4.2 не включает его в список
+живых ETF, тогда как §5 и чёрный список оба ссылаются на 21Shares TSUI, живой на Nasdaq с 2026-02-24.
+Взято конкретное утверждение с источником. Поэтому SUI несёт оба штрафа — и CME, и живой ETF.
 
 ---
 
-## 4. Shortlist
+## 4. Шортлист
 
-`ticks` = §2.1 · `d10`/`d25` = min-side USD resting within 10/25 bps · `touch` = median USD at best
-bid/ask · `HL/UM` = §2.3 · **CORE** = passes all gates · **COND** = one named gate miss.
+`ticks` = §2.1 · `d10`/`d25` = USD на меньшей стороне в пределах 10/25 б.п. · `touch` = медианный USD на
+лучшем биде/аске · `HL/UM` = §2.3 · **CORE** = проходит все гейты · **COND** = один поименованный провал
+гейта.
 
-| # | Coin | Score | Tier | HL vol | UM vol | HL/UM | spread | ticks | touch | d10 | d25 | day% | UM pair | Lighter |
+| # | Монета | Балл | Ярус | Объём HL | Объём UM | HL/UM | спред | тики | тач | d10 | d25 | день% | UM-пара | Lighter |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | **VVV** | 91.2 | CORE | $7.75M | $20.2M | 0.38 | 4.54 | 6 | $250 | $2.9k | $15.4k | 1.79 | VVVUSDT | VVV#69 |
 | 2 | **JTO** | 90.5 | CORE | $1.85M | $14.6M | 0.13 | 2.22 | 12 | $250 | $6.6k | $51.2k | 6.25 | JTOUSDT | JTO#134 |
@@ -170,242 +177,255 @@ bid/ask · `HL/UM` = §2.3 · **CORE** = passes all gates · **COND** = one name
 | 9 | **DOT** | 76.0 | CORE | $2.04M | $56.3M | 0.036 | 1.96 | 15 | $250 | $21.1k | $21.1k | 2.03 | DOTUSDT | DOT#11 |
 | 10 | **ONDO** | 75.1 | CORE | $9.95M | $86.8M | 0.11 | 1.96 | 8 | $434 | $23.0k | $25.1k | 2.41 | ONDOUSDT | ONDO#38 |
 | 11 | **KAITO** | 73.2 | COND | $15.6M | $131M | 0.12 | 4.19 | 5 | $364 | **$1.3k** | $61.0k | 9.46 | KAITOUSDT | KAITO#33 |
-| 12 | **INJ** | 71.6 | CORE | $1.30M | $27.1M | 0.048 | 3.05 | 14 | $314 | $16.0k | $22.3k | 4.06 | INJUSDT | **none** |
+| 12 | **INJ** | 71.6 | CORE | $1.30M | $27.1M | 0.048 | 3.05 | 14 | $314 | $16.0k | $22.3k | 4.06 | INJUSDT | **нет** |
 | 13 | **ETHFI** | 63.6 | CORE | $1.19M | $12.3M | 0.10 | 4.08 | 17 | $250 | $12.3k | $23.1k | **0.09** | ETHFIUSDT | ETHFI#64 |
 
-### Per-coin rationale
+### Обоснование по монетам
 
-**1. VVV — 91.2.** $7.75M/day squarely in the target band and HL carries 38% of the VVV/Binance pair, the
-second-best cross-venue ratio in the shortlist — this is not a pure lagging venue. Book is 6 ticks wide at
-4.54 bps with a single $250 order at the touch: a small grid can hold front-of-queue.
-No CME, no ETF, no named tier-1 mandate anywhere in the research.
-*Risks:* thinnest book of the CORE group ($2.9k min side within 10 bps) — price will gap through rungs,
-so size down and widen spacing. Venice AI TGE ~Jan 2025 → ~18 months, right at the mandate-window edge.
+**1. VVV — 91.2.** $7.75M/сутки точно в целевой полосе, и HL несёт 38% пары VVV/Binance — второе лучшее
+межплощадочное отношение в шортлисте; это не чисто отстающая площадка. Стакан 6 тиков шириной при
+4.54 б.п. с единственным ордером $250 на таче: маленький грид может держать голову очереди.
+Ни CME, ни ETF, ни поименованного мандата tier-1 нигде в ресёрче.
+*Риски:* самый тонкий стакан в группе CORE ($2.9k на меньшей стороне в пределах 10 б.п.) — цена будет
+прошивать ступени сетки насквозь, поэтому уменьшай размер и расширяй шаг. TGE Venice AI ~январь 2025 →
+~18 месяцев, ровно на краю окна мандата.
 
-**2. JTO — 90.5.** The best-shaped book in the set: $250 and one order at the touch, but $51.2k by 25 bps —
-shallow where you quote, deep where you need the market to not run away. 12 ticks of slack at 2.22 bps,
-6.25% daily range. 31 months post-TGE, no CME/ETF/mandate; JTX self-custody terminal (public July 2026) is
-a genuine retail, spread-crossing catalyst.
-*Risks:* **rank is landscape-driven.** Base metric score is 73.5; +17 of adjustment (Lighter, expired
-mandate, retail catalyst, spread widening) carries it to #2. Volume is the weak leg at $1.85M/day.
+**2. JTO — 90.5.** Лучшая форма стакана в наборе: $250 и один ордер на таче, но $51.2k к 25 б.п. — мелко
+там, где котируешь, глубоко там, где нужно, чтобы рынок не убежал. 12 тиков запаса при 2.22 б.п., дневной
+ход 6.25%. 31 месяц после TGE, ни CME/ETF/мандата; терминал самокастоди JTX (публичен с июля 2026) —
+настоящий розничный катализатор, кроссящий спред.
+*Риски:* **ранг сделан ландшафтом.** Базовый метрический балл — 73.5; +17 поправок (Lighter, истёкший
+мандат, розничный катализатор, расширение спреда) выносит его на #2. Слабое звено — объём $1.85M/сутки.
 
-**3. GRAM — 84.6.** Highest base score of any gate-passer (85.6) on metrics alone. $3.91M/day, HL/UM 0.34,
-5 ticks at 3.44 bps, and the healthiest depth ladder in the CORE group ($12.0k at 10 bps → $29.8k at 25).
-*Risks:* **provenance unverified.** No TGE date, no mandate evidence either way — scored −4 for the
-unknown rather than researched. The metrics agent verified `onboardDate` to rule out a same-ticker
-collision, but nobody has established what GRAM actually is. Resolve that before any capital.
+**3. GRAM — 84.6.** Высший базовый балл среди прошедших гейты (85.6) на одних метриках. $3.91M/сутки,
+HL/UM 0.34, 5 тиков при 3.44 б.п. и самая здоровая лестница глубины в группе CORE ($12.0k на 10 б.п. →
+$29.8k на 25).
+*Риски:* **происхождение не проверено.** Ни даты TGE, ни свидетельств о мандате в любую сторону — за
+неизвестность выставлено −4 вместо ресёрча. METRICS-агент проверил `onboardDate`, чтобы исключить
+коллизию одинаковых тикеров, но что такое GRAM на самом деле — никто не установил. Разберись с этим до
+любого капитала.
 
-**4. ZRO — 84.3.** 16 ticks of slack — the book is wide in venue terms even though 1.94 bps looks tight,
-because the tick is only 0.121 bps. $13.6k min side, $504 at the touch, HL/UM 0.23. 9.45% daily range is
-the highest in the CORE group. LayerZero, ~25 months post-TGE, no institutional loop.
-*Risks:* 1.94 bps sits right on the fee-viability line — the grid must earn from spacing, not the touch.
-OI/vol 9.0 means positions are parked rather than turning over.
+**4. ZRO — 84.3.** 16 тиков запаса — стакан широкий в терминах площадки, хотя 1.94 б.п. выглядят узко,
+потому что тик стоит всего 0.121 б.п. $13.6k на меньшей стороне, $504 на таче, HL/UM 0.23. Дневной ход
+9.45% — максимум в группе CORE. LayerZero, ~25 месяцев после TGE, институционального контура нет.
+*Риски:* 1.94 б.п. сидят прямо на линии окупаемости комиссии — грид должен зарабатывать шагом сетки, а
+не тачем. OI/vol 9.0 означает, что позиции припаркованы, а не оборачиваются.
 
-**5. PENDLE — 83.6.** 5 ticks at 3.37 bps, $589 touch, $8.9k→$28.6k depth ladder, funding off baseline
-(+0.34). 63 months post-TGE — mandate long expired. The DWF/GSR partnership claim is contradicted across
-aggregators (`landscape.md` §6.5) and is scored at only −3.
-*Risks:* $1.19M/day is thin, and HL/UM 0.12.
+**5. PENDLE — 83.6.** 5 тиков при 3.37 б.п., тач $589, лестница глубины $8.9k→$28.6k, фандинг вне
+базовой линии (+0.34). 63 месяца после TGE — мандат давно истёк. Утверждение о партнёрстве DWF/GSR
+противоречиво по агрегаторам (`landscape.md` §6.5) и оценено лишь в −3.
+*Риски:* $1.19M/сутки — тонко, и HL/UM 0.12.
 
-**6. AERO — 83.1.** 15 ticks at 3.41 bps with a $241 touch — genuinely uncontested at the front. 35 months
-post-TGE, no CME/ETF/named mandate, Lighter listed.
-*Risks:* **HL/UM 0.068 is the weakest cross-venue ratio in the CORE group.** Binance is 15× larger, so
-this is close to a textbook Binance-leads/HL-lags pair — the exact profile that gets picked off by IOC arb.
-$1.36M/day.
+**6. AERO — 83.1.** 15 тиков при 3.41 б.п. с тачем $241 — голова очереди по-настоящему свободна.
+35 месяцев после TGE, ни CME/ETF/поименованного мандата, листингован на Lighter.
+*Риски:* **HL/UM 0.068 — слабейшее межплощадочное отношение в группе CORE.** Binance в 15 раз больше,
+так что это почти хрестоматийная пара «Binance ведёт / HL отстаёт» — ровно тот профиль, который
+выщёлкивают IOC-арбитражёры. $1.36M/сутки.
 
-**7. CONDITIONAL — CRV — 80.7.** *Gate miss: spread 1.881 vs 1.9 — a 1% miss, inside measurement noise.*
-Best-formed depth ladder in the whole shortlist ($17.2k → $32.0k), $3.35M/day, HL/UM 0.19, funding −0.40
-off baseline. 72 months post-TGE, no CME/ETF/mandate.
-*Risks:* only 4 ticks of slack, and 1.88 bps is below the round-trip fee floor at the touch.
+**7. УСЛОВНО — CRV — 80.7.** *Провал гейта: спред 1.881 против 1.9 — промах в 1%, внутри шума
+измерения.* Лучше всех сформированная лестница глубины во всём шортлисте ($17.2k → $32.0k),
+$3.35M/сутки, HL/UM 0.19, фандинг −0.40 от базовой линии. 72 месяца после TGE, ни CME/ETF/мандата.
+*Риски:* всего 4 тика запаса, и 1.88 б.п. на таче — ниже комиссионного пола за круг.
 
-**8. CONDITIONAL — NEAR — 79.5.** *Gate miss: spread 1.808 and only 3 ticks.* Highest volume of any
-clean-landscape coin in the sample at $13.5M/day.
-*Risks:* **the most crowded book of any candidate** — $1,843 across 2–3 orders at the touch, $63.5k at
-10 bps, $115k at 25 bps. That much depth at that volume is precisely `landscape.md`'s "someone is being
-paid or hedged to hold it there" tell. Admit only as a wide-grid, larger-size instrument, or not at all.
+**8. УСЛОВНО — NEAR — 79.5.** *Провал гейта: спред 1.808 и всего 3 тика.* Максимальный объём среди
+монет с чистым ландшафтом во всей выборке — $13.5M/сутки.
+*Риски:* **самый населённый стакан среди всех кандидатов** — $1,843 в 2–3 ордерах на таче, $63.5k на
+10 б.п., $115k на 25 б.п. Столько глубины при таком объёме — в точности тот самый признак из
+`landscape.md`: «кому-то платят или кого-то хеджируют, чтобы он это там держал». Впускать только как
+инструмент для широкой сетки крупным размером — или не впускать вовсе.
 
-**9. DOT — 76.0.** 15 ticks at 1.96 bps, $250 touch, $21.1k min side, 70 months post-TGE, no CME, no live
-ETF, no named mandate. A clean, quiet, uncontested book.
-*Risks:* **HL/UM 0.036 — the worst in the shortlist.** Binance UM is 28× the HL book. Maximum Mode-A
-stale-liquidity exposure. Also note `d10 == d25 == $21.1k`, meaning the 20-level API cap binds: true depth
-is larger than shown and crowding is understated.
+**9. DOT — 76.0.** 15 тиков при 1.96 б.п., тач $250, $21.1k на меньшей стороне, 70 месяцев после TGE,
+ни CME, ни живого ETF, ни поименованного мандата. Чистый, тихий, свободный стакан.
+*Риски:* **HL/UM 0.036 — худшее в шортлисте.** Binance UM в 28 раз больше стакана HL. Максимальная
+экспозиция на протухшую ликвидность в режиме A. Заметь также `d10 == d25 == $21.1k` — упёрлись в
+20-уровневую крышку API: истинная глубина больше показанной, и толкучка занижена.
 
-**10. ONDO — 75.1.** Best raw metrics in the current traded set: $9.95M/day in band, 8 ticks at 1.96 bps,
-$23.0k min side, vpd 138.7, and OI/vol 1.53 — the most turnover-driven (least position-parked) book in the
-set. Funding −0.95 off baseline.
-*Risks:* carries the heaviest landscape penalty of any keeper (−18: documented Wintermute USDY partnership
-plus cross-firm consensus overlap). The counter-argument is `landscape.md`'s own §6.2 — that mandate is an
-OTC/spot obligation and does not put Wintermute in the HL perp book — and the measured book behaviour is
-good. Metrics win; keep, and re-check if the book tightens.
+**10. ONDO — 75.1.** Лучшие сырые метрики в текущем торгуемом наборе: $9.95M/сутки в полосе, 8 тиков
+при 1.96 б.п., $23.0k на меньшей стороне, vpd 138.7 и OI/vol 1.53 — самый оборотный (наименее
+запаркованный) стакан в наборе. Фандинг −0.95 от базовой линии.
+*Риски:* несёт тяжелейший ландшафтный штраф среди оставляемых (−18: документированное партнёрство
+Wintermute по USDY плюс попадание в межфирменный консенсусный набор). Контраргумент — собственный §6.2
+`landscape.md`: этот мандат — OTC/спотовое обязательство и в перп-стакан HL Wintermute не сажает, а
+измеренное поведение стакана хорошее. Метрики побеждают; держать и перепроверить, если стакан сузится.
 
-**11. CONDITIONAL — KAITO — 73.2.** *Gate miss: $1,268 min side within 10 bps, half the $2.5k floor.*
-Highest volume of any non-blacklisted candidate at $15.6M/day, 5 ticks at 4.19 bps, and vpd 1431 — flow per
-unit of resting depth is ~10× the CORE group. OI/vol 0.65 is the lowest in the shortlist: pure turnover, no
-parked positioning.
-*Risks:* the raw samples show the touch swinging $4,594 → $33 → $128 across four minutes. A 9.46% daily
-move against a $1.3k near-touch book means price gaps straight through rungs. 17 months post-TGE, so a
-mandate may still be live. Trial at minimum size with wide spacing, or defer to the recorded re-rank.
+**11. УСЛОВНО — KAITO — 73.2.** *Провал гейта: $1,268 на меньшей стороне в пределах 10 б.п. — половина
+пола $2.5k.* Максимальный объём среди кандидатов вне чёрного списка — $15.6M/сутки, 5 тиков при
+4.19 б.п., и vpd 1431 — поток на единицу пассивной глубины в ~10 раз выше группы CORE. OI/vol 0.65 —
+минимум в шортлисте: чистый оборот, никакого запаркованного позиционирования.
+*Риски:* сырые замеры показывают тач, скачущий $4,594 → $33 → $128 за четыре минуты. Дневной ход 9.46%
+против стакана $1.3k у тача означает, что цена прошивает ступени насквозь. 17 месяцев после TGE — мандат
+ещё может быть жив. Пробовать минимальным размером с широким шагом — или отложить до переранжирования
+по записи.
 
-**12. INJ — 71.6.** 14 ticks at 3.05 bps, $16.0k min side, $314 touch, 70 months post-TGE. Funding
-**−6.11 bps/8h** is by far the largest dislocation in the entire 232-coin sweep — positioning-driven rather
-than arb-flattened, which is a green pattern.
-*Risks:* 21Shares spot INJ ETF filed 2025-10-20 (anticipatory positioning starts at filing);
-**no Lighter listing**, the only shortlist member without one; HL/UM 0.048; $1.30M/day.
+**12. INJ — 71.6.** 14 тиков при 3.05 б.п., $16.0k на меньшей стороне, тач $314, 70 месяцев после TGE.
+Фандинг **−6.11 б.п./8ч** — крупнейшая дислокация во всём свипе из 232 монет: движимая
+позиционированием, а не выровненная арбитражём, — зелёный паттерн.
+*Риски:* заявка 21Shares на спотовый INJ ETF подана 2025-10-20 (упреждающее позиционирование начинается
+с подачи); **нет листинга на Lighter** — единственный в шортлисте; HL/UM 0.048; $1.30M/сутки.
 
-**13. ETHFI — 63.6.** Widest slack in the shortlist at 17 ticks / 4.08 bps, $12.3k → $23.1k ladder.
-*Risks:* **day_abs_ret 0.09%** — the price essentially did not move on the sample day, which for a grid is
-the single most disqualifying observation available; a grid on a still instrument pays fees and earns
-nothing. Plus GSR names EtherFi as a client (−10). Ranked last for those two reasons and included only
-because the book shape is otherwise excellent. **Do not deploy without an intraday-vol re-measure.**
+**13. ETHFI — 63.6.** Самый широкий запас в шортлисте — 17 тиков / 4.08 б.п., лестница $12.3k → $23.1k.
+*Риски:* **day_abs_ret 0.09%** — цена в день выборки практически не сдвинулась, а для грида это самое
+дисквалифицирующее наблюдение из возможных: грид на неподвижном инструменте платит комиссии и не
+зарабатывает ничего. Плюс GSR называет EtherFi клиентом (−10). Поставлен последним по этим двум причинам
+и включён только потому, что форма стакана в остальном отличная. **Не деплоить без перезамера
+внутридневной волатильности.**
 
 ---
 
-## 5. Current set — honest verdict
+## 5. Текущий набор — честный вердикт
 
-| Coin | Score | Rank /87 | Verdict | Why |
+| Монета | Балл | Ранг /87 | Вердикт | Почему |
 |---|---|---|---|---|
-| **JTO** | 90.5 | 2 | **KEEP — best-chosen** | Shallow-touch/deep-25bps ladder, 12 ticks, retail catalyst, no institutional loop. |
-| **PENDLE** | 83.6 | 5 | **KEEP** | 5 ticks at 3.37 bps, mandate long expired, only the contradicted DWF/GSR claim against it. |
-| **ONDO** | 75.1 | 15 | **KEEP, caveat** | Best metrics in the set; heaviest mandate baggage. Metrics outrank a spot-shaped mandate. |
-| **INJ** | 71.6 | 21 | **KEEP, smallest size** | Good book, huge funding dislocation; but ETF filed, no Lighter, HL/UM 0.048. |
-| **SEI** | 71.0 | 22 | **PARK** | Book is fine (12 ticks, 2.78 bps, $12.8k) and landscape is clean — but $570k/day and HL/UM 0.038. Flow-starved, not saturated. Re-check on a normal-volume week. |
-| **TIA** | 62.8 | 43 | **PARK / drop** | Best *book* in the set (17 ticks, 5.15 bps, clean landscape) and the lowest *volume* in the entire 87-coin sample ($318k). HL/UM 0.026 is the worst ratio in the set. Celestia's $100M Bain-led raise is an unresolved mandate re-arm trigger. |
-| **ENA** | 69.4 | 27 | **DROP** | 1.32 bps. 11 ticks of slack on a 0.12 bps tick is economically nothing. Wintermute authored *and passed* Ethena's revenue-share governance change; GSR names Ethena. HL/UM 0.067. |
-| **xyz:GOLD** | 8.3 | 81 | **DROP** | **$1,067,373 resting per side within 10 bps** — the literal "$1M wall" red flag — with flow-per-depth of 12.9, 6th lowest of 85 (`metrics.json` calls it the lowest, but that holds only within its top-40; PAXG, WLFI, BCH, XLM and HBAR are lower across the full sample). 1-tick book, $16.4k across 5 orders at the touch. HIP-3, where Jump ($3.15B), Selini ($1.03B) and Wintermute ($229.6M) are the *documented* population. No UM pair → signal-less. |
-| **HYPE** | −3.4 | 82 | **DROP** | 0.18 bps = 1 tick, $9.7k at the touch, $152k min side. Live US spot ETF whose S-1 amendment **names Wintermute and Flowdesk as approved trading counterparties**. HL's own token = maximum on-venue maker competition by construction. Its one virtue (HL/UM 0.74, best anywhere) cannot offset the rest. |
-| **SUI** | −4.4 | 83 | **DROP** | 0.144 bps = 1 tick. **Three independent professional loops**: CME futures listed 2026-05-04 (24/7 since 05-29), live 21Shares TSUI spot ETF since 2026-02-24, plus filed products. HL/UM 0.064. The most institutionally saturated instrument in the current set. |
+| **JTO** | 90.5 | 2 | **ДЕРЖАТЬ — лучший выбор** | Лестница «мелкий тач / глубокие 25 б.п.», 12 тиков, розничный катализатор, институционального контура нет. |
+| **PENDLE** | 83.6 | 5 | **ДЕРЖАТЬ** | 5 тиков при 3.37 б.п., мандат давно истёк, против него — только противоречивое утверждение о DWF/GSR. |
+| **ONDO** | 75.1 | 15 | **ДЕРЖАТЬ, с оговоркой** | Лучшие метрики в наборе; тяжелейший мандатный багаж. Метрики важнее спотового по природе мандата. |
+| **INJ** | 71.6 | 21 | **ДЕРЖАТЬ, минимальным размером** | Хороший стакан, огромная дислокация фандинга; но подана заявка на ETF, нет Lighter, HL/UM 0.048. |
+| **SEI** | 71.0 | 22 | **ПАРКОВАТЬ** | Стакан в порядке (12 тиков, 2.78 б.п., $12.8k), ландшафт чист — но $570k/сутки и HL/UM 0.038. Голод по потоку, а не насыщенность. Перепроверить на неделе с нормальным объёмом. |
+| **TIA** | 62.8 | 43 | **ПАРКОВАТЬ / убрать** | Лучший *стакан* в наборе (17 тиков, 5.15 б.п., чистый ландшафт) и самый низкий *объём* во всей выборке из 87 монет ($318k). HL/UM 0.026 — худшее отношение в наборе. Раунд Celestia на $100M во главе с Bain — неразрешённый триггер перезарядки мандата. |
+| **ENA** | 69.4 | 27 | **УБРАТЬ** | 1.32 б.п. 11 тиков запаса на тике в 0.12 б.п. — экономически ничто. Wintermute — автор *и* победитель голосования по revenue-share Ethena; GSR называет Ethena. HL/UM 0.067. |
+| **xyz:GOLD** | 8.3 | 81 | **УБРАТЬ** | **$1,067,373 пассива на сторону в пределах 10 б.п.** — буквальный красный флаг «стена в $1M» — при потоке-на-глубину 12.9, 6-й с конца из 85 (`metrics.json` называет его минимальным, но это верно лишь внутри его топ-40; PAXG, WLFI, BCH, XLM и HBAR ниже по полной выборке). Стакан в 1 тик, $16.4k в 5 ордерах на таче. HIP-3, где Jump ($3.15B), Selini ($1.03B) и Wintermute ($229.6M) — *документированное* население. Нет UM-пары → без сигнала. |
+| **HYPE** | −3.4 | 82 | **УБРАТЬ** | 0.18 б.п. = 1 тик, $9.7k на таче, $152k на меньшей стороне. Живой US spot ETF, чья поправка к S-1 **называет Wintermute и Flowdesk одобренными торговыми контрагентами**. Собственный токен HL = максимальная мейкерская конкуренция на площадке по построению. Его единственное достоинство (HL/UM 0.74, максимум вообще) остального не перевешивает. |
+| **SUI** | −4.4 | 83 | **УБРАТЬ** | 0.144 б.п. = 1 тик. **Три независимых профессиональных контура**: фьючерсы CME с 2026-05-04 (24/7 с 05-29), живой спотовый ETF 21Shares TSUI с 2026-02-24, плюс поданные продукты. HL/UM 0.064. Самый институционально насыщенный инструмент в текущем наборе. |
 
-**Summary: 4 keeps, 2 parks, 4 drops.** The set's real problem is not that it is badly chosen — JTO,
-PENDLE and ONDO are genuinely good picks — it is that **three of ten slots (SUI, HYPE, xyz:GOLD) are spent
-on the three most professionally-quoted books available**, and two more (SEI, TIA) on books with no tape.
-Half the capital is in instruments that cannot pay a small passive grid.
+**Итог: 4 держим, 2 паркуем, 4 убираем.** Настоящая проблема набора не в том, что он плохо выбран —
+JTO, PENDLE и ONDO по-настоящему хорошие выборы, — а в том, что **три слота из десяти (SUI, HYPE,
+xyz:GOLD) потрачены на три самых профессионально котируемых стакана из доступных**, и ещё два (SEI, TIA)
+— на стаканы без ленты. Половина капитала — в инструментах, которые маленькому пассивному гриду
+заплатить не могут.
 
 ---
 
-## 6. Watch tier
+## 6. Наблюдательный ярус
 
-Not shortlisted, but the group most likely to move on re-measurement.
+Не в шортлисте, но группа, которая с наибольшей вероятностью сдвинется при перезамере.
 
-**6.1 Coarse-tick locked books — revisit only with a queue-position study.**
-PUMP ($32.1M/day, 5.02 bps/tick), kPEPE ($14.1M, 3.55), kBONK ($2.79M, 3.28), kSHIB ($5.30M, 2.15),
+**6.1 Стаканы, зажатые грубым тиком — возвращаться только с исследованием позиции в очереди.**
+PUMP ($32.1M/сутки, 5.02 б.п./тик), kPEPE ($14.1M, 3.55), kBONK ($2.79M, 3.28), kSHIB ($5.30M, 2.15),
 EIGEN ($0.92M, 5.10), BOME ($0.68M, 18.6).
-All sit at **exactly 1 tick** — the whole spread *is* the tick, so nobody can quote tighter. What makes
-this group different from the 1-tick names in §7 is that their tick is genuinely coarse, so the locked
-spread still clears the 3.0 bps round-trip fee floor: PUMP's 5.02 bps nets ~2 bps if you get both sides.
-The obstacle is the queue, not the economics — PUMP shows 7.5 orders and $5,401 at the touch (top-5 min
-side $111,214), kPEPE 6.5 orders and $4,930 ($162,969), and you would join at the back of a FIFO queue at
-a single price against desks running a 1.8 bps/side fee advantage. This is a latency-sensitive game rather
-than a passive-grid one; it is not dead, it is just a different strategy.
+Все стоят **ровно в 1 тик** — весь спред и *есть* тик, узее котировать невозможно. От однотиковых имён
+из §7 эту группу отличает то, что тик у них по-настоящему грубый, и зажатый спред всё равно перекрывает
+комиссионный пол 3.0 б.п. за круг: 5.02 б.п. у PUMP дают ~2 б.п. чистыми, если взял обе стороны.
+Препятствие — очередь, а не экономика: PUMP показывает 7.5 ордера и $5,401 на таче (мин. сторона топ-5 —
+$111,214), kPEPE — 6.5 ордера и $4,930 ($162,969), и вставать пришлось бы в хвост FIFO-очереди на
+единственной цене против десков с комиссионным преимуществом 1.8 б.п./сторону. Это игра на латентность,
+а не пассивный грид; она не мертва — она просто другая стратегия.
 
-**6.2 Good book shape, no flow — the group to re-check first.**
-MET ($864k, 14 ticks), ALGO ($830k, 21 ticks, funding −1.46), MEGA ($748k, 14), DASH ($646k, 12),
-POL ($563k, 17), SEI ($570k, 12), CHIP ($518k, 14, funding −2.06), ENS ($512k, 16), TIA ($318k, 17).
-Every one has a clean landscape and a slack, uncontested book. They failed only the $1M flow gate, on a day
-when just 33 of 232 coins cleared $3M. **If a normal-volume week lifts any of these over $1M/day they
-become CORE candidates immediately** — this is where the sample-day distortion bites hardest.
+**6.2 Хорошая форма стакана, нет потока — группа для первой перепроверки.**
+MET ($864k, 14 тиков), ALGO ($830k, 21 тик, фандинг −1.46), MEGA ($748k, 14), DASH ($646k, 12),
+POL ($563k, 17), SEI ($570k, 12), CHIP ($518k, 14, фандинг −2.06), ENS ($512k, 16), TIA ($318k, 17).
+У каждой чистый ландшафт и свободный, неконтестуемый стакан. Провалили только гейт потока $1M — в день,
+когда лишь 33 из 232 монет перешагнули $3M. **Если неделя с нормальным объёмом поднимет любую из них
+выше $1M/сутки — они немедленно становятся CORE-кандидатами**; здесь искажение дня выборки кусает
+больнее всего.
 
-**6.3 In-band volume, professionally tight — no fee headroom.**
-UNI (1.28 bps), WLD (1.25), ENA (1.32), XMR (1.47), JUP (1.57), LDO (1.60), FARTCOIN (1.60), VIRTUAL (1.22).
-Flow is fine; the spread is at or under the 3.0 bps round-trip fee floor. FARTCOIN is notable for HL/UM
-0.46 — the second-highest ratio anywhere — but at 2 ticks and 1.60 bps there is nothing to capture.
+**6.3 Объём в полосе, профессионально узко — нет запаса над комиссией.**
+UNI (1.28 б.п.), WLD (1.25), ENA (1.32), XMR (1.47), JUP (1.57), LDO (1.60), FARTCOIN (1.60),
+VIRTUAL (1.22).
+С потоком всё в порядке; спред на комиссионном полу 3.0 б.п. за круг или под ним. FARTCOIN примечателен
+HL/UM 0.46 — второе отношение вообще, — но при 2 тиках и 1.60 б.п. ловить нечего.
 
 ---
 
-## 7. Avoid tier
+## 7. Ярус «избегать»
 
-| Coin(s) | Reason |
+| Монета(ы) | Причина |
 |---|---|
-| **BTC, ETH, SOL, XRP, ADA, LINK, XLM, AVAX** | CME regulated futures listed, all 24/7 since 2026-05-29 → permanent basis-desk loop. BTC/ETH/SOL/XRP also have live US spot ETFs, and their touch queues are 7.5–23 orders deep holding $32k–$273k. ADA/LINK/XLM/AVAX have thin touches ($250–$1,224) but are 1–3 tick books at 0.12–1.85 bps — tight for structural reasons, not crowded ones. Zero edge either way for a small passive grid. |
-| **SUI** | CME futures (2026-05-04) **and** live 21Shares TSUI spot ETF. 1-tick 0.144 bps book. Three professional loops. |
-| **HYPE** | Live spot ETF naming Wintermute + Flowdesk as trading counterparties; HL's own token; 1-tick 0.18 bps; $152k min side. |
-| **xyz:GOLD** | $1.07M resting per side within 10 bps; 1-tick; HIP-3 builder dex with documented Jump/Selini/Wintermute presence; **no Binance UM pair → signal-less**. |
-| **ENA** | 1.32 bps with Wintermute having authored and passed Ethena's revenue-share governance change (implies a large stake and ongoing relationship); GSR names Ethena. |
-| **XPL** | 1.19 bps, and the **only public per-coin MM attribution on HL core anywhere in the research** — a suspected Auros wallet deposited 30M USDC and accumulated ~$17.25M of XPL on-chain. Also 10 months post-TGE. |
-| **AAVE, TAO** | Cross-firm consensus overlap set (multiple tier-1 desks converge) plus 0.99 / 0.51 bps 1-tick books. |
-| **ZEC, LIT** | 1-tick books on a *fine* tick — ZEC $80.6M/day at 0.213 bps, LIT $26.0M/day at 0.432 bps. Real volume, but the entire spread is 2–4 hundredths of a basis point wide; there is nothing above the 3.0 bps fee floor to capture. LIT additionally onboarded 2025-12-23, i.e. deep inside the mandate window. |
-| **PENGU, APT, ARB, ASTER, DOGE, HBAR, PAXG, BNB, LTC, TRX, BCH** | 1–2 tick locked books at 0.14–1.70 bps (TRX and BCH are 2-tick, the rest 1-tick). APT is additionally named in Jump's focus set and has a filed ETF; PAXG is Wintermute's tokenized-gold OTC franchise and shows $230k min-side depth. |
-| **CASHCAT** | **The dead-book trap.** $5.76M/day nominal clears the strict volume band, but median spread is 23.3 bps and there is **$0 resting within 10 bps of mid on either side** — the entire book sits outside the band, ~84 ticks wide, $28 at the touch. No UM pair. Nominal volume cannot catch this; `depth_10bps_min_side` can. |
-| **VINE** | 20.2 bps, $0 within 10 bps, and its Binance UM contract is in `SETTLING` status (being delisted) → no signal feed. |
-| **GRIFFAIN, NIL, SKR, IMX, REZ** | Sub-$1M flow ($0.52M–$0.84M) with $0.77k–$2.2k min-side depth within 10 bps and 5.4–11.4 bps spreads. Wide because empty, not because slack — the difference from §6.2 is that those books have depth and no flow, while these have neither. |
+| **BTC, ETH, SOL, XRP, ADA, LINK, XLM, AVAX** | Листингованные регулируемые фьючерсы CME, все 24/7 с 2026-05-29 → постоянный контур базисных десков. У BTC/ETH/SOL/XRP вдобавок живые US spot ETF, а их очереди на таче — 7.5–23 ордера глубиной, держащие $32k–$273k. У ADA/LINK/XLM/AVAX тач тонкий ($250–$1,224), но это стаканы в 1–3 тика при 0.12–1.85 б.п. — узкие по структурным причинам, а не из-за толкучки. Маленькому пассивному гриду edge нет в обоих случаях. |
+| **SUI** | Фьючерсы CME (2026-05-04) **и** живой спотовый ETF 21Shares TSUI. Стакан 1 тик, 0.144 б.п. Три профессиональных контура. |
+| **HYPE** | Живой спотовый ETF, называющий Wintermute + Flowdesk торговыми контрагентами; собственный токен HL; 1 тик, 0.18 б.п.; $152k на меньшей стороне. |
+| **xyz:GOLD** | $1.07M пассива на сторону в пределах 10 б.п.; 1 тик; HIP-3 builder dex с документированным присутствием Jump/Selini/Wintermute; **нет UM-пары Binance → без сигнала**. |
+| **ENA** | 1.32 б.п., при этом Wintermute — автор и победитель голосования по revenue-share Ethena (что предполагает крупную долю и продолжающиеся отношения); GSR называет Ethena. |
+| **XPL** | 1.19 б.п., и **единственная во всём ресёрче публичная помонетная атрибуция MM на ядре HL** — подозреваемый кошелёк Auros занёс 30M USDC и накопил ~$17.25M XPL он-чейн. Плюс 10 месяцев после TGE. |
+| **AAVE, TAO** | Межфирменный консенсусный набор (сходятся несколько десков tier-1) плюс однотиковые стаканы 0.99 / 0.51 б.п. |
+| **ZEC, LIT** | Однотиковые стаканы на *мелком* тике — ZEC $80.6M/сутки при 0.213 б.п., LIT $26.0M/сутки при 0.432 б.п. Объём настоящий, но весь спред — 2–4 сотых базисного пункта; над комиссионным полом 3.0 б.п. ловить нечего. LIT вдобавок онбордился 2025-12-23, т.е. глубоко внутри окна мандата. |
+| **PENGU, APT, ARB, ASTER, DOGE, HBAR, PAXG, BNB, LTC, TRX, BCH** | Зажатые стаканы в 1–2 тика при 0.14–1.70 б.п. (TRX и BCH — 2 тика, остальные 1). APT дополнительно назван в фокус-наборе Jump и имеет поданный ETF; PAXG — франшиза токенизированного золота Wintermute в OTC, глубина меньшей стороны $230k. |
+| **CASHCAT** | **Ловушка мёртвого стакана.** $5.76M/сутки номинала проходят строгую полосу объёма, но медианный спред — 23.3 б.п. и **$0 пассива в пределах 10 б.п. от мида с обеих сторон** — весь стакан вне полосы, ~84 тика шириной, $28 на таче. Нет UM-пары. Номинальный объём это не ловит; `depth_10bps_min_side` ловит. |
+| **VINE** | 20.2 б.п., $0 в пределах 10 б.п., и его UM-контракт Binance в статусе `SETTLING` (делистится) → нет сигнального фида. |
+| **GRIFFAIN, NIL, SKR, IMX, REZ** | Поток ниже $1M ($0.52M–$0.84M) при $0.77k–$2.2k глубины меньшей стороны в пределах 10 б.п. и спредах 5.4–11.4 б.п. Широкие, потому что пустые, а не потому что свободные — отличие от §6.2 в том, что у тех стаканов глубина есть, а потока нет, у этих нет ни того ни другого. |
 
 ---
 
-## 8. Threats to validity
+## 8. Угрозы валидности
 
-Read this section before acting on §4.
+Прочитай этот раздел до того, как действовать по §4.
 
-**8.1 It is a four-minute snapshot, not a regime estimate.** Seven touch samples per coin, ~35 s apart,
-on a single day. Enough to separate "always ~0.15 bps" from "always ~4 bps"; **not** enough to characterise
-intraday variation, session effects, or behaviour during a move. Do not size anything on these medians.
+**8.1 Это четырёхминутный снапшот, а не оценка режима.** Семь замеров тача на монету с шагом ~35 с в
+один-единственный день. Достаточно, чтобы отделить «всегда ~0.15 б.п.» от «всегда ~4 б.п.»; **не**
+достаточно, чтобы охарактеризовать внутридневную вариацию, сессионные эффекты или поведение во время
+движения. Не рассчитывай размер ни на чём из этих медиан.
 
-**8.2 The sample day was abnormally quiet, and this biases every volume-dependent conclusion.** Only 33 of
-232 canonical perps cleared $3M/24h; only 4 cleared $150M. BTC marked $63,963 vs $64,686 prev-day. The
-$1M flow gate is calibrated on that day, and it is the gate that demoted the entire §6.2 group. On an
-active week the shortlist could look materially different — most plausibly *longer*.
+**8.2 День выборки был аномально тихим, и это смещает каждый объёмозависимый вывод.** Лишь 33 из 232
+канонических перпов перешагнули $3M/24ч; лишь 4 перешагнули $150M. BTC маркировался $63,963 против
+$64,686 днём ранее. Гейт потока $1M откалиброван на этом дне, и именно он понизил всю группу §6.2. На
+активной неделе шортлист мог бы выглядеть существенно иначе — правдоподобнее всего, *длиннее*.
 
-**8.3 Spreads were sampled, not recorded — so the single best available saturation test was not run.**
-`landscape.md` names *conditional spread vs realised-vol quantile* as "the cleanest professional-presence
-signature available from L2 data alone": organic books blow out on impulse, professionally-made books
-mean-revert to fair value within seconds. Seven point samples cannot compute that curve. The
-`spread widened during sampling` bonus (+4, applied to **28 of 87 coins**) is a 7-observation proxy for it
-and is explicitly low-confidence — it fires on roughly a third of the sample, which is itself a sign it is
-picking up sampling noise as much as book behaviour. Four of the top six shortlist entries carry it, so
-removing it would compress the top band substantially.
+**8.3 Спреды были отсэмплированы, а не записаны — то есть единственный лучший доступный тест на
+насыщенность не проведён.** `landscape.md` называет *условный спред против квантиля реализованной
+волатильности* «чистейшей сигнатурой профессионального присутствия, доступной из одних L2-данных»:
+органические стаканы разлетаются на импульсе, профессионально сделанные возвращаются к fair value за
+секунды. Семь точечных замеров эту кривую не посчитают. Бонус «спред расширился во время сэмплирования»
+(+4, применён к **28 монетам из 87**) — 7-наблюденческий прокси для неё и явно низкодостоверен: он
+срабатывает примерно на трети выборки, что само по себе признак, что он ловит шум сэмплирования не
+меньше, чем поведение стакана. Его несут четыре из шести верхних строк шортлиста, так что его удаление
+заметно сжало бы верхнюю полосу.
 
-**8.4 MM presence is inferential everywhere.** There is **no public per-asset MM-share data for HL core
-perps**. Every concentration figure in `landscape.md` (top-5 = 50% of MM volume, 363 MM wallets,
-order-to-fill 19.4, the `pct_alo ≥ 80%` classifier) comes from HIP-3 / Trade.xyz, a different venue surface.
-Further: mandates are CEX-spot obligations and do not put a firm in the HL perp book; HL has no DMM
-program, no rebate lock-in and no latency tier; and Wintermute held positions in **111 HL assets** in
-May 2026, so no HL perp is genuinely MM-free. The landscape is a **prior for ordering the queue**, which is
-why it is capped at roughly a fifth of the score. §2.2 (touch queue) is the only *measured* saturation
-signal here.
+**8.4 Присутствие MM — везде выводное.** **Публичных поактивных данных о доле MM на core-перпах HL не
+существует.** Каждая цифра концентрации в `landscape.md` (топ-5 = 50% MM-объёма, 363 MM-кошелька,
+order-to-fill 19.4, классификатор `pct_alo ≥ 80%`) — с HIP-3 / Trade.xyz, другой поверхности площадки.
+Далее: мандаты — CEX-спотовые обязательства и в перп-стакан HL фирму не сажают; у HL нет DMM-программы,
+нет привязки ребейтами и нет латентных тиров; а Wintermute в мае 2026 держал позиции в **111 активах
+HL**, так что по-настоящему свободных от MM перпов на HL нет. Ландшафт — это **приор для упорядочивания
+очереди**, поэтому он и ограничен примерно пятой частью балла. §2.2 (очередь на таче) — единственный
+*измеренный* сигнал насыщенности здесь.
 
-**8.5 TGE dates are my estimates, not sourced.** The mandate-window term (−7 … +6) rests on them.
-GRAM, MET, CHIP, STABLE, MEGA, SKR and CASHCAT have unknown TGE dates and were penalised −4 rather than
-researched — which directly caps GRAM at #3 despite the highest base score in the set.
+**8.5 Даты TGE — мои оценки, без источников.** Мандатно-оконный член (−7 … +6) опирается на них.
+У GRAM, MET, CHIP, STABLE, MEGA, SKR и CASHCAT даты TGE неизвестны, и они оштрафованы на −4 вместо
+ресёрча — что напрямую ограничивает GRAM третьим местом при высшем базовом балле в наборе.
 
-**8.6 The tick model is a reconstruction.** §2.1 validates strongly (98.9% integer, median deviation 0)
-but it is inferred from HL's documented price rules, not read from an API field. Every `spread_ticks` value
-— and therefore the entire reordering in §1 — depends on it.
+**8.6 Модель тика — реконструкция.** §2.1 валидируется сильно (98.9% целых, медианное отклонение 0),
+но она выведена из документированных правил цены HL, а не прочитана из поля API. Каждое значение
+`spread_ticks` — и, следовательно, всё переупорядочивание из §1 — зависит от неё.
 
-**8.7 `depth_10bps` is a lower bound where the 20-level API cap binds.** Flagged upstream for 14 coins;
-among the shortlist that is **ONDO, DOT, INJ** (and NEAR/ENA in the watch/avoid tiers). Their crowding is
-understated and their `vpd` correspondingly overstated. DOT's `d10 == d25 == $21.1k` is the visible symptom.
+**8.7 `depth_10bps` — нижняя граница там, где кусает 20-уровневая крышка API.** Помечено апстримом для
+14 монет; в шортлисте это **ONDO, DOT, INJ** (и NEAR/ENA в ярусах наблюдения/избегания). Их толкучка
+занижена, а `vpd` соответственно завышен. `d10 == d25 == $21.1k` у DOT — видимый симптом.
 
-**8.8 `day_abs_ret_pct` is markPx vs prevDayPx — an endpoint difference, not realised volatility.**
-A grid's economics depend on *intraday path length*, which this cannot see. ETHFI's 0.09% may be a full
-round trip that returned to its start. This is the weakest input to the score and it carries 9 points.
+**8.8 `day_abs_ret_pct` — это markPx против prevDayPx, разность конечных точек, а не реализованная
+волатильность.** Экономика грида зависит от *длины внутридневного пути*, которую эта метрика не видит.
+0.09% у ETHFI могут быть полным круговым походом, вернувшимся в начало. Это слабейший вход скоринга, и
+он несёт 9 баллов.
 
-**8.9 The Mode-A tension is mitigated, not resolved.** Requiring a Binance UM perp selects for coins with
-the most active cross-venue arb loop — the mechanism that picks off resting quotes. HL/UM share is the best
-available proxy and it is only 12 of 100 points. Actual lead-lag was not measured; see §9.
+**8.9 Напряжение режима A смягчено, а не разрешено.** Требование UM-перпа на Binance отбирает монеты с
+самым активным межплощадочным арбитражным контуром — тем самым механизмом, который выщёлкивает пассивные
+котировки. Доля HL/UM — лучший доступный прокси, и это лишь 12 баллов из 100. Фактический lead-lag не
+измерялся; см. §9.
 
-**8.10 Funding is a weak discriminator here.** HL pulls hard to a 0.00125%/hr baseline = exactly
-1.00 bps/8h and most coins sit precisely there. Only genuine outliers carry information (INJ −6.11,
-CASHCAT +2.42, CHIP −2.06, ALGO −1.46, KAITO −1.15, ONDO −0.95). Reading anything into the coins pinned at
-1.00 would be noise, and the +3 bonus is applied only to the outliers.
+**8.10 Фандинг здесь — слабый дискриминатор.** HL жёстко тянет к базовой линии 0.00125%/ч = ровно
+1.00 б.п./8ч, и большинство монет сидит точно там. Информацию несут только настоящие выбросы (INJ −6.11,
+CASHCAT +2.42, CHIP −2.06, ALGO −1.46, KAITO −1.15, ONDO −0.95). Вычитывать что-либо из монет,
+приколотых к 1.00, — шум, и бонус +3 применён только к выбросам.
 
-**8.11 Weights are judgement, fitted to nothing.** No P&L, no backtest. Sensitivity was not run. The
-ordering within ±5 points is not meaningful — treat §4 as roughly three bands (91–83, 80–75, 73–63), not
-as a strict ranking.
+**8.11 Веса — суждение, ни к чему не подогнанное.** Ни P&L, ни бэктеста. Анализ чувствительности не
+проводился. Порядок внутри ±5 баллов незначим — читай §4 как примерно три полосы (91–83, 80–75, 73–63),
+а не как строгое ранжирование.
 
-**8.12 The snapshot decays fast.** Wintermute went $40M → $4M on HL in a single day (2026-05-18); Oros
-Global closed 175 positions in about two hours. Treat the landscape half of this document as having a
-roughly one-quarter half-life.
+**8.12 Снапшот быстро протухает.** Wintermute сходил $40M → $4M на HL за один день (2026-05-18); Oros
+Global закрыл 175 позиций примерно за два часа. Считай, что у ландшафтной половины этого документа
+период полураспада — примерно квартал.
 
 ---
 
-## 9. Recommended next step — record, then re-rank
+## 9. Рекомендуемый следующий шаг — записать и переранжировать
 
-**We own the tooling for exactly this.** The collector already records the right HL streams
-(`trades`, `bbo`, `activeAssetCtx`, `l2Book × {slow,fast}`) and the matching Binance UM streams
-(`@trade`, `@bookTicker`, `@depth@0ms`, + REST `premiumIndex`). Nothing needs to be built.
+**Инструментарий ровно под это у нас уже есть.** Коллектор уже пишет нужные стримы HL
+(`trades`, `bbo`, `activeAssetCtx`, `l2Book × {slow,fast}`) и парные стримы Binance UM
+(`@trade`, `@bookTicker`, `@depth@0ms`, + REST `premiumIndex`). Строить ничего не нужно.
 
-### 9.1 The run
+### 9.1 Прогон
 
-Record the 13 shortlist coins plus the 4 current-set keepers plus a deliberate control group — SUI and
-HYPE (known-saturated) and PUMP (known tick-locked) — so the re-rank has calibration points at the
-saturated end.
+Записать 13 монет шортлиста плюс 4 оставленных из текущего набора плюс намеренную контрольную группу —
+SUI и HYPE (заведомо насыщенные) и PUMP (заведомо зажатый тиком), — чтобы у переранжирования были
+калибровочные точки на насыщенном конце.
 
 ```
 collector /mnt/marketdata hyperliquid \
@@ -415,64 +435,67 @@ collector /mnt/marketdata binancefuturesum \
   ondousdt kaitousdt injusdt ethfiusdt  suiusdt hypeusdt pumpusdt
 ```
 
-`--hl-l2-modes` default `slow,fast` is correct — keep both; `book_mode='bbo+fast'` is the pairing the live
-connector is specified on, so the recording matches live behaviour.
+Дефолт `--hl-l2-modes` = `slow,fast` корректен — держать оба; `book_mode='bbo+fast'` — та пара, на
+которой специфицирован live-коннектор, так что запись соответствует живому поведению.
 
-**Duration: 10–14 days,** to cover at least one weekend and one volatile session. §8.2 is the binding
-uncertainty and only calendar time fixes it.
+**Длительность: 10–14 дней,** чтобы накрыть хотя бы один уикенд и одну волатильную сессию. §8.2 —
+связывающая неопределённость, и лечится она только календарным временем.
 
-**Capacity.** HL measured at 15–23 MB/day/coin for BTC/ETH/SOL (alts will be lighter) + 2.4 MB/day/coin for
-`activeAssetCtx` → ~**5 GB** for 16 coins over 14 days. Binance UM is far heavier: budget with real
-headroom and note the `premiumIndex` poller costs **~1.6 GB/day of ingress** regardless of symbol count —
-on a metered link that is the number that matters, not the file sizes.
+**Ёмкость.** HL измерен на 15–23 МБ/сутки на монету для BTC/ETH/SOL (альты будут легче) + 2.4 МБ/сутки
+на монету за `activeAssetCtx` → ~**5 ГБ** на 16 монет за 14 дней. Binance UM сильно тяжелее: закладывай
+реальный запас, и учти, что поллер `premiumIndex` стоит **~1.6 ГБ/сутки входящего трафика** независимо
+от числа символов — на тарифицируемом канале важно именно это число, а не размеры файлов.
 
-### 9.2 What to compute on the recording
+### 9.2 Что посчитать на записи
 
-1. **Conditional spread curve** — median touch spread bucketed by realised-vol quantile, from `bbo` at
-   0.14 s median interval. *Flat curve = professionally made; rising curve = organic.* §8.3. This is the
-   single highest-value output and the one thing a snapshot fundamentally cannot produce.
-2. **Time-at-one-tick** — fraction of the session the book sits at exactly 1 tick. §2.1 gives a point
-   estimate; the recording gives the distribution. This is the number that most directly separates the
-   shortlist from §6.1, and it converts the whole tick argument from inference to measurement.
-3. **Touch-queue survival** — distribution of order count and USD at the best bid/ask, and how long a
-   front-of-queue position survives. §2.2 says the shortlist touch is one $250 order; confirm that it
-   *stays* that way rather than being a sampling artifact.
-4. **Depth at the intended grid rungs** (±10 / ±20 / ±30 bps) from `l2Book fast` at 0.54 s — not the 20-level
-   slow feed at 5.4 s, and not the 20-level cap that produced §8.7.
-5. **HL↔Binance lead-lag, in milliseconds** — cross-correlate HL `bbo` against UM `@bookTicker` per coin.
-   This replaces the HL/UM volume ratio proxy with a direct measurement of the §8.9 exposure, and it is the
-   only way to know which candidates are actually the designated stale liquidity.
-6. **Re-run `score.py`** with recorded medians substituted for the 7-sample medians, and with components 1–5
-   added. Then re-read §8.11 before treating the new ordering as meaningful.
+1. **Кривая условного спреда** — медианный спред тача по бакетам квантиля реализованной волатильности,
+   из `bbo` с медианным интервалом 0.14 с. *Плоская кривая = стакан сделан профессионалами; растущая =
+   органический.* §8.3. Это самый ценный выход и единственная вещь, которую снапшот принципиально дать
+   не может.
+2. **Время-в-одном-тике** — доля сессии, которую стакан стоит ровно в 1 тик. §2.1 даёт точечную оценку;
+   запись даёт распределение. Это число прямее всего отделяет шортлист от §6.1 и превращает весь
+   тиковый аргумент из вывода в измерение.
+3. **Выживаемость очереди на таче** — распределение числа ордеров и USD на лучшем биде/аске и того,
+   сколько живёт позиция в голове очереди. §2.2 говорит, что тач шортлиста — один ордер на $250;
+   подтверди, что он *таким и остаётся*, а не артефакт сэмплирования.
+4. **Глубина на планируемых ступенях сетки** (±10 / ±20 / ±30 б.п.) из `l2Book fast` с шагом 0.54 с —
+   не из 20-уровневого медленного фида раз в 5.4 с и не из-под той 20-уровневой крышки, что породила
+   §8.7.
+5. **Lead-lag HL↔Binance в миллисекундах** — кросс-корреляция `bbo` HL против `@bookTicker` UM по
+   монетам. Это заменяет прокси из отношения объёмов прямым измерением экспозиции §8.9 — и это
+   единственный способ узнать, какие кандидаты на самом деле назначенная протухшая ликвидность.
+6. **Перезапуск `score.py`** с подстановкой записанных медиан вместо медиан 7 замеров и с добавлением
+   компонент 1–5. После — перечитать §8.11, прежде чем считать новый порядок значимым.
 
-### 9.3 Decision rule
+### 9.3 Правило решения
 
-Deploy only coins that, on recorded data: keep `spread_ticks ≥ 3` for a **majority of the session**, show a
-**rising** conditional-spread curve, and hold a touch queue a small order can realistically join. Start with
-the top 3–5 at minimum size. Re-run the whole screen **quarterly** — §8.12.
+Деплоить только монеты, которые на записанных данных: держат `spread_ticks ≥ 3` **большую часть
+сессии**, показывают **растущую** кривую условного спреда и держат очередь на таче, к которой маленький
+ордер реально может присоединиться. Начинать с верхних 3–5 минимальным размером. Перегонять весь скрин
+**ежеквартально** — §8.12.
 
-### 9.4 One live-path prerequisite, unrelated to selection — ALREADY MET
+### 9.4 Один пререквизит live-пути, не связанный с отбором, — УЖЕ ВЫПОЛНЕН
 
-The trap this section would have warned about (`AGENTS.md` §4.1/§4.1a: `LiveBot` applies only kind-1
-incremental depth events while Hyperliquid publishes only full snapshots) is closed: the HL connector's
-`DepthMirror` synthesises kind-1 deltas from `bbo` + `l2Book fast` (Phase 1, testnet-verified with a live
-LiveBot — non-empty uncrossed book tracking `bbo`; deletions-before-inserts keeps the §4.7 fusion path
-inert), and the full order path traded a real testnet grid session end to end. See
-`docs/design-hyperliquid-connector.md` §10–11.14.
+Ловушка, о которой этот раздел бы предупреждал (`AGENTS.md` §4.1/§4.1a: `LiveBot` применяет только
+инкрементальные depth-события вида 1, а Hyperliquid публикует только полные снапшоты), закрыта:
+`DepthMirror` HL-коннектора синтезирует дельты вида 1 из `bbo` + `l2Book fast` (Фаза 1, проверено на
+тестнете живым `LiveBot` — непустой некроссированный стакан, следящий за `bbo`; порядок
+«удаления-раньше-вставок» держит fusion-путь §4.7 инертным), и весь ордерный путь оттторговал реальную
+тестнет-сессию грида из конца в конец. См. `docs/design-hyperliquid-connector.md` §10–11.14.
 
 ---
 
-## 10. Reproduction
+## 10. Воспроизведение
 
-| File | What |
+| Файл | Что |
 |---|---|
-| `metrics.json` | METRICS agent output, 233 rows, 87 sampled |
-| `landscape.md` | MM-LANDSCAPE agent output |
-| `l2_full.json` | raw 20-level books, 7 samples × 87 coins — source for §2.2 |
-| `binance_24hr.json` | Binance UM 24h ticker, closeTime 2026-07-28T22:32:04Z — source for §2.3 |
-| `enriched.json` | metrics rows + `tick_bps` / `spread_ticks` (§2.1) |
-| `score.py` | gates, weights, landscape table, touch-queue merge — all thresholds are literals in one file |
-| `scored.json` | full 87-row output with per-component breakdown, gate failures and landscape notes |
+| `metrics.json` | выход агента METRICS, 233 строки, 87 отсэмплировано |
+| `landscape.md` | выход агента MM-LANDSCAPE |
+| `l2_full.json` | сырые 20-уровневые стаканы, 7 замеров × 87 монет — источник §2.2 |
+| `binance_24hr.json` | 24h-тикер Binance UM, closeTime 2026-07-28T22:32:04Z — источник §2.3 |
+| `enriched.json` | строки метрик + `tick_bps` / `spread_ticks` (§2.1) |
+| `score.py` | гейты, веса, таблица ландшафта, мерж очереди на таче — все пороги литералами в одном файле |
+| `scored.json` | полный 87-строчный выход с поразбивкой компонент, провалами гейтов и ландшафтными пометками |
 
-`python3 score.py` regenerates `scored.json` and prints the three tables. Every threshold in §3 is a
-named constant; changing a weight and re-running is a one-line edit.
+`python3 score.py` перегенерирует `scored.json` и печатает три таблицы. Каждый порог из §3 — именованная
+константа; поменять вес и перезапустить — правка в одну строку.
