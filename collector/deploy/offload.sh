@@ -33,8 +33,12 @@
 #     LEFT: kilobytes against gigabytes, and the host's own audit trail for a
 #     day whose data has gone is worth keeping where the journal is.
 #   - Never touches a file whose name it does not recognise. The allowlist is
-#     also what makes the remote commands safe: only [A-Za-z0-9._-] and the
-#     `gate/` prefix ever reach a remote shell.
+#     also what makes the remote commands safe: only [A-Za-z0-9._:-] and the
+#     `gate/` prefix ever reach a remote shell. The colon is for HL builder-dex
+#     symbols (xyz:gold_20260728.gz was silently "unrecognised" without it) and
+#     is safe in every mechanism used here: names travel by `xargs -d '\n'`,
+#     `rsync --files-from` (entries are never parsed as host:path), and
+#     single-quoted directory paths — no remote shell ever word-splits them.
 #
 # Requires on this machine: ssh, rsync, sha256sum or shasum, gzip.
 # Requires on the host: GNU find, sha256sum, a shell. Nothing is installed.
@@ -162,7 +166,7 @@ echo "==> Instances: ${INSTANCES[*]}"
 # makes it safe to interpolate these names into a remote shell command below.
 day_of() {
     local name="$1"
-    if [[ "${name}" =~ ^[A-Za-z0-9._-]+_([0-9]{8})\.gz$ ]] \
+    if [[ "${name}" =~ ^[A-Za-z0-9._:-]+_([0-9]{8})\.gz$ ]] \
     || [[ "${name}" =~ ^_meta_[A-Za-z0-9._-]+_([0-9]{8})\.jsonl$ ]] \
     || [[ "${name}" =~ ^gate/([0-9]{8})\.(txt|json)$ ]]; then
         echo "${BASH_REMATCH[1]}"
