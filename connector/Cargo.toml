@@ -44,3 +44,10 @@ serde_qs = "0.15.0"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 sha3 = "0.10"
 rmp-serde = "1.3"
+# Direct dependency ONLY to name the crate for CryptoProvider::install_default at
+# startup (see `install_crypto_provider` in main.rs). Already in the tree via
+# tokio-tungstenite/reqwest; `ring` matches the feature they enable, so this adds
+# no second provider — it just picks one explicitly when a workspace build links
+# both (py-hftbacktest → s3 → aws-config brings aws-lc-rs, and rustls refuses to
+# guess between two providers: the first TLS handshake panics).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

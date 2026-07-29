@@ -640,7 +640,28 @@ struct Args {
 /// variable, which is the other way a deployment gets there by accident.
 const MIN_WORKER_THREADS: usize = 2;
 
+/// Picks the process-wide rustls provider before anything opens a TLS connection.
+///
+/// A `cargo build --workspace` binary links TWO providers: this crate's deps enable
+/// `rustls/ring`, while `py-hftbacktest → hftbacktest/s3 → aws-config` unifies in
+/// `rustls/aws-lc-rs`. With both present rustls refuses to guess, and the first
+/// handshake panics with "Could not automatically determine the process-level
+/// CryptoProvider" — through the panic hook that is `exit(1)` on the first message
+/// of every venue (AGENTS.md §4.7, reproduced on bybit 2026-07-28). Installing
+/// explicitly makes the workspace build behave like `cargo build -p connector`.
+///
+/// Idempotent so a test harness that already installed one — or a future second
+/// call — is a no-op rather than a startup panic.
+fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // A racing install between the check and here can only be the same provider;
+        // losing that race is fine, so the error is deliberately ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 fn main() {
+    install_crypto_provider();
     let workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(MIN_WORKER_THREADS)
@@ -651,6 +672,20 @@ fn main() {
         .build()
         .unwrap()
         .block_on(run());
+}
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    use super::install_crypto_provider;
+
+    /// Pins the §4.7 fix: after startup installation a default provider exists, and a
+    /// second call — or one racing a provider someone else installed — does not panic.
+    #[test]
+    fn installing_the_crypto_provider_is_effective_and_idempotent() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        install_crypto_provider();
+    }
 }
 
 async fn run() {

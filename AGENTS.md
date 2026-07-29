@@ -222,15 +222,13 @@ Bybit/Binance получили шов `serve(write, read)`: `connect` тольк
 
 Если трогаешь эту область: сначала поправь design note, потом код. И не удаляй документацию гонки — она load-bearing.
 
-### 4.5 `Backtest::submit_order` игнорирует сторону ордера
+### 4.5 `Backtest::submit_order` игнорирует сторону ордера — **починено апстримом, в дереве с 2026-07-30**
 
-`backtest/mod.rs:988`: перегрузка `submit_order(asset_no, order: OrderRequest, wait)` передаёт в `local.submit_order` жёстко `Side::Sell` (строка 997) и не смотрит на `order.side`. Live-аналог (`live/bot.rs:538`) передаёт `order.side` (строка 553). То есть бэктест-стратегия на `OrderRequest` молча шлёт только продажи, а в live та же стратегия работает как задумано.
+Было: перегрузка `submit_order(asset_no, order: OrderRequest, wait)` передавала в `local.submit_order` жёстко `Side::Sell` и не смотрела на `order.side` — бэктест-стратегия на `OrderRequest` молча слала только продажи, а в live та же стратегия работала как задумано. Закрыто upstream-коммитом `3a3d1be` (#298), приехал мерджем `ed96480` (см. историю секции про ревизию `myhft` ниже — обе стороны теперь согласованы).
 
-**Пока не исправлено — пользуйся `submit_buy_order` / `submit_sell_order`.** Фикс существует в сборке, которую тянет `myhft` (см. §5, расхождение ревизий), но в этом дереве его нет.
+### 4.6 Частичные исполнения не доезжали до позиции — **починено (`cd44349`)**
 
-### 4.6 Частичные исполнения не доезжали до позиции — **починено, не закоммичено**
-
-Ветка `feat/hyperliquid-connector`, правка живёт в рабочем дереве. Якорь — не хеш, а тесты: 9 пинов в `backtest/mod.rs`, `mod test`, перечислены ниже поимённо. Если они зелёные — фикс на месте.
+Ветка `feat/hyperliquid-connector`. Якорь — не хеш, а тесты: 9 пинов в `backtest/mod.rs`, `mod test`, перечислены ниже поимённо. Если они зелёные — фикс на месте.
 
 **Было.** `PartialFillExchange::fill` выставляет `Status::PartiallyFilled`, а `Local::process_recv_order_` звал `state.apply_fill` только при `status == Status::Filled` (`proc/local.rs`, то же в `l3_local.rs`). С `ExchangeKind::PartialFillExchange` позиция и PnL стратегии молча игнорировали **каждое** частичное исполнение. Живое подтверждение, тестнет-сетка 2026-07-28: 5 частичных из 20 филлов, один ордер исполнился двумя кусками с разрывом 2.7 с. Для сетки это норма, а не угол.
 
@@ -273,7 +271,7 @@ Bybit/Binance получили шов `serve(write, read)`: `connect` тольк
 - **`snapshot()` реализован не у всех стаканов**: `todo!()` в `BTreeMarketDepth`, `unimplemented!()` в `ROIVectorMarketDepth`. Коннектору годятся только `HashMap` и `Fused`.
 - **Паника = смерть процесса.** `connector/src/main.rs` ставит panic hook с `exit(1)`; по всему коннектору `pub_tx.send(...).unwrap()`. Это де-факто контракт с супервизором, а не небрежность.
 - **`panic = "abort"` в release-профиле** (корневой `Cargo.toml`). `catch_unwind` в проде не работает.
-- **Коннектор, собранный `cargo build --workspace`, паникует на первом TLS-хендшейке** («Could not automatically determine the process-level CryptoProvider») и умирает через panic hook. Причина — фичеюнификация workspace: `py-hftbacktest → hftbacktest/s3 → aws-config` включает `rustls/aws-lc-rs`, а `connector` тянет `rustls/ring`; с двумя провайдерами rustls требует явного выбора. Воспроизводится на **любом** бэкенде (проверено на bybit), обнаружено live-проверкой HL-бэкенда 2026-07-28. Обход: собирать `cargo build -p connector`. Настоящий фикс — `CryptoProvider::install_default()` на старте коннектора либо единый провайдер по workspace — хорошая отдельная задача.
+- **Коннектор из workspace-сборки паниковал на первом TLS-хендшейке — починено 2026-07-30.** Причина была в фичеюнификации workspace: `py-hftbacktest → hftbacktest/s3 → aws-config` включает `rustls/aws-lc-rs`, а `connector` тянет `rustls/ring`; с двумя провайдерами rustls требует явного выбора, и первый хендшейк умирал через panic hook («Could not automatically determine the process-level CryptoProvider»). Теперь `install_crypto_provider()` в `main.rs` выбирает `ring` явно и идемпотентно (пин — `installing_the_crypto_provider_is_effective_and_idempotent`); проверено живым прогоном workspace-сборки против bybit: TLS проходит, venue отвечает. `cargo build -p connector` больше не обязателен, но остаётся быстрее для итераций.
 - **`LiveBot` ведёт в `StateValues` только `position`.** `balance`/`fee`/`num_trades`/`trading_volume`/`trading_value` в live всегда нули: `LiveEvent::Position` присваивает лишь `state.position` (`live/bot.rs:273-277`), и ни один live-путь не вызывает `apply_fill`. Замерено на тестнет-сессии 2026-07-28: после 18 филлов позиция точна, остальное — нули. Стратегия, считающая live-PnL или комиссии из `StateValues`, слепа молча; источник истины — venue (`userFills` и т.п.). Это свойство ядра, не какого-то бэкенда.
 - **Штатный SIGINT коннектора заканчивается exit 0 — но только если остановка сделала то, что обещала** (`connector/src/main.rs` + `connector/src/supervision.rs`, дизайн: [`docs/design-hyperliquid-connector.md`](docs/design-hyperliquid-connector.md) §12.1). Порядок: сигнальный хендлер выставляет только `stopping` → `run_receive_task` перестаёт принимать запросы → sweep ордеров, и остановка **дожидается его** (`shutdown.sweep_timeout_ms`, 30 с) → `Connector::shutdown` → и лишь теперь publish-таск будят на `drain_publish`, который ждёт, пока дропнутся **все** отправители → `exit(code)` **не дропая receiver**. Код выхода считает `supervision::exit_code`: `1`, если sweep не успел, publish-таск упал или исчез не отчитавшись, или receive-loop кончился сам. Ни один `pub_tx.send(...).unwrap()` не тронут: контракт «нештатная смерть publish-таска = паника и exit 1» жив и закреплён тестом `an_unexpected_publish_task_death_still_panics_a_production_sender` — он теперь дёргает **настоящий** send-сайт (`hyperliquid::private_stream::expire_and_report`), а не свой собственный канал, как прежняя версия, которая проверяла свойство tokio и пережила бы любую «чистку» этих `unwrap`.
 - **У drain есть дедлайн (`shutdown.grace_ms`, 5 с), потому что `Connector::shutdown` реализован только у Hyperliquid.** У bybit/binancefutures/binancespot стрим-таски спавнятся без хендла и крутятся вечно, их отправители не дропаются никогда — без дедлайна коннектор на этих бэкендах висел бы на SIGTERM. Реализуешь wind-down у них — коннектор станет останавливаться сразу, а не по таймауту. **Этот дедлайн не ограничивает sweep** — для него отдельный `shutdown.sweep_timeout_ms` (30 с), и остановка ждёт sweep до того, как разбудит publish-таск. Пока обе вещи делили `grace_ms`, у sweep-а с бюджетом 20 с **на символ** было 5 с на всё: остановка могла срезать его в середине POST-а и отрапортовать успех. Поэтому `Connector::sweep` возвращает `Option<JoinHandle<()>>` — его завершение теперь наблюдаемо.
@@ -346,13 +344,11 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 - Ветки в полёте: `feat/snapshot-marker` (база — snapshot-маркер плюс деплой-тулинг коллектора), `feat/hyperliquid-connector` (ответвлена от неё), `feat/order-id-link`, `bybit-run`, `fix/fix-bybit-live-depth`, `fix/fix-bybit-live--orderbook-depth`.
 - `task-brief-connector-snapshot-marker.md` в корне — **не в git**. Это документ из `myhft`, оказавшийся здесь; на него нельзя ссылаться как на общий контекст.
 
-#### ⚠️ Ревизия, которую собирает `myhft`, отсутствует в этом клоне
+#### Ревизия, которую собирает `myhft` — **согласовано 2026-07-30**
 
-`myhft/Cargo.toml` пинит `rev = "ed96480e05f77ed8f756bf553e5f1e10559cd978"` (комментарий: `# branch feat/snapshot-marker`), а `git cat-file -t ed96480` здесь → `Not a valid object name`. Ни локальная, ни `origin/feat/snapshot-marker` его не содержат — обе на `5abd7f8`. Версия в `myhft/Cargo.lock` — `0.9.4`, в этом дереве `hftbacktest/Cargo.toml` — `0.9.3`.
+`myhft/Cargo.toml` пинит `rev = "ed96480"` (`# branch feat/snapshot-marker`). Разгадка тревожной версии этой секции: `ed96480` — это мердж upstream master в `feat/snapshot-marker`, сделанный на GitHub («Sync fork»); несвежим был локальный клон, а не origin. 2026-07-30 сделан `git fetch`, локальная `feat/snapshot-marker` подтянута на `ed96480`, и он же смерджен в `feat/hyperliquid-connector` (конфликты: `collector/Cargo.toml` — взята наша сторона, rustls/env-filter/raw_value там load-bearing; `bybit/public_stream.rs` — взята наша сторона, upstream-овский хардкод `orderbook.1000` покрывается конфигом `orderbook_depths`). Версия `hftbacktest` теперь 0.9.4, MSRV 1.91.1 — как в проде.
 
-Практический смысл: **деплой и это дерево разошлись** (force-push или незапушенная работа). Что именно крутится в проде, видно только в `~/.cargo/git/checkouts/hftbacktest-*/ed96480/`.
-
-Прежде чем что-то менять здесь в расчёте на `myhft` — сначала сверь эти две вещи и приведи их в согласие. Иначе правка либо не доедет, либо затрёт то, что уже работает.
+Остаётся верным навсегда: прежде чем менять здесь что-то в расчёте на `myhft`, сверь пин в `myhft/Cargo.toml` с этим деревом.
 
 ---
 
