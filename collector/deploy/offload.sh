@@ -359,7 +359,12 @@ for instance in "${INSTANCES[@]}"; do
     done < "${verified}"
 
     echo "  removing ${n_verified} verified file(s) on the host…"
-    if ! ssh "${HOST}" "cd '${remote_dir}' && xargs -d '\n' -r rm -f --" < "${verified}"; then
+    # sudo is load-bearing: the recordings are owned by the hftcollector
+    # system user and the directory is 0755, so the operator's ssh user can
+    # READ everything (which is why download+verify succeed) but cannot unlink.
+    # Found on the first real run — the shimmed test harness could not model
+    # host permissions. Reads stay unprivileged; only the unlink escalates.
+    if ! ssh "${HOST}" "cd '${remote_dir}' && sudo xargs -d '\n' -r rm -f --" < "${verified}"; then
         echo "  ERROR: remove failed on the host; the local copies are good." >&2
         FAILURES=$((FAILURES + 1))
         SUMMARY+=("${instance}: verified ${ver_total}, REMOVE FAILED")
