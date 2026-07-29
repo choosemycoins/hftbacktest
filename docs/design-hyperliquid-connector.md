@@ -95,7 +95,8 @@ Two repository-wide rules apply and are easy to violate:
 
 - **Emit only kind-1 depth events** (§1).
 - **Re-subscribe after every reconnect.** `AGENTS.md` §4.2 documents an upstream bug the
-  other three backends all share: the symbol list is broadcast exactly once over a
+  other three backends all shared (fixed 2026-07-30 by porting this backend's pattern
+  back): the symbol list is broadcast exactly once over a
   `tokio::sync::broadcast`, and each reconnect creates a fresh receiver that never sees it,
   so a reconnected public stream is connected but subscribed to nothing. The Hyperliquid
   backend must hold the `SharedSymbolSet` and re-subscribe from it on every connect.

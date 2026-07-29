@@ -115,6 +115,9 @@ impl BinanceFutures {
         let base_url = self.config.stream_url.clone();
         let client = self.client.clone();
         let symbol_tx = self.symbol_tx.clone();
+        // The registered symbols, so every reconnect re-derives its subscriptions from them
+        // rather than from a fresh broadcast receiver that has seen nothing. `AGENTS.md` §4.2.
+        let symbols = self.symbols.clone();
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
@@ -135,6 +138,7 @@ impl BinanceFutures {
                     let mut stream = market_data_stream::MarketDataStream::new(
                         client.clone(),
                         ev_tx.clone(),
+                        symbols.clone(),
                         symbol_tx.subscribe(),
                     );
                     debug!("Connecting to the market data stream...");
@@ -220,7 +224,13 @@ impl Connector for BinanceFutures {
         let mut symbols = self.symbols.lock().unwrap();
         if !symbols.contains(&symbol) {
             symbols.insert(symbol.clone());
-            self.symbol_tx.send(symbol).unwrap();
+            // Only a wake-up, and not fatal if nobody hears it: the market data stream re-reads
+            // the shared set above on every connect, so a symbol registered while it is between
+            // connections is subscribed as soon as it reconnects. A send error means there is no
+            // receiver at all — and on a market-data-only connector, where `run` starts no user
+            // data stream, that stream is the *only* receiver, so a single reconnect backoff
+            // was enough for `unwrap` to panic the whole connector.
+            let _ = self.symbol_tx.send(symbol);
         }
     }
 
@@ -389,4 +399,34 @@ impl Connector for BinanceFutures {
 
     /// **Not implemented for this backend.** See `Bybit::shutdown`.
     fn shutdown(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        binancefutures::BinanceFutures,
+        connector::{Connector, ConnectorBuilder},
+    };
+
+    /// The shared symbol set is what the market data stream now subscribes from, so the
+    /// lowercasing has to happen on the way *into* it: Binance's stream names are lowercase,
+    /// and `BTCUSDT@trade` is simply not a stream the venue has.
+    ///
+    /// No receiver is subscribed here, on purpose. That is the state during a reconnect
+    /// backoff — up to a minute of it — and on a market-data-only connector the market data
+    /// stream is the *only* receiver there is, so registering then must not be fatal. It used
+    /// to `unwrap` the broadcast send, and `main.rs` turns a panic into `exit(1)`.
+    #[test]
+    fn register_lowercases_the_symbol_and_survives_having_no_listener() {
+        let mut connector = BinanceFutures::build_from(
+            "stream_url = \"wss://example.invalid/ws\"\napi_url = \"https://example.invalid\"\n",
+        )
+        .unwrap();
+
+        connector.register("BTCUSDT".to_string());
+
+        let symbols = connector.symbols.lock().unwrap();
+        assert!(symbols.contains("btcusdt"), "{symbols:?}");
+        assert_eq!(symbols.len(), 1);
+    }
 }

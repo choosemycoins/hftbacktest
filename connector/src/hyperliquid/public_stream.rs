@@ -310,32 +310,9 @@ impl MarketState {
     }
 }
 
-/// Which coins have been subscribed **on the current connection**.
-///
-/// A connection owns one of these and never inherits another's: `connect` builds a fresh
-/// tracker, so every reconnect re-derives its subscriptions from the shared symbol set.
-#[derive(Default)]
-pub struct SubscriptionTracker {
-    subscribed: HashSet<String>,
-}
-
-impl SubscriptionTracker {
-    /// Registered coins that this connection has not subscribed yet, in a stable order.
-    pub fn pending(&self, registered: &HashSet<String>) -> Vec<String> {
-        let mut pending: Vec<String> = registered
-            .difference(&self.subscribed)
-            .cloned()
-            .collect::<Vec<_>>();
-        pending.sort();
-        pending
-    }
-
-    pub fn mark(&mut self, symbols: &[String]) {
-        for symbol in symbols {
-            self.subscribed.insert(symbol.clone());
-        }
-    }
-}
+/// Which coins have been subscribed **on the current connection**. Shared with the other
+/// backends, which have the same reconnect problem to avoid — see [`SubscriptionTracker`].
+pub use crate::utils::SubscriptionTracker;
 
 /// The subscribe frames for a set of coins: `bbo`, `l2Book` and `trades` each.
 ///
@@ -720,19 +697,15 @@ where
 mod tests {
     use std::{
         collections::HashSet,
-        pin::Pin,
         sync::{Arc, Mutex},
-        task::{Context, Poll},
     };
 
-    use futures_util::Sink;
     use hftbacktest::prelude::{
         LOCAL_ASK_DEPTH_EVENT,
         LOCAL_BID_DEPTH_EVENT,
         LOCAL_BUY_TRADE_EVENT,
     };
     use tokio::sync::{broadcast, mpsc::unbounded_channel};
-    use tokio_tungstenite::tungstenite::Message;
 
     use crate::{
         connector::PublishEvent,
@@ -758,6 +731,7 @@ mod tests {
             },
             rest::SymbolInfo,
         },
+        utils::testing::RecordingSink,
     };
 
     /// The local receive clock the mirrors sanity-check the venue's time against. Has to be
@@ -775,34 +749,6 @@ mod tests {
 
     fn set(symbols: &[&str]) -> HashSet<String> {
         symbols.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// A write half that records what was written, so the subscribe path can be driven
-    /// without a socket.
-    #[derive(Default)]
-    struct RecordingSink {
-        sent: Vec<String>,
-    }
-
-    impl Sink<Message> for RecordingSink {
-        type Error = HyperliquidError;
-
-        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-            self.sent.push(item.into_text().unwrap().to_string());
-            Ok(())
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
     }
 
     fn stream(
@@ -899,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn every_symbol_is_resubscribed_after_a_reconnect() {
         let (mut stream, _ev_rx) = stream(&["BTC", "ETH"]);
-        let mut sink = RecordingSink::default();
+        let mut sink = RecordingSink::<HyperliquidError>::default();
         let mut tracker = SubscriptionTracker::default();
         let registered = set(&["BTC", "ETH"]);
 
@@ -938,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn a_coin_the_venue_would_not_answer_about_is_asked_about_again() {
         let (mut stream, _ev_rx) = stream(&["BTC", "ETH", "SOL"]);
-        let mut sink = RecordingSink::default();
+        let mut sink = RecordingSink::<HyperliquidError>::default();
         let mut tracker = SubscriptionTracker::default();
         let pending = vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string()];
 
@@ -976,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn a_venue_wide_failure_leaves_every_coin_pending() {
         let (mut stream, mut ev_rx) = stream(&["BTC", "ETH"]);
-        let mut sink = RecordingSink::default();
+        let mut sink = RecordingSink::<HyperliquidError>::default();
         let mut tracker = SubscriptionTracker::default();
         let pending = vec!["BTC".to_string(), "ETH".to_string()];
 
