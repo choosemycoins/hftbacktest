@@ -163,11 +163,14 @@ def second_producer_of(prev_stream, stream) -> Optional[str]:
 #: not the collector. `test_the_interleave_bound_still_covers_the_socket_hop_it_
 #: is_derived_from` reads the Rust and fails if either number moves, so raising
 #: the capacity re-checks the gate instead of silently reddening burst days.
-WS_QUEUE_CAPACITY = 4096
+#: That is exactly what happened on 2026-07-29: the socket hop overflowed on
+#: both `binancefuturesum` instances at once and went from 4096 to 16384, which
+#: quadrupled the honest overtake below and forced the tolerance up with it.
+WS_QUEUE_CAPACITY = 16384
 PEAK_MSG_PER_S = 20_000
 
 #: The longest a WS frame can sit behind the REST snapshot that skips it: the
-#: whole socket hop, drained at the measured peak. 4096 / 20 000 = 204.8ms.
+#: whole socket hop, drained at the measured peak. 16384 / 20 000 = 819.2ms.
 SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 
 #: How far the *write* order of two different streams may disagree with their
@@ -185,18 +188,26 @@ SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 #: 2026-07-26: one inversion per ~5M lines, always at a REST refetch (12 that
 #: day), worst 134us — but that was a writer keeping up. The two hops cancel
 #: (both frames pass the writer hop), so the honest maximum is exactly
-#: `SOCKET_HOP_NS`, and 250ms is that with ~20% of headroom. A bound at the
+#: `SOCKET_HOP_NS`, and this is that with ~20% of headroom. A bound at the
 #: observed 134us, or at the 10ms this shipped with, would go red on precisely
 #: the burst days whose data matters most: a burst is also what breaks the `pu`
 #: chain the refetch responds to, so a deep socket hop and a REST snapshot
 #: co-occur by construction. Red is a hard build refusal in `build_dataset.py`.
+#:
+#: It was 250ms while the socket hop was 4096. Raising that hop to 16384 on
+#: 2026-07-29 raised the honest maximum to 819.2ms, and this bound is a
+#: consequence of the hop rather than a judgement of its own — so it follows,
+#: to 1s. The cost is real and worth naming: a genuine 900ms inversion is now
+#: yellow where it used to be red. That is the price of the deeper hop, not a
+#: separate decision, and the alternative is a gate that calls the collector's
+#: own design corruption on every burst day.
 #:
 #: Two things this bound is NOT. It does not apply within one stream: there is
 #: one producer appending in receive order, so a step backwards of any size is
 #: red. And it does not apply where no second producer exists — see
 #: `_SECOND_PRODUCER`; a venue with one WS reader gets no tolerance at all,
 #: whatever the size, because there is no mechanism to tolerate.
-CROSS_STREAM_TOLERANCE_NS = 250 * 1_000_000
+CROSS_STREAM_TOLERANCE_NS = 1_000 * 1_000_000
 
 
 # ---------------------------------------------------------------------------

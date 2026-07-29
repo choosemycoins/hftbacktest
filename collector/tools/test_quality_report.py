@@ -1488,7 +1488,7 @@ def test_a_snapshot_overtake_the_full_depth_of_the_socket_hop_is_not_red(tmp_pat
 
     The socket hop holds WS frames the REST snapshot skips, so the largest
     honest overtake is that hop's whole occupancy: `WS_QUEUE_CAPACITY` /
-    `burst::PEAK_MSG_PER_S` = 4096 / 20 000 = 204.8ms. A burst is also what
+    `burst::PEAK_MSG_PER_S` = 16384 / 20 000 = 819.2ms. A burst is also what
     breaks the `pu` chain that triggers the refetch, so the deep hop and the
     snapshot co-occur by construction — a bound below the hop's depth goes red
     on precisely the days whose data is most wanted, and a red day is a hard
@@ -1511,7 +1511,7 @@ def test_a_cross_stream_inversion_beyond_the_bound_is_red(tmp_path):
     a full socket hop reorders two producers by that much."""
     d = tmp_path / "um-interleave-wide"
     d.mkdir()
-    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(600 * MS))
+    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(2_000 * MS))
     write_meta(d, "binancefuturesum", DAY,
                [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
 
@@ -1521,21 +1521,25 @@ def test_a_cross_stream_inversion_beyond_the_bound_is_red(tmp_path):
     assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
     symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
     assert symbol["interleave_inversion"] is None
-    assert symbol["interleave_excess"]["delta_ns"] == 600 * MS
+    assert symbol["interleave_excess"]["delta_ns"] == 2_000 * MS
 
 
 @pytest.mark.parametrize(
     "delta_ns,expected_code,expected_check",
     [
-        (250 * MS, 0, "interleave_inversion"),
-        (250 * MS + 1, 1, "interleave_excess"),
+        (1_000 * MS, 0, "interleave_inversion"),
+        (1_000 * MS + 1, 1, "interleave_excess"),
     ],
 )
 def test_the_interleave_bound_is_pinned_to_the_nanosecond(
     tmp_path, delta_ns, expected_code, expected_check
 ):
-    """Widening the tolerance must break a test, not pass silently."""
-    assert qr.CROSS_STREAM_TOLERANCE_NS == 250 * MS
+    """Widening the tolerance must break a test, not pass silently.
+
+    It widened once, on 2026-07-29, and only because the socket hop it is
+    derived from did — see `CROSS_STREAM_TOLERANCE_NS`.
+    """
+    assert qr.CROSS_STREAM_TOLERANCE_NS == 1_000 * MS
     d = tmp_path / f"um-bound-{delta_ns}"
     d.mkdir()
     write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(delta_ns))
@@ -1636,9 +1640,18 @@ def test_a_whole_file_out_of_order_is_red_not_a_tolerated_interleave(tmp_path):
     base = ns(0, nanos=500_000_000)
     recs = [(base, um_book_ticker("BTCUSDT", base))]
     for i in range(1, 6):
-        # Each snapshot is stamped a full second after the bookTicker written
-        # next to it: far beyond any hand-off skew.
-        recs.append((base + i * SEC, um_depth_snapshot("BTCUSDT", base + i * SEC, 1000 + i)))
+        # Each snapshot is stamped at least two seconds after the bookTicker
+        # written next to it: far beyond any hand-off skew, and beyond the
+        # tolerance with the whole socket hop to spare. The offsets are
+        # `(i + 1) * SEC` and not `i * SEC` for that last reason — at one
+        # second the SMALLEST of the five inversions is 999ms, which slipped
+        # under the bound the moment it followed the socket hop up to 1s on
+        # 2026-07-29 and turned this into a four-violation file. The fixture
+        # has to keep saying "every pair here is out of order" whatever the
+        # bound is; pinning the count to whatever survives it would be reading
+        # the answer off the implementation.
+        at = base + (i + 1) * SEC
+        recs.append((at, um_depth_snapshot("BTCUSDT", at, 1000 + i)))
         recs.append((base + i * MS, um_book_ticker("BTCUSDT", base + i * MS)))
     write_gz(d / f"btcusdt_{DAY}.gz", recs)
     write_meta(d, "binancefuturesum", DAY,
@@ -1648,7 +1661,11 @@ def test_a_whole_file_out_of_order_is_red_not_a_tolerated_interleave(tmp_path):
     assert code == 1
     symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
     assert symbol["interleave_excess"]["violations"] == 5
-    assert symbol["interleave_excess"]["max_delta_ns"] == 5 * SEC - 5 * MS
+    assert symbol["interleave_excess"]["max_delta_ns"] == 6 * SEC - 5 * MS
+    assert symbol["interleave_inversion"] is None, (
+        "every pair in this file is beyond the bound; a tolerated one left over "
+        "means the fixture has drifted back under it"
+    )
 
 
 def test_equal_local_ts_is_not_a_violation(tmp_path):
@@ -2602,7 +2619,7 @@ def test_the_premium_index_poller_is_a_second_producer(tmp_path):
     writer** while every WS frame queues through the socket hop first, so a
     premium-index line stamped later can reach the file before a book tick
     stamped earlier. Eight thousand polls a day against a hop that holds up to
-    204.8ms of frames — without an entry in `_SECOND_PRODUCER` a healthy UM
+    819.2ms of frames — without an entry in `_SECOND_PRODUCER` a healthy UM
     recording would go red on `interleave_excess`, and red is a hard build
     refusal in `build_dataset.py`.
     """

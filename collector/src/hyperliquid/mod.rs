@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{error, info, warn};
 
 use crate::{
+    backoff::retry_startup,
     error::ConnectorError,
     file::META_STREAM,
     meta,
@@ -222,6 +223,27 @@ fn match_universes(
     Ok(out)
 }
 
+/// One `/info` round trip.
+///
+/// A free function rather than the closure it used to be, so that
+/// [`retry_startup`] can hold it: that helper takes an `FnMut` whose future must
+/// not borrow the closure itself, and every argument here is a shared reference,
+/// which copies into one.
+async fn info(
+    client: &reqwest::Client,
+    rest_url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    Ok(client
+        .post(format!("{rest_url}/info"))
+        .json(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
 /// Fails unless every requested coin exists on the perp dex it names.
 ///
 /// Hyperliquid closes the ENTIRE WebSocket when asked to subscribe to a coin it
@@ -241,23 +263,25 @@ async fn resolve_symbols(
     // a hung `/info` would leave the collector "starting" indefinitely,
     // recording nothing and reporting nothing. The responses are small, and a
     // refusal to start is a better outcome than an invisible stall.
+    //
+    // The timeout bounds one attempt; `retry_startup` bounds how many there
+    // are. On 2026-07-29 at 06:09:48 there was only ever one, and a single
+    // `error sending request` on a fresh process ended it a second after it
+    // started — with the next systemd restart succeeding immediately, which is
+    // what says the network and not the venue was the fault.
     const INFO_TIMEOUT: Duration = Duration::from_secs(15);
 
     let client = reqwest::Client::builder().timeout(INFO_TIMEOUT).build()?;
-    let info = async |body: serde_json::Value| -> Result<serde_json::Value, anyhow::Error> {
-        Ok(client
-            .post(format!("{rest_url}/info"))
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
-    };
 
     // Token index -> name, so the collateral can be recorded as "USDE" rather
-    // than "235". Best effort: a failure here must not block startup.
-    let token_names: HashMap<i64, String> = match info(serde_json::json!({"type":"spotMeta"})).await
+    // than "235". Best effort: a failure here must not block startup — but it
+    // is retried like everything else on this path, because the incident's
+    // transient failure would have hit whichever call happened to go first.
+    let spot_meta = serde_json::json!({"type": "spotMeta"});
+    let token_names: HashMap<i64, String> = match retry_startup("the spot token list", || {
+        info(&client, rest_url, &spot_meta)
+    })
+    .await
     {
         Ok(sm) => sm
             .get("tokens")
@@ -292,9 +316,11 @@ async fn resolve_symbols(
         } else {
             serde_json::json!({"type": "meta", "dex": dex})
         };
-        let meta = info(body)
-            .await
-            .map_err(|e| anyhow::anyhow!("couldn't read the perp universe for dex {dex:?}: {e}"))?;
+        let meta = retry_startup(&format!("the perp universe for dex {dex:?}"), || {
+            info(&client, rest_url, &body)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("couldn't read the perp universe for dex {dex:?}: {e}"))?;
         let ct = meta.get("collateralToken").and_then(|v| v.as_i64());
         collateral.insert(
             dex.clone(),
@@ -484,6 +510,129 @@ mod universe_tests {
         assert!(err.contains("NOPE"), "{err}");
         assert!(err.contains("ALSONOPE"), "{err}");
     }
+}
+
+#[cfg(test)]
+mod resolve_transport_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    /// Enough of a `meta` response for `match_universes` to resolve `BTC`, and
+    /// harmless as an answer to `spotMeta`: no `tokens` array means the
+    /// collateral is left unnamed, which is the documented degraded case.
+    const META_BODY: &str =
+        r#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40}],"collateralToken":0}"#;
+
+    /// A stand-in for `/info` that drops the `fail_on`th connection it accepts
+    /// (`0` drops every one) and answers the rest with [`META_BODY`].
+    ///
+    /// A dropped connection is what the 06:09:48 incident looked like from
+    /// inside the process: reqwest reports it as `error sending request`,
+    /// exactly the phrase in the journal. Nothing here fakes the retry — the
+    /// count of accepted connections is the observation, and it is the only way
+    /// to tell a resolve that tried twice from one that gave up.
+    /// Bound here and not inside the task: `#[tokio::test]` runs on a
+    /// current-thread runtime, so waiting for the address on a blocking channel
+    /// would park the only thread the accept loop could have started on.
+    async fn flaky_info(fail_on: usize) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                if fail_on == 0 || counted.fetch_add(1, Ordering::SeqCst) + 1 == fail_on {
+                    // Closed with no answer at all. Dropping the socket here is
+                    // the whole fault being reproduced.
+                    continue;
+                }
+
+                // Consume the request before answering, or the client can meet
+                // a closed pipe while it is still writing the body and report
+                // that instead of reading the response.
+                let mut buf = vec![0u8; 8192];
+                let mut n = 0;
+                while let Ok(read) = socket.read(&mut buf[n..]).await {
+                    n += read;
+                    if read == 0 {
+                        break;
+                    }
+                    let seen = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if let Some(end) = seen.find("\r\n\r\n") {
+                        let len: usize = seen
+                            .to_lowercase()
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|rest| rest.split("\r\n").next())
+                            .and_then(|value| value.trim().parse().ok())
+                            .unwrap_or(0);
+                        if n >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{META_BODY}",
+                    META_BODY.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        (format!("http://{addr}"), accepted, handle)
+    }
+
+    /// Incident B, 2026-07-29 at 06:09:48. A Hyperliquid instance restarted,
+    /// met one `error sending request` while resolving its symbols, and exited
+    /// a second later; the next systemd restart succeeded on the first try. The
+    /// process was right to fail closed on a resolve it could not complete and
+    /// wrong to conclude that from a single attempt.
+    ///
+    /// The second connection is the one that fails, because that is the fetch
+    /// that was fatal: `spotMeta` is best effort and warns, the per-dex `meta`
+    /// is what the subscription cannot be built without.
+    ///
+    /// Real time, not virtual: the retry sleeps for a real 2s here. Pausing the
+    /// clock alongside live sockets would let it jump the per-attempt timeout
+    /// while the kernel was still delivering bytes, which is a flaky test rather
+    /// than a fast one.
+    #[tokio::test]
+    async fn one_dropped_connection_no_longer_refuses_the_startup() {
+        let (rest_url, accepted, server) = flaky_info(2).await;
+
+        let resolved = resolve_symbols(&["BTC".to_string()], &rest_url)
+            .await
+            .expect("a single transient REST failure must not stop the collector starting");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].wire, "BTC");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "spotMeta, the dropped meta attempt, and the retry that succeeded"
+        );
+        server.abort();
+    }
+
+    // The other half — every attempt failing, and the collector still refusing
+    // to start with the venue's own error — is
+    // `backoff::startup_tests::a_resolve_that_never_succeeds_still_fails_closed`
+    // and not a second copy here. Over this transport it would be the same
+    // assertion at the cost of two exhausted ladders of real sleeps, 12s, in a
+    // suite that otherwise finishes in a fraction of one.
 }
 
 #[cfg(test)]

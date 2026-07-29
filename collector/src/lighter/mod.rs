@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{error, info, warn};
 
 use crate::{
+    backoff::retry_startup,
     error::ConnectorError,
     file::META_STREAM,
     meta,
@@ -647,16 +648,38 @@ pub async fn resolve_markets(
     let client = reqwest::Client::builder()
         .timeout(CATALOG_TIMEOUT)
         .build()?;
-    let catalog: serde_json::Value = client
-        .get(format!("{rest_url}/api/v1/orderBooks"))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("couldn't read the Lighter market catalog: {e}"))?
-        .error_for_status()?
-        .json()
-        .await?;
+    // Retried, because a fresh process that meets one refused connection on the
+    // way up has recorded nothing and can simply ask again — see
+    // `backoff::retry_startup`, and the 2026-07-29 06:09:48 incident it was
+    // added for. The retry covers the fetch only: the refusal above is a
+    // configuration error and `match_catalog` below is a pure function of bytes
+    // already in hand, so neither has a second answer to give.
+    let catalog = retry_startup("the Lighter market catalog", || {
+        fetch_catalog(&client, rest_url)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("couldn't read the Lighter market catalog: {e}"))?;
 
     match_catalog(symbols, &catalog)
+}
+
+/// One catalog round trip.
+///
+/// Split from [`resolve_markets`] so it can be retried on its own: the helper
+/// takes an `FnMut` whose future must not borrow the closure, which a free
+/// function taking shared references satisfies and an inline `async` block
+/// capturing them does not.
+async fn fetch_catalog(
+    client: &reqwest::Client,
+    rest_url: &str,
+) -> Result<serde_json::Value, anyhow::Error> {
+    Ok(client
+        .get(format!("{rest_url}/api/v1/orderBooks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 pub async fn run_collection(
@@ -1294,6 +1317,41 @@ mod nonce_tests {
         h.feed(MARKET_STATS_ETH);
         assert!(h.meta().is_empty());
         assert!(h.resubscribes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The retry ladder covers a network that hiccupped, and nothing else.
+    ///
+    /// `--no-symbol-check` on this venue is a configuration error, not a
+    /// transient one: there is no addressing without the catalog, so the answer
+    /// will be the same on the third attempt as on the first. Retrying it would
+    /// spend the whole ladder to arrive at the identical refusal, and print two
+    /// warnings saying the venue had failed when nothing was ever asked of it.
+    ///
+    /// Virtual time, so a ladder that did run would be visible as an advance
+    /// rather than as a slow test. The URL is unroutable for the same reason:
+    /// if this ever does reach the network, it fails here instead of passing
+    /// quietly on a machine that happens to be online.
+    #[tokio::test(start_paused = true)]
+    async fn the_refusal_to_run_without_the_catalog_is_not_retried() {
+        let started = tokio::time::Instant::now();
+
+        let error = resolve_markets(&["BTC".to_string()], "http://192.0.2.1:1", false)
+            .await
+            .expect_err("lighter cannot subscribe without the catalog");
+
+        assert!(error.to_string().contains("--no-symbol-check"), "{error}");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a configuration error must be reported at once, not after the retry ladder"
+        );
     }
 }
 

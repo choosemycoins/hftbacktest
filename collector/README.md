@@ -1185,7 +1185,7 @@ different reasons they are bounded differently:
 
 | Hop | Capacity | Consumer | What a full queue means |
 |---|---|---|---|
-| socket reader → parser | 4096 | JSON parse, no syscalls | the process is out of CPU |
+| socket reader → parser | 16 384 | JSON parse, no syscalls | the parser is not keeping up with the tape |
 | parser → writer | 32 768 | gzip + `write(2)` | the writer stalled or stopped |
 
 If either fills, the collector stops: `{"_collector":"queue_overflow", …}` goes
@@ -1225,7 +1225,7 @@ The memory that buys: a typical UM frame is 300–600 B, so a full writer hop is
 throttled to 100/min, and a queue only stays full while nothing is being
 dequeued — which is also what trips `--stall-timeout-min` and ends the process
 inside five minutes. At most ~500 of them, so ~25 MB. Call the hop **under
-50 MB**, and under 55 MB with both hops full, against 2 GB of host. Tokio's
+50 MB**, and under 61 MB with both hops full, against 2 GB of host. Tokio's
 bounded channels do not preallocate, so this is a ceiling and not a resting
 cost. Memory is not what limits the number; the stall budget is.
 
@@ -1233,22 +1233,118 @@ Two caveats on that number, neither of them a risk at this scale. Setting
 `COLLECTOR_STALL_TIMEOUT_MIN=0` disarms the watchdog, and with it the ~25 MB
 half of the cap. And the frame sizes are Binance UM's, while the capacity is
 shared by every backend: a Bybit instance carrying 1–2 KB `orderbook.200`
-deltas is nearer **65 MB**, and its snapshots come over the WebSocket, so the
-100/min throttle — which gates only the Binance REST refetch — does not bound
-them. Still an order of magnitude inside the host.
+deltas is nearer **65 MB** — ~98 MB with its socket hop full alongside — and its
+snapshots come over the WebSocket, so the 100/min throttle, which gates only the
+Binance REST refetch, does not bound them. Four such instances wedged at once is
+under 400 MB on the 2 GB host, so the conclusion holds and the number does not.
 
-The socket hop stayed at 4096 on purpose. Its consumer parses JSON and hands
-over without ever making a syscall, so it can only stall on losing the CPU —
-and the burst proves it was keeping up, since the writer hop could not have
-filled unless the parser was running flat out to fill it. A backlog there means
-something different, and burying it under a deeper buffer would only delay the
-report.
+**The socket capacity is measured too, since 2026-07-29.** It stayed at 4096
+when the writer hop was raised, on the argument that its consumer parses JSON
+and hands over without ever making a syscall, so it can only stall on losing the
+CPU — tens of milliseconds, against the 205 ms that 4096 buys at the measured
+peak.
+
+At 03:30:02 UTC on 2026-07-29 both `binancefuturesum` instances — separate
+processes, separate sockets — filled this hop within 100 ms of each other and
+exited, each leaving a ~6s hole and restarting clean. The `cpu` gauge either
+side of it reads ~85% idle and 1.4% steal, so neither had lost the CPU, and
+neither lost it at the same instant as the other by coincidence: the market
+moved. The argument was too narrow. Two `serde_json` parsers on 2 vCPUs have a
+*throughput*, and a tape peak above it fills this hop at the difference between
+the two rates for as long as the excursion lasts — nothing has to stall.
+
+So it is now sized by the duration of an excursion, as the writer hop is sized
+by the duration of a stall: **16 384**, or 0.82s at the measured peak. The
+budget is stated as a multiple of the depth that failed rather than of the
+excursion, because nothing measured the excursion — both processes died 205 ms
+into it. The writer hop is untouched: it held through the same event with 8106
+and 9064 records queued, a quarter of its depth, and both backlogs reached disk
+on the way out.
+
+Two soft spots in that arithmetic, both written out in `queue.rs` and neither
+closeable without another measurement. The 0.82s divides by the arrival rate,
+which is the fill time for a parser that has stopped dead rather than one that
+is merely out-run, so it is a floor — as is the 205 ms it is compared against,
+computed the same way, which is why what the pair really decides is the 4×
+ratio. And *the rate is 2026-07-26's*: nobody counted frames at 03:30 on the
+29th, so if that excursion was faster than 20 000 msg/s every figure here
+shrinks in proportion. A third burst is worth more than another round of
+reasoning.
+
+One cost the depth does carry: `drain_backlog` empties the **writer** hop on
+the way out and nothing drains this one, so whatever is sitting here when the
+process stops is lost. That went from ~4096 unparsed frames to ~16 384 — about
+0.6s more of the ~6s hole a restart leaves anyway, which is why it did not
+change the choice.
+
+It cannot simply keep growing. This hop's overflow is the only *specific*
+diagnosis the process has for a parser that cannot keep up, and it races the
+stall watchdog — a parser that has stopped dequeuing produces no writes either,
+so whichever fires first is what the operator gets, and the watchdog can only
+say "nothing for five minutes". 16 384 reports in ~82s at the background rate,
+or ~164s if the market is half as busy as when it was measured; a hop as deep as
+the writer's would lose that race outright. Both bounds are pinned by tests
+(`queue.rs` and `main.rs`), and 16 384 is the only power of two between them.
+The same arithmetic puts a **floor under `--stall-timeout-min` of 3 minutes** —
+it was 1 while the hop was 4096. Set it lower and the watchdog wins the race,
+so the operator gets "silence" instead of the hop that broke.
+One consequence reaches the offline gate: the deeper hop widens the largest
+honest cross-stream overtake to 819 ms, so `quality_report.py`'s interleave
+tolerance moved from 250 ms to 1s with it.
 
 One case escapes all of it. If a write blocks for ever in the kernel — a hung
 mount, a device that stops answering — the main loop never gets back to notice
 the signal, so the process stops recording without exiting. Memory still stays
 bounded and the reason is in `journalctl`, but only an external watchdog
 (systemd `WatchdogSec`) turns that into a restart.
+
+### Starting up into a network blip
+
+Two venues make REST calls before anything is recorded: Hyperliquid resolves
+every coin against `/info` (plus `spotMeta` for the collateral name), and
+Lighter reads the market catalog it has no addressing without. Both refuse to
+start when the call fails, which is right — a collector that cannot name what it
+is recording should not record — but until 2026-07-29 each of them concluded
+that from a **single** attempt.
+
+At 06:09:48 that day a Hyperliquid instance restarted, met one `error sending
+request` on `/info`, and exited a second after starting. The next systemd
+restart succeeded immediately, which is what says the fault was the network and
+not the venue.
+
+So a startup resolve is now tried up to **three times, waiting 2s and then 4s**,
+with a `WARN` naming the endpoint on each failed attempt. Every attempt still
+carries its own timeout (15s for `/info`, 15s for the catalog), so a venue that
+hangs rather than refuses is still bounded. After the last attempt the behaviour
+is exactly what it was: the venue's own error, `{"_collector":
+"symbol_check_failed", …}` in the sidecar, and a non-zero exit.
+
+The bound is bigger than the ladder, and worth knowing before you read a slow
+start as a hang. A venue that **refuses** costs only the 6s of backoff. A venue
+that **hangs** costs 3 × 15s + 6s = 51s per endpoint, and Hyperliquid makes one
+call for `spotMeta` plus one per referenced dex — so the shipped example config
+takes ~153s to refuse to start where it used to take ~45s. That is still inside
+`StartLimitIntervalSec=3600`, so ten failed starts still land the unit in
+`failed` and fire the alert (~26 minutes rather than ~6). It stops being inside
+the hour at **six** referenced dexes — seven endpoints is 362s a cycle against
+the 360s that ten starts allow — and past that the unit would restart for ever
+without ever reaching `failed`, which is the silent crash-loop
+`StartLimitIntervalSec` exists to prevent. A config that wide wants a
+`TimeoutStartSec` on the unit.
+
+The ladder is deliberately short and deliberately not the reconnect ladder
+(`src/backoff.rs` holds both, side by side, for that reason). A *running*
+collector reconnects for as long as the venue is away, because the alternative
+is to stop recording over a blip. A *starting* one has recorded nothing, so
+retrying for ever would leave systemd believing the unit is coming up while
+nothing is captured and nothing has failed.
+
+What is **not** retried: mid-run REST — the Binance depth-snapshot refetch and
+the `premiumIndex` poller — which have their own policies, because a snapshot is
+worthless once stale and a poll is superseded by the next one. Nor Lighter's
+`--no-symbol-check` refusal, which is a configuration error with the same answer
+every time. Nor Lighter's WebSocket geoblocking probe, whose failure is usually
+a jurisdiction rather than a hiccup.
 
 ### Going silent
 

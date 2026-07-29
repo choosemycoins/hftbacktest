@@ -175,11 +175,11 @@ mod tests {
     /// The socket hop is built here and nowhere else, so this is the only place
     /// the two capacities can be confused — and the whole reason there are two.
     ///
-    /// `queue.rs` argues the socket hop must stay shallow: its overflow is the
-    /// one that races the stall watchdog, and it has to win that race with a
-    /// diagnosis where the watchdog would only report silence. Wiring this call
-    /// to `WRITER_QUEUE_CAPACITY` would make it eight times deeper and undo
-    /// that silently — the drain in `main` has
+    /// `queue.rs` argues the socket hop must stay the shallower of the two: its
+    /// overflow is the one that races the stall watchdog, and it has to win that
+    /// race with a diagnosis where the watchdog would only report silence.
+    /// Wiring this call to `WRITER_QUEUE_CAPACITY` would make it twice as deep
+    /// and undo that silently — the drain in `main` has
     /// `the_drain_is_bounded_even_if_the_producers_keep_pushing` guarding the
     /// symmetric mistake, and `queue.rs`'s own tests only check arithmetic over
     /// the constants, never which one arrives here.
@@ -214,8 +214,8 @@ mod tests {
             accepted.load(Ordering::Relaxed),
             WS_QUEUE_CAPACITY,
             "the socket hop must be built with WS_QUEUE_CAPACITY; a hop of \
-             WRITER_QUEUE_CAPACITY here would bury an out-of-CPU parser under \
-             eight times the buffer and let the stall watchdog report it first, \
+             WRITER_QUEUE_CAPACITY here would bury a parser that cannot keep up \
+             under twice the buffer and let the stall watchdog report it first, \
              as silence"
         );
     }

@@ -105,6 +105,17 @@ struct Args {
     /// is roughly fifty-fold — raise it if you record something slower, and
     /// lower it once a real quiet-period gap has been measured.
     ///
+    /// **Do not lower it below 3.** This is the slower of two guards on
+    /// purpose: a starved parser fills the socket hop in ~82s at the measured
+    /// background rate (~164s if the market is half as busy), and that overflow
+    /// is the only report that NAMES the fault — this one can say no more than
+    /// "silence". Below 3 minutes the watchdog wins the race and the diagnosis
+    /// is lost. The margin used to run down to 1; raising the socket hop to
+    /// 16 384 on 2026-07-29 raised the floor with it. See
+    /// `queue::WS_QUEUE_CAPACITY` and
+    /// `the_socket_hop_reports_a_starved_parser_before_the_stall_watchdog_does`,
+    /// which pins the ordering against the default here.
+    ///
     /// It only ever catches TOTAL silence: not a dead depth stream while trades
     /// still arrive, not one Hyperliquid cadence out of three. Sidecar records
     /// do not count as data. One symbol of ten that stopped is
@@ -152,9 +163,9 @@ struct Args {
 /// consumer decided to: the socket keeps delivering, and an unbounded drain
 /// could be fed for as long as the venue stays up. The cap is
 /// [`WRITER_QUEUE_CAPACITY`] — **this hop's** capacity, not the socket hop's,
-/// which is eight times smaller — so everything that was waiting is written and
+/// which is half the size — so everything that was waiting is written and
 /// nothing that arrives afterwards can extend the shutdown. Capping it with the
-/// wrong constant would silently discard seven eighths of a full backlog, which
+/// wrong constant would silently discard half of a full backlog, which
 /// `the_drain_is_bounded_even_if_the_producers_keep_pushing` exists to catch.
 ///
 /// The full backlog is now ~13 MB of gzip work (32 768 records at a few hundred
@@ -971,7 +982,7 @@ mod tests {
     ///
     /// Since the two hops stopped sharing a capacity it guards the wiring as
     /// well: capped with the socket hop's constant instead, this would recover
-    /// 4096 of 32 768 and throw away the rest of the last data the collector
+    /// 16 384 of 32 768 and throw away the rest of the last data the collector
     /// captured. Checked by temporarily swapping the constant — it fails.
     #[test]
     fn the_drain_is_bounded_even_if_the_producers_keep_pushing() {
@@ -993,15 +1004,28 @@ mod tests {
     /// `queue_overflow` in the sidecar, which is what Phase 2's gap attribution
     /// reads. The specific diagnosis has to arrive first.
     ///
-    /// Bounded from both sides, or the rule has no teeth. Merely beating the
-    /// five-minute watchdog would still be satisfied at ~60 000 messages,
-    /// fifteen times the shipped depth, so the requirement is stated as the
-    /// absolute an operator cares about: **a diagnosis inside a minute** at the
-    /// measured background rate. That caps the hop near 12 000, which the
-    /// shipped 4096 clears with room and a `WRITER_QUEUE_CAPACITY`-sized hop
-    /// (32 768, ~164s) does not. The lower bound is
-    /// `the_socket_hop_covers_a_scheduling_hiccup_at_the_measured_burst` in
-    /// `queue.rs`, so between them the socket hop is pinned to [2000, 12000).
+    /// Bounded from both sides, or the rule has no teeth: merely beating the
+    /// five-minute watchdog is still satisfied at ~60 000 messages, four times
+    /// the shipped depth. What the upper bound is stated as changed when the hop
+    /// was raised to 16 384 on 2026-07-29 (see `queue::burst`), and the old
+    /// version is worth recording because it was the tighter of the two: **a
+    /// diagnosis inside a minute** at the measured background rate, which capped
+    /// the hop near 12 000 and which 16 384 (~82s) does not meet.
+    ///
+    /// That absolute was never the invariant, though — it was a proxy for one,
+    /// and a decision about how quickly an operator should hear about a fault
+    /// that has already stopped the recording either way. The invariant is the
+    /// **ordering**, and what it needs is not speed but margin, because the
+    /// number it is computed from is an estimate: `BACKGROUND_MSG_PER_S` is what
+    /// four Binance UM symbols ran at when they were measured, and a quiet hour,
+    /// a thinner instance or a venue between listings all make it smaller —
+    /// which makes the hop slower to fill and the race closer. So the
+    /// requirement is that the overflow still lands first **at half the measured
+    /// background rate**. At 16 384 that is 164s against 300s; a
+    /// `WRITER_QUEUE_CAPACITY`-sized hop (32 768) would be 328s and lose. The
+    /// cap that follows is ~30 000 messages, the floor from
+    /// `the_socket_hop_outlasts_the_excursion_that_overflowed_it` in `queue.rs`
+    /// is 10 000, and 16 384 is the only power of two in between.
     ///
     /// The writer hop is deliberately not held to the same rule. Every dequeue
     /// pets the watchdog, so a writer that is slow rather than stopped keeps it
@@ -1013,11 +1037,6 @@ mod tests {
     /// invalidating it.
     #[test]
     fn the_socket_hop_reports_a_starved_parser_before_the_stall_watchdog_does() {
-        /// What "first" has to mean for the diagnosis to be the one an operator
-        /// acts on, rather than a footnote found after the watchdog has already
-        /// said "silence".
-        const REQUIRED_MS: usize = 60_000;
-
         let shipped = Args::parse_from(["collector", "/tmp/recording", "binancefuturesum"]);
         assert!(
             shipped.stall_timeout_min > 0,
@@ -1036,14 +1055,23 @@ mod tests {
              background rate, which is no sooner than the {watchdog_ms} ms stall watchdog; the \
              collector would then report silence instead of naming the hop"
         );
-        assert!(
-            fill_ms <= REQUIRED_MS,
-            "the websocket->parser hop takes {fill_ms} ms to report a starved parser at the \
-             measured background rate ({} messages); beating the {watchdog_ms} ms watchdog is \
-             not enough — the diagnosis is only the one acted on if it lands inside \
-             {REQUIRED_MS} ms, which caps this hop near {} messages",
+
+        // The margin, and where the teeth are. The background rate is an
+        // estimate from one venue on one day; the ordering has to survive it
+        // being wrong in the direction that hurts.
+        let thin_market_ms = queue::burst::fill_time_ms(
             queue::WS_QUEUE_CAPACITY,
-            REQUIRED_MS * queue::burst::BACKGROUND_MSG_PER_S / 1000,
+            queue::burst::BACKGROUND_MSG_PER_S / 2,
+        );
+        assert!(
+            thin_market_ms < watchdog_ms,
+            "the websocket->parser hop ({} messages) takes {thin_market_ms} ms to report a \
+             starved parser at half the measured background rate, and the {watchdog_ms} ms \
+             stall watchdog would get there first — the recording would then be explained by \
+             \"silence\" rather than by the hop that broke. That caps this hop near {} \
+             messages",
+            queue::WS_QUEUE_CAPACITY,
+            watchdog_ms * (queue::burst::BACKGROUND_MSG_PER_S / 2) / 1000,
         );
     }
 
