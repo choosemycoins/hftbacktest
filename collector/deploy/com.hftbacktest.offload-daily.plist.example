@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily collector offload from the operator Mac. Install:
+
+    cp com.hftbacktest.offload-daily.plist.example \
+       ~/Library/LaunchAgents/com.hftbacktest.offload-daily.plist
+    #  edit the two /Users/YOU/... paths and the schedule below
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hftbacktest.offload-daily.plist
+    launchctl kickstart gui/$(id -u)/com.hftbacktest.offload-daily   # run once now
+
+  Semantics of StartCalendarInterval: if the Mac is ASLEEP at the scheduled
+  time the job runs on wake; if it is POWERED OFF the run is skipped — the
+  wrapper's healthchecks hook (HFT_OFFLOAD_PING_URL) is the guard for that.
+  Pick an hour when yesterday's gate (00:35 UTC on the host) has finished, so
+  its reports ride along with the data.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hftbacktest.offload-daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/YOU/rust/hftbacktest/collector/deploy/offload-daily.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>15</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HFT_HOST</key><string>hft-collector-tokyo</string>
+        <key>HFT_TARGET</key><string>/Users/YOU/hft-data</string>
+        <!-- optional: a dedicated healthchecks.io check for the offload itself
+        <key>HFT_OFFLOAD_PING_URL</key><string>https://hc-ping.com/UUID</string>
+        -->
+    </dict>
+
+    <!-- The wrapper writes the real log under <target>/offload-logs/; these
+         catch only launchd-level failures (script missing, bash not found). -->
+    <key>StandardOutPath</key>
+    <string>/tmp/com.hftbacktest.offload-daily.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.hftbacktest.offload-daily.err</string>
+</dict>
+</plist>

@@ -144,7 +144,13 @@ if [[ -n "${INSTANCES_ARG}" ]]; then
 else
     INSTANCES=()
     while IFS= read -r line; do
-        [[ -n "${line}" ]] && INSTANCES+=("${line}")
+        [[ -z "${line}" ]] && continue
+        # An ext4 fixture at every volume root, not an instance. Skipped only
+        # here, in auto-discovery: if an operator NAMES it via --instances the
+        # allowlist below still refuses it loudly. Without this, a data root
+        # on its own volume fails every unattended run and cries wolf daily.
+        [[ "${line}" == "lost+found" ]] && continue
+        INSTANCES+=("${line}")
     done < <(ssh -n "${HOST}" \
         "find '${REMOTE_DATA_ROOT}' -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort")
 fi
