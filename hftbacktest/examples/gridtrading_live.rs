@@ -10,6 +10,7 @@ use hftbacktest::{
     prelude::{Bot, HashMapMarketDepth},
 };
 
+#[path = "common/algo.rs"]
 mod algo;
 
 const ORDER_PREFIX: &str = "prefix";

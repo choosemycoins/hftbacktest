@@ -20,6 +20,7 @@ use hftbacktest::{
     prelude::{ApplySnapshot, Bot, HashMapMarketDepth},
 };
 
+#[path = "common/algo.rs"]
 mod algo;
 
 #[derive(Parser, Debug)]
