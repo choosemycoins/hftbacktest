@@ -376,8 +376,12 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 
 ### Git
 
-- Работа ведётся в ветках от `master`; `master` отслеживает upstream.
-- Ветки в полёте: `feat/snapshot-marker` (база — snapshot-маркер плюс деплой-тулинг коллектора), `feat/hyperliquid-connector` (ответвлена от неё), `feat/order-id-link`, `bybit-run`, `fix/fix-bybit-live-depth`, `fix/fix-bybit-live--orderbook-depth`.
+Модель веток с 2026-07-30:
+
+- **`develop` — интеграционная ветка форка и рабочая по умолчанию.** Вся форк-работа ведётся в ней или в фичевых ветках от неё. Создана из `feat/hyperliquid-connector` (вся multi-venue/HL/§4.x-работа) и содержит его целиком.
+- **`master` — зеркало upstream (`nkaz001/hftbacktest`), форк-коммитов в нём нет и не будет.** Обновляется только fast-forward-ом с `upstream/master` (remote `upstream` прописан). Апстримные изменения въезжают в `develop` мерджем master → develop.
+- **`upstream-pr/*` — ветки для PR в апстрим**, базируются на `upstream/master`, а не на `develop`; форк-специфика туда не попадает.
+- Исторические ветки (`feat/snapshot-marker` = `ed96480`, который пинит `myhft`; `feat/hyperliquid-connector`; `feat/order-id-link`; `bybit-run`; `fix/*`) заморожены — не удалять, пока `myhft` пинит `ed96480`.
 - `task-brief-connector-snapshot-marker.md` в корне — **не в git**. Это документ из `myhft`, оказавшийся здесь; на него нельзя ссылаться как на общий контекст.
 
 #### Ревизия, которую собирает `myhft` — **согласовано 2026-07-30**
