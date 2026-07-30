@@ -1,0 +1,83 @@
+{
+  "sdk": "lighter-sdk==1.1.2 / lighter-signer-darwin-arm64.dylib",
+  "hash_purity_violations": {},
+  "hash_is_pure": true,
+  "base_vector": {
+    "chain_id": 300,
+    "tx_type": 14,
+    "private_key_hex_le_40b": "0x11223344556677889900112233445566778899001122334455667788990011223344556677889900",
+    "inputs": {
+      "market_index": 1,
+      "client_order_index": 123456789,
+      "base_amount": 1000,
+      "price": 6500000,
+      "is_ask": 0,
+      "order_type": 0,
+      "time_in_force": 2,
+      "reduce_only": 0,
+      "trigger_price": 0,
+      "order_expiry": 1800000000000,
+      "nonce": 42,
+      "api_key_index": 2,
+      "account_index": 1,
+      "ExpiredAt": 1785428437806
+    },
+    "note_L2TxAttributes": "null/empty -> AggregateTxHash returns the bare tx hash",
+    "expected_txHash_40b_hex": "70eea35982e01dfc151534c05cef8eaf161dd0b8e4fd7ff5e84b7bb2efe17a0522027e5ffa6287c9",
+    "n_confirmations": 5
+  },
+  "field_sensitivity": {
+    "market_index": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "client_order_index": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "base_amount": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "price": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "is_ask": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "order_type": {
+      "rejected": "OrderTimeInForce is not valid"
+    },
+    "time_in_force": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "reduce_only": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "trigger_price": {
+      "rejected": "TriggerPrice is invalid"
+    },
+    "order_expiry": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "nonce": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    },
+    "api_key_index": {
+      "rejected": "client is not created for apiKeyIndex: 3 accountIndex: 1"
+    },
+    "account_index": {
+      "rejected": "client is not created for apiKeyIndex: 2 accountIndex: 2"
+    },
+    "skip_nonce": {
+      "changes_hash": null,
+      "via": "no shared ExpiredAt in window"
+    }
+  }
+}

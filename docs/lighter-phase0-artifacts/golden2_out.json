@@ -1,0 +1,59 @@
+{
+  "sdk_version": "lighter-sdk==1.1.2",
+  "shared_lib": "lighter-signer-darwin-arm64.dylib",
+  "chain_id": 300,
+  "private_key_fixed": "0x11223344556677889900112233445566778899001122334455667788990011223344556677889900",
+  "order_fields": {
+    "market_index": 1,
+    "client_order_index": 123456789,
+    "base_amount": 1000,
+    "price": 6500000,
+    "is_ask": 0,
+    "order_type": 0,
+    "time_in_force": 2,
+    "reduce_only": 0,
+    "trigger_price": 0,
+    "order_expiry": 1800000000000,
+    "integrator_account_index": 0,
+    "integrator_taker_fee": 0,
+    "integrator_maker_fee": 0,
+    "self_trade_behavior_mode": 0,
+    "self_trade_equality_mode": 0,
+    "skip_nonce": 0,
+    "nonce": 42,
+    "api_key_index": 2,
+    "account_index": 1
+  },
+  "n_signatures": 400,
+  "n_distinct_signatures": 400,
+  "n_distinct_expired_at": 92,
+  "expired_at_groups_with_more_than_one_hash": {},
+  "hash_is_pure_function_of_fields": true,
+  "signature_is_deterministic": false,
+  "golden_vectors": [
+    {
+      "ExpiredAt": 1785428161890,
+      "txHash": "d7cb6b0ce134ea96fad7f32a1a6ff73f4471c6ae9fafd7bd55a377fbdcde2475cd3b0dbe1faf40be"
+    },
+    {
+      "ExpiredAt": 1785428161891,
+      "txHash": "199e83ac65fad5355f774377b58a9f974ea729fb2ed774c810cb249fa5eeb7331fb986b7198c4bea"
+    },
+    {
+      "ExpiredAt": 1785428161892,
+      "txHash": "10596150e34a142d921c085e154edf307ff4c5a02ce2fc3e37f5e4431f95bc073340175aa8ef3ddf"
+    },
+    {
+      "ExpiredAt": 1785428161893,
+      "txHash": "f97e712c6d58683399ede3f7f7abe450a86dbf13823cb04fb989d836aa9b87a8f9abe94de92dcec1"
+    },
+    {
+      "ExpiredAt": 1785428161894,
+      "txHash": "79fa63ac75cc7903cfa1752d6e53b4b2b9395d328b75421d87b086270a91deb19d7bf0039ba18795"
+    },
+    {
+      "ExpiredAt": 1785428161895,
+      "txHash": "5cfc8f8095a28e6384dfe05cac78cf17fda32d72c550e058ebb5fe910cf6d052ad6bcdaea3e2210c"
+    }
+  ]
+}

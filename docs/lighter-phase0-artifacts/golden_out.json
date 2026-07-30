@@ -1,0 +1,91 @@
+{
+  "sdk": "lighter-sdk==1.1.2 (PyPI)",
+  "lib": "lighter-signer-darwin-arm64.dylib",
+  "platform": "Darwin/arm64",
+  "generated_key_sample": {
+    "err": null,
+    "priv": "0xa69180d1f5aec4b18a3a066a62daf281d81c43c38a74d1550739b74112188250593362bc62aaa46e",
+    "pub": "0x762894a5c7662f4362cea93e734514a15ea8af4ba3398e2217720888549746d0f24bd9d8e6fa4cc2",
+    "priv_hexlen": 80,
+    "priv_bytelen": 40,
+    "pub_hexlen": 80,
+    "pub_bytelen": 40
+  },
+  "create_client": {
+    "chain_id": 300,
+    "api_key_index": 2,
+    "account_index": 1,
+    "private_key": "0x11223344556677889900112233445566778899001122334455667788990011223344556677889900",
+    "err": null
+  },
+  "order_fields": {
+    "market_index": 1,
+    "client_order_index": 123456789,
+    "base_amount": 1000,
+    "price": 6500000,
+    "is_ask": 0,
+    "order_type": 0,
+    "time_in_force": 2,
+    "reduce_only": 0,
+    "trigger_price": 0,
+    "order_expiry": 1800000000000,
+    "integrator_account_index": 0,
+    "integrator_taker_fee": 0,
+    "integrator_maker_fee": 0,
+    "self_trade_behavior_mode": 0,
+    "self_trade_equality_mode": 0,
+    "skip_nonce": 0,
+    "nonce": 42,
+    "api_key_index": 2,
+    "account_index": 1
+  },
+  "create_order_runs": [
+    {
+      "txType": 14,
+      "err": null,
+      "txInfo": "{\"AccountIndex\":1,\"ApiKeyIndex\":2,\"MarketIndex\":1,\"ClientOrderIndex\":123456789,\"BaseAmount\":1000,\"Price\":6500000,\"IsAsk\":0,\"Type\":0,\"TimeInForce\":2,\"ReduceOnly\":0,\"TriggerPrice\":0,\"OrderExpiry\":1800000000000,\"ExpiredAt\":1785428092764,\"Nonce\":42,\"Sig\":\"YPpm8XydLI27/LltBHuTwAsTIrfwX1a5GEUSCkIsxx+h+uE8mrXYGcFum789vsZ1EJVnteoatcaQREoKoUaRNvT4MDn+I0oLwZ9Jb+5M5gY=\",\"L2TxAttributes\":null}",
+      "txHash": "be0893dd4157338c66472dea9483a4fd4a101d6e084b60e42305e80b2a02795013449e9ff4543e75",
+      "messageToSign": null
+    },
+    {
+      "txType": 14,
+      "err": null,
+      "txInfo": "{\"AccountIndex\":1,\"ApiKeyIndex\":2,\"MarketIndex\":1,\"ClientOrderIndex\":123456789,\"BaseAmount\":1000,\"Price\":6500000,\"IsAsk\":0,\"Type\":0,\"TimeInForce\":2,\"ReduceOnly\":0,\"TriggerPrice\":0,\"OrderExpiry\":1800000000000,\"ExpiredAt\":1785428092765,\"Nonce\":42,\"Sig\":\"5ZLYbDt/iVGq0oVRe3Y+mGNGNDxoEIAv6+G2UxieKsBQK6wM2AewbChvbWkbdjy2HuEDKYCcoijki/T553m+mtiLqdFfHaHIvrn5qm9wwyw=\",\"L2TxAttributes\":null}",
+      "txHash": "7f3a94e99485c502e87a9af7b5a3fd4f6cb5b2894ec3b9500584961bce2140efe43a330a04757dcf",
+      "messageToSign": null
+    },
+    {
+      "txType": 14,
+      "err": null,
+      "txInfo": "{\"AccountIndex\":1,\"ApiKeyIndex\":2,\"MarketIndex\":1,\"ClientOrderIndex\":123456789,\"BaseAmount\":1000,\"Price\":6500000,\"IsAsk\":0,\"Type\":0,\"TimeInForce\":2,\"ReduceOnly\":0,\"TriggerPrice\":0,\"OrderExpiry\":1800000000000,\"ExpiredAt\":1785428092765,\"Nonce\":42,\"Sig\":\"WQR3yeoIjKuM8XTRNcb1ECscCElRvTBi4a6YNVdSSodehX+r6uFABmzxjhM52eRmzH7rO+az8xjNgIhSaRGAQAJnbtoQ+sBS+JlZQ98ppDU=\",\"L2TxAttributes\":null}",
+      "txHash": "7f3a94e99485c502e87a9af7b5a3fd4f6cb5b2894ec3b9500584961bce2140efe43a330a04757dcf",
+      "messageToSign": null
+    }
+  ],
+  "determinism": {
+    "txHash_stable_across_runs": false,
+    "messageToSign_stable_across_runs": true,
+    "Sig_stable_across_runs": false,
+    "distinct_txHash": 2,
+    "distinct_Sig": 3
+  },
+  "cancel_order_runs": [
+    {
+      "txType": 15,
+      "err": null,
+      "txInfo": "{\"AccountIndex\":1,\"ApiKeyIndex\":2,\"MarketIndex\":1,\"Index\":987654321,\"ExpiredAt\":1785428092765,\"Nonce\":43,\"Sig\":\"a+kxVpl8PImb3AUo7o9ga3Y/Vf/ppghb671O1f+USSBbeNSQH5iMavvL/9kmrj40uwyKKer+4XwbBlioYpwzF/m/S74GhiRyk0BNKhEnJHI=\",\"L2TxAttributes\":null}",
+      "txHash": "f3f1de3293e31609b20f34cb5839914c2a6273d9eb9410940d321f9723974ac3a3b58130def8b83c",
+      "messageToSign": null
+    },
+    {
+      "txType": 15,
+      "err": null,
+      "txInfo": "{\"AccountIndex\":1,\"ApiKeyIndex\":2,\"MarketIndex\":1,\"Index\":987654321,\"ExpiredAt\":1785428092765,\"Nonce\":43,\"Sig\":\"xm4e22ScHdub4At3tknA0c71NT2az7yGX/NnDbx8ov57Sjq6iNnmTIpcm9rZudbhNCvcVLJlkKVMngBZm7Yc5OuKTADDifgYpAYVaQ7H2H4=\",\"L2TxAttributes\":null}",
+      "txHash": "f3f1de3293e31609b20f34cb5839914c2a6273d9eb9410940d321f9723974ac3a3b58130def8b83c",
+      "messageToSign": null
+    }
+  ],
+  "cancel_determinism": {
+    "txHash_stable": true
+  }
+}

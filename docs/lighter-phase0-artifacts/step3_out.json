@@ -1,0 +1,67 @@
+{
+ "check_client": "OK (registered pubkey matches local private key)",
+ "token_8h": {
+  "err": null,
+  "shape": "1785460345:516:5:<random_hex len=160>"
+ },
+ "token_9h_over_ceiling": {
+  "err": null,
+  "got": true
+ },
+ "accountLimits_with_8h_token": {
+  "status": 200,
+  "ms": 344,
+  "body": {
+   "code": 200,
+   "max_llp_percentage": 100,
+   "max_llp_amount": "0.000000",
+   "user_tier": "standard",
+   "can_create_public_pool": false,
+   "user_tier_name": "standard",
+   "current_maker_fee_tick": 0,
+   "current_taker_fee_tick": 0,
+   "leased_lit": "0.00000000",
+   "effective_lit_stakes": "0.00000000",
+   "user_tier_last_update": 0
+  }
+ },
+ "accountLimits_with_9h_token": {
+  "status": 401,
+  "body": {
+   "code": 20013,
+   "message": "invalid auth: invalid deadline"
+  }
+ },
+ "ws_frames": [
+  {
+   "session_id": "8898936c-6d87-4e7d-b443-4cb33304591f",
+   "type": "connected"
+  },
+  {
+   "channel": "account_all_orders:516",
+   "orders": {},
+   "type": "subscribed/account_all_orders"
+  },
+  {
+   "channel": "account_all_positions:516",
+   "positions": {},
+   "shares": [],
+   "type": "subscribed/account_all_positions"
+  },
+  {
+   "channel": "account_all_trades:516",
+   "daily_volume": 0,
+   "monthly_volume": 0,
+   "total_volume": 0,
+   "trades": {},
+   "type": "subscribed/account_all_trades",
+   "weekly_volume": 0
+  }
+ ],
+ "ws_frame_types": [
+  "connected",
+  "subscribed/account_all_orders",
+  "subscribed/account_all_positions",
+  "subscribed/account_all_trades"
+ ]
+}

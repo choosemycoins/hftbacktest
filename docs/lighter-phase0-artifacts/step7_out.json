@@ -1,0 +1,293 @@
+{
+ "log": [
+  {
+   "t": 1785431963.4152,
+   "tag": "nonce_start",
+   "n": 7
+  },
+  {
+   "t": 1785431963.7609,
+   "tag": "gap_nonce_plus_1",
+   "ms": 345.7,
+   "err": "HTTP response body: code=21104 message='invalid nonce' additional_properties={}",
+   "resp": null
+  },
+  {
+   "t": 1785431964.0979,
+   "tag": "nonce_after_gap",
+   "n": 7
+  },
+  {
+   "t": 1785431964.3801,
+   "tag": "correct_nonce_after_gap",
+   "ms": 282.2,
+   "err": null,
+   "resp": {
+    "code": 200,
+    "message": "{\"ratelimit\": \"Ratelimit is off\"}",
+    "tx_hash": "6241732c6328176503fd922a78a34d7650f624361837344bde957325da6c4a564ed6730a95fb1535",
+    "predicted_execution_time_ms": 1785431964515
+   }
+  },
+  {
+   "t": 1785431966.2165,
+   "tag": "nonce_now",
+   "n": 8
+  },
+  {
+   "t": 1785431966.5546,
+   "tag": "back_to_back_no_delay",
+   "total_ms": 338.0,
+   "first": [
+    337.9,
+    null
+   ],
+   "second": [
+    285.2,
+    "HTTP response body: code=21104 message='invalid nonce' additional_properties={}"
+   ]
+  },
+  {
+   "t": 1785431969.8918,
+   "tag": "nonce_after_b2b",
+   "n": 9
+  },
+  {
+   "t": 1785431969.8918,
+   "tag": "orders_seen",
+   "n": [
+    {
+     "client_order_index": 900000000002,
+     "price": "58200.0",
+     "status": "open"
+    },
+    {
+     "client_order_index": 900000000003,
+     "price": "58100.0",
+     "status": "open"
+    }
+   ]
+  },
+  {
+   "t": 1785431970.5241,
+   "tag": "cleanup_cancel_all",
+   "err": null,
+   "resp": {
+    "code": 200,
+    "message": "{\"ratelimit\": \"Ratelimit is off\"}",
+    "tx_hash": "c0bb24276e113a58857c09763728a6869d186651419e21e15e36f445c6269c699a0a40ecf169d9a0",
+    "predicted_execution_time_ms": 1785431970657
+   }
+  }
+ ],
+ "frames": [
+  {
+   "t": 1785431961.476604,
+   "f": {
+    "session_id": "ee7ab18b-aec4-451b-b05f-3938dd41a6d3",
+    "type": "connected"
+   }
+  },
+  {
+   "t": 1785431961.748214,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {},
+    "type": "subscribed/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431964.583852,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914279171,
+       "client_order_index": 900000000002,
+       "order_id": "844424914279171",
+       "client_order_id": "900000000002",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58200.0",
+       "nonce": 281474960857859,
+       "remaining_base_amount": "0.00100",
+       "is_ask": false,
+       "base_size": 100,
+       "base_price": 582000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787851164098,
+       "status": "open",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510881,
+       "timestamp": 1785431956,
+       "created_at": 1785431956,
+       "updated_at": 1785431956,
+       "transaction_time": 1785431964520225
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431966.763873,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914279138,
+       "client_order_index": 900000000003,
+       "order_id": "844424914279138",
+       "client_order_id": "900000000003",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58100.0",
+       "nonce": 281474960857826,
+       "remaining_base_amount": "0.00100",
+       "is_ask": false,
+       "base_size": 100,
+       "base_price": 581000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787851166216,
+       "status": "open",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510882,
+       "timestamp": 1785431964,
+       "created_at": 1785431964,
+       "updated_at": 1785431964,
+       "transaction_time": 1785431966692910
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431970.72799,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914279171,
+       "client_order_index": 900000000002,
+       "order_id": "844424914279171",
+       "client_order_id": "900000000002",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58200.0",
+       "nonce": 281474960857859,
+       "remaining_base_amount": "0.00000",
+       "is_ask": false,
+       "base_size": 0,
+       "base_price": 582000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787851164098,
+       "status": "canceled",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510882,
+       "timestamp": 1785431964,
+       "created_at": 1785431956,
+       "updated_at": 1785431964,
+       "transaction_time": 1785431970663553
+      },
+      {
+       "order_index": 844424914279138,
+       "client_order_index": 900000000003,
+       "order_id": "844424914279138",
+       "client_order_id": "900000000003",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58100.0",
+       "nonce": 281474960857826,
+       "remaining_base_amount": "0.00000",
+       "is_ask": false,
+       "base_size": 0,
+       "base_price": 581000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787851166216,
+       "status": "canceled",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510882,
+       "timestamp": 1785431964,
+       "created_at": 1785431964,
+       "updated_at": 1785431964,
+       "transaction_time": 1785431970663517
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  }
+ ]
+}

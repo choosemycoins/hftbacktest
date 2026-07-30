@@ -1,0 +1,397 @@
+{
+ "log": [
+  {
+   "t": 1785431670.9702,
+   "tag": "subscribed",
+   "n_frames": 4
+  },
+  {
+   "t": 1785431671.3122,
+   "tag": "nonce_before",
+   "nonce": 1
+  },
+  {
+   "t": 1785431671.6658,
+   "tag": "submit_response",
+   "ms": 353.5,
+   "err": null,
+   "resp": {
+    "code": 200,
+    "message": "{\"ratelimit\": \"Ratelimit is off\"}",
+    "tx_hash": "52857ec7f2fd7703f5411a2916ade8a48125d1c3750d456e32cce1d9da79962dcce67c9344c6798d",
+    "predicted_execution_time_ms": 1785431671831
+   },
+   "tx_signed": {
+    "account_index": 516,
+    "order_book_index": null,
+    "base_amount": 100,
+    "price": 583000,
+    "is_ask": 0,
+    "order_type": null,
+    "expired_at": 1785432270312,
+    "nonce": 1,
+    "sig": "VecfHJ3BbMLSK3qcaC44W67is0PWCCdf+whTccZAUfJHgMQrZvORBI4NKSD3vkKzN9gAh+dcgux6udJ4P4BDuxPDXeEGuUCi9iltVCO2yFI="
+   }
+  },
+  {
+   "t": 1785431671.8738,
+   "tag": "order_on_private_channel",
+   "ms_from_send": 555.5,
+   "ms_from_resp": 202.0,
+   "frame": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914280484,
+       "client_order_index": 424242424242,
+       "order_id": "844424914280484",
+       "client_order_id": "424242424242",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58300.0",
+       "nonce": 281474960859172,
+       "remaining_base_amount": "0.00100",
+       "is_ask": false,
+       "base_size": 100,
+       "base_price": 583000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787850871312,
+       "status": "open",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510802,
+       "timestamp": 1785431667,
+       "created_at": 1785431667,
+       "updated_at": 1785431667,
+       "transaction_time": 1785431671836228
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431672.2596,
+   "tag": "nonce_after_submit",
+   "nonce": 2,
+   "delta": 1
+  },
+  {
+   "t": 1785431672.5446,
+   "tag": "replayed_nonce",
+   "ms": 285.0,
+   "err": "HTTP response body: code=21104 message='invalid nonce' additional_properties={}",
+   "resp": null
+  },
+  {
+   "t": 1785431672.8841,
+   "tag": "nonce_after_replay",
+   "nonce": 2,
+   "delta_vs_after_submit": 0
+  },
+  {
+   "t": 1785431672.8841,
+   "tag": "resolved_order_index",
+   "order_index": 844424914280484
+  },
+  {
+   "t": 1785431673.1702,
+   "tag": "cancel_response",
+   "ms": 286.1,
+   "err": null,
+   "resp": {
+    "code": 200,
+    "message": "{\"ratelimit\": \"Ratelimit is off\"}",
+    "tx_hash": "f5c9881e01015ec1f3e330f9c3397d3716009ab3369b37edd5a70beac4bc0e70e72bc2ca09fda17b",
+    "predicted_execution_time_ms": 1785431673337
+   }
+  },
+  {
+   "t": 1785431673.1703,
+   "tag": "cancel_on_private_channel",
+   "ms_from_send": -1016.3,
+   "ms_from_resp": -1302.4,
+   "frame": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914280484,
+       "client_order_index": 424242424242,
+       "order_id": "844424914280484",
+       "client_order_id": "424242424242",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58300.0",
+       "nonce": 281474960859172,
+       "remaining_base_amount": "0.00100",
+       "is_ask": false,
+       "base_size": 100,
+       "base_price": 583000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787850871312,
+       "status": "open",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510802,
+       "timestamp": 1785431667,
+       "created_at": 1785431667,
+       "updated_at": 1785431667,
+       "transaction_time": 1785431671836228
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431673.5132,
+   "tag": "nonce_after_cancel",
+   "nonce": 3,
+   "delta": 1
+  },
+  {
+   "t": 1785431675.5143,
+   "tag": "all_frame_types",
+   "types": [
+    "connected",
+    "subscribed/account_all_orders",
+    "subscribed/account_all_trades",
+    "subscribed/account_all_positions",
+    "update/account_all_orders",
+    "update/account_all_positions",
+    "update/account_all_orders",
+    "update/account_all_positions"
+   ]
+  }
+ ],
+ "frames": [
+  {
+   "t": 1785431668.9690912,
+   "f": {
+    "session_id": "f093465a-74c6-44f2-91ea-692c4026f004",
+    "type": "connected"
+   }
+  },
+  {
+   "t": 1785431669.289929,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {},
+    "type": "subscribed/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431669.289933,
+   "f": {
+    "channel": "account_all_trades:516",
+    "daily_volume": 0,
+    "monthly_volume": 0,
+    "total_volume": 0,
+    "trades": {},
+    "type": "subscribed/account_all_trades",
+    "weekly_volume": 0
+   }
+  },
+  {
+   "t": 1785431669.2899358,
+   "f": {
+    "channel": "account_all_positions:516",
+    "positions": {},
+    "shares": [],
+    "type": "subscribed/account_all_positions"
+   }
+  },
+  {
+   "t": 1785431671.8678,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914280484,
+       "client_order_index": 424242424242,
+       "order_id": "844424914280484",
+       "client_order_id": "424242424242",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58300.0",
+       "nonce": 281474960859172,
+       "remaining_base_amount": "0.00100",
+       "is_ask": false,
+       "base_size": 100,
+       "base_price": 583000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787850871312,
+       "status": "open",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510802,
+       "timestamp": 1785431667,
+       "created_at": 1785431667,
+       "updated_at": 1785431667,
+       "transaction_time": 1785431671836228
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431671.867807,
+   "f": {
+    "channel": "account_all_positions:516",
+    "positions": {
+     "1": {
+      "market_id": 1,
+      "symbol": "BTC",
+      "initial_margin_fraction": "5.00",
+      "open_order_count": 1,
+      "pending_order_count": 0,
+      "position_tied_order_count": 0,
+      "sign": 1,
+      "position": "0.00000",
+      "avg_entry_price": "0.0",
+      "position_value": "-0.000000",
+      "unrealized_pnl": "0.000000",
+      "realized_pnl": "0.000000",
+      "liquidation_price": "0",
+      "margin_mode": 0,
+      "margin_set_flag": 1,
+      "allocated_margin": "0.000000"
+     }
+    },
+    "shares": [],
+    "type": "update/account_all_positions"
+   }
+  },
+  {
+   "t": 1785431673.51337,
+   "f": {
+    "channel": "account_all_orders:516",
+    "orders": {
+     "1": [
+      {
+       "order_index": 844424914280484,
+       "client_order_index": 424242424242,
+       "order_id": "844424914280484",
+       "client_order_id": "424242424242",
+       "market_index": 1,
+       "owner_account_index": 516,
+       "initial_base_amount": "0.00100",
+       "price": "58300.0",
+       "nonce": 281474960859172,
+       "remaining_base_amount": "0.00000",
+       "is_ask": false,
+       "base_size": 0,
+       "base_price": 583000,
+       "filled_base_amount": "0.00000",
+       "filled_quote_amount": "0.000000",
+       "side": "",
+       "type": "limit",
+       "time_in_force": "post-only",
+       "reduce_only": false,
+       "trigger_price": "0.0",
+       "order_expiry": 1787850871312,
+       "status": "canceled",
+       "trigger_status": "na",
+       "trigger_time": 0,
+       "parent_order_index": 0,
+       "parent_order_id": "0",
+       "to_trigger_order_id_0": "0",
+       "to_trigger_order_id_1": "0",
+       "to_cancel_order_id_0": "0",
+       "integrator_fee_collector_index": "0",
+       "integrator_taker_fee": "0",
+       "integrator_maker_fee": "0",
+       "order_flags": 0,
+       "block_height": 510802,
+       "timestamp": 1785431667,
+       "created_at": 1785431667,
+       "updated_at": 1785431667,
+       "transaction_time": 1785431673342590
+      }
+     ]
+    },
+    "type": "update/account_all_orders"
+   }
+  },
+  {
+   "t": 1785431673.513375,
+   "f": {
+    "channel": "account_all_positions:516",
+    "positions": {
+     "1": {
+      "market_id": 1,
+      "symbol": "BTC",
+      "initial_margin_fraction": "5.00",
+      "open_order_count": 0,
+      "pending_order_count": 0,
+      "position_tied_order_count": 0,
+      "sign": 1,
+      "position": "0.00000",
+      "avg_entry_price": "0.0",
+      "position_value": "-0.000000",
+      "unrealized_pnl": "0.000000",
+      "realized_pnl": "0.000000",
+      "liquidation_price": "0",
+      "margin_mode": 0,
+      "margin_set_flag": 1,
+      "allocated_margin": "0.000000"
+     }
+    },
+    "shares": [],
+    "type": "update/account_all_positions"
+   }
+  }
+ ]
+}

@@ -1,0 +1,113 @@
+{
+  "fields_that_change_the_hash": [
+    "account_index",
+    "api_key_index",
+    "base_amount",
+    "client_order_index",
+    "integrator_account_index",
+    "is_ask",
+    "market_index",
+    "nonce",
+    "order_expiry",
+    "price",
+    "reduce_only",
+    "self_trade_behavior_mode",
+    "self_trade_equality_mode",
+    "skip_nonce",
+    "time_in_force"
+  ],
+  "fields_that_DO_NOT_change_the_hash": [],
+  "other": {},
+  "detail": {
+    "market_index": {
+      "same_ExpiredAt": 1785428470774,
+      "base": "9cac0ef1e2bbbaed",
+      "tweaked": "e109d281df06ca02",
+      "hash_changed": true
+    },
+    "client_order_index": {
+      "same_ExpiredAt": 1785428470775,
+      "base": "3ec43e8cd328cb73",
+      "tweaked": "3f9a31a50db012b7",
+      "hash_changed": true
+    },
+    "base_amount": {
+      "same_ExpiredAt": 1785428470775,
+      "base": "3ec43e8cd328cb73",
+      "tweaked": "af9bbccd46d74dc6",
+      "hash_changed": true
+    },
+    "price": {
+      "same_ExpiredAt": 1785428470776,
+      "base": "a84590d4de14ec69",
+      "tweaked": "f5067f7f2f0a4ccf",
+      "hash_changed": true
+    },
+    "is_ask": {
+      "same_ExpiredAt": 1785428470776,
+      "base": "a84590d4de14ec69",
+      "tweaked": "e80cb1dd69118837",
+      "hash_changed": true
+    },
+    "time_in_force": {
+      "same_ExpiredAt": 1785428470777,
+      "base": "bf16a42e5652670f",
+      "tweaked": "6fb3fa9d02162a4d",
+      "hash_changed": true
+    },
+    "reduce_only": {
+      "same_ExpiredAt": 1785428470777,
+      "base": "bf16a42e5652670f",
+      "tweaked": "4047d313429f1d41",
+      "hash_changed": true
+    },
+    "order_expiry": {
+      "same_ExpiredAt": 1785428470778,
+      "base": "559e5bc04af7baf2",
+      "tweaked": "c7987cc6acec37ce",
+      "hash_changed": true
+    },
+    "nonce": {
+      "same_ExpiredAt": 1785428470778,
+      "base": "559e5bc04af7baf2",
+      "tweaked": "082d3fe25d10b950",
+      "hash_changed": true
+    },
+    "skip_nonce": {
+      "same_ExpiredAt": 1785428470779,
+      "base": "30a1f7ed2bd146f5",
+      "tweaked": "2fe1697bf5fbb367",
+      "hash_changed": true
+    },
+    "api_key_index": {
+      "same_ExpiredAt": 1785428470780,
+      "base": "6ecbe8a4b0c9fd95",
+      "tweaked": "21be9211d9105706",
+      "hash_changed": true
+    },
+    "account_index": {
+      "same_ExpiredAt": 1785428470780,
+      "base": "6ecbe8a4b0c9fd95",
+      "tweaked": "9a68092262b331f6",
+      "hash_changed": true
+    },
+    "self_trade_behavior_mode": {
+      "same_ExpiredAt": 1785428470781,
+      "base": "724b353f90f9f819",
+      "tweaked": "041dce800abaec31",
+      "hash_changed": true
+    },
+    "self_trade_equality_mode": {
+      "same_ExpiredAt": 1785428470781,
+      "base": "724b353f90f9f819",
+      "tweaked": "816d5ee03acae46c",
+      "hash_changed": true
+    },
+    "integrator_account_index": {
+      "same_ExpiredAt": 1785428470782,
+      "base": "b2bb4b29e058e6c5",
+      "tweaked": "2d450739269fad00",
+      "hash_changed": true
+    }
+  }
+}
