@@ -40,6 +40,13 @@ use crate::{
     utils::{SubscriptionTracker, parse_depth},
 };
 
+/// What a subscribe batch's `req_id` starts with; the symbol it covers follows.
+///
+/// Written by [`subscription_frames`], read back by [`acked_symbol`] — one constant, because a
+/// rejection can only be pinned on a symbol if the two agree. Bybit echoes `req_id` on the ack
+/// and it is the sole field there that leads back to a registration.
+const SUBSCRIBE_REQ_ID_PREFIX: &str = "subscribe:";
+
 /// The subscribe batch for one symbol: the orderbook depths plus `publicTrade`.
 ///
 /// Several depths are subscribed to obtain both a wider book and the most frequent updates;
@@ -64,13 +71,24 @@ pub fn subscription_frames(symbols: &[String]) -> Vec<String> {
                 format!("publicTrade.{symbol}"),
             ];
             serde_json::to_string(&Op {
-                req_id: "subscribe".to_string(),
+                req_id: format!("{SUBSCRIBE_REQ_ID_PREFIX}{symbol}"),
                 op: "subscribe".to_string(),
                 args,
             })
             .unwrap()
         })
         .collect()
+}
+
+/// The symbol whose batch an ack belongs to, read out of the `req_id` it was sent with.
+///
+/// `None` for any other shape — the keepalive's `"ping"`, an older build's constant
+/// `"subscribe"`, a venue reply that carries no `req_id` at all. Guessing there would point the
+/// operator at a symbol that is fine, which is worse than naming none.
+fn acked_symbol(req_id: Option<&str>) -> Option<&str> {
+    req_id?
+        .strip_prefix(SUBSCRIBE_REQ_ID_PREFIX)
+        .filter(|symbol| !symbol.is_empty())
 }
 
 pub struct PublicStream {
@@ -138,22 +156,25 @@ impl PublicStream {
                 // One unknown topic fails the *whole* batch, and Bybit then keeps the socket
                 // open and goes on answering pings, so the symbols in that batch simply have
                 // no market data while everything looks healthy. That makes the rejection
-                // something the bots have to hear about, and the operator's only lead is
-                // `ret_msg`, which names the offending topic.
+                // something the bots have to hear about.
                 //
-                // Not retried on this connection: the tracker has already marked those
-                // symbols, and a rejection over a topic *name* is a verdict that will not
-                // change while the connection lives. A transient rejection — rate limit
-                // (`10006`, "Too many visits") — is not told apart from it here, because
-                // `req_id` is not per symbol, so nothing can say which symbols to un-mark.
-                // Those recover on the next reconnect, which re-derives every subscription.
-                // Attributing rejections would mean putting the symbol in `req_id`; until
-                // then this error is the only signal, and it is not a quiet one.
+                // The batch is one symbol's, and `req_id` carries which one, so the log names
+                // the symbol whose market data has just stopped instead of leaving the operator
+                // to grep for it. The bots still only get `CriticalConnectionError`: the symbol
+                // belongs in the log, not the payload — see below.
+                //
+                // Not retried on this connection: the tracker has already marked that symbol,
+                // and a rejection over a topic *name* is a verdict that will not change while
+                // the connection lives — re-asking would spend rate limit for the same answer.
+                // A transient rejection (`10006`, "Too many visits") is still not told apart
+                // from a permanent one; both recover on the next reconnect, which re-derives
+                // every subscription from the shared symbol set.
                 if resp.op == "subscribe" && !resp.success.unwrap_or(true) {
                     error!(
+                        symbol = acked_symbol(resp.req_id.as_deref()).unwrap_or("unattributed"),
                         ?resp,
-                        "Bybit rejected a subscribe batch. Every topic in it failed, so those \
-                         symbols get no market data on this connection, and it will not be \
+                        "Bybit rejected a subscribe batch. Every topic in it failed, so that \
+                         symbol gets no market data on this connection, and it will not be \
                          retried. `ret_msg` names the topic the venue refused."
                     );
                     // The venue's message stays in the log rather than going into the payload:
@@ -371,20 +392,34 @@ impl PublicStream {
 mod tests {
     use std::{
         collections::HashSet,
+        fmt,
         sync::{Arc, Mutex},
+        task::Poll,
     };
 
+    use futures_util::{Stream, stream};
     use hftbacktest::types::{ErrorKind, LiveEvent};
     use tokio::sync::{
         broadcast,
         mpsc::{UnboundedReceiver, unbounded_channel},
+    };
+    use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+    use tracing::{
+        Event as LogEvent,
+        Level,
+        Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{
+        Layer,
+        layer::{Context as LayerContext, SubscriberExt},
     };
 
     use crate::{
         bybit::{
             BybitError,
             SharedSymbolSet,
-            public_stream::{PublicStream, subscription_frames},
+            public_stream::{PublicStream, acked_symbol, subscription_frames},
         },
         connector::PublishEvent,
         utils::testing::{RecordingSink, closed_read, read_after_connect, read_frames},
@@ -429,6 +464,111 @@ mod tests {
             .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
             .filter(|frame| frame["op"] == "subscribe")
             .collect()
+    }
+
+    /// How many `CriticalConnectionError`s reached the bots, draining what is queued.
+    fn errors(ev_rx: &mut UnboundedReceiver<PublishEvent>) -> usize {
+        let mut errors = 0;
+        while let Ok(event) = ev_rx.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Error(error)) = event {
+                assert_eq!(error.kind, ErrorKind::CriticalConnectionError);
+                errors += 1;
+            }
+        }
+        errors
+    }
+
+    /// The `symbol` field of every `error!` the code under test emitted, in order.
+    ///
+    /// The attribution **is** a log field, and only a log field: nothing about the connection
+    /// changes when a batch is rejected — nothing retries, nothing un-marks, and the payload the
+    /// bots get is deliberately symbol-free because a `LiveEvent` is capped at 512 bytes.
+    /// So the field is what has to be asserted, or the one line that is the whole feature is
+    /// pinned by nothing: hard-coding `symbol = "unattributed"` at the call site kept every
+    /// other test in this module green.
+    ///
+    /// The *field*, never the message — prose is free to change, `symbol` is what the operator
+    /// greps and therefore the contract.
+    #[derive(Clone, Default)]
+    struct ReportedSymbols(Arc<Mutex<Vec<String>>>);
+
+    impl ReportedSymbols {
+        /// Captures on **this thread only**, for as long as the guard lives. `#[tokio::test]`
+        /// polls the future on the calling thread, so the loop under test logs in here while
+        /// every other test's subscriber is left alone.
+        fn capturing(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn reported(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for ReportedSymbols {
+        fn on_event(&self, event: &LogEvent<'_>, _: LayerContext<'_, S>) {
+            if *event.metadata().level() != Level::ERROR {
+                return;
+            }
+            let mut symbol = SymbolField(None);
+            event.record(&mut symbol);
+            if let Some(symbol) = symbol.0 {
+                self.0.lock().unwrap().push(symbol);
+            }
+        }
+    }
+
+    /// Pulls a `symbol = ...` field out of one event and ignores every other field.
+    struct SymbolField(Option<String>);
+
+    impl Visit for SymbolField {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "symbol" {
+                self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, _: &Field, _: &dyn fmt::Debug) {}
+    }
+
+    /// A rejection ack for `symbol`, echoing the `req_id` its subscribe batch really carried.
+    ///
+    /// Built from [`subscription_frames`] rather than hand-written, so writer and reader have to
+    /// agree through the code under test. Two matching literals in two tests would let the two
+    /// sides drift apart into a `req_id` nothing can attribute.
+    fn rejection_for(symbol: &str) -> String {
+        let batch: serde_json::Value =
+            serde_json::from_str(&subscription_frames(&[symbol.to_string()])[0]).unwrap();
+        let req_id = batch["req_id"].as_str().unwrap();
+        format!(
+            r#"{{"success":false,"ret_msg":"error:handler not found,topic:orderbook.500.{symbol}","conn_id":"c","req_id":"{req_id}","op":"subscribe"}}"#
+        )
+    }
+
+    /// A read half that hands the loop `frames` as text and then runs `script`, staying quiet
+    /// afterwards.
+    ///
+    /// `utils::testing::read_frames` ends instead, which is a dropped socket — and a connection
+    /// that is gone cannot be asked what a frame did to its subscription state. The script ends
+    /// the loop itself by dropping the wake-up sender it captured, as `read_after_connect` does.
+    fn read_frames_then<F>(
+        frames: Vec<String>,
+        script: F,
+    ) -> impl Stream<Item = Result<Message, WsError>> + Unpin
+    where
+        F: FnOnce(),
+    {
+        let mut frames = frames.into_iter();
+        let mut script = Some(script);
+        stream::poll_fn(move |_| match frames.next() {
+            Some(frame) => Poll::Ready(Some(Ok(Message::Text(frame.into())))),
+            None => {
+                if let Some(script) = script.take() {
+                    script();
+                }
+                Poll::Pending
+            }
+        })
     }
 
     /// Every symbol registered before this connection existed has to be subscribed at
@@ -591,9 +731,9 @@ mod tests {
         let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["BTCUSDT"]);
         let mut sink = RecordingSink::<BybitError>::default();
         let mut read = read_frames(vec![
-            r#"{"success":true,"ret_msg":"","conn_id":"c","req_id":"subscribe","op":"subscribe"}"#
+            r#"{"success":true,"ret_msg":"","conn_id":"c","req_id":"subscribe:BTCUSDT","op":"subscribe"}"#
                 .to_string(),
-            r#"{"success":false,"ret_msg":"error:handler not found,topic:orderbook.500.BTCUSDT","conn_id":"c","req_id":"subscribe","op":"subscribe"}"#
+            r#"{"success":false,"ret_msg":"error:handler not found,topic:orderbook.500.BTCUSDT","conn_id":"c","req_id":"subscribe:BTCUSDT","op":"subscribe"}"#
                 .to_string(),
         ]);
 
@@ -602,14 +742,123 @@ mod tests {
             .await
             .expect_err("the read half ended");
 
-        let mut errors = 0;
-        while let Ok(PublishEvent::LiveEvent(event)) = ev_rx.try_recv() {
-            if let LiveEvent::Error(error) = event {
-                assert_eq!(error.kind, ErrorKind::CriticalConnectionError);
-                errors += 1;
-            }
+        assert_eq!(
+            errors(&mut ev_rx),
+            1,
+            "the accepted batch must not report anything"
+        );
+    }
+
+    /// The rejection has to name the symbol whose market data just stopped: with a constant
+    /// `req_id` the `error!` named nobody and the operator grepped blind.
+    ///
+    /// A round trip on purpose — the ack echoes the `req_id` [`subscription_frames`] really
+    /// wrote, so writer and reader agree through the code rather than through two literals in
+    /// two tests. And the assertion is on the `symbol` field the loop emitted, because that
+    /// field is the entire deliverable: replacing it with a hard-coded `"unattributed"` leaves
+    /// every other test in this module green, so nothing else here can notice the feature being
+    /// reverted.
+    #[tokio::test]
+    async fn a_rejection_names_the_symbol_it_answers_for() {
+        let reported = ReportedSymbols::default();
+        let _capturing = reported.capturing();
+        let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["BTCUSDT"]);
+        let mut sink = RecordingSink::<BybitError>::default();
+        let mut read = read_frames(vec![rejection_for("BTCUSDT")]);
+
+        stream
+            .serve(&mut sink, &mut read)
+            .await
+            .expect_err("the read half ended");
+
+        assert_eq!(
+            reported.reported(),
+            vec!["BTCUSDT"],
+            "the rejection must be pinned on the symbol whose batch it answers"
+        );
+        assert_eq!(errors(&mut ev_rx), 1);
+    }
+
+    /// A rejection must not disturb anything else: nothing un-subscribes or retries on this
+    /// connection, so a rejection that quietly un-marked a symbol would leave the next wake-up
+    /// resubscribing a live one and spending rate limit (`10006`, "Too many visits").
+    ///
+    /// Tracker state is only visible in what the connection writes next, so this drives a
+    /// wake-up after the rejection and requires it to write nothing — for the rejected symbol
+    /// and for the healthy one beside it alike.
+    #[tokio::test]
+    async fn a_rejection_un_marks_nothing() {
+        let (mut stream, _symbols, symbol_tx, mut ev_rx) = stream(&["BTCUSDT", "ETHUSDT"]);
+        let mut sink = RecordingSink::<BybitError>::default();
+        let mut read = read_frames_then(vec![rejection_for("BTCUSDT")], move || {
+            // Whatever the rejection did to this connection's subscription state is only
+            // visible in what the next wake-up writes. Dropping the sender ends the loop.
+            symbol_tx.send("BTCUSDT".to_string()).unwrap();
+        });
+
+        stream.serve(&mut sink, &mut read).await.unwrap();
+
+        let batches = subscribed(&sink);
+        assert_eq!(
+            batches.len(),
+            2,
+            "the two connect-time batches and nothing else: {:?}",
+            sink.sent
+        );
+        assert_eq!(
+            errors(&mut ev_rx),
+            1,
+            "the rejection is still reported to the bots"
+        );
+    }
+
+    /// A `req_id` this connector did not write — the keepalive's `"ping"`, an older build's
+    /// constant `"subscribe"`, a venue that echoes nothing — is not a symbol, and guessing one
+    /// would point the operator at a symbol that is fine. Unattributed still means reported:
+    /// the batch's topics are dead either way, and the log says so in as many words rather than
+    /// dropping the field and leaving a rejection that looks like every other one.
+    #[tokio::test]
+    async fn a_rejection_with_no_symbol_in_its_req_id_is_reported_unattributed() {
+        let reported = ReportedSymbols::default();
+        let _capturing = reported.capturing();
+        let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["BTCUSDT"]);
+        let mut sink = RecordingSink::<BybitError>::default();
+        for req_id in [Some("ping"), Some("subscribe"), Some("subscribe:"), None] {
+            assert_eq!(acked_symbol(req_id), None, "{req_id:?} is not a symbol");
         }
-        assert_eq!(errors, 1, "the accepted batch must not report anything");
+        let mut read = read_frames(vec![
+            r#"{"success":false,"ret_msg":"error:handler not found,topic:orderbook.500.BTCUSDT","conn_id":"c","req_id":"subscribe","op":"subscribe"}"#.to_string(),
+            r#"{"success":false,"ret_msg":"Too many visits","conn_id":"c","op":"subscribe"}"#
+                .to_string(),
+        ]);
+
+        stream
+            .serve(&mut sink, &mut read)
+            .await
+            .expect_err("the read half ended");
+
+        assert_eq!(errors(&mut ev_rx), 2);
+        assert_eq!(reported.reported(), vec!["unattributed", "unattributed"]);
+    }
+
+    /// A batch's `req_id` names the symbol it covers, because it is the only field that comes
+    /// back on the ack: a rejection carries
+    /// `ret_msg` at the venue's discretion and nothing else that ties it to a registration.
+    /// With a constant `req_id` the `error!` and the `CriticalConnectionError` named nobody,
+    /// and the operator had to guess which symbol's market data had just stopped.
+    ///
+    /// `op` is pinned alongside it: the ack handler keys the rejection branch off `resp.op`,
+    /// so folding the symbol into `op` instead would make every rejection invisible.
+    #[test]
+    fn every_batch_names_its_symbol_in_the_req_id() {
+        let frames = subscription_frames(&["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+
+        assert_eq!(frames.len(), 2);
+        for (frame, symbol) in frames.iter().zip(["BTCUSDT", "ETHUSDT"]) {
+            let batch: serde_json::Value = serde_json::from_str(frame).unwrap();
+            assert_eq!(batch["req_id"], format!("subscribe:{symbol}"), "{frame}");
+            assert_eq!(batch["op"], "subscribe", "{frame}");
+        }
     }
 
     /// One rejected topic fails the whole batch, so the batches stay per-symbol: merged into
