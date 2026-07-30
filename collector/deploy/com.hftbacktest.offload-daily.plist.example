@@ -36,6 +36,12 @@
     <dict>
         <key>HFT_HOST</key><string>hft-collector-tokyo</string>
         <key>HFT_TARGET</key><string>/Users/YOU/hft-data</string>
+        <!-- Hybrid tier: days older than HFT_KEEP_DAYS move from HFT_TARGET to
+             this path (an external volume) before each offload. Unset = the
+             Mac keeps everything and only the free-space floor warns.
+        <key>HFT_ARCHIVE_DIR</key><string>/Volumes/YOUR-DISK/hft-archive</string>
+        <key>HFT_KEEP_DAYS</key><string>2</string>
+        -->
         <!-- optional: a dedicated healthchecks.io check for the offload itself
         <key>HFT_OFFLOAD_PING_URL</key><string>https://hc-ping.com/UUID</string>
         -->

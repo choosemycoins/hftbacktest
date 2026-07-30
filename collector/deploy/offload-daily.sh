@@ -28,6 +28,10 @@
 #   HFT_TG_ENV              telegram env file          (default ~/.config/hftbacktest-connector/telegram-alert.env)
 #   HFT_OFFLOAD_PING_URL    optional healthchecks check for the offload itself
 #   HFT_OFFLOAD_WARN_PCT    host volume use%% that warns (default 70)
+#   HFT_ARCHIVE_DIR         hybrid tier: where days older than the local window
+#                           move (external volume); unset = tier disabled
+#   HFT_KEEP_DAYS           local rolling window in days (default 2)
+#   HFT_LOCAL_FLOOR_GB      local free-space floor that warns (default 15)
 #
 # Deliberately bash 3.2 — this runs on a Mac, same rule as offload.sh.
 
@@ -57,6 +61,22 @@ telegram() {
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         || echo "offload-daily: telegram delivery failed" >>"${LOG}"
 }
+
+# Hybrid tier, BEFORE the offload: moving days older than the local window to
+# HFT_ARCHIVE_DIR is what frees the space the offload is about to need. Its
+# failure never blocks the offload.
+rot_rc=0
+"${DEPLOY_DIR}/archive-rotate.sh" >>"${LOG}" 2>&1 || rot_rc=$?
+
+# Local headroom, checked regardless of WHY it is low — tier disabled, volume
+# unplugged, or the burn rate simply outrunning the window. Running out of
+# local disk is how a whole morning's offload was lost once (2026-07-30), and
+# the offload's own ENOSPC error arrives a day later than this warning.
+free_kb="$(df -k "${HFT_TARGET}" 2>/dev/null | awk 'NR==2 {print $4}')"
+floor_kb=$(( ${HFT_LOCAL_FLOOR_GB:-15} * 1024 * 1024 ))
+if [[ -n "${free_kb}" ]] && (( free_kb < floor_kb )); then
+    telegram "🟡 hft-data на маке: свободно $((free_kb / 1024 / 1024)) ГБ (< ${HFT_LOCAL_FLOOR_GB:-15} ГБ). archive-rotate exit ${rot_rc} ($([[ ${rot_rc} -eq 2 ]] && echo 'архивный том не подключён' || echo 'см. лог')). Следующий вывоз может упереться в место. Лог: ${LOG}"
+fi
 
 rc=0
 "${DEPLOY_DIR}/offload.sh" --host "${HFT_HOST}" --target "${HFT_TARGET}" >>"${LOG}" 2>&1 || rc=$?
