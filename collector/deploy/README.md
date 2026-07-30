@@ -225,3 +225,11 @@ SIGTERM'ом (проверяйте `gzip -t` только на прошлых UT
     целиком; `--buffer-size` у `build_dataset.py` можно поднимать смело, а
     датасеты хранить рядом с сырьём (`dataset-*` не трогает ни вывоз, ни
     ротация).
+- **Linux-оператор (systemd вместо launchd)**: те же скрипты, юниты —
+  `hft-offload-daily.{service,timer}.example` → `~/.config/systemd/user/`,
+  поправить пути/Environment, затем `systemctl --user daemon-reload &&
+  systemctl --user enable --now hft-offload-daily.timer` и
+  `loginctl enable-linger $USER` (иначе таймер живёт только при активной
+  сессии). `Persistent=true` — аналог launchd-семантики «проспал — запустись
+  при пробуждении». Проверка: `systemctl --user start hft-offload-daily` и
+  лог в `<target>/offload-logs/`.

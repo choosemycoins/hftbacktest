@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the hft-collector offload daily at 09:15 local
+
+[Timer]
+OnCalendar=*-*-* 09:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

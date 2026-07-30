@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily hft-collector offload from Tokyo (hybrid archive wrapper)
+
+[Service]
+Type=oneshot
+Environment=HFT_HOST=hft-collector-tokyo
+Environment=HFT_TARGET=/home/YOU/hft-data
+Environment=HFT_LOCAL_FLOOR_GB=25
+ExecStart=/bin/bash /home/YOU/hftbacktest/collector/deploy/offload-daily.sh
