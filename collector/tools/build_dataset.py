@@ -33,14 +33,19 @@ What it does, in the order the design doc requires:
    the ``bbo`` frames folded into the book are read back the same way into
    ``converter.bbo_depth_frames``, and a reported **zero** refuses the build: it
    means the mode produced the plain ``l2Book`` book under another name.
-5. **Signal array** built straight from the raw ``@bookTicker`` frames — no
+5. **Tick and lot.** The tick is MEASURED from the day's own prices — the
+   coarsest power-of-ten grid every quoted price lands on — and cross-checked
+   against Hyperliquid's price rule; the szDecimals term of that rule is only
+   the tick's lower bound, and registering it gave ONDO/JTO a 10x-too-fine tick
+   on 2026-07-29. See :func:`reconcile_tick`. The lot stays ``10^-szDecimals``.
+6. **Signal array** built straight from the raw ``@bookTicker`` frames — no
    converter is involved on the Binance side in mode A.
-6. **No initial snapshot** (§3.4). The window's days go to one ``BacktestAsset``
+7. **No initial snapshot** (§3.4). The window's days go to one ``BacktestAsset``
    as a continuous stream, so an end-of-day snapshot *inside* the window changes
    nothing; the only useful one would come from the day before the window, which
    is not part of it. The first day therefore starts with an empty book and the
    Phase 4 warm-up guard is what keeps the strategy out.
-7. **Manifest** (§3.3) with everything needed to rebuild, including the exact
+8. **Manifest** (§3.3) with everything needed to rebuild, including the exact
    argv, the converter's knobs, and the models Phase 4 reads back.
 
 Nanosecond timestamps (~1.8e18) do not fit float64 exactly — 2^53 is about
@@ -74,6 +79,10 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from rerank_metrics import PX_DECIMALS, scaled_px  # noqa: E402
 
 NS_PER_SEC = 1_000_000_000
 NS_PER_MS = 1_000_000
@@ -572,12 +581,21 @@ def worst_verdict(
         report: dict,
         venues: Sequence[str],
         days: Optional[Sequence[str]] = None,
+        include_overall: bool = True,
 ) -> tuple[str, list[str], list[str]]:
     """Worst of the overall verdict and the day verdicts of the venues used.
 
     ``days`` restricts which day verdicts count. A red day the window does not
     touch contributes nothing to the dataset being built, so it comes back in
     the third list — reported, recorded in the manifest, but not a refusal.
+
+    ``include_overall=False`` folds in only the named venues. The report's own
+    verdict is the worst over *every* venue it covers (``quality_report.py``:
+    a venue's verdict is the worst of its days, the report's the worst of its
+    venues), so for a dataset that holds one venue it can only ever import
+    another venue's fault — which is what ``build_hl_dataset.py`` refuses to be
+    stopped by. Nothing is lost: everything red about the named venue is in its
+    own day verdicts.
     """
     worst = 'green'
     reasons: list[str] = []
@@ -599,7 +617,8 @@ def worst_verdict(
         if VERDICT_ORDER[key] > VERDICT_ORDER[worst]:
             worst = key
 
-    consider(report.get('verdict'), 'overall', True)
+    if include_overall:
+        consider(report.get('verdict'), 'overall', True)
     for venue in venues:
         entry = _venue(report, venue)
         for day in sorted((entry.get('days') or {})):
@@ -754,6 +773,408 @@ def read_meta_records(paths: Sequence[Path]) -> list[tuple[Optional[int], dict]]
 
 
 # ---------------------------------------------------------------------------
+# the tick, measured from the recording
+# ---------------------------------------------------------------------------
+
+#: Hyperliquid has no tick-size field. A perp price is legal when it has at most
+#: five significant figures AND at most ``6 - szDecimals`` decimals
+#: (design-hyperliquid-connector.md §5.3), so the effective tick is the COARSER
+#: of the two constraints — and, through the first term, a step function of the
+#: price itself.
+#:
+#: Only the second term can be reconstructed from the sidecar, and it is a lower
+#: bound. Measured 2026-07-29: ONDO quoted 0.39040..0.41209 with ``szDecimals=0``,
+#: i.e. a reconstructed tick of 1e-6, while all 2.78M recorded prices sat on a
+#: 1e-5 grid. A dataset built on the lower bound lets the backtest quote nine
+#: phantom levels between every real one; correcting it flipped the sign of
+#: ONDO's PnL. Hence: the tick is measured here, and the rule is the cross-check.
+HL_PRICE_SIG_FIGS = 5
+HL_MAX_PRICE_DECIMALS = 6
+
+#: The channels whose prices the grid is measured from — and only from the
+#: frames the chosen ``book_mode`` actually converts (:func:`converts_frame`).
+#: `trades` is deliberately not among them: a trade prints at a level that
+#: already existed, so it adds no evidence about the grid — measured 2026-07-30
+#: over eight coin-days (ONDO, HYPE, BTC, SEI, PUMP, GRAM, AERO, KAITO), where
+#: `l2Book`, `bbo` and `trades` each gave the identical exponent — while a single
+#: odd print, a liquidation or an auction fill, would drag the measured tick
+#: finer and reopen exactly the hole this measurement closes.
+PRICE_CHANNELS = ('l2Book', 'bbo')
+
+#: Fewer than two distinct prices is not a grid: one price always lands on a grid
+#: as coarse as its own last non-zero digit, so 0.39040 alone would "measure"
+#: 1e-4. Two is the point at which the answer stops being a property of a single
+#: number — thin evidence is then reported (`distinct_prices`) and cross-checked
+#: against the rule, not silently trusted.
+MIN_GRID_PRICES = 2
+
+#: Indexed by exponent in the hot path; :func:`_pow10` covers anything past it.
+#: The table reaches a tick of 1e6, which is well past any venue price.
+_POW10 = tuple(10 ** i for i in range(PX_DECIMALS + 7))
+
+
+def _pow10(exponent: int) -> int:
+    """``10 ** exponent`` for a non-negative exponent, table-backed where it can be."""
+    try:
+        return _POW10[exponent]
+    except IndexError:
+        return 10 ** exponent
+
+
+def _trailing_tens(value: int) -> int:
+    """How many times 10 divides a positive integer.
+
+    The coarsest power-of-ten grid ONE price lands on. Walked digit by digit
+    rather than through ``log10``, for the same reason as :func:`price_decade`.
+    """
+    exponent = 0
+    while value % 10 == 0:
+        value //= 10
+        exponent += 1
+    return exponent
+
+
+@dataclass
+class PriceGrid:
+    """The coarsest power-of-ten grid every observed price lands on.
+
+    Prices are exact integers scaled by ``10^PX_DECIMALS`` (``rerank_metrics``'s
+    ``scaled_px``, shared so the two tools cannot drift apart about what a price
+    is). The measurement is a divisibility test, and a tick of 1e-6 on a 0.001816
+    price is not a binary fraction: through float64 the test is a rounding coin
+    toss.
+
+    ``exponent`` is the number of trailing tens common to every price seen, in
+    scaled units, and is ``None`` until the first price arrives. It is **not**
+    capped at ``PX_DECIMALS`` (a tick of 1.0): five significant figures make the
+    venue tick 10 above 100 000 and 100 above a million
+    (``design-hyperliquid-connector.md`` §11.5, measured on testnet 2026-07-28 —
+    ``123456`` is rejected and rounds to ``123460``), so a measurement that
+    stopped at 1.0 would answer 1.0 for a book quoted in tens. That is a tick ten
+    times too fine — the ONDO defect this class exists to remove, reintroduced by
+    the tool instead of by szDecimals — and it would win the cross-check in
+    :func:`reconcile_tick`, because the measurement is what wins there.
+    """
+
+    prices: int = 0
+    non_positive: int = 0
+    unparsed: int = 0
+    min_px: Optional[int] = None
+    max_px: Optional[int] = None
+    exponent: Optional[int] = None
+    # Thousands of entries on a real day: counted and summarised, never printed.
+    _distinct: set = field(default_factory=set, repr=False)
+
+    @property
+    def tick_exponent(self) -> int:
+        """``tick = 10 ** tick_exponent``, in real (unscaled) units."""
+        if self.exponent is None:
+            raise BuildError('no Hyperliquid price was observed, so there is no '
+                             'grid to report a tick from')
+        return self.exponent - PX_DECIMALS
+
+    @property
+    def distinct_prices(self) -> int:
+        return len(self._distinct)
+
+    def observe(self, text) -> None:
+        """Fold one quoted price into the grid."""
+        try:
+            value = scaled_px(text)
+        except (ValueError, ArithmeticError):
+            # A non-numeric px is a broken recording, not a finer grid. Counted
+            # rather than guessed at; `reconcile_tick` says so out loud.
+            self.unparsed += 1
+            return
+        if value <= 0:
+            # An empty side of a thin coin's book prints a zero, and a zero is on
+            # every grid there is.
+            self.non_positive += 1
+            return
+        self.prices += 1
+        self._distinct.add(value)
+        if self.min_px is None or value < self.min_px:
+            self.min_px = value
+        if self.max_px is None or value > self.max_px:
+            self.max_px = value
+        # One modulo per price while the grid holds, which is the common case.
+        exponent = self.exponent
+        if exponent is None:
+            self.exponent = _trailing_tens(value)
+        elif exponent and value % _pow10(exponent):
+            while exponent and value % _pow10(exponent):
+                exponent -= 1
+            self.exponent = exponent
+
+    def merge(self, other: 'PriceGrid') -> 'PriceGrid':
+        """Fold another file's grid into this one."""
+        self.prices += other.prices
+        self.non_positive += other.non_positive
+        self.unparsed += other.unparsed
+        self._distinct |= other._distinct
+        if other.exponent is not None:
+            self.exponent = (other.exponent if self.exponent is None
+                             else min(self.exponent, other.exponent))
+        for value in (other.min_px, other.max_px):
+            if value is None:
+                continue
+            if self.min_px is None or value < self.min_px:
+                self.min_px = value
+            if self.max_px is None or value > self.max_px:
+                self.max_px = value
+        return self
+
+    def summary(self) -> dict:
+        """What the manifest records about the measurement itself."""
+        empty = self.prices == 0
+        return {
+            'tick': None if empty else tick_from_exponent(self.tick_exponent),
+            'exponent': None if empty else self.tick_exponent,
+            'prices': self.prices,
+            'distinct_prices': self.distinct_prices,
+            'min_px': _unscale(self.min_px),
+            'max_px': _unscale(self.max_px),
+            'non_positive_prices': self.non_positive,
+            'unparsed_prices': self.unparsed,
+            'channels': list(PRICE_CHANNELS),
+            'scope': 'every price level of the frames this build\'s book_mode '
+                     'converts — its l2Book cadence, plus the bbo touch under a '
+                     'fusing mode — inside the window, as exact integers scaled '
+                     'by 1e-%d; the other cadence is not read (its levels never '
+                     'reach the dataset, so they say nothing about the dataset\'s '
+                     'grid), and neither are trades (they print at levels that '
+                     'already existed)' % PX_DECIMALS,
+        }
+
+
+def converts_frame(channel: Optional[str], data, book_mode: str) -> bool:
+    """Does ``book_mode`` build the dataset out of this frame?
+
+    ``l2Book`` arrives on two cadences and ``hyperliquid.convert`` takes exactly
+    one of them, skipping the other frame whole (``is_fast != (book_mode !=
+    'slow')``); ``bbo`` is read only by a fusing mode. One predicate for both the
+    latency accounting and the price grid, so the two cannot come to disagree
+    about what the converter will read.
+    """
+    if not isinstance(data, dict):
+        return False
+    if channel == 'bbo':
+        return book_mode in BBO_BOOK_MODES
+    if channel == 'l2Book':
+        return (book_mode != 'slow') == bool(data.get('fast', False))
+    return False
+
+
+def observe_prices(grid: PriceGrid, channel: Optional[str], data) -> None:
+    """Feed one frame's quoted prices to ``grid``.
+
+    ``l2Book`` carries ``levels`` (bids then asks), ``bbo`` carries a two-entry
+    ``bbo`` array whose side is ``null`` when that side of a thin coin's book is
+    empty. Callers pass only frames the converter will read
+    (:func:`converts_frame`) — see :func:`scan_hl_time_policy`.
+    """
+    if not isinstance(data, dict):
+        return
+    if channel == 'l2Book':
+        sides = data.get('levels') or []
+    elif channel == 'bbo':
+        sides = [data.get('bbo') or []]
+    else:
+        return
+    for side in sides:
+        for level in side or []:
+            if isinstance(level, dict) and level.get('px') is not None:
+                grid.observe(level['px'])
+
+
+def combined_price_grid(scans: Sequence['FileScan']) -> PriceGrid:
+    """One grid over every scanned day — the window is built as one stream."""
+    grid = PriceGrid()
+    for scan in scans:
+        grid.merge(scan.price_grid)
+    return grid
+
+
+def _unscale(value: Optional[int]) -> Optional[float]:
+    return None if value is None else float(Decimal(value).scaleb(-PX_DECIMALS))
+
+
+def tick_from_exponent(exponent: int) -> float:
+    """``10 ** exponent`` without going through ``pow`` on floats."""
+    return float(Decimal(1).scaleb(int(exponent)))
+
+
+def price_decade(px_scaled: int) -> int:
+    """``floor(log10(px))`` for a scaled price, by digit count.
+
+    Integer arithmetic on purpose: ``log10`` of a price that is a decade
+    boundary — 10.0, 0.001 — can land either side of the integer in float, and
+    the whole cross-check below is about which side of a decade a price is on.
+    """
+    if px_scaled <= 0:
+        raise BuildError('price_decade needs a positive price, got %r' % px_scaled)
+    return len(str(px_scaled)) - 1 - PX_DECIMALS
+
+
+def hl_rule_tick_terms(px_scaled: int, sz_decimals: int,
+                       max_decimals: int = HL_MAX_PRICE_DECIMALS) -> tuple[int, int]:
+    """The two terms of the venue's price rule AT THIS PRICE, as exponents.
+
+    ``(five significant figures, 6 - szDecimals decimals)``. They are kept apart
+    because they carry different weight: the first was measured against the venue
+    (``design-hyperliquid-connector.md`` §11.5, testnet 2026-07-28), the second is
+    read from a sidecar field that can be stale or wrong for the instrument. A
+    recording that contradicts the second is evidence about the sidecar; one that
+    contradicts the first is evidence that something here is broken.
+    """
+    sz = int(sz_decimals)
+    if sz < 0 or sz > max_decimals:
+        raise BuildError('szDecimals=%d is outside 0..%d' % (sz, max_decimals))
+    return (price_decade(px_scaled) - (HL_PRICE_SIG_FIGS - 1), -(max_decimals - sz))
+
+
+def hl_rule_tick_exponent(px_scaled: int, sz_decimals: int,
+                          max_decimals: int = HL_MAX_PRICE_DECIMALS) -> int:
+    """Exponent of the venue's effective tick AT THIS PRICE.
+
+    ``max(10^(decade - 4), 10^-(6 - szDecimals))``: both HL rules are ceilings on
+    precision, so the coarser of the two is the grid a legal price sits on.
+    """
+    return max(hl_rule_tick_terms(px_scaled, sz_decimals, max_decimals))
+
+
+def reconcile_tick(grid: PriceGrid, sz_decimals: int,
+                   symbol: Optional[str] = None) -> dict:
+    """The measured tick, cross-checked against the venue's price rule.
+
+    The measurement wins wherever the two disagree — the rule is a
+    reconstruction and the recording is the evidence (the stance
+    ``rerank_metrics.summarize_tick`` takes, §8.6) — and the disagreement is
+    recorded and warned about rather than smoothed over:
+
+    * **coarser than the rule**: the window never used the finest legal
+      increment. Every recorded price is still representable, so the dataset is
+      intact; the strategy is merely held to the levels the day actually had.
+    * **finer than the szDecimals term**: the sidecar's ``szDecimals`` is wrong
+      or stale for this instrument. Registering the rule's coarser tick would
+      round an observed price onto a level that never existed, which is data
+      corruption; the measurement is used instead.
+
+    It refuses in two cases, both of them "no single honest answer exists":
+
+    * the rule yields two different ticks across the window's price range — a
+      decade crossing — because then no single ``tick_size`` describes the
+      window and the finer of the two invents levels in the upper half;
+    * the measurement is finer than the **five-significant-figure** term. Unlike
+      szDecimals that term was measured against the venue
+      (``design-hyperliquid-connector.md`` §11.5), so a recording quoting past it
+      means the recording or this measurement is broken — and then the measured
+      tick invents levels the venue would reject while the rule's tick rounds an
+      observed price away. Fail closed (§1.1) rather than pick one.
+
+    ``--tick-size``/``--lot-size`` overrides both, as always.
+    """
+    where = '' if symbol is None else ' for %s' % symbol
+    if grid.unparsed:
+        _warn('%d Hyperliquid price(s)%s did not parse as numbers and were left '
+              'out of the tick measurement' % (grid.unparsed, where))
+    if grid.distinct_prices < MIN_GRID_PRICES:
+        raise BuildError(
+            'the window holds %d distinct Hyperliquid price(s)%s (%d observed) — '
+            'too few to measure a tick from: one price lands on a grid as coarse '
+            'as its own last non-zero digit, so any answer here would be a '
+            'property of that number and not of the instrument. Widen the window '
+            'or pass --tick-size/--lot-size explicitly.'
+            % (grid.distinct_prices, where, grid.prices)
+        )
+    lo_terms = hl_rule_tick_terms(grid.min_px, sz_decimals)
+    hi_terms = hl_rule_tick_terms(grid.max_px, sz_decimals)
+    lo, hi = max(lo_terms), max(hi_terms)
+    measured_exp = grid.tick_exponent
+    if lo != hi:
+        raise BuildError(
+            'the Hyperliquid price rule gives no single tick over this window%s: '
+            'the converted prices run %r..%r, which crosses a price decade — the '
+            'rule says %r at the low end and %r at the high end (%d significant '
+            'figures, at most %d decimals from szDecimals=%d). The measurement '
+            'over that range is %r, and no single value is right: the finer tick '
+            'lets the backtest quote levels that do not exist above the '
+            'crossing, the coarser one rounds prices quoted below it onto levels '
+            'that were never there. The range is over every level of the frames '
+            '--book-mode converts, so the crossing may be in time (narrow the window) or '
+            'down the book at one instant (it cannot be split; pass '
+            '--tick-size/--lot-size explicitly).'
+            % (where, _unscale(grid.min_px), _unscale(grid.max_px),
+               tick_from_exponent(lo), tick_from_exponent(hi),
+               HL_PRICE_SIG_FIGS, HL_MAX_PRICE_DECIMALS - int(sz_decimals),
+               int(sz_decimals), tick_from_exponent(measured_exp))
+        )
+    sig_fig_exp, sz_decimals_exp = lo_terms
+    if measured_exp < sig_fig_exp:
+        raise BuildError(
+            'the measured tick%s is %r, finer than the %r that %d significant '
+            'figures allow at these prices (%r..%r). That term of the rule was '
+            'measured against the venue — 123456 is rejected and rounds to '
+            '123460 (design-hyperliquid-connector.md §11.5, testnet 2026-07-28) '
+            '— so a recording quoting past it means the recording or this '
+            'measurement is broken, and neither value can be registered: the '
+            'measured tick invents levels the venue would reject, the rule\'s '
+            'tick rounds an observed price onto a level that was never quoted. '
+            'Pass --tick-size/--lot-size explicitly.'
+            % (where, tick_from_exponent(measured_exp),
+               tick_from_exponent(sig_fig_exp), HL_PRICE_SIG_FIGS,
+               _unscale(grid.min_px), _unscale(grid.max_px))
+        )
+    decades = measured_exp - lo
+    if decades == 0:
+        cross_check = 'agree'
+    elif decades > 0:
+        cross_check = 'measured_coarser_than_rule'
+        _warn('the measured tick%s is %r, %d decade(s) coarser than the %r the '
+              'price rule reconstructs from szDecimals=%d. Every recorded price '
+              'lands on the measured grid, so the dataset is intact — but this '
+              'window never used the finest legal increment, which is what a '
+              'short or quiet window looks like (%d distinct prices).'
+              % (where, tick_from_exponent(measured_exp), decades,
+                 tick_from_exponent(lo), int(sz_decimals), grid.distinct_prices))
+    else:
+        # Only the szDecimals term can be contradicted here: the refusal above
+        # took the five-figure one, and the rule is the coarser of the two.
+        cross_check = 'measured_finer_than_rule'
+        _warn('the measured tick%s is %r, finer than the %r that szDecimals=%d '
+              'allows (%d - szDecimals decimals). The five-significant-figure '
+              'term allows %r and the recording agrees with it, so what is wrong '
+              'is szDecimals for this instrument — stale, or not the field this '
+              'sidecar record means. Using the measurement: the coarser value '
+              'would round an observed price onto a level that never existed.'
+              % (where, tick_from_exponent(measured_exp),
+                 tick_from_exponent(sz_decimals_exp), int(sz_decimals),
+                 HL_MAX_PRICE_DECIMALS, tick_from_exponent(sig_fig_exp)))
+    return {
+        'value': tick_from_exponent(measured_exp),
+        'source': 'measured',
+        'measured': tick_from_exponent(measured_exp),
+        'exponent': measured_exp,
+        'rule': tick_from_exponent(lo),
+        'rule_exponent': lo,
+        'rule_terms': {
+            'significant_figures': sig_fig_exp,
+            'sz_decimals': sz_decimals_exp,
+        },
+        'cross_check': cross_check,
+        'decades_from_rule': decades,
+        'sz_decimals': int(sz_decimals),
+        'rule_note': 'tick = max(10^(floor(log10 px) - %d), 10^-(%d - '
+                     'szDecimals)) — the coarser of the five-significant-figure '
+                     'and the szDecimals constraint '
+                     '(design-hyperliquid-connector.md §5.3). szDecimals alone '
+                     'is a LOWER bound, which is what registered a 10x-too-fine '
+                     'tick for ONDO/JTO on 2026-07-29.'
+                     % (HL_PRICE_SIG_FIGS - 1, HL_MAX_PRICE_DECIMALS),
+    }
+
+
+# ---------------------------------------------------------------------------
 # time policy (§"Политика времени", п. 2)
 # ---------------------------------------------------------------------------
 
@@ -798,6 +1219,11 @@ class FileScan:
     converted_min_latency_ns: Optional[int] = None
     converted_local: array = field(default_factory=lambda: array('q'))
     converted_exch: array = field(default_factory=lambda: array('q'))
+    #: the price grid this file's quotes inside the window land on. Measured in
+    #: the same pass: the file is decompressed and parsed here already, and a
+    #: second pass over a multi-GB day to look at the same bytes twice would buy
+    #: nothing.
+    price_grid: PriceGrid = field(default_factory=PriceGrid)
 
     def summary(self) -> dict:
         return {
@@ -810,6 +1236,9 @@ class FileScan:
             'converted_frames_in_window': self.converted_frames,
             'converted_l2book_frames_in_window': self.converted_book_frames,
             'converted_min_local_minus_exch_ns': self.converted_min_latency_ns,
+            'price_grid_tick': (None if not self.price_grid.prices
+                                else tick_from_exponent(self.price_grid.tick_exponent)),
+            'prices_in_window': self.price_grid.prices,
         }
 
 
@@ -830,6 +1259,15 @@ def scan_hl_time_policy(
 
     Scanning a file stops at its first violation — the caller is going to refuse
     anyway, and the first offender is the one worth naming.
+
+    The same pass measures the price grid (:class:`PriceGrid`), over the frames
+    inside the window that this ``book_mode`` converts and no others
+    (:func:`converts_frame`). The wider evidence would measure the same *grid* —
+    both ``l2Book`` cadences quote one venue — but not the same price *range*,
+    and :func:`reconcile_tick` refuses on the range: the 20-level cadence reaches
+    0.1–0.5 % further down the book than the 5-level one does (measured over ten
+    day-29 coins), so under ``bbo+fast`` a level the dataset never contains could
+    refuse the build for crossing a decade the dataset never crosses.
     """
     scans = []
     for path in paths:
@@ -842,6 +1280,10 @@ def scan_hl_time_policy(
                 raise BuildError('%s line %d: payload is not valid JSON' % (path, rec.line_no))
             channel = msg.get('channel')
             data = msg.get('data')
+
+            if (channel in PRICE_CHANNELS and window.contains(rec.local_ts)
+                    and converts_frame(channel, data, book_mode)):
+                observe_prices(scan.price_grid, channel, data)
 
             samples: list[tuple[int, bool, bool]] = []  # (exch_ts_ns, converted?, l2Book?)
             if channel == 'trades' and isinstance(data, list):
@@ -856,12 +1298,8 @@ def scan_hl_time_policy(
                 if t is None:
                     scan.frames_without_ts += 1
                 else:
-                    is_fast = bool(data.get('fast', False))
-                    if channel == 'bbo':
-                        converted = book_mode in BBO_BOOK_MODES
-                    else:
-                        converted = (book_mode != 'slow') == is_fast
-                    samples.append((int(t) * exch_ts_multiplier, converted,
+                    samples.append((int(t) * exch_ts_multiplier,
+                                    converts_frame(channel, data, book_mode),
                                     channel == 'l2Book'))
 
             for exch_ts, converted, is_book in samples:
@@ -1425,12 +1863,101 @@ def build_signal_union(
 # ---------------------------------------------------------------------------
 
 
+def resolve_tick_lot(
+        grid: PriceGrid,
+        *,
+        cli_tick: Optional[float],
+        cli_lot: Optional[float],
+        hl_meta: Sequence[tuple[Optional[int], dict]],
+        hl_meta_files: Sequence[Path],
+        hl_dir: Path,
+        symbol: str,
+) -> tuple[float, float, dict]:
+    """``(tick_size, lot_size, tick_lot_source)`` for one Hyperliquid instrument.
+
+    The tick is measured from the recording and cross-checked against the venue
+    rule (:func:`reconcile_tick`); the lot stays ``10^-szDecimals``, which is a
+    size rule and has nothing price-dependent about it, so nothing in the
+    recording contradicts it.
+
+    An explicit ``--tick-size``/``--lot-size`` wins over both — it is the escape
+    hatch a refusal points at — and the measurement is recorded beside it, with
+    a warning when the two disagree. That warning is the same signal that
+    identified the ONDO/JTO datasets, read from the other side.
+
+    The returned ``tick_lot_source`` stays readable by everything that read the
+    old one: ``sz_decimals`` and ``meta_files`` are where they were
+    (``backtest_first.py`` digs out ``tick_lot_source.sz_decimals`` for the HL
+    price-normalisation rule), ``kind`` now says ``measured`` rather than
+    ``hl_universe``, and everything else is added.
+    """
+    if (cli_tick is None) != (cli_lot is None):
+        # Both callers check this before they read a file, so the answer costs
+        # nothing there. Repeated here so the function is total on its own.
+        raise BuildError('give both --tick-size and --lot-size, or neither')
+    measurement = grid.summary()
+    if cli_tick is not None:
+        tick_size, lot_size = float(cli_tick), float(cli_lot)
+        measured = measurement['tick']
+        if measured is not None and tick_size != measured:
+            _warn('--tick-size %r is %s than the tick measured from the '
+                  'recording (%r over %d prices, %d distinct). The override '
+                  'wins; a tick finer than the grid the venue actually quoted '
+                  'lets the backtest sit at levels that do not exist, which is '
+                  'what it did for ONDO/JTO on 2026-07-29.'
+                  % (tick_size, 'finer' if tick_size < measured else 'coarser',
+                     measured, measurement['prices'],
+                     measurement['distinct_prices']))
+        return tick_size, lot_size, {
+            'kind': 'cli',
+            'tick': {'value': tick_size, 'source': 'cli'},
+            'lot': {'value': lot_size, 'source': 'cli'},
+            'measurement': measurement,
+            'note': 'the explicit override always wins; the measurement it '
+                    'overrode is recorded here so the disagreement is visible '
+                    'in the manifest and not only in the build log',
+        }
+
+    sz = find_universe_sz_decimals(hl_meta, symbol)
+    if sz is None:
+        raise BuildError(
+            'no `universe` record for %r in %s, and no --tick-size/--lot-size '
+            'given. Without szDecimals the instrument has no lot, and the '
+            'measured tick has nothing to be cross-checked against.'
+            % (symbol, ', '.join(str(p) for p in hl_meta_files) or hl_dir)
+        )
+    tick = reconcile_tick(grid, sz, symbol=symbol)
+    _, lot_size = tick_lot_from_sz_decimals(sz)
+    return tick['value'], lot_size, {
+        'kind': 'measured',
+        'sz_decimals': int(sz),
+        'tick': tick,
+        'lot': {
+            'value': lot_size,
+            'source': 'hl_universe',
+            'sz_decimals': int(sz),
+            'rule': 'lot = 10^-szDecimals (design-hyperliquid-connector.md §5.3). '
+                    'A size rule: unlike the tick it is not price-dependent, so '
+                    'the recording has nothing to add to it.',
+        },
+        'measurement': measurement,
+        'rule': 'lot = 10^-szDecimals; tick MEASURED from the recording and '
+                'cross-checked against max(10^(floor(log10 px) - 4), '
+                '10^-(6 - szDecimals)). szDecimals alone gives only the lower '
+                'bound of the tick, which is what made ONDO/JTO 10x too fine on '
+                '2026-07-29.',
+        'meta_files': [str(p) for p in hl_meta_files],
+    }
+
+
 def tick_lot_from_sz_decimals(sz_decimals: int, max_decimals: int = 6) -> tuple[float, float]:
     """``lot = 10^-sz``, ``tick = 10^-(MAX_DECIMALS - sz)`` for HL perps.
 
     ``design-hyperliquid-connector.md`` §5.3: Hyperliquid has no tick-size field
-    and its effective tick is price-dependent, so the finest legal increment is
-    registered and the 5-significant-figure rule is enforced at submit time.
+    and its effective tick is price-dependent, so this is the finest legal
+    increment — a LOWER bound on the tick, not the tick. Kept because the lot
+    half of it is exact and because it is the value the cross-check in
+    :func:`reconcile_tick` reconstructs; nothing registers its tick any more.
     """
     sz = int(sz_decimals)
     if sz < 0 or sz > max_decimals:
@@ -1602,10 +2129,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument('--num-levels', type=int, default=None,
                    help='Snapshot depth. Must match --book-mode (slow=20, fast=5, '
                         'bbo+fast=5); omit to take the paired default.')
-    p.add_argument('--tick-size', type=float, default=None)
+    p.add_argument('--tick-size', type=float, default=None,
+                   help='Overrides the tick measured from the recording. The '
+                        'measurement is recorded beside it either way, and a '
+                        'disagreement is warned about.')
     p.add_argument('--lot-size', type=float, default=None,
                    help='Give both --tick-size and --lot-size, or neither and let '
-                        'them come from the HL universe record in the sidecar.')
+                        'the tick be measured from the recording and the lot come '
+                        'from the HL universe record in the sidecar.')
     p.add_argument('--min-window-hours', type=_decimal_hours, default=Decimal('1'),
                    help='Refuse a window shorter than this. Default: 1.')
     p.add_argument('--clock-correction-ns', type=int, default=0,
@@ -1880,25 +2411,16 @@ def build(args: argparse.Namespace,
           % ('n/a' if overall_min is None else overall_min))
 
     # --- tick / lot ---------------------------------------------------------
-    if args.tick_size is not None:
-        tick_size, lot_size = float(args.tick_size), float(args.lot_size)
-        tick_lot_source = {'kind': 'cli'}
-    else:
-        sz = find_universe_sz_decimals(hl_meta, args.hl_symbol)
-        if sz is None:
-            raise BuildError(
-                'no `universe` record for %r in %s, and no --tick-size/--lot-size '
-                'given. Without szDecimals the instrument has no lot or tick.'
-                % (args.hl_symbol, ', '.join(str(p) for p in hl_meta_files) or hl_dir)
-            )
-        tick_size, lot_size = tick_lot_from_sz_decimals(sz)
-        tick_lot_source = {
-            'kind': 'hl_universe',
-            'sz_decimals': int(sz),
-            'rule': 'lot = 10^-szDecimals, tick = 10^-(6 - szDecimals) '
-                    '(design-hyperliquid-connector.md §5.3)',
-            'meta_files': [str(p) for p in hl_meta_files],
-        }
+    # The tick is MEASURED from the day's own prices (see `reconcile_tick`); the
+    # sidecar's szDecimals gives the lot and the cross-check. An explicit
+    # override still wins over both, and is recorded beside the measurement it
+    # overrode so a disagreement stays visible.
+    tick_size, lot_size, tick_lot_source = resolve_tick_lot(
+        combined_price_grid(scans),
+        cli_tick=args.tick_size, cli_lot=args.lot_size,
+        hl_meta=hl_meta, hl_meta_files=hl_meta_files, hl_dir=hl_dir,
+        symbol=args.hl_symbol,
+    )
     _step('tick_size=%r lot_size=%r (%s)' % (tick_size, lot_size, tick_lot_source['kind']))
 
     # --- 3.3 conversion -----------------------------------------------------

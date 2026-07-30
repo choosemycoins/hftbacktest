@@ -668,6 +668,39 @@ def test_config_carries_the_hl_decimal_rule_from_sz_decimals(manifest_path):
     assert cfg['hl_max_decimals'] == 1  # 6 - szDecimals(5)
 
 
+def test_the_measured_tick_lot_source_is_still_readable(manifest_path):
+    """The shape `build_dataset.py` writes since the tick became measured.
+
+    Built by the real function rather than hand-written, so this cannot go on
+    passing after the writer moves `sz_decimals`: the manifest is a contract
+    between two tools and only one of them is exercised here otherwise. The
+    older `{'kind': 'hl_universe', ...}` shape stays covered by the fixture
+    above — manifests carrying it are on disk and must keep loading.
+    """
+    import build_dataset as bd
+
+    grid = bd.PriceGrid()
+    for px in ('0.39040', '0.41209', '0.39875'):
+        grid.observe(px)
+    _tick, _lot, source = bd.resolve_tick_lot(
+        grid, cli_tick=None, cli_lot=None,
+        hl_meta=[(0, {'_collector': 'universe',
+                      'symbols': [{'wire': 'ONDO', 'szDecimals': 0}]})],
+        hl_meta_files=[], hl_dir=pathlib.Path('.'), symbol='ONDO')
+
+    raw = json.loads(manifest_path.read_text())
+    raw['tick_lot_source'] = source
+    raw['tick_size'] = _tick
+    manifest_path.write_text(json.dumps(raw))
+
+    manifest = bf.load_manifest(str(manifest_path))
+    assert manifest.tick_size == 1e-05
+    assert manifest.sz_decimals == 0
+    cfg = bf.resolve_config(
+        bf.build_parser().parse_args(['--manifest', str(manifest_path)]), manifest)
+    assert cfg['hl_max_decimals'] == 6  # 6 - szDecimals(0)
+
+
 def test_config_grid_qty_defaults_to_one_lot(manifest_path):
     cfg = bf.resolve_config(
         bf.build_parser().parse_args(

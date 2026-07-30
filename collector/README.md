@@ -649,6 +649,24 @@ data = hyperliquid.convert(
 The pair is not free to choose: `DiffOrderBookSnapshot` preallocates exactly
 `num_levels` rows, so a mismatch is refused.
 
+**Do not derive `tick_size` from `szDecimals`.** `10^-(6 - szDecimals)` is the
+*lower bound* of the Hyperliquid tick, not the tick: a price is legal at ≤5
+significant figures **and** ≤ `6 - szDecimals` decimals, so the effective tick is
+the coarser of the two and therefore depends on the price. Measured on
+2026-07-29: ONDO quoted 0.39040..0.41209 with `szDecimals=0`, every one of 2.76M
+recorded prices on a 1e-5 grid, while the formula says 1e-6 — a backtest built on
+it quotes nine phantom levels between every real one, and ONDO's PnL changed sign
+when it was corrected. The step runs the other way too: above 100 000 five
+figures make the effective tick 10 (testnet, 2026-07-28 — `123456` is rejected
+and rounds to `123460`), so BTC is the same trap one decade up.
+`tools/build_dataset.py` (mode A) and `tools/build_hl_dataset.py` (Hyperliquid
+only, for a day whose signal recording is broken) measure the tick from the
+recording — over the frames `--book-mode` actually converts, since the cadence it
+skips never reaches the dataset — cross-check it against the rule, record both in
+the manifest, and refuse a window that crosses a price decade or that quotes
+finer than five significant figures. Converting by hand, take the tick from a
+built manifest rather than from a formula.
+
 The sidecar is `.jsonl`, so a `<dir>/*_<date>.gz` loop will not pick it up.
 Independently of that, `hyperliquid.convert` raises on a recording that yields zero rows rather
 than writing an empty `.npz` that looks like a legitimately silent day. That

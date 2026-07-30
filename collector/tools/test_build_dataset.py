@@ -38,18 +38,28 @@ DAY0_START = int(datetime(2026, 7, 25, tzinfo=timezone.utc).timestamp()) * NS
 DAY1_START = DAY0_START + 86_400 * NS
 
 
-def hl_l2book(coin, time_ms, bid_px, ask_px, fast=False):
+def hl_l2book_levels(coin, time_ms, bids, asks, fast=False):
+    """One ``l2Book`` frame with as many levels a side as it is given.
+
+    The two cadences differ in depth as well as in period — 20 levels every
+    ~5.4 s against 5 every ~0.54 s — so a fixture that wants to tell them apart
+    has to be able to write the deep one.
+    """
     data = {
         'coin': coin,
         'time': time_ms,
         'levels': [
-            [{'px': str(bid_px), 'sz': '1.0', 'n': 1}],
-            [{'px': str(ask_px), 'sz': '2.0', 'n': 1}],
+            [{'px': str(px), 'sz': '1.0', 'n': 1} for px in bids],
+            [{'px': str(px), 'sz': '2.0', 'n': 1} for px in asks],
         ],
     }
     if fast:
         data['fast'] = True
     return json.dumps({'channel': 'l2Book', 'data': data})
+
+
+def hl_l2book(coin, time_ms, bid_px, ask_px, fast=False):
+    return hl_l2book_levels(coin, time_ms, [bid_px], [ask_px], fast=fast)
 
 
 def hl_trades(coin, fills, side='B'):
@@ -160,6 +170,60 @@ def hl_day_lines(day_start, *, n=6, base_ms=None, latency_ns=200 * MS, fast=Fals
         out.append((local + 1000, hl_l2book('BTC', exch_ms, 100 + i, 101 + i, fast=True)))
         out.append((local + 2000, hl_bbo('BTC', exch_ms, 100 + i, 101 + i)))
         out.append((local + 3000, hl_trade('BTC', exch_ms, 100 + i, 0.5)))
+    return out
+
+
+#: ONDO on 2026-07-29, shortened: every recorded price on a 1e-5 grid while
+#: szDecimals=0 says the tick is 1e-6. Prices are strings so the decimals reach
+#: the recording exactly as written.
+ONDO_QUOTES = [
+    ('0.39040', '0.39045'),
+    ('0.40000', '0.40005'),
+    ('0.41209', '0.41210'),
+    ('0.39875', '0.39880'),
+    ('0.40155', '0.40160'),
+    ('0.40500', '0.40505'),
+]
+
+#: BTC on 2026-07-28 was 63022..63823, one decade below the step that matters:
+#: above 100 000 five significant figures make the venue tick 10, measured on
+#: testnet 2026-07-28 (`design-hyperliquid-connector.md` §11.5 — `123456` is
+#: rejected and rounds to `123460`). Every price here is a multiple of 10 and not
+#: all of them are multiples of 100, so the coarsest grid they land on is 10.
+HIGH_PRICE_QUOTES = [
+    ('118230', '118240'),
+    ('118240', '118250'),
+    ('118250', '118260'),
+    ('118260', '118270'),
+]
+
+#: A window that crosses a power of ten: 1e-4 below it, 1e-3 above. The venue
+#: tick is a step function of the price and this window contains the step.
+DECADE_CROSSING_QUOTES = [
+    ('9.9995', '9.9996'),
+    ('9.9998', '9.9999'),
+    ('10.001', '10.002'),
+    ('10.003', '10.004'),
+    ('10.005', '10.006'),
+    ('9.9990', '9.9991'),
+]
+
+
+def hl_price_day(day_start, quotes, *, coin='BTC', latency_ns=200 * MS):
+    """A day of HL frames quoting exactly ``quotes`` — ``(bid, ask)`` price strings.
+
+    Every channel the builder reads carries the same pair, so the grid the build
+    measures is the grid of the strings written here and of nothing else.
+    """
+    base_ms = day_start // MS
+    out = []
+    for i, (bid, ask) in enumerate(quotes):
+        exch_ms = base_ms + i * 1000
+        local = exch_ms * MS + latency_ns
+        out.append((local, hl_l2book(coin, exch_ms, bid, ask)))
+        out.append((local + 1000, hl_l2book(coin, exch_ms, bid, ask, fast=True)))
+        out.append((local + 2000, hl_bbo(coin, exch_ms, bid, ask)))
+        out.append((local + 3000, hl_trade(coin, exch_ms, bid, 0.5)))
     return out
 
 
@@ -386,6 +450,41 @@ def dataset(tmp_path):
         'root': tmp_path, 'hl_dir': hl_dir, 'bn_dir': bn_dir, 'report': report,
         'out': tmp_path / 'out', 'hl_lines': hl_lines, 'bn_lines': bn_lines,
     }
+
+
+@pytest.fixture
+def priced_dataset(tmp_path):
+    """A one-day recording whose Hyperliquid prices are chosen by the test.
+
+    Same shape as :func:`dataset`, but the HL day quotes exactly the pairs given
+    and the sidecar's ``szDecimals`` is a parameter — which is what the tick
+    measurement and its cross-check against the venue rule are made of.
+    """
+    def make(quotes, *, sz_decimals=0):
+        hl_dir = tmp_path / 'hl'
+        bn_dir = tmp_path / 'bn'
+        hl_lines = hl_price_day(DAY0_START, quotes)
+        bn_lines = bn_day_lines(DAY0_START)
+        write_gz(hl_dir / f'btc_{DAY0}.gz', hl_lines)
+        write_gz(bn_dir / f'btcusdt_{DAY0}.gz', bn_lines)
+        write_meta(hl_dir / f'_meta_hyperliquid_{DAY0}.jsonl', [
+            (DAY0_START, session_start('hyperliquid', ['BTC'])),
+            (DAY0_START + 1, universe_record('BTC', sz_decimals)),
+        ])
+        write_meta(bn_dir / f'_meta_binancefuturesum_{DAY0}.jsonl', [
+            (DAY0_START, session_start('binancefuturesum', ['BTCUSDT'],
+                                       commit='def5678')),
+        ])
+        report = make_report(
+            tmp_path / 'report.json', hl_dir, bn_dir,
+            (hl_lines[0][0], hl_lines[-1][0]),
+            (bn_lines[0][0], bn_lines[-1][0]),
+        )
+        return {
+            'root': tmp_path, 'hl_dir': hl_dir, 'bn_dir': bn_dir, 'report': report,
+            'out': tmp_path / 'out', 'hl_lines': hl_lines, 'bn_lines': bn_lines,
+        }
+    return make
 
 
 def base_argv(ds, **overrides):
@@ -1572,13 +1671,412 @@ def test_tick_lot_from_sz_decimals_follows_the_hl_rule():
 
 
 def test_tick_lot_source_is_recorded_when_derived(dataset):
+    """The lot still comes from ``szDecimals``; the tick is measured.
+
+    The fixture quotes whole numbers around 100, so the measured grid is 1.0
+    while the venue rule at that price says 0.1 — a thin fixture, and the
+    manifest has to say which of the two it registered and that they differed.
+    """
     ds = dataset
     bd.main(base_argv(ds), convert_fn=FakeConverter(), snapshot_fn=FakeSnapshotter())
     m = json.loads((ds['out'] / 'manifest.json').read_text())
-    assert m['tick_size'] == 0.1
+    assert m['tick_size'] == 1.0
     assert m['lot_size'] == 0.00001
-    assert m['tick_lot_source']['kind'] == 'hl_universe'
+    assert m['tick_lot_source']['kind'] == 'measured'
     assert m['tick_lot_source']['sz_decimals'] == 5
+    assert m['tick_lot_source']['tick']['measured'] == 1.0
+    assert m['tick_lot_source']['tick']['rule'] == 0.1
+    assert m['tick_lot_source']['tick']['cross_check'] == 'measured_coarser_than_rule'
+    assert m['tick_lot_source']['lot']['source'] == 'hl_universe'
+
+
+# ---------------------------------------------------------------------------
+# the measured tick (the ONDO/JTO sign flip, 2026-07-30)
+#
+# szDecimals gives only the LOWER bound of the Hyperliquid tick: the venue also
+# caps a price at five significant figures, so the effective tick is a step
+# function of the price. Registering the lower bound gave ONDO 1e-6 on a day
+# every recorded price sat on a 1e-5 grid, and the backtest quoted levels that
+# do not exist.
+# ---------------------------------------------------------------------------
+
+def grid_of(prices):
+    grid = bd.PriceGrid()
+    for px in prices:
+        grid.observe(px)
+    return grid
+
+
+def test_the_measured_tick_is_the_coarsest_grid_every_price_lands_on():
+    # ONDO, 2026-07-29: quoted 0.39040..0.41209, every price a multiple of 1e-5.
+    grid = grid_of(['0.39040', '0.41209', '0.40000', '0.39875'])
+    assert grid.tick_exponent == -5
+    assert bd.tick_from_exponent(grid.tick_exponent) == 1e-05
+    assert grid.distinct_prices == 4
+
+
+def test_one_price_off_the_grid_makes_the_measured_tick_finer():
+    """The grid is the coarsest one EVERY price lands on, not the common case."""
+    assert grid_of(['0.39040', '0.41209']).tick_exponent == -5
+    assert grid_of(['0.39040', '0.41209', '0.412095']).tick_exponent == -6
+
+
+def test_the_measurement_is_not_capped_at_a_tick_of_one():
+    """Above 100 000 the venue tick is 10, and the measurement has to be able to say so.
+
+    Five significant figures make the tick a step function of the price, and the
+    step does not stop at 1.0: `design-hyperliquid-connector.md` §11.5, measured
+    on testnet 2026-07-28, has `123456` rejected and rounded to `123460`. A
+    measurement that could not return anything coarser than 1.0 would answer 1.0
+    on a book quoted in tens — a tick ten times too fine, which is the exact
+    defect this measurement exists to remove, reintroduced by the tool rather
+    than by szDecimals.
+    """
+    grid = grid_of(['118230', '118240', '118250', '118260'])
+    assert grid.tick_exponent == 1
+    assert bd.tick_from_exponent(grid.tick_exponent) == 10.0
+    assert grid_of(['1182300', '1182400', '1182500']).tick_exponent == 2
+
+
+def test_a_thin_coin_is_measured_on_exact_integers():
+    """PUMP quotes ~0.001816; a tick of 1e-6 there is not a binary fraction.
+
+    Through floats the divisibility test this measurement consists of is a
+    rounding coin toss, so prices are held as exact integers scaled by 1e10 —
+    ``rerank_metrics.scaled_px``, shared rather than reimplemented. The scaled
+    value is asserted here too: the grid alone would also come out right from a
+    float path that happened to round the right way.
+    """
+    assert bd.scaled_px('0.001816') == 18160000
+    grid = grid_of(['0.001816', '0.001897', '0.001788'])
+    assert grid.tick_exponent == -6
+    assert bd.tick_from_exponent(grid.tick_exponent) == 1e-06
+
+
+def test_non_positive_prices_are_not_observations():
+    """An empty side of a thin coin's book prints a zero, which is not a price."""
+    grid = grid_of(['0.39040', '0', '0.41209'])
+    assert grid.tick_exponent == -5
+    assert grid.distinct_prices == 2
+    assert grid.non_positive == 1
+
+
+def test_a_window_with_one_distinct_price_measures_nothing():
+    """One price always 'lands on' a grid as coarse as its own last digit."""
+    with pytest.raises(bd.BuildError) as e:
+        bd.reconcile_tick(grid_of(['0.39040', '0.39040']), sz_decimals=0)
+    assert 'distinct' in str(e.value)
+    assert '--tick-size' in str(e.value)
+
+
+def test_the_rule_tick_is_the_coarser_of_the_five_figure_and_szdecimals_terms():
+    """Both HL constraints are ceilings on precision; the coarser one binds."""
+    px = bd.scaled_px
+    # ONDO: five significant figures at 0.41 is 1e-5, szDecimals=0 allows 1e-6.
+    assert bd.hl_rule_tick_exponent(px('0.41209'), 0) == -5
+    # SEI at 0.041: five figures allows 1e-6 and szDecimals=0 stops there too.
+    assert bd.hl_rule_tick_exponent(px('0.041109'), 0) == -6
+    # BTC at 63022 with szDecimals=5: five figures is 1.0, the floor is 0.1.
+    assert bd.hl_rule_tick_exponent(px('63022.0'), 5) == 0
+    # HYPE at 53.044, szDecimals=2: five figures is 1e-3, the floor is 1e-4.
+    assert bd.hl_rule_tick_exponent(px('53.044'), 2) == -3
+    # szDecimals binding: a 0.5 price whose venue floor is 1e-2, not 1e-5.
+    assert bd.hl_rule_tick_exponent(px('0.5'), 4) == -2
+
+
+def test_the_scan_measures_the_book_and_the_bbo_but_not_the_trades(tmp_path):
+    """Which channels the grid is made of, through the real scan.
+
+    ``bbo`` is a price source in its own right — under ``bbo+fast`` it is the
+    majority of frames — so a grid built from ``l2Book`` alone would miss the
+    touch. ``trades`` are deliberately excluded: a fill prints at a level that
+    already existed, so it adds nothing, while one odd print would drag the
+    measured tick finer and reopen the hole this whole measurement closes.
+    """
+    base_ms = DAY0_START // MS
+    lines = [
+        (DAY0_START + MS, hl_l2book('BTC', base_ms, '0.4000', '0.4100', fast=True)),
+        (DAY0_START + 2 * MS, hl_bbo('BTC', base_ms, '0.40005', '0.41000')),
+        (DAY0_START + 3 * MS, hl_trade('BTC', base_ms, '0.400051', 1.0)),
+    ]
+    path = write_gz(tmp_path / f'btc_{DAY0}.gz', lines)
+    grid = bd.combined_price_grid(
+        bd.scan_hl_time_policy([path], 'bbo+fast', bd.Window(0, 2 ** 62)))
+    assert grid.tick_exponent == -5, 'the bbo touch is on the grid too'
+    assert grid.prices == 4, 'two book levels and two bbo sides, no trade price'
+
+
+def hl_two_cadence_day(tmp_path):
+    """A recording whose slow cadence reaches below a decade the fast one never does.
+
+    The touch and the five fast levels sit on 1e-3 above 10; the 20-level slow
+    snapshot reaches 9.9905, three levels further down. Measured on ten day-29
+    coins: the slow cadence's minimum sits 0.1–0.5 % below the ``bbo`` minimum
+    (dot 0.74937 against 0.75125), so this shape is what every real day looks
+    like, not a corner.
+    """
+    base_ms = DAY0_START // MS
+    lines = [
+        (DAY0_START + MS, hl_l2book('DOT', base_ms, '10.000', '10.001', fast=True)),
+        (DAY0_START + 2 * MS, hl_bbo('DOT', base_ms, '10.005', '10.006')),
+        (DAY0_START + 3 * MS,
+         hl_l2book_levels('DOT', base_ms, ['10.000', '9.9990', '9.9905'], ['10.001'])),
+    ]
+    return write_gz(tmp_path / f'dot_{DAY0}.gz', lines)
+
+
+def test_the_grid_reads_only_the_frames_the_book_mode_converts(tmp_path):
+    """Depth the dataset will not contain is not evidence about the dataset's grid.
+
+    ``hyperliquid.convert`` skips a whole ``l2Book`` frame whose cadence is not
+    the one ``book_mode`` asked for (``is_fast != (book_mode != 'slow')``), and
+    reads ``bbo`` only under a fusing mode. Prices from the frames it skips
+    describe a book the backtest never sees; reading them widens the measured
+    price range past the dataset's own, and the decade cross-check is built on
+    that range.
+    """
+    path = hl_two_cadence_day(tmp_path)
+    window = bd.Window(0, 2 ** 62)
+
+    fused = bd.combined_price_grid(bd.scan_hl_time_policy([path], 'bbo+fast', window))
+    assert fused.prices == 4, 'the fast touch and the bbo, not the slow snapshot'
+    assert bd._unscale(fused.min_px) == 10.0
+    assert bd.tick_from_exponent(fused.tick_exponent) == 0.001
+
+    slow = bd.combined_price_grid(bd.scan_hl_time_policy([path], 'slow', window))
+    assert slow.prices == 4, 'the slow snapshot alone — bbo is not converted here'
+    assert bd._unscale(slow.min_px) == 9.9905
+
+
+def test_a_decade_only_an_unconverted_frame_crosses_does_not_refuse(tmp_path):
+    """The refusal is about the prices the dataset holds, not the ones on disk.
+
+    Under ``bbo+fast`` nothing below 10 is converted, so one tick describes the
+    window and there is nothing to refuse. Under ``slow`` the deep levels are
+    the dataset, the crossing is real, and the refusal stands — the same
+    recording, and the answer follows the mode.
+    """
+    path = hl_two_cadence_day(tmp_path)
+    window = bd.Window(0, 2 ** 62)
+
+    out = bd.reconcile_tick(
+        bd.combined_price_grid(bd.scan_hl_time_policy([path], 'bbo+fast', window)),
+        sz_decimals=0, symbol='DOT')
+    assert out['value'] == 0.001
+    assert out['cross_check'] == 'agree'
+
+    with pytest.raises(bd.BuildError) as e:
+        bd.reconcile_tick(
+            bd.combined_price_grid(bd.scan_hl_time_policy([path], 'slow', window)),
+            sz_decimals=0, symbol='DOT')
+    assert 'decade' in str(e.value)
+
+
+def test_the_grid_is_measured_inside_the_window_only(tmp_path):
+    base_ms = DAY0_START // MS
+    lines = [
+        (DAY0_START + MS, hl_l2book('BTC', base_ms, '0.4000', '0.4100')),
+        (DAY0_START + 10 * MS,
+         hl_l2book('BTC', base_ms + 9, '0.400001', '0.410001')),
+    ]
+    path = write_gz(tmp_path / f'btc_{DAY0}.gz', lines)
+    window = bd.Window(DAY0_START, DAY0_START + 5 * MS)
+    grid = bd.combined_price_grid(bd.scan_hl_time_policy([path], 'slow', window))
+    assert grid.prices == 2
+    assert grid.tick_exponent == -2, 'the frame outside the window is not built'
+
+
+def test_a_measured_tick_that_matches_the_rule_is_recorded_as_agreeing():
+    out = bd.reconcile_tick(grid_of(['0.39040', '0.41209', '0.39875']), sz_decimals=0)
+    assert out['value'] == 1e-05
+    assert out['source'] == 'measured'
+    assert out['measured'] == 1e-05
+    assert out['rule'] == 1e-05
+    assert out['cross_check'] == 'agree'
+    assert out['sz_decimals'] == 0
+
+
+def test_a_window_crossing_a_price_decade_is_refused():
+    """Two ticks in one window, and a manifest can carry one.
+
+    Below 10 the venue quotes on 1e-4 and above it on 1e-3; the measurement
+    returns the finer grid because every price lands on it, and using it lets
+    the backtest quote ten phantom levels between every real one above 10.
+    """
+    with pytest.raises(bd.BuildError) as e:
+        bd.reconcile_tick(grid_of(['9.9995', '9.9999', '10.001', '10.002']),
+                          sz_decimals=0)
+    msg = str(e.value)
+    assert 'decade' in msg
+    assert '0.0001' in msg and '0.001' in msg, 'both ticks must be named'
+    assert '--tick-size' in msg
+
+
+def test_a_decade_crossing_the_szdecimals_floor_covers_is_not_refused():
+    """The refusal is about the RULE not being constant, not about the decade.
+
+    With szDecimals=6 the floor is 1.0 on both sides of the crossing, so the
+    window has one tick after all and there is nothing to refuse.
+    """
+    out = bd.reconcile_tick(grid_of(['9.0', '11.0', '12.0']), sz_decimals=6)
+    assert out['value'] == 1.0
+    assert out['cross_check'] == 'agree'
+
+
+def test_the_measurement_wins_when_szdecimals_says_the_tick_is_coarser(capsys):
+    """Prices finer than the szDecimals floor are evidence about szDecimals.
+
+    Registering the rule's coarser tick would make an observed price
+    unrepresentable — the converter would round it onto a level the venue never
+    quoted. The recording is the evidence (rerank_metrics.summarize_tick).
+
+    Only the szDecimals term is contradicted here: the five-figure term allows
+    1e-5 at 0.5 and the recording uses exactly that. The warning has to name the
+    term it found wrong, because the other one is a measured venue rule (§11.5)
+    and a measurement contradicting *it* is refused two tests down.
+    """
+    out = bd.reconcile_tick(grid_of(['0.50001', '0.50002', '0.51234']), sz_decimals=4)
+    assert out['measured'] == 1e-05
+    assert out['rule'] == 0.01
+    assert out['value'] == 1e-05
+    assert out['cross_check'] == 'measured_finer_than_rule'
+    assert out['rule_terms'] == {'significant_figures': -5, 'sz_decimals': -2}
+    assert out['exponent'] == out['rule_terms']['significant_figures'], (
+        'the measurement matches the measured term and contradicts the read one')
+    assert 'szDecimals=4' in capsys.readouterr().err
+
+
+def test_a_price_above_a_hundred_thousand_measures_the_tick_the_rule_expects():
+    """BTC at 118 230: five figures say 10, and the measurement says 10 too.
+
+    The regression this pins is a tool artefact, not a venue one — a measurement
+    that stopped at 1.0 read `measured_finer_than_rule`, won the cross-check
+    against a rule that was right, and registered a tick ten times too fine while
+    warning that the venue had quoted past its own rule.
+    """
+    out = bd.reconcile_tick(grid_of(['118230', '118240', '118250', '118260']),
+                            sz_decimals=5)
+    assert out['measured'] == 10.0
+    assert out['rule'] == 10.0
+    assert out['value'] == 10.0
+    assert out['cross_check'] == 'agree'
+
+
+def test_a_measurement_finer_than_five_significant_figures_is_refused(capsys):
+    """Neither value can be registered, so the build stops (§1.1, fail closed).
+
+    `10.0015` has six significant figures, which §11.5 measured the venue
+    rejecting. Registering the measured 1e-4 would let the backtest quote levels
+    the venue does not accept; registering the rule's 1e-3 would round an
+    observed price onto a level that was never quoted. A disagreement with the
+    *measured* half of the rule is a broken recording or a broken measurement,
+    and the operator's `--tick-size` is the only thing that can settle it.
+    """
+    with pytest.raises(bd.BuildError) as e:
+        bd.reconcile_tick(grid_of(['10.0015', '10.0025', '10.0035']), sz_decimals=0)
+    msg = str(e.value)
+    assert 'significant' in msg
+    assert '0.0001' in msg and '0.001' in msg, 'both ticks must be named'
+    assert '--tick-size' in msg
+
+
+def test_a_quiet_window_measures_a_coarser_tick_than_the_rule_and_says_so(capsys):
+    """A window that never used the finest legal increment measures its own grid.
+
+    Every recorded price still lands on it, so nothing is rounded and the
+    dataset is intact — the strategy is only held to the levels the day had.
+    That is a fact about the window, not about the instrument, so it is warned
+    about and carried in the manifest rather than corrected.
+    """
+    out = bd.reconcile_tick(grid_of(['0.4001', '0.4102', '0.3903']), sz_decimals=0)
+    assert out['measured'] == 0.0001
+    assert out['rule'] == 1e-05
+    assert out['value'] == 0.0001
+    assert out['cross_check'] == 'measured_coarser_than_rule'
+    assert out['decades_from_rule'] == 1
+    assert 'coarser' in capsys.readouterr().err
+
+
+def test_the_measured_tick_reaches_the_converter_and_the_manifest(priced_dataset):
+    """The regression: ONDO day 29 was converted with 1e-6 on a 1e-5 grid."""
+    ds = priced_dataset(ONDO_QUOTES, sz_decimals=0)
+    conv = FakeConverter()
+    bd.main(base_argv(ds), convert_fn=conv, snapshot_fn=FakeSnapshotter())
+
+    assert [c['tick_size'] for c in conv.calls] == [1e-05]
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['tick_size'] == 1e-05, 'szDecimals alone would have said 1e-06'
+    assert m['lot_size'] == 1.0
+    src = m['tick_lot_source']
+    assert src['kind'] == 'measured'
+    assert src['tick'] == {
+        'value': 1e-05, 'source': 'measured', 'measured': 1e-05, 'rule': 1e-05,
+        'exponent': -5, 'rule_exponent': -5, 'cross_check': 'agree',
+        'decades_from_rule': 0, 'sz_decimals': 0,
+        'rule_terms': {'significant_figures': -5, 'sz_decimals': -6},
+        'rule_note': src['tick']['rule_note'],
+    }
+    assert src['sz_decimals'] == 0, 'backtest_first.py reads this path'
+    assert src['measurement']['distinct_prices'] >= 2
+    assert src['measurement']['prices'] > 0
+    assert src['measurement']['channels'] == ['l2Book', 'bbo']
+    assert src['measurement']['min_px'] == 0.39040, 'the lowest bid quoted'
+    assert src['measurement']['max_px'] == 0.41210, 'the highest ask quoted'
+
+
+def test_a_high_priced_day_registers_the_tick_the_venue_enforces(priced_dataset):
+    """The other end of the ONDO regression, end to end.
+
+    A day quoted in tens must reach the converter and the manifest as a tick of
+    10 — a measurement that could not exceed 1.0 registered 1.0 here, ten times
+    too fine, and said in the log that the venue was at fault.
+    """
+    ds = priced_dataset(HIGH_PRICE_QUOTES, sz_decimals=5)
+    conv = FakeConverter()
+    bd.main(base_argv(ds), convert_fn=conv, snapshot_fn=FakeSnapshotter())
+
+    assert [c['tick_size'] for c in conv.calls] == [10.0]
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['tick_size'] == 10.0
+    assert m['lot_size'] == 1e-05
+    tick = m['tick_lot_source']['tick']
+    assert tick['measured'] == 10.0 and tick['rule'] == 10.0
+    assert tick['cross_check'] == 'agree'
+
+
+def test_a_decade_crossing_day_refuses_the_build_before_converting(priced_dataset,
+                                                                   capsys):
+    ds = priced_dataset(DECADE_CROSSING_QUOTES, sz_decimals=0)
+    conv = FakeConverter()
+    with pytest.raises(SystemExit) as e:
+        bd.main(base_argv(ds), convert_fn=conv)
+    assert e.value.code == 1
+    assert conv.calls == [], 'the refusal comes before any conversion'
+    assert 'decade' in capsys.readouterr().err
+
+
+def test_an_explicit_tick_size_overrides_the_decade_crossing_refusal(priced_dataset):
+    """The override always wins and is recorded as `cli` — unchanged behaviour."""
+    ds = priced_dataset(DECADE_CROSSING_QUOTES, sz_decimals=0)
+    conv = FakeConverter()
+    bd.main(base_argv(ds, tick_size='0.001', lot_size='1.0'), convert_fn=conv,
+            snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    assert m['tick_size'] == 0.001
+    assert m['tick_lot_source']['kind'] == 'cli'
+    assert [c['tick_size'] for c in conv.calls] == [0.001]
+
+
+def test_the_cli_override_records_the_measurement_it_overrode(priced_dataset, capsys):
+    """An override that disagrees with the recording is the ONDO shape again."""
+    ds = priced_dataset(ONDO_QUOTES, sz_decimals=0)
+    bd.main(base_argv(ds, tick_size='0.000001', lot_size='1.0'),
+            convert_fn=FakeConverter(), snapshot_fn=FakeSnapshotter())
+    m = json.loads((ds['out'] / 'manifest.json').read_text())
+    src = m['tick_lot_source']
+    assert src['kind'] == 'cli'
+    assert src['measurement']['tick'] == 1e-05
+    assert 'finer' in capsys.readouterr().err
 
 
 def test_tick_lot_from_cli_overrides_and_is_recorded(dataset):
