@@ -349,6 +349,22 @@ impl SubscriptionTracker {
             self.subscribed.insert(symbol.clone());
         }
     }
+
+    /// Forgets one symbol, so the next [`Self::pending`] offers it again.
+    ///
+    /// For a subscribe the venue refused *transiently* — rate limiting, which heals by itself:
+    /// the batch has to go out again, and the only thing in the way is this tracker's own record
+    /// that it was already asked for. A permanent refusal must **not** come through here, or the
+    /// same batch is re-sent for the same answer until the connection dies; the caller decides,
+    /// and fails closed when it cannot tell (`classify_rejection` in
+    /// `bybit/public_stream.rs`, `AGENTS.md` §4.2).
+    ///
+    /// One symbol at a time, never a reset: the symbols beside it are live, and resubscribing
+    /// those would spend rate limit while recovering from rate limiting. A symbol that was never
+    /// marked is a no-op — a rejection whose `req_id` names nobody has nothing to put back.
+    pub fn unmark(&mut self, symbol: &str) {
+        self.subscribed.remove(symbol);
+    }
 }
 
 pub fn generate_rand_string(length: usize) -> String {

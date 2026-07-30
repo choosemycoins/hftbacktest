@@ -87,6 +87,73 @@ fn acked_symbol(req_id: Option<&str>) -> Option<&str> {
         .filter(|symbol| !symbol.is_empty())
 }
 
+/// Whether a rejected subscribe batch is worth asking about again on this connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Rejection {
+    /// A verdict on the batch as written. Measured on mainnet 2026-07-25:
+    /// `error:handler not found,topic:orderbook.500.BTCUSDT`, for a depth the docs promise and
+    /// the venue refuses. The batch is deterministic, so asking again buys the same refusal and
+    /// spends rate limit doing it; it clears on the next reconnect, which re-derives every
+    /// subscription from the shared symbol set.
+    Permanent,
+    /// A verdict on *when* the batch was sent, not on what it said — rate limiting. It heals by
+    /// itself, so the symbol goes back to pending and the next keepalive tick asks again.
+    ///
+    /// **This shape is inferred, not measured, and that is the weak point of the retry.** `10006`
+    /// / "Too many visits" is Bybit's rate-limit wording as this repo has recorded it elsewhere
+    /// (`AGENTS.md` §3, against the REST/private-stream throttling todo in `private_stream.rs`);
+    /// no *public* subscribe ack carrying it has been captured. Two things must hold for the
+    /// retry to fire in production, and neither is measured:
+    ///
+    /// - the refusal's `ret_msg` matches one of the two strings [`classify_rejection`] looks for;
+    /// - Bybit echoes `req_id` on it, so [`acked_symbol`] can name the symbol to un-mark. A rate
+    ///   limiter that answers before parsing the request would not, and then the refusal is
+    ///   written off like a permanent one — there is nothing to put back.
+    ///
+    /// If either is wrong, the retry is inert and nothing raises its hand. The log is where it
+    /// shows: a refusal the operator believes was rate limiting, carrying `rejection=Permanent`
+    /// or `symbol=unattributed`. Both are grep targets, and either sighting is the measurement
+    /// this branch is waiting for — the same standard `AGENTS.md` §4.2 sets before doing this for
+    /// Binance, not yet met here.
+    ///
+    /// One more assumption rides along: the retry re-sends the batch whole, which is right only
+    /// if a refused batch applied *none* of its topics. Measured for the permanent shape (§4.1 —
+    /// one bad topic fails the batch), unmeasured for this one. A partially applied rate-limited
+    /// batch would have the retry resubscribe topics that are already live and double their
+    /// delivery.
+    Transient,
+}
+
+/// Classifies a rejected subscribe ack by the `ret_msg` the venue chose. Total over every input.
+///
+/// **Unknown is permanent, deliberately.** Only the two shapes above are recognized — the measured
+/// permanent one and the *inferred* transient one, whose standing is spelled out on
+/// [`Rejection::Transient`] and is load-bearing for whether the retry ever fires. Anything else —
+/// prose the venue changed, a code not in the docs, no `ret_msg` at all — is written off until the
+/// next reconnect. Reading an unknown message as transient would retry it once every keepalive
+/// tick for the life of the connection: a rate-limit storm built out of one unrecognized string,
+/// and most likely aimed at a venue that is already refusing. Reading it as permanent costs at
+/// worst one symbol's market data until the reconnect that would have fixed it anyway. Fail closed
+/// (`AGENTS.md` §1.1, §4.2).
+///
+/// The permanent shape is matched first: a message carrying both is a verdict on the batch, and
+/// that ordering is also what keeps a topic name that happens to contain `10006` from reading as
+/// rate limiting.
+fn classify_rejection(ret_msg: Option<&str>) -> Rejection {
+    let Some(ret_msg) = ret_msg else {
+        return Rejection::Permanent;
+    };
+    // The venue writes this prose, and its case is not something to depend on.
+    let ret_msg = ret_msg.to_ascii_lowercase();
+    if ret_msg.contains("handler not found") {
+        return Rejection::Permanent;
+    }
+    if ret_msg.contains("too many") || ret_msg.contains("10006") {
+        return Rejection::Transient;
+    }
+    Rejection::Permanent
+}
+
 pub struct PublicStream {
     ev_tx: UnboundedSender<PublishEvent>,
     /// The registered symbols, authoritative for what to subscribe. The broadcast below is
@@ -148,7 +215,16 @@ impl PublicStream {
         Ok(())
     }
 
-    async fn handle_public_stream(&self, text: &str) -> Result<(), BybitError> {
+    /// Handles one frame from the venue.
+    ///
+    /// Takes the connection's tracker because a subscribe ack is where a rejection lands, and a
+    /// *transient* rejection has to put its symbol back into pending — see
+    /// [`classify_rejection`]. Nothing else here touches it.
+    async fn handle_public_stream(
+        &self,
+        text: &str,
+        tracker: &mut SubscriptionTracker,
+    ) -> Result<(), BybitError> {
         let stream = serde_json::from_str::<PublicStreamMsg>(text)?;
         match stream {
             PublicStreamMsg::Op(resp) => {
@@ -163,19 +239,23 @@ impl PublicStream {
                 // to grep for it. The bots still only get `CriticalConnectionError`: the symbol
                 // belongs in the log, not the payload — see below.
                 //
-                // Not retried on this connection: the tracker has already marked that symbol,
-                // and a rejection over a topic *name* is a verdict that will not change while
-                // the connection lives — re-asking would spend rate limit for the same answer.
-                // A transient rejection (`10006`, "Too many visits") is still not told apart
-                // from a permanent one; both recover on the next reconnect, which re-derives
-                // every subscription from the shared symbol set.
+                // What happens next is the *only* thing the classification changes: a transient
+                // rejection puts its symbol back into pending, so the next keepalive tick asks
+                // again, while a permanent — or unrecognized — one stays marked and is left for
+                // the next reconnect. The `error!` and the `CriticalConnectionError` are the
+                // same either way, on purpose: this library does not decide what a rejection is
+                // worth, the bot's `error_handler` does (`AGENTS.md` §1.1).
                 if resp.op == "subscribe" && !resp.success.unwrap_or(true) {
+                    let symbol = acked_symbol(resp.req_id.as_deref());
+                    let rejection = classify_rejection(resp.ret_msg.as_deref());
                     error!(
-                        symbol = acked_symbol(resp.req_id.as_deref()).unwrap_or("unattributed"),
+                        symbol = symbol.unwrap_or("unattributed"),
+                        ?rejection,
                         ?resp,
                         "Bybit rejected a subscribe batch. Every topic in it failed, so that \
-                         symbol gets no market data on this connection, and it will not be \
-                         retried. Check `orderbook_depths` against what the venue accepts."
+                         symbol has no market data on this connection. A transient rejection is \
+                         asked for again on the next keepalive tick; anything else waits for a \
+                         reconnect. Check `orderbook_depths` against what the venue accepts."
                     );
                     // The venue's message stays in the log rather than going into the payload:
                     // a `LiveEvent` is capped at 512 bytes (`live/ipc/config.rs`) and an
@@ -186,6 +266,12 @@ impl PublicStream {
                             ErrorKind::CriticalConnectionError,
                         ))))
                         .unwrap();
+                    // Un-marked one symbol at a time, and only the one this ack answers for: an
+                    // ack whose `req_id` names nobody has nothing to put back, and guessing
+                    // would resubscribe a healthy symbol every tick.
+                    if let (Rejection::Transient, Some(symbol)) = (rejection, symbol) {
+                        tracker.unmark(symbol);
+                    }
                 } else {
                     debug!(?resp, "Op");
                 }
@@ -336,6 +422,14 @@ impl PublicStream {
                     };
                     let s = serde_json::to_string(&op).unwrap();
                     write.send(Message::Text(s.into())).await?;
+                    // The retry impulse for a transiently rejected subscribe, riding the
+                    // keepalive rather than a timer of its own: nothing is pending on a healthy
+                    // connection and `subscribe_pending` then writes nothing, so a quiet
+                    // connection still sends exactly one ping every 15 s — and a symbol the
+                    // venue rate-limited is re-asked at most once per tick, which bounds the
+                    // pressure by construction. The ping goes first: it is what keeps the socket
+                    // alive and it must not queue behind a subscribe.
+                    self.subscribe_pending(write, &mut tracker).await?;
                 }
                 msg = self.symbol_rx.recv() => match msg {
                     // Only a wake-up: the shared symbol set says what to subscribe, and the
@@ -356,7 +450,7 @@ impl PublicStream {
                 message = read.next() => {
                     match message {
                         Some(Ok(Message::Text(text))) => {
-                            if let Err(error) = self.handle_public_stream(&text).await {
+                            if let Err(error) = self.handle_public_stream(&text, &mut tracker).await {
                                 error!(?error, %text, "Couldn't handle PublicStreamMsg.");
                             }
                         }
@@ -395,13 +489,17 @@ mod tests {
         fmt,
         sync::{Arc, Mutex},
         task::Poll,
+        time::Duration,
     };
 
     use futures_util::{Stream, stream};
     use hftbacktest::types::{ErrorKind, LiveEvent};
-    use tokio::sync::{
-        broadcast,
-        mpsc::{UnboundedReceiver, unbounded_channel},
+    use tokio::{
+        sync::{
+            broadcast,
+            mpsc::{UnboundedReceiver, unbounded_channel},
+        },
+        time,
     };
     use tokio_tungstenite::tungstenite::{Error as WsError, Message};
     use tracing::{
@@ -419,7 +517,13 @@ mod tests {
         bybit::{
             BybitError,
             SharedSymbolSet,
-            public_stream::{PublicStream, acked_symbol, subscription_frames},
+            public_stream::{
+                PublicStream,
+                Rejection,
+                acked_symbol,
+                classify_rejection,
+                subscription_frames,
+            },
         },
         connector::PublishEvent,
         utils::testing::{RecordingSink, closed_read, read_after_connect, read_frames},
@@ -456,13 +560,45 @@ mod tests {
         )
     }
 
+    /// The `op` of every frame the connection wrote, in order.
+    ///
+    /// The retry's *cadence* is only visible here. The same three subscribes and two pings in a
+    /// different order describe a different feature — one that re-asked without waiting for a
+    /// tick — so a test that counts frames per symbol pins the retry while saying nothing about
+    /// what triggers it. Measured before this existed: with the keepalive period mutated from
+    /// 15 s to an hour, so that no tick but the immediate one could fire, the transient pin was
+    /// still green in 20 of 30 runs.
+    fn ops(sink: &RecordingSink<BybitError>) -> Vec<String> {
+        sink.sent
+            .iter()
+            .map(|frame| {
+                serde_json::from_str::<serde_json::Value>(frame).unwrap()["op"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The frames the connection wrote under `op`, in order and exactly as written.
+    ///
+    /// Two ops go out here: the `subscribe` batches, and the keepalive `ping`s the loop emits
+    /// every 15 s. Counting the pings is what tells a test that a tick really happened, which
+    /// is the difference between "nothing was resubscribed" and "nothing had the chance to be".
+    fn frames_with_op(sink: &RecordingSink<BybitError>, op: &str) -> Vec<String> {
+        sink.sent
+            .iter()
+            .filter(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap()["op"] == op)
+            .cloned()
+            .collect()
+    }
+
     /// The subscribe batches that went out, in order, ignoring the keepalive pings the
     /// connection loop also writes.
     fn subscribed(sink: &RecordingSink<BybitError>) -> Vec<serde_json::Value> {
-        sink.sent
+        frames_with_op(sink, "subscribe")
             .iter()
             .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
-            .filter(|frame| frame["op"] == "subscribe")
             .collect()
     }
 
@@ -531,18 +667,48 @@ mod tests {
         fn record_debug(&mut self, _: &Field, _: &dyn fmt::Debug) {}
     }
 
-    /// A rejection ack for `symbol`, echoing the `req_id` its subscribe batch really carried.
+    /// A rejection ack for `symbol` carrying `ret_msg`, echoing the `req_id` its subscribe batch
+    /// really carried.
     ///
     /// Built from [`subscription_frames`] rather than hand-written, so writer and reader have to
     /// agree through the code under test. Two matching literals in two tests would let the two
     /// sides drift apart into a `req_id` nothing can attribute.
-    fn rejection_for(symbol: &str, depths: &[u32]) -> String {
+    ///
+    /// `ret_msg` goes in unescaped — every message the venue is known to send here is plain
+    /// prose, and a caller passing a quote would produce invalid JSON and fail loudly.
+    fn rejection_for(symbol: &str, depths: &[u32], ret_msg: &str) -> String {
         let batch: serde_json::Value =
             serde_json::from_str(&subscription_frames(&[symbol.to_string()], depths)[0]).unwrap();
         let req_id = batch["req_id"].as_str().unwrap();
         format!(
-            r#"{{"success":false,"ret_msg":"error:handler not found,topic:orderbook.500.{symbol}","conn_id":"c","req_id":"{req_id}","op":"subscribe"}}"#
+            r#"{{"success":false,"ret_msg":"{ret_msg}","conn_id":"c","req_id":"{req_id}","op":"subscribe"}}"#
         )
+    }
+
+    /// The measured permanent rejection: an unknown topic name, which fails the whole batch.
+    ///
+    /// Exactly what mainnet answered for `orderbook.500` on 2026-07-25 — a depth the docs
+    /// promise and the venue refuses. Deterministic, so it will be refused identically for as
+    /// long as this connection lives.
+    fn permanent_rejection_for(symbol: &str, depths: &[u32]) -> String {
+        let depth = depths.last().unwrap();
+        rejection_for(
+            symbol,
+            depths,
+            &format!("error:handler not found,topic:orderbook.{depth}.{symbol}"),
+        )
+    }
+
+    /// A rate-limit rejection: the same batch, refused for *when* it was sent.
+    ///
+    /// **Modelled, not recorded** — see [`Rejection::Transient`]. `"Too many visits"` is Bybit's
+    /// rate-limit wording from elsewhere in this connector's world, not a public subscribe ack
+    /// anybody captured; and this frame naming no topic, while `req_id` still attributes it, is
+    /// the assumption the whole branch rests on rather than an observation of the venue. What
+    /// mainnet actually answers a rate-limited public subscribe with — prose, and whether `req_id`
+    /// comes back at all — is the open measurement behind this test.
+    fn rate_limited_rejection_for(symbol: &str, depths: &[u32]) -> String {
+        rejection_for(symbol, depths, "Too many visits")
     }
 
     /// A read half that hands the loop `frames` as text and then runs `script`, staying quiet
@@ -570,6 +736,57 @@ mod tests {
             }
         })
     }
+
+    /// A read half whose `frames` land strictly *between* two keepalive ticks, and which then
+    /// ends: quiet, frames, quiet, gone.
+    ///
+    /// **The leading quiet is what makes the cadence pinnable, and it was missing.**
+    /// `time::interval` fires its first tick immediately, so a read half that handed a frame over
+    /// at once left two `select!` branches ready at t=0 — the tick and the frame — and tokio picks
+    /// between those at random. The retry then rode the *immediate* tick in most runs, which is
+    /// no cadence at all: measured, the transient pin stayed green in 20 of 30 runs with the
+    /// keepalive period mutated from 15 s to an hour. Withholding the frames until the immediate
+    /// tick is spent leaves exactly one ready branch at every step, so the whole run is ordered
+    /// by the clock — tick, frames, tick, end — and a retry can only be riding the second tick.
+    ///
+    /// Under `#[tokio::test(start_paused = true)]` the current-thread runtime advances the mocked
+    /// clock to the next timer whenever no task can make progress, so none of this waits: the
+    /// 21 s of connection lifetime scripted here cost no wall-clock time.
+    ///
+    /// Deliberately not a second task calling [`time::advance`]: `serve` holds the borrow of the
+    /// recording sink for as long as it runs, and a driver racing it would have to end the loop
+    /// itself, which puts the wake-up channel closing and the tick firing in the same `select!`
+    /// with nothing to order them.
+    fn read_frames_between_ping_ticks(
+        frames: Vec<String>,
+    ) -> impl Stream<Item = Result<Message, WsError>> + Unpin {
+        // Written with `unfold` rather than `poll_fn` so the script reads in order. The state
+        // lives in the stream, so the sleeps survive the `select!` that drops a losing `next()`.
+        Box::pin(stream::unfold(
+            (frames.into_iter(), true),
+            |(mut frames, first)| async move {
+                if first {
+                    time::sleep(AFTER_THE_IMMEDIATE_TICK).await;
+                }
+                match frames.next() {
+                    Some(frame) => Some((Ok(Message::Text(frame.into())), (frames, false))),
+                    None => {
+                        time::sleep(PAST_THE_NEXT_TICK).await;
+                        None
+                    }
+                }
+            },
+        ))
+    }
+
+    /// Long enough that the loop's immediate keepalive tick is already spent, short enough to
+    /// stay inside the first 15 s period — so a frame handed over after it lands strictly between
+    /// two ticks.
+    const AFTER_THE_IMMEDIATE_TICK: Duration = Duration::from_secs(1);
+
+    /// Past the loop's 15 s keepalive period, so exactly one more tick fires — the first one
+    /// *after* the frames — before the read half ends and the loop with it.
+    const PAST_THE_NEXT_TICK: Duration = Duration::from_secs(20);
 
     /// **`AGENTS.md` §4.2.** Every symbol registered before this connection existed has to be
     /// subscribed at connect. The broadcast cannot deliver them: `Connector::register` sends
@@ -763,7 +980,7 @@ mod tests {
         let _capturing = reported.capturing();
         let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["BTCUSDT"], &[1, 500]);
         let mut sink = RecordingSink::<BybitError>::default();
-        let mut read = read_frames(vec![rejection_for("BTCUSDT", &[1, 500])]);
+        let mut read = read_frames(vec![permanent_rejection_for("BTCUSDT", &[1, 500])]);
 
         stream
             .serve(&mut sink, &mut read)
@@ -778,23 +995,28 @@ mod tests {
         assert_eq!(errors(&mut ev_rx), 1);
     }
 
-    /// A rejection must not disturb anything else: nothing un-subscribes or retries on this
-    /// connection, so a rejection that quietly un-marked a symbol would leave the next wake-up
-    /// resubscribing a live one and spending rate limit (`10006`, "Too many visits").
+    /// A **permanent** rejection must not disturb anything else: the batch is written off until
+    /// the next reconnect, so a rejection that quietly un-marked a symbol would leave the next
+    /// wake-up resubscribing for the same refusal and spending rate limit (`10006`, "Too many
+    /// visits") on it. Only a transient rejection un-marks — see
+    /// [`a_transient_rejection_is_resubscribed_on_the_next_ping_tick`].
     ///
     /// Tracker state is only visible in what the connection writes next, so this drives a
     /// wake-up after the rejection and requires it to write nothing — for the rejected symbol
     /// and for the healthy one beside it alike.
     #[tokio::test]
-    async fn a_rejection_un_marks_nothing() {
+    async fn a_permanent_rejection_un_marks_nothing() {
         let (mut stream, _symbols, symbol_tx, mut ev_rx) =
             stream(&["BTCUSDT", "ETHUSDT"], &[1, 500]);
         let mut sink = RecordingSink::<BybitError>::default();
-        let mut read = read_frames_then(vec![rejection_for("BTCUSDT", &[1, 500])], move || {
-            // Whatever the rejection did to this connection's subscription state is only
-            // visible in what the next wake-up writes. Dropping the sender ends the loop.
-            symbol_tx.send("BTCUSDT".to_string()).unwrap();
-        });
+        let mut read = read_frames_then(
+            vec![permanent_rejection_for("BTCUSDT", &[1, 500])],
+            move || {
+                // Whatever the rejection did to this connection's subscription state is only
+                // visible in what the next wake-up writes. Dropping the sender ends the loop.
+                symbol_tx.send("BTCUSDT".to_string()).unwrap();
+            },
+        );
 
         stream.serve(&mut sink, &mut read).await.unwrap();
 
@@ -812,11 +1034,204 @@ mod tests {
         );
     }
 
+    /// **`AGENTS.md` §4.2, the transient half.** A subscribe refused for *when* it was sent heals
+    /// by itself, so the symbol goes back to pending and the next keepalive tick asks again —
+    /// otherwise one rate-limited batch cost that symbol its market data until the next
+    /// reconnect, which on a healthy socket may never come.
+    ///
+    /// Four things are pinned at once, and each is a different way to get this wrong:
+    ///
+    /// - the retry happens at all (nothing un-marked → two batches);
+    /// - it happens **on a tick**, and on the next tick of the 15 s keepalive rather than one that
+    ///   was already due when the rejection arrived — that is the whole bound on rate-limit
+    ///   pressure, and the only assertion that sees it is the order of ops on the wire (see
+    ///   [`ops`], and [`read_frames_between_ping_ticks`] for why that order is deterministic);
+    /// - it is the *same* batch, byte for byte (a retry that asked for different topics would be
+    ///   a second bug wearing the first one's clothes);
+    /// - it covers **exactly** its own symbol — `unmark` clearing the tracker instead of removing
+    ///   one entry would resubscribe the healthy symbol beside it and spend rate limit while
+    ///   recovering from rate limiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_rejection_is_resubscribed_on_the_next_ping_tick() {
+        let (mut stream, _symbols, _symbol_tx, mut ev_rx) =
+            stream(&["BTCUSDT", "ETHUSDT"], &[1, 50]);
+        let mut sink = RecordingSink::<BybitError>::default();
+        let mut read =
+            read_frames_between_ping_ticks(vec![rate_limited_rejection_for("BTCUSDT", &[1, 50])]);
+
+        stream
+            .serve(&mut sink, &mut read)
+            .await
+            .expect_err("the read half ended");
+
+        assert_eq!(
+            ops(&sink),
+            ["subscribe", "subscribe", "ping", "ping", "subscribe"],
+            "the retry rides a keepalive tick, and the one that can carry it is the tick after \
+             the rejection — the immediate tick is already spent when the rejection arrives. The \
+             ping goes out before the subscribe within a tick, too: it is what keeps the socket \
+             alive and must not queue behind a batch. {:?}",
+            sink.sent
+        );
+        let (btcusdt, ethusdt): (Vec<String>, Vec<String>) = frames_with_op(&sink, "subscribe")
+            .into_iter()
+            .partition(|frame| frame.contains("subscribe:BTCUSDT"));
+        assert_eq!(
+            btcusdt.len(),
+            2,
+            "the rejected symbol has to be asked for again: {:?}",
+            sink.sent
+        );
+        assert_eq!(
+            btcusdt[1], btcusdt[0],
+            "the retry must be the batch that was rejected, byte for byte"
+        );
+        assert_eq!(
+            ethusdt.len(),
+            1,
+            "only the rejected symbol goes back to pending: {:?}",
+            sink.sent
+        );
+        assert_eq!(
+            errors(&mut ev_rx),
+            1,
+            "the rejection is still reported to the bots — the retry is underneath the policy, \
+             not instead of it"
+        );
+    }
+
+    /// **The fail-closed pin.** A permanent rejection stays dead for the life of the connection:
+    /// the batch is deterministic, so re-asking buys the same refusal and spends rate limit doing
+    /// it. Only the next reconnect, which re-derives every subscription from the shared symbol
+    /// set, can clear it.
+    ///
+    /// The ping count is what keeps this from pinning nothing: it proves a tick fired *after* the
+    /// rejection and still wrote no subscribe. Without it, a read half that ended too early would
+    /// pass this test while the retry ran on every tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_rejection_stays_dead_across_a_ping_tick() {
+        let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["BTCUSDT"], &[1, 500]);
+        let mut sink = RecordingSink::<BybitError>::default();
+        let mut read =
+            read_frames_between_ping_ticks(vec![permanent_rejection_for("BTCUSDT", &[1, 500])]);
+
+        stream
+            .serve(&mut sink, &mut read)
+            .await
+            .expect_err("the read half ended");
+
+        assert_eq!(
+            frames_with_op(&sink, "ping").len(),
+            2,
+            "a tick has to fall after the rejection, or this test pins nothing: {:?}",
+            sink.sent
+        );
+        assert_eq!(
+            frames_with_op(&sink, "subscribe").len(),
+            1,
+            "the connect-time batch and nothing else: {:?}",
+            sink.sent
+        );
+        assert_eq!(errors(&mut ev_rx), 1);
+    }
+
+    /// **The same pin for a message nobody recognized.** An unknown `ret_msg` is treated exactly
+    /// as a permanent one: retrying it every tick for the life of the connection would be a
+    /// rate-limit storm built out of one string the venue changed, while writing it off costs one
+    /// symbol's market data until a reconnect. `AGENTS.md` §1.1 — fail closed.
+    #[tokio::test(start_paused = true)]
+    async fn an_unrecognised_rejection_stays_dead_across_a_ping_tick() {
+        let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["BTCUSDT"], &[1, 50]);
+        let mut sink = RecordingSink::<BybitError>::default();
+        let mut read = read_frames_between_ping_ticks(vec![rejection_for(
+            "BTCUSDT",
+            &[1, 50],
+            "invalid request, please check your request",
+        )]);
+
+        stream
+            .serve(&mut sink, &mut read)
+            .await
+            .expect_err("the read half ended");
+
+        assert_eq!(
+            frames_with_op(&sink, "ping").len(),
+            2,
+            "a tick has to fall after the rejection, or this test pins nothing: {:?}",
+            sink.sent
+        );
+        assert_eq!(
+            frames_with_op(&sink, "subscribe").len(),
+            1,
+            "an unrecognised rejection must not be retried: {:?}",
+            sink.sent
+        );
+        assert_eq!(errors(&mut ev_rx), 1);
+    }
+
+    /// The two shapes the connector knows, read out of the venue's own prose.
+    ///
+    /// The permanent one is what mainnet answered for `orderbook.500` on 2026-07-25; the
+    /// transient one is rate limiting, which the venue writes as `10006` / "Too many visits" and
+    /// whose case is not something to depend on.
+    #[test]
+    fn a_rejection_is_classified_by_the_message_the_venue_chose() {
+        assert_eq!(
+            classify_rejection(Some("error:handler not found,topic:orderbook.500.BTCUSDT")),
+            Rejection::Permanent
+        );
+        for transient in [
+            "Too many visits",
+            "too many visits!",
+            "TOO MANY VISITS",
+            "10006",
+            "error:10006,too many visits",
+        ] {
+            assert_eq!(
+                classify_rejection(Some(transient)),
+                Rejection::Transient,
+                "{transient}"
+            );
+        }
+    }
+
+    /// **The classifier is total, and everything it does not recognize is permanent.**
+    ///
+    /// Including no `ret_msg` at all: `OpResponse::ret_msg` is optional, and an ack that omits it
+    /// says nothing about whether asking again would help. A wrong "permanent" costs one symbol's
+    /// market data until the next reconnect; a wrong "transient" retries for the life of the
+    /// connection, once every tick, on a connection the venue is already rate-limiting.
+    ///
+    /// A message carrying *both* shapes is permanent too — the verdict on the batch wins, which
+    /// is also what keeps a topic name that happens to contain `10006` from reading as rate
+    /// limiting.
+    #[test]
+    fn an_unrecognised_rejection_is_classified_permanent() {
+        for unknown in [
+            None,
+            Some(""),
+            Some("invalid request, please check your request"),
+            Some("Internal server error"),
+            Some("error:handler not found,topic:orderbook.10006.BTCUSDT"),
+            Some("error:handler not found,topic:x. also, too many visits"),
+        ] {
+            assert_eq!(
+                classify_rejection(unknown),
+                Rejection::Permanent,
+                "{unknown:?}"
+            );
+        }
+    }
+
     /// A `req_id` this connector did not write — the keepalive's `"ping"`, an older build's
     /// constant `"subscribe"`, a venue that echoes nothing — is not a symbol, and guessing one
     /// would point the operator at a symbol that is fine. Unattributed still means reported:
     /// the batch's topics are dead either way, and the log says so in as many words rather than
     /// dropping the field and leaving a rejection that looks like every other one.
+    ///
+    /// The second frame is the case where the two halves meet: a rate-limit rejection *is*
+    /// transient, but with no symbol on it there is nothing to un-mark, so it is written off like
+    /// a permanent one. Un-marking on a guess would resubscribe a healthy symbol every tick.
     #[tokio::test]
     async fn a_rejection_with_no_symbol_in_its_req_id_is_reported_unattributed() {
         let reported = ReportedSymbols::default();
