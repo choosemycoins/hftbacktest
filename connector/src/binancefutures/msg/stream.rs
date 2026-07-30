@@ -14,7 +14,20 @@ pub enum Stream {
 #[derive(Deserialize, Debug)]
 pub struct Result {
     pub result: Option<String>,
+    /// Present when the venue *refused* the request — `{"error":{"code":2,"msg":"…"},"id":"…"}`.
+    ///
+    /// Without this field a refusal deserialized into `result: None` and was indistinguishable
+    /// from the `{"result":null}` that acknowledges a SUBSCRIBE, so a symbol could end up with
+    /// no streams at all on a connection that looked healthy. See
+    /// `MarketDataStream::handle_subscription_response`.
+    pub error: Option<StreamError>,
     pub id: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct StreamError {
+    pub code: i64,
+    pub msg: String,
 }
 
 #[derive(Deserialize, Debug)]

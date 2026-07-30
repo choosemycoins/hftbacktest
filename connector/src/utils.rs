@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt,
     fmt::{Debug, Write},
     future::Future,
@@ -306,6 +307,33 @@ impl Equivalent<SymbolOrderId> for RefSymbolOrderId<'_> {
     }
 }
 
+/// Which symbols have been subscribed **on the current connection**.
+///
+/// A connection owns one of these and never inherits another's: it is built where the
+/// connection is served, so every reconnect re-derives its subscriptions from the shared
+/// symbol set. Hoisting one to struct level would let it survive a reconnect and suppress
+/// exactly the resubscription it exists to allow. Each backend has a test that serves two
+/// connections in a row and fails if the second subscribes nothing.
+#[derive(Default)]
+pub struct SubscriptionTracker {
+    subscribed: HashSet<String>,
+}
+
+impl SubscriptionTracker {
+    /// Registered symbols this connection has not subscribed yet, in a stable order.
+    pub fn pending(&self, registered: &HashSet<String>) -> Vec<String> {
+        let mut pending: Vec<String> = registered.difference(&self.subscribed).cloned().collect();
+        pending.sort();
+        pending
+    }
+
+    pub fn mark(&mut self, symbols: &[String]) {
+        for symbol in symbols {
+            self.subscribed.insert(symbol.clone());
+        }
+    }
+}
+
 pub fn generate_rand_string(length: usize) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                              abcdefghijklmnopqrstuvwxyz\
@@ -317,6 +345,105 @@ pub fn generate_rand_string(length: usize) -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! Seams shared by the connector's socketless tests.
+
+    use std::{
+        marker::PhantomData,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use futures_util::{Sink, Stream, stream};
+    use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+    /// A write half that records what was written, so a subscribe path can be driven without
+    /// a socket.
+    ///
+    /// Generic over the backend's error type because every backend has its own and none of
+    /// them is ever produced here: this sink accepts everything.
+    pub struct RecordingSink<E> {
+        pub sent: Vec<String>,
+        /// `fn() -> E` rather than `E`: a plain `PhantomData<E>` would leak `E`'s auto traits
+        /// and cost this sink its unconditional `Unpin`, which `Pin<&mut Self>` needs.
+        _error: PhantomData<fn() -> E>,
+    }
+
+    impl<E> Default for RecordingSink<E> {
+        fn default() -> Self {
+            Self {
+                sent: Vec::new(),
+                _error: PhantomData,
+            }
+        }
+    }
+
+    impl<E> Sink<Message> for RecordingSink<E> {
+        type Error = E;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sent.push(item.into_text().unwrap().to_string());
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A read half that hands the connection loop `frames` as text and then ends.
+    ///
+    /// Ending is how the loop under test terminates: a read half that is done is a dropped
+    /// socket, which every backend reports as `ConnectionInterrupted`.
+    pub fn read_frames(
+        frames: Vec<String>,
+    ) -> impl Stream<Item = Result<Message, WsError>> + Unpin {
+        stream::iter(
+            frames
+                .into_iter()
+                .map(|frame| Ok(Message::Text(frame.into()))),
+        )
+    }
+
+    /// A read half that is already gone: the loop subscribes, reads nothing, and reports the
+    /// connection interrupted. What the write half recorded is therefore exactly what went out
+    /// *at connect*.
+    pub fn closed_read() -> impl Stream<Item = Result<Message, WsError>> + Unpin {
+        read_frames(Vec::new())
+    }
+
+    /// A read half that runs `script` the first time the loop polls it — by which point the
+    /// connect-time subscribe has already gone out — and then stays quiet for ever.
+    ///
+    /// This is how a registration arriving *during* a connection is delivered without a socket
+    /// and without a second task. The script ends the loop itself by dropping the wake-up
+    /// sender it captured: the loops return `Ok(())` when the broadcast closes, and every
+    /// wake-up already buffered is delivered before that.
+    pub fn read_after_connect<F>(script: F) -> impl Stream<Item = Result<Message, WsError>> + Unpin
+    where
+        F: FnOnce(),
+    {
+        let mut script = Some(script);
+        stream::poll_fn(move |_| {
+            if let Some(script) = script.take() {
+                script();
+            }
+            // Never woken again on purpose: the loop is driven from here on by the wake-ups
+            // the script sent, and it must not see a frame it did not ask for.
+            Poll::Pending
+        })
+    }
 }
 
 #[cfg(test)]

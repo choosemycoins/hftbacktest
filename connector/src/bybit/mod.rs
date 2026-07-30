@@ -129,6 +129,9 @@ impl Bybit {
         // Connects to the public stream for the market data.
         let public_url = self.config.public_url.clone();
         let symbol_tx = self.symbol_tx.clone();
+        // The registered symbols, so every reconnect re-derives its subscriptions from them
+        // rather than from a fresh broadcast receiver that has seen nothing.
+        let symbols = self.symbols.clone();
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
@@ -143,7 +146,8 @@ impl Bybit {
                     Ok(())
                 })
                 .retry(|| async {
-                    let mut stream = PublicStream::new(ev_tx.clone(), symbol_tx.subscribe());
+                    let mut stream =
+                        PublicStream::new(ev_tx.clone(), symbols.clone(), symbol_tx.subscribe());
                     if let Err(error) = stream.connect(&public_url).await {
                         error!(?error, "A connection error occurred.");
                         ev_tx
@@ -286,7 +290,13 @@ impl Connector for Bybit {
         let mut symbols = self.symbols.lock().unwrap();
         if !symbols.contains(&symbol) {
             symbols.insert(symbol.clone());
-            self.symbol_tx.send(symbol).unwrap();
+            // Only a wake-up, and not fatal if nobody hears it: the streams re-read the shared
+            // set above on every connect, so a symbol registered while a stream is between
+            // connections is subscribed as soon as it reconnects. A send error means there is
+            // no receiver at all — every stream task is inside its reconnect backoff, up to a
+            // minute of it — and `unwrap` there panicked the whole connector, taking down
+            // market data and order flow for every other bot in the middle of an outage.
+            let _ = self.symbol_tx.send(symbol);
         }
     }
 
@@ -349,5 +359,48 @@ impl Connector for Bybit {
                     .unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        bybit::Bybit,
+        connector::{Connector, ConnectorBuilder},
+    };
+
+    /// The shared symbol set is what the public stream now subscribes from, and the broadcast
+    /// is only a wake-up.
+    ///
+    /// No receiver is subscribed here, on purpose. That is the state during a reconnect
+    /// backoff — up to a minute of it — and a network partition takes the public and private
+    /// streams together, so both `symbol_tx.subscribe()` sites can be gone at once. A bot
+    /// registering an instrument in that window must not be fatal: `register` used to `unwrap`
+    /// the broadcast send, and `main.rs` turns a panic into `exit(1)`, which would take down
+    /// market data and order flow for every other bot in the middle of an outage.
+    #[test]
+    fn register_records_the_symbol_and_survives_having_no_listener() {
+        let mut connector = Bybit::build_from(
+            r#"
+                public_url = "wss://example.invalid/public"
+                private_url = "wss://example.invalid/private"
+                trade_url = "wss://example.invalid/trade"
+                rest_url = "https://example.invalid"
+                api_key = ""
+                secret = ""
+                category = "linear"
+                order_prefix = "t"
+            "#,
+        )
+        .unwrap();
+
+        connector.register("BTCUSDT".to_string());
+        // Registering the same symbol twice must stay a no-op: the set is what the stream
+        // reads, and a second wake-up would only cost a rate-limit slot.
+        connector.register("BTCUSDT".to_string());
+
+        let symbols = connector.symbols.lock().unwrap();
+        assert!(symbols.contains("BTCUSDT"), "{symbols:?}");
+        assert_eq!(symbols.len(), 1);
     }
 }
