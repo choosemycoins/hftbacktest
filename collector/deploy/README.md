@@ -174,3 +174,54 @@ SIGTERM'ом (проверяйте `gzip -t` только на прошлых UT
   наполнять 48КБ-буфер gzip дольше 10 минут — mtime стоит, декодер видит только
   сброшенное. Смотрите журнал и liveness-гейдж, не mtime.
 - Гейт-отчёты: `data/gate/YYYYMMDD.txt` — построчно, какие дыры и чем объяснены.
+
+## Переезд операторской машины
+
+Операторская машина — это та, что вывозит данные, держит локальное окно записей
+и гоняет тулинг/бэктесты. Сервер записи она не трогает: там ничего менять не
+надо. Порядок переезда — именно такой; пункт 8 (выключение старого агента)
+делайте ДО пункта 5 на новой машине, чтобы два вывоза не гонялись за одними
+файлами.
+
+1. **Секреты** (в git их нет, переносятся руками, права 600):
+   - `hl_bn_md.pem` — из корня старого клона (gitignored) в корень нового;
+   - `~/.ssh/config` — алиас `hft-collector-tokyo` (HostName EC2, User ubuntu,
+     IdentityFile → pem);
+   - `~/.config/hftbacktest-connector/telegram-alert.env` — `TG_BOT_TOKEN`,
+     `TG_CHAT_ID`, `HEALTHCHECK_PING_URL`;
+   - `~/.config/hftbacktest-connector/hl-testnet.toml` — ключи HL-тестнета.
+2. **Репозиторий**: `git clone git@github-coins:choosemycoins/hftbacktest.git`,
+   ветка `feat/hyperliquid-connector`. В `~/.cargo/config.toml` нового
+   пользователя — `git-fetch-with-cli = true` (ssh-алиас `github-coins` cargo
+   сам не разрешит). Путь клона свободный, но перенос сессий Claude Code
+   требует тот же абсолютный путь (см. п. 9).
+3. **Rust**: stable ≥ 1.91.1 (MSRV) + nightly для `cargo +nightly fmt`.
+   Проверка: `cargo test --workspace --lib --bins` — все крейты зелёные.
+4. **Python**: `python3 -m venv .venv && .venv/bin/pip install numpy numba
+   pytest maturin`, затем `cd py-hftbacktest && ../.venv/bin/maturin develop
+   --release`. Проверка: `.venv/bin/pytest collector/tools/ -q`.
+5. **Данные**: перенести `~/hft-data` целиком (окно последних дней + `reports/`
+   + `offload-logs/`); правило одно — какие дни лежат локально, такие доступны
+   датасетам и бэктестам без внешнего диска.
+6. **launchd-вывоз**: `cp collector/deploy/com.hftbacktest.offload-daily.plist.example
+   ~/Library/LaunchAgents/com.hftbacktest.offload-daily.plist`, поправить в нём
+   оба пути и, при большом диске, окно: `HFT_KEEP_DAYS` можно растянуть (данные
+   тогда копятся локально, ярус `HFT_ARCHIVE_DIR` не нужен), а
+   `HFT_LOCAL_FLOOR_GB` поднять с запасом на 2–3 дня расхода (~25–35 ГБ).
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/...` и пробный
+   `launchctl kickstart gui/$(id -u)/com.hftbacktest.offload-daily`.
+7. **Смоук всего пути**: `ssh hft-collector-tokyo uptime` →
+   `bash collector/deploy/offload.sh --host hft-collector-tokyo --target
+   ~/hft-data --dry-run` → лог свежего kickstart-прогона в
+   `~/hft-data/offload-logs/`.
+8. **Старая машина**: `launchctl bootout gui/$(id -u)/com.hftbacktest.offload-daily`,
+   стереть секреты из п. 1. Делается до включения агента на новой.
+9. **Сессии Claude Code** (по желанию): `rsync -av
+   ~/.claude/projects/-Users-andrew-rust-hftbacktest/` на новую машину в тот же
+   путь — это транскрипты и файловая память; репозиторий должен лежать по тому
+   же абсолютному пути, иначе `--resume <id>` сессию не найдёт.
+10. **Бэктесты на машине с 64 ГБ**: полный день HYPE-класса в `.npz` — единицы
+    ГБ, так что многодневные мультисимвольные прогоны помещаются в память
+    целиком; `--buffer-size` у `build_dataset.py` можно поднимать смело, а
+    датасеты хранить рядом с сырьём (`dataset-*` не трогает ни вывоз, ни
+    ротация).
