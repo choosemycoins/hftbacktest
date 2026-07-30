@@ -331,8 +331,44 @@ struct Args {
     config: String,
 }
 
+/// Picks the process-wide rustls provider before anything opens a TLS connection.
+///
+/// A `cargo build --workspace` binary links TWO rustls providers: this crate's dependencies
+/// enable `rustls/ring`, while `py-hftbacktest -> hftbacktest/s3 -> aws-config` unifies in
+/// `rustls/aws-lc-rs`. With both present rustls refuses to guess and the first handshake
+/// panics with "Could not automatically determine the process-level CryptoProvider from
+/// Rustls crate features" - which the panic hook below turns into `exit(1)`, on the first
+/// message from any venue. Installing explicitly makes the workspace build behave like
+/// `cargo build -p connector`.
+///
+/// Idempotent, so a test harness that already installed a provider - or a future second
+/// call - is a no-op rather than a startup panic.
+fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // A racing install between the check and here can only be the same provider, so
+        // losing that race is fine and the error is deliberately ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    use super::install_crypto_provider;
+
+    /// A default provider exists after installation, and a second call - or one racing a
+    /// provider someone else installed - does not panic.
+    #[test]
+    fn installing_the_crypto_provider_is_effective_and_idempotent() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        install_crypto_provider();
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    install_crypto_provider();
+
     // Ensures that the main thread will terminate if any of its child threads panics.
     let orig_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {

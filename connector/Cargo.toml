@@ -40,3 +40,9 @@ ed25519-dalek = { version = "2.2.0", features = [
 ] }
 base64 = "0.22.1"
 serde_qs = "0.15.0"
+# A direct dependency ONLY so `install_crypto_provider` in main.rs can name the crate.
+# rustls is already in the tree through tokio-tungstenite and reqwest, and `ring` is the
+# provider they enable, so this adds no second provider - it just makes the choice
+# explicit for the workspace build, which also links aws-lc-rs through
+# py-hftbacktest -> hftbacktest/s3 -> aws-config.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
