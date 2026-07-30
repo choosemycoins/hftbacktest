@@ -39,7 +39,7 @@
 | Движок бэктеста | `hftbacktest/src/backtest/` — `mod.rs` (`Backtest`, билдеры), `proc/` (`Processor`, local / no-partial-fill / partial-fill / L3), `models/` (`queue.rs`, `latency.rs`, `fee.rs`), `data/` | Событийная симуляция с очередью в стакане и латентностями. |
 | Стаканы | `hftbacktest/src/depth/` — `hashmapmarketdepth.rs`, `btreemarketdepth.rs`, `roivectormarketdepth.rs`, `fuse.rs` | `fuse.rs` (`FusedHashMapMarketDepth`) — слияние нескольких depth-стримов разной глубины/частоты. Самый большой файл ядра. |
 | Коннектор | `connector/src/main.rs` (процесс, регистрация, publish-таск), `connector/src/bybit/`, `binancefutures/`, `binancespot/` | Отдельный бинарь. Вся биржевая специфика — только здесь. |
-| Snapshot-маркер (форк-фича) | `docs/snapshot-complete-marker.md` | Контракт `LiveEvent::SnapshotComplete` / `Bot::snapshot_ready`. **Внимание: раздел «Known gap» в нём содержит фактическую ошибку — см. §4.4.** |
+| Snapshot-маркер (форк-фича) | `docs/snapshot-complete-marker.md` | Контракт `LiveEvent::SnapshotComplete` / `Bot::snapshot_ready`. Раздел «Known gap» исправлен 2026-07-30 и описывает гонку маркера со свипом — см. §4.4. |
 | Примеры конфигов коннектора | `connector/examples/{bybit,binancefutures,binancespot}.toml` | Любое новое поле конфига обязано появиться здесь. |
 | Коллектор: как пользоваться | `collector/README.md` | CLI, наборы стримов по биржам, формат выхода, конвертация в `.npz`, известные ограничения. |
 | Коллектор: эксплуатация | `collector/deploy/` | Версионированные релизы, атомарный своп симлинка, откат, шаблонный systemd-юнит. Паттерн взят из `myhft/deploy/`; два осознанных отличия описаны в `README.md`. |
@@ -216,7 +216,7 @@ Bybit/Binance получили шов `serve(write, read)`: `connect` тольк
 
 ### 4.4 Реальная семантика `SnapshotComplete` — «стакан почищен», а не «состояние подтянуто»
 
-`docs/snapshot-complete-marker.md` в разделе «Known gap» утверждает, что REST-префетч закомментирован и `cancel_all`/`get_all_position` не реализованы. **Это неверно.** Закомментированный блок в `bybit/mod.rs:225–232` — устаревшая альтернативная развязка (методы на `PrivateStream`, которых действительно нет). Рабочий путь живёт в `private_stream.rs` и **активен**:
+`docs/snapshot-complete-marker.md`, раздел «Known gap», **исправлен 2026-07-30** и теперь описывает ровно то, что ниже (прежняя редакция утверждала, что REST-префетч закомментирован — это было неверно: закомментированный блок в `bybit/mod.rs` — мёртвая альтернативная развязка). Рабочий путь живёт в `private_stream.rs` и **активен**:
 
 - на subscribe-ack — по всем уже известным символам (`private_stream.rs:100–151`);
 - на каждую новую регистрацию символа (`private_stream.rs:275+`);
@@ -226,7 +226,7 @@ Bybit/Binance получили шов `serve(write, read)`: `connect` тольк
 
 Настоящая проблема другая — **гонка**. Оба вызова уходят в `tokio::spawn`, а `SnapshotComplete` публикуется publish-тредом сразу после `BatchEnd` (`connector/src/main.rs:186`), синхронно с обработкой `RegisterInstrument`. Регистрация в `run_receive_task` при этом идёт в порядке «сначала отправить `PublishEvent::RegisterInstrument`, потом вызвать `connector.register(symbol)`». Значит `snapshot_ready` может стать `true` **до** того, как REST-раунд-трип завершился.
 
-Если трогаешь эту область: сначала поправь design note, потом код. И не удаляй документацию гонки — она load-bearing.
+Design note поправлена; гонка остаётся **открытой в коде**. Если будешь закрывать — варианты и их цена перечислены в «Possible follow-ups» самой ноты, и не удаляй документацию гонки ни там, ни здесь: она load-bearing.
 
 ### 4.5 `Backtest::submit_order` игнорирует сторону ордера — **починено апстримом, в дереве с 2026-07-30**
 

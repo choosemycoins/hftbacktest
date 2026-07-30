@@ -120,41 +120,58 @@ fatal exit and supervisor restart, which triggers a fresh `LiveBot::build()`
 and a fresh `false → true` cycle for each asset. No connector-side reconnect
 marker is required.
 
-## Known gap: snapshot content does not equal exchange state
+## Known gap: the marker can outrun the venue-side sweep
 
-The Bybit connector's `order_manager` is populated only by the private
-WebSocket stream during its uptime. The code path that would REST-prefetch
-open orders and position at connect time is present but commented out
-(`connector/src/bybit/mod.rs:206–213`, with the `todo: fix the operation
-order.` comment, and the referenced `PrivateStream::cancel_all` /
-`PrivateStream::get_all_position` methods are not implemented).
+> Corrected 2026-07-30. An earlier revision of this section claimed the
+> REST-prefetch path was commented out and `cancel_all`/`get_all_position`
+> unimplemented. That described a dead alternative (the commented block in
+> `bybit/mod.rs` referencing methods that never existed on `PrivateStream`);
+> the working path lives in `bybit/private_stream.rs` and is **active**.
 
-This means the formal contract of `SnapshotComplete` is upheld only if the
-connector was started **before** any orders were placed by the exchange for
-the configured account, and if the private stream has delivered every
-order/position update since. Specifically:
+What the Bybit connector actually does about pre-existing exchange state
+is a *policy*, and the policy is: **cancel everything and start clean.**
+On the private stream's subscribe-ack it walks every registered symbol,
+and on each later registration it repeats for that symbol
+(`private_stream.rs`, both call sites): REST `cancel_all_orders` on the
+venue, then `get_position`, whose result is published to the bot. A bot
+restart therefore cannot duplicate a live grid — the old orders are swept
+at the venue, not adopted. `SnapshotComplete` then correctly describes an
+`order_manager` that holds no resting orders, because the venue was just
+told to hold none either.
 
-- **Fresh connector start, orders exist on the exchange:** contract
-  violated — the snapshot says "no orders" but the exchange has orders.
-- **Connector continuous since first order:** contract holds for the
-  connector's own view, which is as close to exchange state as private
-  stream gives us.
-- **Connector reconnect after missed messages:** contract degrades silently.
+The real gap is a **race**, and it is load-bearing knowledge for any
+consumer:
 
-The task brief (§Out of scope) explicitly defers the REST-prefetch work to
-a separate incident class. This document surfaces the gap so that
-consumers and future work understand what the marker does and does not
-promise.
+- both the sweep and the position fetch run inside `tokio::spawn` — the
+  subscribe-ack handler and the registration path do not await them;
+- `SnapshotComplete` is published by the publish task immediately after
+  the registration's `BatchEnd`, synchronously with `RegisterInstrument`
+  processing (`connector/src/main.rs`), and registration sends
+  `PublishEvent::RegisterInstrument` *before* calling
+  `connector.register(symbol)`.
+
+So `snapshot_ready(asset_no) == true` guarantees the marker's formal
+contract — the registration round-trip finished and the state batch was
+flushed — but **not** that the REST round-trip to the venue has completed.
+For a short window after the marker a consumer may still observe: fills
+from a not-yet-swept order of a previous incarnation, cancel
+acknowledgements for orders it never placed, and a `Position` update
+arriving strictly after the marker. A strategy gating on `snapshot_ready`
+must tolerate those, or wait additionally for the first `Position` event.
+(Separately, the marker never promised a populated book — see AGENTS.md
+§4.1.)
 
 Possible follow-ups (not in scope of this change):
 
-1. Enable the commented `cancel_all` + `get_all_position` path in
-   `bybit/mod.rs` and implement the missing `PrivateStream` methods. Simple
-   option, gives clean "no orders + fresh position" state at the cost of
-   wiping the book on connector start.
-2. Add a `BybitClient::get_open_orders` endpoint call and integrate
-   fetched orders into `order_manager` before `SnapshotComplete` is emitted.
-   Preserves existing orders but more code and more rate-limit surface.
+1. Sequence the marker after the sweep: plumb the spawned round-trip's
+   completion back into the registration path so `SnapshotComplete` is
+   only published once `cancel_all` + `get_position` for that symbol have
+   returned. Closes the race at the cost of coupling marker latency to
+   venue REST latency.
+2. Failure loudness: today an error inside the spawned sweep is logged
+   (`error!`) and the marker is published regardless; publishing a
+   `LiveEvent::Error` on sweep failure would let the consumer's
+   `error_handler` decide instead of trading on an unswept book.
 
 Either approach does not change the wire contract defined here; it
 strengthens its content.
