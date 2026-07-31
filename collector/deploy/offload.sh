@@ -29,9 +29,13 @@
 #   - Never touches today's files, and asserts that a second time immediately
 #     before the delete — that is the one irreversible step here.
 #   - Never deletes anything it did not just verify byte for byte.
-#   - Never deletes the gate reports (gate/*.txt|json). They are copied and
-#     LEFT: kilobytes against gigabytes, and the host's own audit trail for a
-#     day whose data has gone is worth keeping where the journal is.
+#   - Never deletes the gate reports (gate/*.txt|json) OR the _meta_*.jsonl
+#     sidecars. Both are copied and LEFT: kilobytes against gigabytes. The
+#     reports are the host's audit trail; the sidecars hold `session_start`,
+#     by which quality_report identifies the venue — an instance running
+#     across midnight writes later-day sidecars with gauges only, so taking
+#     the older sidecar blinds the gate until the next restart (the
+#     2026-07-31 exit-2 incident).
 #   - Never touches a file whose name it does not recognise. The allowlist is
 #     also what makes the remote commands safe: only [A-Za-z0-9._:-] and the
 #     `gate/` prefix ever reach a remote shell. The colon is for HL builder-dex
@@ -181,8 +185,16 @@ day_of() {
     return 1
 }
 
-# Gate reports are copied and left behind; everything else is copied and taken.
+# Gate reports and _meta sidecars are copied and LEFT on the host; everything
+# else is copied and taken. The sidecars stay because `session_start` lives in
+# the sidecar of the day an instance last (re)started — quality_report
+# identifies the venue by it, and an instance running across midnight writes
+# later-day sidecars with gauges only. Removing the older sidecar blinds the
+# gate for every later day until the next restart: exactly the 2026-07-31
+# exit-2 ("no session_start in any sidecar") after the 07-30 offload took the
+# 07-29 sidecars. Kilobytes per day, re-verified on every run — deliberate.
 is_gate_report() { [[ "$1" == gate/* ]]; }
+is_kept_on_host() { [[ "$1" == gate/* || "$1" == _meta_*.jsonl ]]; }
 
 human() {
     local bytes="$1"
@@ -241,7 +253,7 @@ for instance in "${INSTANCES[@]}"; do
             live=$((live + 1))
             continue
         fi
-        if is_gate_report "${name}"; then
+        if is_kept_on_host "${name}"; then
             printf '%s\n' "${name}" >> "${keep_list}"
         else
             printf '%s\n' "${name}" >> "${move_list}"
@@ -328,7 +340,7 @@ for instance in "${INSTANCES[@]}"; do
             bad=$((bad + 1))
             continue
         fi
-        is_gate_report "${name}" || printf '%s\n' "${name}" >> "${verified}"
+        is_kept_on_host "${name}" || printf '%s\n' "${name}" >> "${verified}"
     done < "${remote_sums}"
 
     n_verified="$(wc -l < "${verified}" | tr -d ' ')"
