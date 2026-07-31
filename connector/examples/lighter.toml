@@ -1,0 +1,143 @@
+# Lighter (zkLighter) connector — PHASE 1: PUBLIC MARKET DATA ONLY.
+#
+# This backend subscribes `order_book` + `trade` for every registered symbol and publishes
+# depth and trade events. It holds no key, signs nothing, and REJECTS every order with
+# ErrorKind::OrderError. Do not point a trading bot at it expecting fills; the order path
+# (signing, nonce slots, sweep) is Phase 2 — docs/design-lighter-connector.md §5.
+#
+# Run:
+#   cargo run -p connector -- <connector-name> lighter connector/examples/lighter.toml
+# where <connector-name> is the name the bot passes to Instrument::new.
+
+# WebSocket endpoint.
+#   mainnet: wss://mainnet.zklighter.elliot.ai/stream
+#   testnet: wss://testnet.zklighter.elliot.ai/stream
+#
+# NOTE ON TESTNET: it lists 5 markets against mainnet's 228, and NONE of the coins this
+# deployment records exist there. It can prove plumbing and nothing else — design note §2.6.
+public_url = "wss://mainnet.zklighter.elliot.ai/stream"
+
+# REST endpoint, used for `GET /api/v1/orderBooks` — the symbol -> market_id catalog.
+#   mainnet: https://mainnet.zklighter.elliot.ai
+#   testnet: https://testnet.zklighter.elliot.ai
+#
+# MUST be the same network as public_url. The catalogs differ by two orders of magnitude,
+# and even where the ids agree the values do not (testnet BTC min_base_amount is 0.00020
+# against mainnet's 0.00010).
+rest_url = "https://mainnet.zklighter.elliot.ai"
+
+# Symbols to resolve and subscribe at startup, before any bot registers. Optional — a bot's
+# own register() is added dynamically either way.
+#
+# Two reasons to set it: an unresolvable symbol is refused loudly at startup instead of at
+# the first registration, and it makes the feed — and the per-symbol tick_size/lot_size the
+# connector logs — observable without a bot attached.
+#
+# THE NAMES ARE THE VENUE'S OWN, and its perps are BARE BASE ASSETS: CRV, HYPE, SUI — not
+# CRVUSDT and not CRV/USDC. A symbol carrying a quote is a SPOT market here, and one that
+# does not resolve at all is refused by name with a suggestion.
+#
+# MATCHING IS EXACT, CASE INCLUDED, and `crv` is refused with "the venue's own spelling is
+# CRV". That is deliberate rather than unhelpful: the symbol is not just a lookup key, it is
+# what every LiveEvent::Feed is keyed by, and the bot's own book is keyed by the string the
+# BOT registered — so a connector that silently corrected the spelling would publish a feed
+# no bot could receive, and say nothing about it. Use the same string in this file and in the
+# bot's Instrument::new.
+symbols = ["CRV", "HYPE"]
+
+# --- What the bot must register -------------------------------------------------------
+#
+# The venue quantises to the decimals in its catalog, and the connector LOGS the tick and
+# lot it derives for every symbol at subscribe time ("Resolved a Lighter instrument"). The
+# BOT declares them when it builds its Instrument, and nothing in the Connector trait lets
+# this backend see or correct the bot's values. Copy the logged numbers.
+#
+#   tick_size = 10^-supported_price_decimals      lot_size = 10^-supported_size_decimals
+#
+# Getting either wrong is silent and NOT self-correcting:
+#
+#   * a coarser tick_size collapses two venue prices into one level, so the bot quotes off a
+#     book that is wrong by a level;
+#   * a coarser lot_size makes every level below it vanish BEFORE the bot sees it, and it
+#     does not come back — a level below the bot's own lot is not representable in its book
+#     however many times the venue re-sends it.
+#
+# NOTHING DETECTS THIS FOR YOU, and in particular the connector's `collapsed_levels` /
+# `sub_lot_levels` counters do not. The bot's tick and lot never reach this backend at all
+# (Connector::register carries a symbol and nothing else), the levels are dropped downstream
+# in the bot's own fused depth, and those two counters compare the venue against the CATALOG's
+# decimals — they read zero over a full day either way. They are a venue-integrity check: a
+# non-zero count means the catalog no longer describes the feed, which is a different and
+# louder problem. The log line above is the whole defence; copy the numbers from it.
+#
+# Measured against mainnet 2026-07-31:
+#   CRV  (market_id 36, price_decimals 5, size_decimals 1): tick_size = 0.00001  lot_size = 0.1
+#   HYPE (market_id 24, price_decimals 4, size_decimals 2): tick_size = 0.0001   lot_size = 0.01
+#   ETH  (market_id  0, price_decimals 2, size_decimals 4): tick_size = 0.01     lot_size = 0.0001
+#
+# --- Not configurable, and why --------------------------------------------------------
+#
+# * THE CHANNEL SET is `order_book` + `trade`, fixed. `ticker` (the venue's own event-driven
+#   touch, ~15 ms against the book's ~50 ms batching) is deliberately NOT taken in Phase 1:
+#   a second feed into one mirror is the whole fusion/crossing problem, and this phase must
+#   not buy it before there is a correct non-empty book. The cost is a touch that lags the
+#   venue's own BBO channel by ~35 ms of median — second-order against the 200 ms the
+#   Standard fee tier adds to every maker place and cancel, first-order on Premium. Design
+#   note §3.1 and §6.В.1; the decision is re-made together with the fee tier.
+#
+# * THE CLIENT MESSAGE BUDGET is 200/minute at the venue, and this connector allows itself
+#   half. Going over it is NOT answered with an error — the connection is throttled, which
+#   from this side is a socket that goes quiet, i.e. the one failure that is
+#   indistinguishable from a quiet market (§2.5). The remaining half covers a reconnect
+#   inside the same minute and the fact that the venue documents neither whether the 200 is
+#   per connection or per IP. Nobody has measured which it is.
+#
+#   PRACTICAL CONSEQUENCE: do not run this connector on the same IP as the Lighter
+#   collector until the per-connection reading is confirmed. Under the per-IP reading the
+#   second process starts from the remainder, not from 200.
+#
+# * ORDERS. There are no keys here, by design. Signing is Schnorr over ECgFp5 with
+#   Poseidon2-Goldilocks, supplied by the venue as a native library; the connector will
+#   drive it through a sidecar in Phase 2 (§3.2). Until then submit and cancel are refused
+#   loudly, and `sweep` is a documented no-op because there is nothing resting to sweep.
+
+# --- Supervision (generic; every backend reads these from its own config file) ---------
+#
+# Read by `connector/src/supervision.rs`, not by the backend. Both sections are optional and
+# both default to the protective side.
+
+[shutdown]
+# Cancel the venue orders of every instrument a bot registered when the connector stops.
+#
+# ON by default, and that is the fail-closed choice everywhere else. On THIS backend it is
+# currently a no-op with a log line: Phase 1 never places an order, so there is nothing
+# resting for it to cancel. Leave it on — when Phase 2 arms the order path this setting is
+# already what it should be, and on a chain venue orders survive both a socket drop and the
+# death of the process (measured: two orders came back in a fresh process's snapshot ~90 s
+# after a kill).
+sweep_orders = true
+
+# How long the publish task waits for the backends' stream tasks to let go before it stops
+# anyway, in milliseconds. It does NOT bound the sweep — sweep_timeout_ms does.
+#
+# This backend implements `Connector::shutdown` (it aborts its stream task), so an orderly
+# stop does not wait this out; it is here because the setting is generic.
+grace_ms = 5000
+
+# How long the stop may spend cancelling before it gives up on the sweep, in milliseconds.
+# Running out is reported loudly AND EXITS NON-ZERO. Not reachable in Phase 1.
+sweep_timeout_ms = 30000
+
+[bot_liveness]
+# Cancel a bot's orders when the bot stops heartbeating.
+#
+# A bot's orders outlive the bot, and between a bot's death and its supervisor's restart
+# nobody is managing them. Safe to leave on: a bot is watched only after it has heartbeated
+# at least once, so a bot built before the heartbeat existed is never swept. In Phase 1 the
+# resulting sweep is a no-op.
+enabled = true
+
+# Silence, in milliseconds, after which a heartbeating bot is presumed dead. What it must
+# clear is the bot's HEARTBEAT INTERVAL (one second by default), not the duration of its
+# `elapse` calls.
+timeout_ms = 10000

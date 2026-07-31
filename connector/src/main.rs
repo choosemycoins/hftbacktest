@@ -114,6 +114,7 @@ use crate::{
     bybit::Bybit,
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     hyperliquid::Hyperliquid,
+    lighter::Lighter,
     supervision::{
         BotRegistry,
         DrainOutcome,
@@ -135,6 +136,8 @@ pub mod binancespot;
 pub mod bybit;
 #[cfg(feature = "hyperliquid")]
 pub mod hyperliquid;
+#[cfg(feature = "lighter")]
+pub mod lighter;
 
 mod connector;
 //mod fuse;
@@ -623,6 +626,7 @@ struct Args {
     /// * binancespot: Binance Spot
     /// * bybit: Bybit Linear Futures
     /// * hyperliquid: Hyperliquid perpetuals (market data only; orders are rejected)
+    /// * lighter: Lighter perpetuals (market data only; orders are rejected)
     connector: String,
 
     /// Connector's configuration file path.
@@ -803,6 +807,15 @@ async fn run() {
             let mut connector = Hyperliquid::build_from(&config)
                 .map_err(|error| {
                     error!(?error, "Couldn't build the Hyperliquid connector.");
+                })
+                .unwrap();
+            connector.run(pub_tx.clone());
+            Box::new(connector)
+        }
+        "lighter" => {
+            let mut connector = Lighter::build_from(&config)
+                .map_err(|error| {
+                    error!(?error, "Couldn't build the Lighter connector.");
                 })
                 .unwrap();
             connector.run(pub_tx.clone());
