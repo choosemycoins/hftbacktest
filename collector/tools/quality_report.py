@@ -42,8 +42,14 @@ What it checks, per finalized UTC day per venue directory:
    the sidecar already accounts for.
 6. **`local_ts` monotonicity, per stream** — with a tolerance for the order two
    streams are interleaved in, allowed only where a second producer exists to
-   have raced (`_SECOND_PRODUCER`) and only up to the socket hop that separates
-   them (`CROSS_STREAM_TOLERANCE_NS`).
+   have raced (`_SECOND_PRODUCER`) and only as far as the hand-offs the *late*
+   row of the pair crossed alone can hold it back (`interleave_kind`): the
+   socket hop where the REST snapshot went first (`CROSS_STREAM_TOLERANCE_NS`),
+   no bound at all where the `premiumIndex` poll went first, because the late
+   row then waited in the writer hop too, and a ceiling of its own where the
+   poll is itself the late row (`POLLER_HOP_CEILING_NS`) — its own hand-off is
+   all it can have waited in, and a poll stamped anywhere but at receive shows
+   up here or nowhere.
 7. **Coverage at both ends**, reported **per symbol** as the interval in which
    *every* required stream of that symbol is live (max of the firsts, min of the
    lasts). That — not the venue-wide union — is what Phase 3 must trim to: a
@@ -118,42 +124,108 @@ MAX_GAP_ISSUES = 10
 #: of the recording starts "explaining" every gap in the day.
 EXPLAIN_MARGIN_NS = SEC_NS // 10
 
-#: Streams a *second*, concurrent producer writes.
+#: The names `collector/src/queue.rs` gives the two hand-offs that carry a record
+#: the last step, into `Writer::write`. A WS frame reaches `WRITER_HOP` only
+#: after the socket hop (`queue::WS_HOP`) ahead of it; a second producer can put
+#: one there directly, or — the poller, and only the poller — bypass it entirely
+#: with a hop of its own.
+#:
+#: Mirrored rather than imported, like the capacities below, and pinned against
+#: the Rust by `test_the_poller_still_has_a_hand_off_of_its_own` — because which
+#: hop a producer uses is now the whole of the interleave model.
+WRITER_HOP = "parser->writer"
+POLLER_HOP = "poller->writer"
+
+
+@dataclass(frozen=True)
+class Producer:
+    """A *second*, concurrent producer of one stream of a symbol file.
+
+    `hop` is the hand-off it uses to reach the writer, and it is the load-bearing
+    field: it says which queues, if any, this producer's row still shares with a
+    WebSocket frame, and therefore what can put the two out of `local_ts` order
+    and by how much. `mechanism` is that written out for the operator.
+    """
+
+    hop: str
+    mechanism: str
+
+
+#: Streams a second, concurrent producer writes.
 #:
 #: Load-bearing, not decoration: this is the whole reason two streams may be
 #: written out of `local_ts` order, so it is also what decides whether an
-#: inversion is tolerable at all. Where no entry matches, the venue has one WS
-#: reader stamping and queueing every frame of a symbol file, write order IS
-#: receive order, and a step backwards is a defect at any size — see
-#: `scan_symbol_file`, which records where that was verified per venue.
+#: inversion is tolerable at all, and — through `Producer.hop` — how far.
+#: Where no entry matches, the venue has one WS reader stamping and queueing
+#: every frame of a symbol file, write order IS receive order, and a step
+#: backwards is a defect at any size — see `scan_symbol_file`, which records
+#: where that was verified per venue.
 _SECOND_PRODUCER = {
-    "depthSnapshot": (
+    "depthSnapshot": Producer(
+        WRITER_HOP,
         "the REST depth-snapshot fetcher is one such producer: it runs detached "
         "(tokio::spawn, the same shape in all three binance* backends) and hands "
-        "its frame straight to the writer, skipping the socket hop that WS "
-        "frames queue through first"
+        "its frame straight to the writer hop, skipping the socket hop that WS "
+        "frames queue through first",
     ),
-    "premiumIndex": (
-        "the premium-index poller is one such producer: it runs on its own "
-        "timer beside the socket loop (binancefuturesum/mod.rs) and hands each "
-        "element straight to the writer, skipping the socket hop that WS frames "
-        "queue through first"
+    "premiumIndex": Producer(
+        POLLER_HOP,
+        "the premium-index poller is one such producer, and the only one with a "
+        "hand-off of its own: it runs on its own timer beside the socket loop "
+        "(binancefuturesum/mod.rs) and hands each element to the writer over "
+        "poller->writer, so it queues behind neither the socket hop nor the "
+        "writer hop that a WS frame crosses in turn",
     ),
 }
 
 #: Said of an inversion between two streams that share the one producer.
+#:
+#: About the pair rather than the venue, because `scan_symbol_file` holds two
+#: shared-chain rows against each other across whatever a second producer wrote
+#: between them: on Binance the venue does have second producers, just not on
+#: this pair, and the two rows named need not be adjacent lines.
 _NO_SECOND_PRODUCER = (
-    "no second producer is known for this venue's symbol files: one WS reader "
-    "stamps every frame at receive time and hands them on in that order"
+    "no second producer stands between these two streams: one WS reader stamps "
+    "both at receive and hands them on in that order, through hops that are "
+    "FIFO the whole way to the writer, so anything written between them came "
+    "off a different hand-off and cannot have reordered either"
 )
 
 
-def second_producer_of(prev_stream, stream) -> Optional[str]:
-    """The concurrent producer that can put these two out of order, if any."""
-    for name in (prev_stream, stream):
-        if name in _SECOND_PRODUCER:
-            return _SECOND_PRODUCER[name]
-    return None
+def second_producer_of(prev_stream, stream) -> Optional[Producer]:
+    """The concurrent producer whose hand-off explains this pair, if any.
+
+    This answers *which mechanism to name*, not *how far it stretches* — the
+    bound is direction-dependent and `interleave_kind` decides it. Usually there
+    is at most one producer here, a second producer against an ordinary WS
+    stream. But both rows can have one (a poll written next to a depth
+    snapshot), and then the one to name is the one sharing the **fewest** queues
+    with the other row, because that is what is left to hold the two in order.
+    `POLLER_HOP` shares none, so it wins, and it is the mechanism in either
+    direction: what changes with the direction is which of the two rows waited,
+    not which hand-off made waiting possible.
+    """
+    found = [
+        _SECOND_PRODUCER[name] for name in (prev_stream, stream) if name in _SECOND_PRODUCER
+    ]
+    if not found:
+        return None
+    for producer in found:
+        if producer.hop == POLLER_HOP:
+            return producer
+    return found[0]
+
+
+def crosses_a_hand_off_of_its_own(stream) -> bool:
+    """True where this stream reaches the writer on a hop no one else uses.
+
+    `premiumIndex` over `queue::POLLER_HOP`, and only it. The single place the
+    hop is compared, because both the classification and the text it prints turn
+    on it.
+    """
+    producer = _SECOND_PRODUCER.get(stream)
+    return producer is not None and producer.hop == POLLER_HOP
+
 
 #: The two numbers in `collector/src/queue.rs` the interleave bound is derived
 #: from — the socket hop's depth (`WS_QUEUE_CAPACITY`) and the burst rate it was
@@ -202,12 +274,291 @@ SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 #: separate decision, and the alternative is a gate that calls the collector's
 #: own design corruption on every burst day.
 #:
-#: Two things this bound is NOT. It does not apply within one stream: there is
+#: Three things this bound is NOT. It does not apply within one stream: there is
 #: one producer appending in receive order, so a step backwards of any size is
-#: red. And it does not apply where no second producer exists — see
+#: red. It does not apply where no second producer exists — see
 #: `_SECOND_PRODUCER`; a venue with one WS reader gets no tolerance at all,
-#: whatever the size, because there is no mechanism to tolerate.
+#: whatever the size, because there is no mechanism to tolerate. And **it does
+#: not apply where the `premiumIndex` poll was written first** — that pair has
+#: no bound at all, because the row it overtook then waited in the writer hop
+#: too; see `interleave_kind`, which is where the arithmetic above runs out.
+#: In the other direction, where the poll is itself the late row, the pair does
+#: keep a ceiling — its own, `POLLER_HOP_CEILING_NS`, which is this same figure
+#: and deliberately not this same constant.
 CROSS_STREAM_TOLERANCE_NS = 1_000 * 1_000_000
+
+#: How far a `premiumIndex` row may be written **behind** a frame stamped later
+#: before the report stops calling it an interleave.
+#:
+#: A ceiling, not a derivation. The late row in that pair is the poll, so the
+#: only queue it can have waited in is `queue::POLLER_HOP` — one element per
+#: recorded symbol per `PREMIUM_INDEX_INTERVAL`, drained from a `select!` arm
+#: `main` offers on every iteration, and `queue.rs` says in as many words that
+#: this hop cannot fill. Nothing measures how fast it drains, so there is no
+#: arithmetic to run here; what there is, is an observation. On 2026-07-29 — the
+#: day the other direction reached 1.034730s — this direction's worst across a
+#: full symbol-day was 3.128ms (tiausdt, 39 of them) and 1.882867ms (seiusdt,
+#: 38). This figure is ~320x the worst thing that hop has ever been seen doing,
+#: and the defect it is here to catch, a stamp that is not the receive moment,
+#: is a poll interval or more.
+#:
+#: **Its own number, though it equals `CROSS_STREAM_TOLERANCE_NS` today.** That
+#: one is the socket hop's occupancy and follows `WS_QUEUE_CAPACITY`: it has
+#: already moved once, 250ms -> 1s, when the hop went 4096 -> 16384, and
+#: `test_the_interleave_bound_still_covers_the_socket_hop_it_is_derived_from`
+#: exists to make the next capacity change move it again. This pair never
+#: crosses the socket hop. Sharing the constant would let a deeper socket hop
+#: silently widen a lookahead detector by the same factor, with no test failing
+#: and no one deciding it. Narrow this one the day something measures the drain;
+#: until then it moves only for a reason of its own.
+POLLER_HOP_CEILING_NS = 1_000 * 1_000_000
+
+
+#: The three findings one out-of-order pair can be, in the order a symbol record
+#: lists them. Field of `FileScan.interleave`, key in the per-symbol JSON and
+#: `check` in the issue list are all this same string, so a pair cannot be filed
+#: under one name and explained under another — which is how an earlier revision
+#: printed "within the bound, so nothing is missing" on a finding it was
+#: reporting as red. Which of them a record carries a key for when the finding
+#: did *not* fire is a separate question — `INTERLEAVE_KEYS_ALWAYS`.
+INTERLEAVE_INVERSION = "interleave_inversion"
+INTERLEAVE_INVERSION_POLLER = "interleave_inversion_poller"
+INTERLEAVE_EXCESS = "interleave_excess"
+INTERLEAVE_CHECKS = (INTERLEAVE_INVERSION, INTERLEAVE_INVERSION_POLLER, INTERLEAVE_EXCESS)
+
+#: The severity each of them carries. Two yellows and one red, and the red is
+#: the one no mechanism explains.
+INTERLEAVE_SEVERITY = {
+    INTERLEAVE_INVERSION: YELLOW,
+    INTERLEAVE_INVERSION_POLLER: YELLOW,
+    INTERLEAVE_EXCESS: RED,
+}
+
+#: The two of them whose key a symbol record carries whether or not the finding
+#: fired, as `null`: a consumer asking "was there an excess?" must not have to
+#: tell an intact recording apart from an older schema.
+#:
+#: `INTERLEAVE_INVERSION_POLLER` is deliberately not one of them, and this line
+#: is what keeps a venue with no poller byte-identical to the report it got
+#: before this class existed. Unconditional, it would add one `null` per symbol
+#: to Hyperliquid, Bybit and Lighter for a class their recordings cannot
+#: produce — a schema change for every venue, carrying no information, in a
+#: change whose own invariant is that nothing about the poller reaches a venue
+#: without one. Nothing is lost by it either: `.get()` answers `None` for an
+#: absent key exactly as it does for a `null`, so the distinction the two keys
+#: above are unconditional *for* does not arise here — the key was never in the
+#: schema to be missing from it.
+INTERLEAVE_KEYS_ALWAYS = (INTERLEAVE_INVERSION, INTERLEAVE_EXCESS)
+
+
+def interleave_json(found: dict) -> dict:
+    """The interleave keys one symbol record carries, in one fixed order.
+
+    `found` maps `INTERLEAVE_CHECKS` names to records — `FileScan.interleave`,
+    or `{}` for a symbol whose file is missing entirely. One function because
+    both of those go into the same JSON object and a key set that differed
+    between them would be a schema that depends on whether the file was there.
+    """
+    return {
+        check: found.get(check)
+        for check in INTERLEAVE_CHECKS
+        if check in INTERLEAVE_KEYS_ALWAYS or check in found
+    }
+
+
+def interleave_kind(prev_stream: str, stream: str, delta_ns: int) -> str:
+    """Which finding an out-of-order pair of streams is, from its mechanism.
+
+    The pair is read in **write order**: `prev_stream` was written first,
+    `stream` second — and `stream` is the *late* row, the one whose `local_ts`
+    is older than the row already above it in the file. Read the class off the
+    hand-offs that late row crossed **alone**, because those are the only queues
+    it can have waited in while the other row went past:
+
+    * **Both rows crossed the same hops** — every WS pair on every venue, and
+      every pair at all on Hyperliquid, Bybit and Lighter. One reader stamps at
+      receive and hands frames on in that order, and every queue after it is a
+      FIFO, so write order IS receive order. `INTERLEAVE_EXCESS`, red, at a
+      nanosecond.
+    * **The late row is the poll** — it crossed `queue::POLLER_HOP` and nothing
+      else, so that hop plus one turn of `main`'s `select!` is the whole of what
+      it can have waited in, and `queue.rs` says in as many words that this hop
+      cannot fill: one element per recorded symbol per ten seconds, against an
+      arm `main` offers on every iteration. Bounded — `POLLER_HOP_CEILING_NS`,
+      and see below for why that figure and why a constant of its own. Under it
+      `INTERLEAVE_INVERSION`, yellow; over it `INTERLEAVE_EXCESS`, red.
+    * **The poll went first, and the late row is anything else** — that row
+      waited in the socket hop *and* the writer hop, and the poll queued in
+      neither. `INTERLEAVE_INVERSION_POLLER`, yellow, at any magnitude; the
+      argument is the section below.
+    * **The REST depth snapshot against a WS frame, either way round** — it
+      sends on `writer_tx`, the same hop the parser feeds, so the two rows do
+      meet in one FIFO and the writer hop cancels: what is left to separate them
+      is the socket hop, `CROSS_STREAM_TOLERANCE_NS`, with the same two verdicts
+      as above. In the direction where the snapshot is itself the late row the
+      honest figure is nearer zero than that; the last of the alternatives below
+      says why that is not exploited.
+
+    # Why the direction decides, when the two streams do not change
+
+    An inversion says the row written second was stamped first, i.e. that it
+    waited longer than the row that overtook it. Write `t` for the stamps and
+    `W` for the moments the two reached `Writer::write`; then `W_first <
+    W_late`, `t_first <= W_first`, and the magnitude the report prints is
+
+        delta = t_first - t_late  <  W_late - t_late
+
+    — the **late row's own latency**, and nothing else. What the row ahead of it
+    did drops out of the arithmetic entirely. So `premiumIndex` against
+    `bookTicker` is two different questions depending on which was written
+    first, and answering both with the unbounded yellow granted the exemption to
+    a case with no mechanism under it: a poll written *last* was not held up by
+    any WS backlog, because `writer_rx` is a FIFO and a backlog delays the rows
+    behind it, not a row that is on another hop entirely. Measured on the
+    recording this class was built for — tiausdt, 2026-07-29, one symbol-day:
+    92 inversions with the poll written first, worst 1.034730s; 39 with the poll
+    written last, worst 0.003128s. Two orders of magnitude apart, and only one
+    of them has a queue in it.
+
+    Keeping the bound on the poll-written-last direction is also the only
+    detector the report has for a `premiumIndex` stamp that is **not** the
+    receive moment — stamped at request time, served from a cache, or copied
+    from the venue's own `E`. That is a lookahead defect in any dataset built
+    from these files: the element would enter the recording ahead of the moment
+    it could have been known. A uniform stale offset preserves the poller's own
+    monotonicity, its cadence and its coverage, the stream carries no sequence
+    chain of its own, and nothing else in `check_day` reads it — so this
+    inversion is where it surfaces or nowhere. Today the stamp is `Utc::now()`
+    taken after the response body arrives (`binancefuturesum/mod.rs`), so the
+    defect is not live; deleting the check that would catch it is a regression
+    all the same, and a gate is for the code that has not been written yet.
+
+    # Why the poll-written-first pair has no bound, when every other pair does
+
+    **The arithmetic that produces one has no shared queue left to run on.** A
+    bound here is the WS row's own wait before the writer sees it, and the poll
+    skips both hops that wait happens in: the two rows meet for the first time
+    in `main`'s `select!`, which takes whichever arm is ready. So the figure
+    would have to be the socket hop **plus** the writer hop, divided by the rate
+    those two actually drain at. Nothing measures that rate.
+    Dividing by the arrival peak instead is what `SOCKET_HOP_NS` does, and
+    `queue.rs` says in as many words that this yields a floor rather than a
+    bound: a hop only fills when its consumer is slower than its producer, so
+    during exactly the events that deepen it, residency exceeds depth ÷ arrival.
+    The writer hop is worse than unmeasured — it drains at the speed of blocking
+    gzip I/O, which was measured **stopping for longer than its own whole depth**
+    on 2026-07-26. While it is stopped the only ceiling on a WS frame's wait is
+    the stall watchdog (`--stall-timeout-min`, 5 minutes, and `0` is a deployable
+    value that disarms it). "Five minutes, or unbounded by configuration" is not
+    a gate; it is a formality.
+
+    **And no failure this red exists to catch can present as a poll-written-
+    first inversion.** The red's own text names the alternatives, and each has a
+    detector the poller cannot mask:
+
+    * *two recordings in one file* — prevented by the directory `flock`
+      (`collector/src/lock.rs`); and if it happened anyway it would not present
+      here, because two `GzEncoder`s interleaving blocks produce a member that
+      does not decode at all, which is `gzip_integrity`, red. Two recordings
+      that did decode would disorder every stream against every other, including
+      the WS pairs that stay red at a nanosecond — and `scan_symbol_file` holds
+      those to their own cursor, so a poll row landing between two of them
+      cannot launder the pair — and each stream against itself.
+    * *a clock step* — every producer stamps `Utc::now()`, so a step backwards
+      lands inside the busiest stream first: `monotonic_violation`, red, at any
+      size. The sidecar's `clock` gauge samples the same discipline every minute.
+    * *a wedged writer replaying old buffers* — a replay writes rows a second
+      time, in an order their own stream has already passed: `monotonic_violation`
+      again. There is no code path that replays, either: `Writer::write` is
+      called once per dequeued record.
+    * *the poller's own rows going backwards against its own timer* — the check
+      already exists and is red, because `poll_premium_index` awaits each
+      response before the next tick, so two polls cannot overtake each other.
+      Pinned by `test_a_premium_index_stream_going_backwards_within_itself_is_red`.
+    * *a `premiumIndex` stamp that is not its receive moment* — the one failure
+      that **would** have presented here, and the reason this class is only half
+      of the pair. It puts the poll on the late side of the inversion, where the
+      bound is kept: see the direction section above.
+
+    So the size of a poll-written-first inversion is evidence about the depth of
+    the collector's own queues, and about nothing else. It stays a finding —
+    yellow, counted, with its worst delta and that occurrence's line in the JSON
+    — because that depth is worth seeing: it is the only measurement anything
+    makes of what those hops hold at a burst, and a wide one is the last trace
+    of a burst the recording only just survived.
+
+    # The alternatives, and why not
+
+    **A larger derived bound (10s poll interval + the two capacities).** The
+    poll interval bounds nothing: the inversion is the WS side's wait, and the
+    poller's cadence has no term in it. The capacities need the drain rate the
+    paragraph above says nobody has, and picking one converts an unmeasured
+    number straight into a hard build refusal on burst days — the same failure
+    being fixed, moved to a larger magnitude. Revisit it the day the parser's
+    and the writer's throughputs are measured; of the first, `queue.rs` says in
+    as many words that nothing has.
+
+    **A derived bound for the poll-written-last direction**, in the shape
+    `SOCKET_HOP_NS` has: `POLLER_QUEUE_CAPACITY / PEAK_MSG_PER_S` = 51.2ms. It
+    has the form of arithmetic and none of the content — that rate is the
+    *socket's* arrival peak, and nothing arrives on this hop at 20 000/s; it
+    takes a dozen elements once every ten seconds and drains at whatever
+    `main`'s loop rate happens to be, which nothing measures either. Minting a
+    number nobody measured is the move being reversed here, so that direction
+    gets a ceiling read off an observation instead — `POLLER_HOP_CEILING_NS`,
+    which is where the observation and the reason for a separate constant are
+    written down.
+
+    **Red at any magnitude for the poll-written-last direction**, on the grounds
+    that the hop cannot fill. Rejected by measurement: 39 of them in one real
+    symbol-day, worst 3.128ms. `select!` picks at random between arms that are
+    both ready, so a poll losing a few turns to a draining backlog is ordinary,
+    and a gate that fires on it would be back to calling the collector's own
+    design corruption.
+
+    **A bounded tolerance in the shape of `MAX_SUPPRESSED_GAP_FACTOR`**, which
+    caps how far a cadence gap may be excused. That cap discriminates: a hole
+    10x its channel's limit is not a quiet book, so *size* separates the excuse
+    from the failure it could hide. Here it does not, per the list above — every
+    failure the red is for is caught by a check the poller pair cannot reach,
+    at any size. A cap that can only ever fire on a healthy recording is not a
+    cap worth having.
+
+    **Reclassifying `depthSnapshot` the same way**, on the grounds that its
+    bound divides by the same unmeasured rate. Deliberately not done. Its row
+    shares the writer hop, so one queue and one measured rate still describe the
+    pair; the bound has ~20% headroom over the derived floor; the fetches are
+    throttled to 100/min against the poller's 8640 rows a day per symbol; and
+    the worst inversion ever observed on that pair is 134us against the poller's
+    1.045s on the first burst it met. Widening a red that has never fired
+    falsely, on an argument rather than an observation, is the move this file
+    rejects everywhere else. If a snapshot pair does go red on a day whose
+    sequence chains are intact, that is the measurement, and the fix is to move
+    it into this class.
+
+    **Splitting the snapshot pair by direction too.** The asymmetry is there:
+    a snapshot written *last* was enqueued on the writer hop behind the frame it
+    is out of order with, and `Utc::now()` and that `send` are a few
+    instructions apart, so the honest figure for that direction is nearer zero
+    than to the socket hop. Not done, because it can only *tighten* a red, and
+    the case for tightening is an argument rather than an observation — the
+    worst that direction has ever produced is well inside the bound it already
+    has. The poller split earned its complexity by being wrong in production, in
+    the direction that costs a detector. This one has not.
+    """
+    if second_producer_of(prev_stream, stream) is None:
+        # One producer, every hop shared and every hop a FIFO.
+        return INTERLEAVE_EXCESS
+    if crosses_a_hand_off_of_its_own(stream):
+        # The poll is the late row: it waited on its own hop or nowhere.
+        return (
+            INTERLEAVE_INVERSION if delta_ns <= POLLER_HOP_CEILING_NS else INTERLEAVE_EXCESS
+        )
+    if crosses_a_hand_off_of_its_own(prev_stream):
+        # The poll went first; the late row waited in both hops it skipped.
+        return INTERLEAVE_INVERSION_POLLER
+    # The snapshot and a WS frame, either way round: the writer hop cancels.
+    return INTERLEAVE_INVERSION if delta_ns <= CROSS_STREAM_TOLERANCE_NS else INTERLEAVE_EXCESS
 
 
 # ---------------------------------------------------------------------------
@@ -730,12 +1081,14 @@ class FileScan:
     #: `local_ts` went backwards WITHIN one stream: one producer, so this is a
     #: clock step or two recordings in one file. Red.
     monotonic_violation: Optional[dict] = None
-    #: Two different streams written out of `local_ts` order, within
-    #: `CROSS_STREAM_TOLERANCE_NS`: concurrent producers racing into one FIFO.
-    #: Yellow.
-    interleave_inversion: Optional[dict] = None
-    #: The same, but beyond the bound — too far for any hand-off to explain. Red.
-    interleave_excess: Optional[dict] = None
+    #: Two different streams written out of `local_ts` order, keyed by which of
+    #: `INTERLEAVE_CHECKS` the pair is — see `interleave_kind` for the three
+    #: classes and for why one of them has no bound. One folded record per class
+    #: per file, so a snapshot overtake and a poll overtake in the same file are
+    #: reported as the two different things they are; the record names the worst
+    #: occurrence of its class, which is the one the verdict is made of
+    #: (`_note_inversion`).
+    interleave: dict = field(default_factory=dict)
     streams: dict = field(default_factory=dict)
     sequence_breaks: dict = field(default_factory=dict)
     #: stream -> the first few breaks, as the interval frames were lost over.
@@ -749,8 +1102,7 @@ class FileScan:
             "malformed_lines": self.malformed,
             "unclassified_frames": self.unclassified,
             "monotonic_violation": self.monotonic_violation,
-            "interleave_inversion": self.interleave_inversion,
-            "interleave_excess": self.interleave_excess,
+            **interleave_json(self.interleave),
             "sequence_breaks": dict(self.sequence_breaks),
             "sequence_break_examples": {
                 stream: [g.as_json() for g in gaps]
@@ -870,24 +1222,50 @@ def _note_inversion(
 ) -> dict:
     """Folds one out-of-order pair into an O(1) summary of its kind.
 
-    The first occurrence is kept whole — a line number and both stamps is what
-    an investigation starts from — and everything after it only moves counters.
+    The **worst** occurrence is kept whole — its line, its two streams and both
+    stamps — and everything else only moves the counter. It used to be the first
+    occurrence, and that was survivable while each magnitude had a class of its
+    own: the one pair beyond the bound was alone in `interleave_excess` and so
+    was its own anchor. It stopped being survivable when a class started folding
+    magnitudes together: on tiausdt 2026-07-29 the record then read
+    `worst 1.034s; first at line 741: depthUpdate <ts> -> premiumIndex <ts>`,
+    where line 741 is 00:00:15, those two stamps are 119us apart, and the 1.034s
+    event the finding exists for — line 1069889, 13:30:03 — appeared nowhere in
+    the report. A sentence whose number and whose location come from different
+    events is worse than either alone, and the number is the one every consumer
+    reads.
+
+    Strictly greater, so the *first* pair to reach the worst magnitude keeps the
+    record: two identical deltas must not depend on which was scanned second.
+    Onset is what is given up. Nothing printed or consumed claimed it: the
+    detail line says "worst", `max_delta_ns` is what decides the verdict, and
+    `violations` already says whether this was one event or a file full of them.
     """
     delta = prev_ts - ts
     if record is None:
+        # Declared whole, so the JSON keeps one key order whichever occurrence
+        # ends up anchoring it. `max_delta_ns` starts below any real delta —
+        # every caller here has already established `ts < prev_ts` — so the
+        # first occurrence always fills the rest in.
         record = {
-            "line": lineno,
-            "previous_stream": prev_stream,
-            "stream": stream,
-            "previous_local_ts": int(prev_ts),
-            "local_ts": int(ts),
-            "delta_ns": int(delta),
+            "line": None,
+            "previous_stream": None,
+            "stream": None,
+            "previous_local_ts": None,
+            "local_ts": None,
             "violations": 0,
-            "max_delta_ns": 0,
+            "max_delta_ns": -1,
         }
     record["violations"] += 1
     if delta > record["max_delta_ns"]:
-        record["max_delta_ns"] = int(delta)
+        record.update(
+            line=lineno,
+            previous_stream=prev_stream,
+            stream=stream,
+            previous_local_ts=int(prev_ts),
+            local_ts=int(ts),
+            max_delta_ns=int(delta),
+        )
     return record
 
 
@@ -1025,16 +1403,35 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     which is everywhere in the list above except `depthSnapshot` and
     `premiumIndex` — so the tolerance is granted on the mechanism, not on the
     venue and not on the size:
-    `_SECOND_PRODUCER` has to name one of the two streams before
-    `CROSS_STREAM_TOLERANCE_NS` is consulted at all. A step backwards between
-    two Hyperliquid cadences, or between `bookTicker` and `trade`, is red at a
-    nanosecond, because the one reader that stamped them also queued them in
-    that order.
+    `_SECOND_PRODUCER` has to name one of the two streams before any tolerance
+    is consulted at all. A step backwards between two Hyperliquid cadences, or
+    between `bookTicker` and `trade`, is red at a nanosecond, because the one
+    reader that stamped them also queued them in that order. Which tolerance —
+    the socket hop's occupancy, a ceiling on the poller's own hop, or none at
+    all — follows from the hand-offs the *late* row of the pair crossed alone;
+    `interleave_kind` is where that is decided and argued.
 
     The file's write order is compared with the previous line's stamp, which is
     what "the writer put these two the wrong way round" means locally; comparing
     against the maximum seen so far would instead count every frame written
     during the overtake.
+
+    **Two cursors, because "the previous line" is the wrong neighbour for the
+    pair that has no tolerance.** Rows that share the whole chain — everything
+    not in `_SECOND_PRODUCER` — are also held against *each other*, across
+    whatever a second producer wrote between them, because a FIFO cannot
+    reorder them however many rows from elsewhere land in the gap. Without that
+    cursor a single `premiumIndex` row laundered the pair it straddled: the
+    genuine WS↔WS relation was never examined, and the pair that was examined
+    got the poller's unbounded yellow. There are ~8640 poll rows per symbol-day
+    to land in exactly the wrong place, and they land during bursts, which is
+    where a writer or parser defect would surface. Measured to invent nothing on
+    real recordings: zero such inversions across the whole of
+    `binancefuturesum-b` for 2026-07-29 — 23 symbol files, 136.3M shared-chain
+    rows, with 110 677 poll rows and 395 REST snapshots landing among them — on
+    the same recording whose adjacent-pair inversions run to 1.046s. On a venue
+    with no second producer at all the two cursors are the same row every time,
+    so nothing about this reaches Hyperliquid, Bybit or Lighter.
     """
     path = Path(path)
     family = family_of(exchange)
@@ -1042,6 +1439,10 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     scan = FileScan(path=str(path), symbol=symbol, exchange=exchange)
     prev_ts = None
     prev_stream = None
+    # The last row that reached the writer through the whole chain, which is not
+    # always the last row written — see the docstring.
+    prev_shared_ts = None
+    prev_shared_stream = None
     last_of_stream: dict = {}
     prev_id: dict = {}
 
@@ -1060,6 +1461,7 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
             stream = classify(family, obj) if isinstance(obj, dict) else None
             key = stream if stream is not None else UNCLASSIFIED
 
+            shares_the_whole_chain = key not in _SECOND_PRODUCER
             # Equal stamps are fine throughout — two frames can share a
             # nanosecond, and on a burst many do.
             last_seen = last_of_stream.get(key)
@@ -1067,26 +1469,46 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
                 scan.monotonic_violation = _note_inversion(
                     scan.monotonic_violation, lineno, key, key, last_seen, ts
                 )
+            elif (
+                shares_the_whole_chain
+                and prev_shared_ts is not None
+                and ts < prev_shared_ts
+            ):
+                # Two rows of the one FIFO chain, out of order. Reported against
+                # each other and ahead of the adjacent pair below, because this
+                # is the relation nothing can explain: what a second producer
+                # wrote between them crossed a different hop and cannot have
+                # reordered either. Classified through the same function as
+                # every other pair, which for two shared-chain streams can only
+                # answer `INTERLEAVE_EXCESS` — there is one classifier, not two.
+                kind = interleave_kind(prev_shared_stream, key, prev_shared_ts - ts)
+                scan.interleave[kind] = _note_inversion(
+                    scan.interleave.get(kind),
+                    lineno,
+                    prev_shared_stream,
+                    key,
+                    prev_shared_ts,
+                    ts,
+                )
             elif prev_ts is not None and ts < prev_ts:
                 # In order for its own stream but written after a line stamped
-                # later. Tolerated only where two producers could actually have
-                # raced, and then only up to the socket hop that separates them:
-                # on a venue with one WS reader there is nothing to tolerate.
-                tolerated = (
-                    prev_ts - ts <= CROSS_STREAM_TOLERANCE_NS
-                    and second_producer_of(prev_stream, key) is not None
+                # later. Which of the three findings that is depends on the
+                # hand-offs the late row crossed alone, not on the size on its
+                # own — see `interleave_kind`, which the explanation reads too,
+                # so the two cannot disagree.
+                kind = interleave_kind(prev_stream, key, prev_ts - ts)
+                scan.interleave[kind] = _note_inversion(
+                    scan.interleave.get(kind), lineno, prev_stream, key, prev_ts, ts
                 )
-                if tolerated:
-                    scan.interleave_inversion = _note_inversion(
-                        scan.interleave_inversion, lineno, prev_stream, key, prev_ts, ts
-                    )
-                else:
-                    scan.interleave_excess = _note_inversion(
-                        scan.interleave_excess, lineno, prev_stream, key, prev_ts, ts
-                    )
             last_of_stream[key] = ts
             prev_ts = ts
             prev_stream = key
+            if shares_the_whole_chain:
+                # Advanced even when this row was the violation, exactly as
+                # `prev_ts` is: the cursor tracks where the file is, not where it
+                # ought to be, and one defect must not report every later row.
+                prev_shared_ts = ts
+                prev_shared_stream = key
 
             if stream is None:
                 scan.unclassified += 1
@@ -1550,11 +1972,27 @@ def issue(severity: str, check: str, detail: str) -> dict:
     return {"severity": severity, "check": check, "detail": detail}
 
 
-def interleave_detail(name: str, record: dict) -> str:
-    """Why two streams are out of order, and whether that is still credible."""
+def interleave_detail(name: str, kind: str, record: dict) -> str:
+    """Why two streams are out of order, and whether that is still credible.
+
+    `kind` is the class `scan_symbol_file` filed the pair under, passed in
+    rather than recomputed: the finding and its explanation have to be the same
+    decision, or the report prints "nothing is missing" on a red.
+
+    Six verdicts, because the class alone does not say what happened: the poller
+    pair is two different findings depending on which of the two rows waited,
+    and a text naming the wrong one is the same defect as a bound applied to the
+    wrong one. This one printed "what separates them is the WS row's own wait"
+    over a pair whose WS row was written first and waited for nothing.
+    """
     delta = record["max_delta_ns"]
-    mechanism = second_producer_of(record["previous_stream"], record["stream"])
-    if mechanism is None:
+    producer = second_producer_of(record["previous_stream"], record["stream"])
+    mechanism = _NO_SECOND_PRODUCER if producer is None else producer.mechanism
+    # Which of the two rows waited decides the class, so it also decides what
+    # there is to say — see `interleave_kind`. The poll written last waited on
+    # its own hop or on nothing; the poll written first held nobody up at all.
+    poll_is_the_late_row = crosses_a_hand_off_of_its_own(record["stream"])
+    if producer is None:
         # No hand-off separates these two, so no hand-off can have reordered
         # them, and the size of the step is beside the point.
         verdict = (
@@ -1562,8 +2000,49 @@ def interleave_detail(name: str, record: dict) -> str:
             "write order IS the receive order, so this is a clock step, a frame "
             "classified into the wrong stream, or two recordings in one file"
         )
-        mechanism = _NO_SECOND_PRODUCER
-    elif delta > CROSS_STREAM_TOLERANCE_NS:
+    elif kind == INTERLEAVE_INVERSION_POLLER:
+        # The one class with no arithmetic behind it, so the text carries the
+        # reason instead of a number: what the row skipped, what that leaves to
+        # bound it, and where loss would actually show if there were any.
+        verdict = (
+            "a disagreement no queue bounds: the poll was written first, over "
+            "%s, a hand-off of its own, so the row it overtook shares no FIFO "
+            "with it and the two meet only in main's select loop. What separates "
+            "them is that row's own wait in the socket hop plus the writer hop, "
+            "and no bound over those capacities holds — the writer hop drains at "
+            "the speed of blocking gzip I/O, measured stopping for longer than "
+            "its whole depth (queue.rs, 2026-07-26). Nothing here says a frame is "
+            "missing: loss shows in the u/pu chain, which is checked separately "
+            "and independently. A large one is worth a look anyway — it is the "
+            "depth of the collector's own queues at a burst, so check _meta for a "
+            "queue_overflow near this line" % POLLER_HOP
+        )
+    elif poll_is_the_late_row and kind == INTERLEAVE_EXCESS:
+        # The poll went last, so no backlog on the WS side can be the reason:
+        # `writer_rx` is a FIFO and delays the rows behind it, not a row on
+        # another hop. That leaves the stamp itself, which is a lookahead
+        # defect and has no other detector in this report.
+        verdict = (
+            "further back than the poll's own hand-off could hold it: the poll "
+            "was written last, so nothing on the WS side delayed it — %s is the "
+            "only queue between its Utc::now() and the file, it carries one "
+            "element per symbol per poll interval, and main offers its arm every "
+            "iteration (worst observed on a full symbol-day: 3.128ms). Either "
+            "this premiumIndex local_ts is not the moment the body arrived — "
+            "stamped at request time, served from a cache, or copied from the "
+            "venue's own E, any of which puts the element into the recording "
+            "ahead of the moment it was knowable — or the file holds two "
+            "recordings" % POLLER_HOP
+        )
+    elif poll_is_the_late_row:
+        verdict = (
+            "within the %s ceiling on the poll's own hand-off, which is the only "
+            "queue between its stamp and the file: the poll was written last, so "
+            "nothing on the WS side held it up, and nothing here is missing or "
+            "mis-stamped — only the write order and the receive order disagree"
+            % fmt_short(POLLER_HOP_CEILING_NS)
+        )
+    elif kind == INTERLEAVE_EXCESS:
         # Two hypotheses, and they need different responses. The backlog one is
         # the reason to look at `_meta` first: a hop holding thousands of frames
         # is one capacity away from the overflow that ends the process, so a
@@ -1571,10 +2050,10 @@ def interleave_detail(name: str, record: dict) -> str:
         # just survived.
         verdict = (
             "beyond the %s interleave bound, which is the whole socket hop at "
-            "the measured burst rate: either a queue was deeper or slower than "
-            "that (check _meta for a burst or a queue_overflow near this line) "
-            "or the file holds two recordings"
-            % fmt_short(CROSS_STREAM_TOLERANCE_NS)
+            "the measured burst rate — the only queue these two do not share: "
+            "either it was deeper or slower than that (check _meta for a burst "
+            "or a queue_overflow near this line) or the file holds two "
+            "recordings" % fmt_short(CROSS_STREAM_TOLERANCE_NS)
         )
     else:
         verdict = (
@@ -1584,12 +2063,15 @@ def interleave_detail(name: str, record: dict) -> str:
         )
     return (
         f"{name}: local_ts goes backwards BETWEEN streams {record['violations']} "
-        f"time(s), worst {fmt_short(delta)}; first at line {record['line']}: "
+        f"time(s), worst {fmt_short(delta)} at line {record['line']}: "
         f"{record['previous_stream']} {iso(record['previous_local_ts'])} -> "
         f"{record['stream']} {iso(record['local_ts'])}. Write order and local_ts "
         f"order can only disagree where two producers stamp their own receive "
-        f"moment and race into one queue, so the question is whether this file "
-        f"has two: {mechanism}. This is {verdict}"
+        f"moment and reach the writer by different paths, so the question is "
+        # "race into one queue" until 2026-07-30, which the poller's own
+        # mechanism sentence then denied in the next clause: its whole point is
+        # that it shares no queue with a WS frame.
+        f"whether this file has two: {mechanism}. This is {verdict}"
     )
 
 
@@ -1723,8 +2205,7 @@ def check_day(
                 "malformed_lines": 0,
                 "unclassified_frames": 0,
                 "monotonic_violation": None,
-                "interleave_inversion": None,
-                "interleave_excess": None,
+                **interleave_json({}),
                 "sequence_breaks": {},
                 "sequence_break_examples": {},
                 "streams": {},
@@ -1797,19 +2278,26 @@ def check_day(
                     "monotonicity",
                     f"{name}/{v['stream']}: local_ts goes backwards within the "
                     f"stream {v['violations']} time(s), worst "
-                    f"{fmt_short(v['max_delta_ns'])}; first at line {v['line']}: "
+                    f"{fmt_short(v['max_delta_ns'])} at line {v['line']}: "
                     f"{iso(v['previous_local_ts'])} -> {iso(v['local_ts'])}. "
                     f"One stream has one producer stamping at receive time, so "
                     f"this is a clock step or two recordings in one file",
                 )
             )
 
-        for record, severity, check in (
-            (scan.interleave_excess, RED, "interleave_excess"),
-            (scan.interleave_inversion, YELLOW, "interleave_inversion"),
-        ):
+        # Red first, so the operator's eye lands on the one finding that refuses
+        # the build; the two yellows follow in the order `INTERLEAVE_CHECKS`
+        # names them.
+        for check in (INTERLEAVE_EXCESS, INTERLEAVE_INVERSION, INTERLEAVE_INVERSION_POLLER):
+            record = scan.interleave.get(check)
             if record:
-                issues.append(issue(severity, check, interleave_detail(name, record)))
+                issues.append(
+                    issue(
+                        INTERLEAVE_SEVERITY[check],
+                        check,
+                        interleave_detail(name, check, record),
+                    )
+                )
 
         missing_required, missing_optional, missing_informational = [], [], []
         if expected is not None:
@@ -2109,6 +2597,14 @@ def render_text(report: dict) -> str:
             if not result["issues"]:
                 lines.append("     no issues")
             for i in result["issues"]:
+                # 19 is a floor, not a fit: two check names are longer than it
+                # (`interleave_inversion` by one, `interleave_inversion_poller`
+                # by eight) and overhang the column. Widening it to fit them was
+                # tried and reverted — the pad applies to every issue row of
+                # every venue, so a cosmetic column on a Binance-only finding
+                # rewrote every line of every Hyperliquid, Bybit and Lighter
+                # report, which is the one thing this change undertook not to
+                # do. Move it only for a reason that is worth that.
                 lines.append(f"     [{i['severity']:<6}] {i['check']:<19} {i['detail']}")
 
     return "\n".join(lines) + "\n"

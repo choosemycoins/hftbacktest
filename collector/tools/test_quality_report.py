@@ -14,6 +14,7 @@ mismatch rather than as a rounding nobody notices.
 import gzip
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -1457,9 +1458,11 @@ def test_a_cross_stream_inversion_within_the_bound_is_yellow_and_named(tmp_path)
     record = symbol["interleave_inversion"]
     assert record["previous_stream"] == "depthSnapshot"
     assert record["stream"] == "bookTicker"
-    assert record["delta_ns"] == 134_021
     assert record["violations"] == 1
     assert record["max_delta_ns"] == 134_021
+    # The two stamps are the record's own, so the delta is recoverable from it
+    # without a field that could disagree with `max_delta_ns`.
+    assert record["previous_local_ts"] - record["local_ts"] == 134_021
 
     detail = next(
         i for i in issues_of(report, "binancefuturesum") if i["check"] == "interleave_inversion"
@@ -1477,7 +1480,7 @@ def test_every_mechanism_sentence_is_a_finished_sentence(mechanism):
     It is interpolated as `...; {mechanism}. This is {verdict}`, and the
     depthSnapshot entry used to end on a dangling "queue in".
     """
-    text = qr._SECOND_PRODUCER[mechanism]
+    text = qr._SECOND_PRODUCER[mechanism].mechanism
     assert not text.rstrip().endswith((" in", " the", " of", " through", ",")), text
     # Rendered exactly as the issue renders it, so a trailing preposition shows.
     assert "queue in." not in f"{text}. This is"
@@ -1521,7 +1524,7 @@ def test_a_cross_stream_inversion_beyond_the_bound_is_red(tmp_path):
     assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
     symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
     assert symbol["interleave_inversion"] is None
-    assert symbol["interleave_excess"]["delta_ns"] == 2_000 * MS
+    assert symbol["interleave_excess"]["max_delta_ns"] == 2_000 * MS
 
 
 @pytest.mark.parametrize(
@@ -1576,7 +1579,37 @@ def test_the_interleave_bound_still_covers_the_socket_hop_it_is_derived_from(tmp
     )
 
 
-@pytest.mark.parametrize("delta_ns", [1, 5 * MS, 200 * MS])
+def test_the_pollers_ceiling_is_not_the_socket_hops_bound(tmp_path):
+    """Equal today, and they have to be two numbers.
+
+    `CROSS_STREAM_TOLERANCE_NS` is the socket hop's occupancy and follows
+    `WS_QUEUE_CAPACITY`: it has moved once already, 250ms -> 1s, when the hop
+    went 4096 -> 16384, and the test above exists to make the next capacity
+    change move it again. A poll written behind a frame stamped later never
+    crossed that hop — its ceiling answers a different question, off a different
+    measurement (`POLLER_HOP_CEILING_NS`). Written as one constant, the next
+    capacity bump would quietly widen a lookahead detector by the same factor,
+    with nothing failing and nobody deciding it.
+    """
+    source = Path(qr.__file__).read_text()
+    assert re.search(r"^POLLER_HOP_CEILING_NS = [0-9_ *]+$", source, re.M), (
+        "the poller's ceiling must be its own literal, not an expression over "
+        "the socket hop's bound or capacity"
+    )
+    # And it really is the number the poll-late pair is measured against: a
+    # ceiling that nothing reads would drift without anyone noticing.
+    d = tmp_path / "um-poll-late-ceiling"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_poll_after_newer_ticks(qr.POLLER_HOP_CEILING_NS + 1))
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    _, report = run(d, out=tmp_path / "r.json")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"]["stream"] == "premiumIndex"
+
+
+@pytest.mark.parametrize("delta_ns", [1, 5 * MS, 200 * MS, 2 * SEC])
 def test_a_cross_stream_inversion_with_no_second_producer_is_red_at_any_size(
     tmp_path, delta_ns
 ):
@@ -1586,6 +1619,13 @@ def test_a_cross_stream_inversion_with_no_second_producer_is_red_at_any_size(
     file (`hyperliquid/mod.rs`), so write order IS receive order and there is
     nothing for the tolerance to excuse. Applying it venue-agnostically
     downgraded a real defect to yellow and printed a self-contradicting reason.
+
+    The 2s case is here because of what the poller class became on 2026-07-30:
+    an inversion of unbounded size is yellow when the row ahead of it was a poll
+    that crossed a hand-off of its own, and on a venue with no such producer the
+    same size must still be red. Hyperliquid, Bybit and Lighter have no second
+    producer at all, so nothing about that change — nor about the shared-chain
+    cursor it needed — may reach them.
     """
     d = hl_dir(tmp_path, name=f"hl-noproducer-{delta_ns}")
     write_gz(
@@ -1630,6 +1670,41 @@ def test_an_inversion_between_two_binance_websocket_streams_is_red(tmp_path):
     code, report = run(d, out=out)
     assert code == 1
     assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+
+
+@pytest.mark.parametrize("delta_ns", [MS, SEC + 1, 30 * SEC])
+def test_two_websocket_streams_stay_red_however_far_apart_they_are(tmp_path, delta_ns):
+    """The pair that shares every hand-off keeps its red at every size.
+
+    `bookTicker` and `trade` reach the file through the same socket hop, the
+    same parser and the same writer hop, in that order and in one FIFO each, so
+    there is no queue left that could hold one of them back — write order IS
+    receive order for this pair whatever the burst. The poller's exemption
+    (2026-07-30) is granted on a hand-off these two do not have, so a wide
+    inversion here has to stay exactly as red as a narrow one; the 1s and 30s
+    cases are the ones that would move if the exemption were read as being
+    about the size.
+    """
+    d = tmp_path / f"um-ws-only-{delta_ns}"
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            (base + delta_ns, um_trade("BTCUSDT", base + delta_ns)),
+            (base, um_book_ticker("BTCUSDT", base, u=2)),  # delta_ns backwards
+        ],
+    )
+    write_meta(d, "binancefuturesum", DAY,
+               [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+    out = tmp_path / f"r-{delta_ns}.json"
+    code, report = run(d, out=out)
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"]["max_delta_ns"] == delta_ns
+    assert "interleave_inversion_poller" not in symbol
 
 
 def test_a_whole_file_out_of_order_is_red_not_a_tolerated_interleave(tmp_path):
@@ -2611,6 +2686,37 @@ def test_a_premium_index_gap_of_exactly_the_limit_is_not_flagged_and_one_more_ns
         assert stat["premiumIndex"]["gap_count"] == expected, (label, gap_ns)
 
 
+def um_poll_before_older_ticks(delta_ns, name="BTCUSDT"):
+    """The 2026-07-29 13:30:03 shape: a poll written before older WS frames.
+
+    One `premiumIndex` row, stamped when the REST body arrived, written into the
+    file immediately ahead of book ticks stamped `delta_ns` earlier. That is
+    what the US-session burst produced in all thirteen symbols of
+    `binancefuturesum-b` at the same instant, at 1.023-1.045s.
+    """
+    early = ns(0, nanos=100_000_000)
+    tick = ns(0, nanos=164_558_903)
+    poll = tick + delta_ns
+    return [
+        (early, um_book_ticker(name, early)),
+        (early, um_trade(name, early)),
+        (early, um_depth(name, early, u=100, pu=99)),
+        (poll, um_premium_index(name, poll)),
+        (tick, um_book_ticker(name, tick, u=2)),  # <- written after, stamped before
+        (tick + 1_000, um_book_ticker(name, tick + 1_000, u=3)),
+    ]
+
+
+def um_poller_day(tmp_path, name, delta_ns):
+    d = tmp_path / name
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_poll_before_older_ticks(delta_ns))
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    return d
+
+
 def test_the_premium_index_poller_is_a_second_producer(tmp_path):
     """It skips the socket hop, so it can legally be written ahead of WS frames.
 
@@ -2625,17 +2731,314 @@ def test_the_premium_index_poller_is_a_second_producer(tmp_path):
     """
     assert "premiumIndex" in qr._SECOND_PRODUCER
 
-    d = tmp_path / "um-pi-interleave"
+    d = um_poller_day(tmp_path, "um-pi-interleave", MS)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "binancefuturesum")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"] is None
+    assert symbol["monotonic_violation"] is None
+    assert symbol["interleave_inversion_poller"]["previous_stream"] == "premiumIndex"
+
+    detail = next(
+        i
+        for i in issues_of(report, "binancefuturesum")
+        if i["check"] == "interleave_inversion_poller"
+    )["detail"]
+    assert "premiumIndex" in detail and "producer" in detail
+
+
+@pytest.mark.parametrize(
+    "delta_ns",
+    [
+        MS,
+        qr.CROSS_STREAM_TOLERANCE_NS,
+        1_034_729_563,  # tiausdt, 2026-07-29T13:30:03 UTC, measured
+        30 * SEC,
+        5 * 60 * SEC,
+    ],
+)
+def test_a_poll_written_before_older_ws_frames_is_yellow_at_any_magnitude(
+    tmp_path, delta_ns
+):
+    """The finding the 2026-07-29 gate got wrong, and the model that fixes it.
+
+    The poller is the only producer in the collector with a **hand-off of its
+    own** (`queue::POLLER_HOP`, `main.rs` claims it for `binancefuturesum`
+    alone). Its row therefore shares no FIFO with a WS frame at all: the two
+    meet for the first time in `main`'s `select!`, which picks between the two
+    arms as they become ready. What separates them is the WS frame's own wait —
+    the socket hop **plus** the writer hop — and the writer hop drains at the
+    speed of blocking gzip I/O, which has been measured stopping for longer than
+    its own depth (`queue.rs`, 2026-07-26). No arithmetic over capacities bounds
+    that, so no magnitude here is evidence of anything, and the bound that was
+    applied to it went red on thirteen intact symbol files at once.
+
+    Five minutes is in the list on purpose: it is the stall watchdog's default
+    window, i.e. the longest a wedged writer can hold WS frames back before
+    something outside this hop ends the process.
+    """
+    d = um_poller_day(tmp_path, f"um-poller-{delta_ns}", delta_ns)
+    out = tmp_path / f"r-{delta_ns}.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "binancefuturesum")
+    assert "interleave_inversion_poller" in checks_of(
+        report, "binancefuturesum", severity="yellow"
+    )
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"] is None
+    assert symbol["interleave_inversion"] is None
+    assert symbol["monotonic_violation"] is None
+    record = symbol["interleave_inversion_poller"]
+    assert record["previous_stream"] == "premiumIndex"
+    assert record["stream"] == "bookTicker"
+    assert record["max_delta_ns"] == delta_ns
+    assert record["violations"] == 1
+    # Nothing was lost: the depth chain is where a dropped frame shows, and this
+    # is the whole argument for the finding not being red.
+    assert not any(symbol["sequence_breaks"].values())
+
+
+def um_poll_after_newer_ticks(delta_ns, name="BTCUSDT"):
+    """The other direction: the poll written *after* a book tick stamped later.
+
+    Nothing on the WS side can have caused this. `writer_rx` is a FIFO, so a
+    backlog holds up the rows queued in it, not a row that crossed
+    `poller->writer` instead — the poll here is the row that waited, and its own
+    hand-off is all it can have waited in. Measured worst on a full symbol-day
+    (tiausdt, 2026-07-29): 3.128ms, against 1.034730s the other way round.
+    """
+    early = ns(0, nanos=100_000_000)
+    tick = ns(10, nanos=164_558_903)
+    poll = tick - delta_ns
+    return [
+        (early, um_book_ticker(name, early)),
+        (early, um_trade(name, early)),
+        (early, um_depth(name, early, u=100, pu=99)),
+        (tick, um_book_ticker(name, tick, u=2)),
+        (poll, um_premium_index(name, poll)),  # <- written after, stamped before
+        (tick + 1_000, um_book_ticker(name, tick + 1_000, u=3)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "delta_ns,expected_code,expected_check",
+    [
+        (3_128_000, 0, "interleave_inversion"),  # the worst ever observed
+        (qr.POLLER_HOP_CEILING_NS, 0, "interleave_inversion"),
+        (qr.POLLER_HOP_CEILING_NS + 1, 1, "interleave_excess"),
+    ],
+)
+def test_a_poll_written_after_newer_ws_frames_keeps_its_bound(
+    tmp_path, delta_ns, expected_code, expected_check
+):
+    """The half of the poller pair that still has a mechanism, and a bound.
+
+    An inversion is bounded by the *late* row's own latency — the row written
+    second, stamped first — and here that row is the poll. It crossed
+    `queue::POLLER_HOP` and nothing else: a hop `queue.rs` says cannot fill,
+    carrying one element per recorded symbol per ten seconds, drained from an
+    arm `main` offers every iteration. Granting this direction the unbounded
+    yellow deletes the only detector the report has for a `premiumIndex` stamp
+    that is not the receive moment, which is a lookahead defect — see
+    `test_a_premium_index_stamp_that_is_not_the_receive_moment_is_red`.
+
+    The bound itself is `POLLER_HOP_CEILING_NS`: a ceiling read off an
+    observation rather than a model of this hop — ~320x the worst it has been
+    seen doing — and a constant of its own, so that a deeper socket hop cannot
+    widen it by a factor nobody decided.
+    """
+    d = tmp_path / f"um-poll-late-{delta_ns}"
+    d.mkdir()
+    write_gz(d / f"btcusdt_{DAY}.gz", um_poll_after_newer_ticks(delta_ns))
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / f"r-{delta_ns}.json"
+    code, report = run(d, out=out)
+
+    assert code == expected_code, issues_of(report, "binancefuturesum")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["monotonic_violation"] is None
+    assert "interleave_inversion_poller" not in symbol, (
+        "the poll is the row that waited here; the exemption is for the row it "
+        "overtakes, and it has overtaken nothing"
+    )
+    record = symbol[expected_check]
+    assert record["previous_stream"] == "bookTicker"
+    assert record["stream"] == "premiumIndex"
+    assert record["max_delta_ns"] == delta_ns
+    detail = next(
+        i for i in issues_of(report, "binancefuturesum") if i["check"] == expected_check
+    )["detail"]
+    assert "the poll was written last" in detail, (
+        "the text has to name the row that waited, or it explains the pair by a "
+        "mechanism that cannot have produced it"
+    )
+
+
+def test_a_premium_index_stamp_that_is_not_the_receive_moment_is_red(tmp_path):
+    """Why that direction keeps its bound: this is the defect it detects.
+
+    A poller stamping at request time, serving a cached body, or copying the
+    venue's own `E` files each element into the recording ahead of the moment it
+    was knowable — lookahead, in every dataset built from these files. A uniform
+    offset is invisible to everything else in `check_day`: `premiumIndex` stays
+    monotone within itself, keeps its cadence and its coverage, and carries no
+    sequence chain to break. It shows up as the poll being written after rows
+    stamped later, at a magnitude its own hand-off cannot account for, and
+    nowhere else.
+
+    Today the collector takes `Utc::now()` after the response body arrives
+    (`binancefuturesum/mod.rs`), so this is not live — which is the point: a
+    gate is for the code that has not been written yet.
+    """
+    d = tmp_path / "um-stale-poll"
+    d.mkdir()
+    base = ns(60, nanos=100_000_000)
+    stale = 30 * SEC
+    rows = [
+        (base, um_book_ticker("BTCUSDT", base)),
+        (base, um_depth("BTCUSDT", base, u=100, pu=99)),
+    ]
+    for k in range(1, 6):
+        tick = base + k * PREMIUM_INDEX_INTERVAL_NS
+        rows.append((tick, um_book_ticker("BTCUSDT", tick, u=k + 1)))
+        rows.append((tick - stale, um_premium_index("BTCUSDT", tick - stale)))
+    write_gz(d / f"btcusdt_{DAY}.gz", rows)
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    record = symbol["interleave_excess"]
+    assert record["stream"] == "premiumIndex"
+    assert record["violations"] == 5
+    assert record["max_delta_ns"] == stale
+    # Every other check on this file is clean, which is the whole argument for
+    # not taking the bound off this direction.
+    assert symbol["monotonic_violation"] is None
+    assert "interleave_inversion_poller" not in symbol
+    assert not any(symbol["sequence_breaks"].values())
+    assert symbol["streams"]["premiumIndex"]["gap_count"] == 0
+    detail = next(
+        i for i in issues_of(report, "binancefuturesum") if i["check"] == "interleave_excess"
+    )["detail"]
+    assert "poller->writer" in detail
+    assert "ahead of the moment it was knowable" in detail, "name the defect, not just the size"
+
+
+def test_a_poll_between_two_ws_frames_does_not_launder_their_inversion(tmp_path):
+    """A poll row is not somewhere a WS pair can hide.
+
+    `bookTicker` and `trade` share every hand-off, so an inversion between them
+    is red at a nanosecond — and it stays red when a `premiumIndex` row is
+    written between them, because that row crossed a different hop and cannot
+    have reordered either. Compared against the previous *line* only, the pair
+    examined would be premiumIndex->trade, which is the unbounded class: one
+    poll row in the right place would take a real defect off the report, and
+    there are ~8640 of them per symbol-day arriving during exactly the bursts a
+    writer or parser defect surfaces in.
+    """
+    d = tmp_path / "um-launder"
     d.mkdir()
     base = ns(0, nanos=100_000_000)
     write_gz(
         d / f"btcusdt_{DAY}.gz",
         [
             (base, um_book_ticker("BTCUSDT", base)),
-            # The poll landed first even though the tick below was stamped
-            # earlier: it never entered the socket hop.
-            (base + 2 * MS, um_premium_index("BTCUSDT", base + 2 * MS)),
-            (base + MS, um_book_ticker("BTCUSDT", base + MS)),
+            (base, um_depth("BTCUSDT", base, u=100, pu=99)),
+            (base + 5 * SEC, um_book_ticker("BTCUSDT", base + 5 * SEC, u=2)),
+            (base + 5 * SEC + MS, um_premium_index("BTCUSDT", base + 5 * SEC + MS)),
+            (base, um_trade("BTCUSDT", base)),  # 5s behind the tick two lines up
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    record = symbol["interleave_excess"]
+    assert (record["previous_stream"], record["stream"]) == ("bookTicker", "trade"), (
+        "the pair reported must be the two rows that share the chain, not the "
+        "poll row that happened to be written between them"
+    )
+    assert record["max_delta_ns"] == 5 * SEC
+    assert "interleave_inversion_poller" not in symbol
+
+
+def test_the_shared_chain_cursor_reaches_across_a_snapshot_too(tmp_path):
+    """The cursor is about the chain, not about the poller.
+
+    A REST snapshot skips the socket hop, so the pair it makes with a WS frame
+    has a bound; two WS frames have none, whichever second producer wrote a row
+    between them. Compared line by line the pair here is depthSnapshot->trade,
+    500ms apart and comfortably inside the socket hop's bound — yellow. The pair
+    that exists is bookTicker->trade, and it shares every hop.
+    """
+    d = tmp_path / "um-launder-snapshot"
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            (base, um_depth("BTCUSDT", base, u=100, pu=99)),
+            (base + 500 * MS, um_book_ticker("BTCUSDT", base + 500 * MS, u=2)),
+            (base + 500 * MS, um_depth_snapshot("BTCUSDT", base + 500 * MS)),
+            (base, um_trade("BTCUSDT", base)),  # 500ms behind the tick above
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 1
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    record = symbol["interleave_excess"]
+    assert (record["previous_stream"], record["stream"]) == ("bookTicker", "trade")
+    assert record["max_delta_ns"] == 500 * MS
+    assert symbol["interleave_inversion"] is None
+
+
+def test_the_folded_record_names_the_worst_occurrence_not_the_first(tmp_path):
+    """One record per class, and the class folds magnitudes — so it has to
+    anchor on the one the verdict is made of.
+
+    Anchored on the first occurrence, the 2026-07-29 report read
+    `worst 1.034s; first at line 741: depthUpdate <ts> -> premiumIndex <ts>`,
+    where those two stamps are 119us apart at 00:00:15 and the 1.034s event is
+    at 13:30:03 on line 1069889 — a sentence whose number and whose location
+    come from different events, and no record of the incident anywhere in the
+    report.
+    """
+    d = tmp_path / "um-worst-anchor"
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    small, big = 119_473, 1_034_729_563
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            (base, um_trade("BTCUSDT", base)),
+            (base, um_depth("BTCUSDT", base, u=100, pu=99)),
+            (ns(10), um_premium_index("BTCUSDT", ns(10))),
+            (ns(10) - small, um_book_ticker("BTCUSDT", ns(10) - small, u=2)),
+            (ns(20), um_premium_index("BTCUSDT", ns(20))),
+            (ns(20) - big, um_book_ticker("BTCUSDT", ns(20) - big, u=3)),
+            (ns(21), um_book_ticker("BTCUSDT", ns(21), u=4)),
         ],
     )
     write_meta(
@@ -2646,14 +3049,436 @@ def test_the_premium_index_poller_is_a_second_producer(tmp_path):
 
     assert code == 0, issues_of(report, "binancefuturesum")
     symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    record = symbol["interleave_inversion_poller"]
+    assert record["violations"] == 2
+    assert record["max_delta_ns"] == big
+    assert record["line"] == 7, "the line of the worst pair, not of the first"
+    assert record["previous_local_ts"] == ns(20)
+    assert record["local_ts"] == ns(20) - big
+    detail = next(
+        i
+        for i in issues_of(report, "binancefuturesum")
+        if i["check"] == "interleave_inversion_poller"
+    )["detail"]
+    assert "worst 1.034s at line 7" in detail
+    assert "first at line" not in detail, (
+        "the number and the location have to come from the same event"
+    )
+
+
+def test_the_pollers_exemption_does_not_reach_the_depth_snapshot(tmp_path):
+    """One file, two second producers, the same magnitude, two verdicts.
+
+    The snapshot is detached but it sends on `writer_tx` — the *same* hop the
+    parser feeds — so the two rows still meet in one FIFO and only the socket
+    hop separates them. That is a bound made of one queue and a measured rate,
+    and it has never gone red on a healthy recording (worst observed 134us,
+    ethusdt 2026-07-26). The poller has a hop of its own and no shared FIFO at
+    all. Reading the 2026-07-30 exemption as "REST rows are exempt" instead of
+    "the row a poll overtook is" would take the red off the snapshot too, and
+    nothing measured asks for that.
+    """
+    d = tmp_path / "um-both-producers"
+    d.mkdir()
+    over = qr.CROSS_STREAM_TOLERANCE_NS + SEC
+    base = ns(0, nanos=100_000_000)
+    tick = ns(10, nanos=164_558_903)
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            (base, um_trade("BTCUSDT", base)),
+            (base, um_depth("BTCUSDT", base, u=100, pu=99)),
+            (tick + over, um_premium_index("BTCUSDT", tick + over)),
+            (tick, um_book_ticker("BTCUSDT", tick, u=2)),
+            (tick + 20 * SEC + over, um_depth_snapshot("BTCUSDT", tick + 20 * SEC + over)),
+            (tick + 20 * SEC, um_book_ticker("BTCUSDT", tick + 20 * SEC, u=3)),
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 1
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"]["previous_stream"] == "depthSnapshot"
+    assert symbol["interleave_excess"]["max_delta_ns"] == over
+    assert symbol["interleave_inversion_poller"]["previous_stream"] == "premiumIndex"
+    assert symbol["interleave_inversion_poller"]["max_delta_ns"] == over
+    assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
+    assert "interleave_inversion_poller" in checks_of(
+        report, "binancefuturesum", severity="yellow"
+    )
+
+
+def um_poll_against_snapshot(tmp_path, name, poll_first, delta_ns):
+    """A poll and a REST depth snapshot written out of order by `delta_ns`.
+
+    The two share no queue at all — one crosses `poller->writer`, the other
+    `parser->writer` — so the only thing the pair can be read by is which of
+    them was written second, i.e. which one waited.
+    """
+    d = tmp_path / name
+    d.mkdir()
+    base = ns(0, nanos=100_000_000)
+    late = ns(30, nanos=100_000_000)
+    early = late - delta_ns
+    first, second = (
+        (um_premium_index("BTCUSDT", late), um_depth_snapshot("BTCUSDT", early))
+        if poll_first
+        else (um_depth_snapshot("BTCUSDT", late), um_premium_index("BTCUSDT", early))
+    )
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (base, um_book_ticker("BTCUSDT", base)),
+            (base, um_trade("BTCUSDT", base)),
+            (base, um_depth("BTCUSDT", base, u=100, pu=99)),
+            (late, first),
+            (early, second),
+        ],
+    )
+    write_meta(
+        d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))]
+    )
+    return d
+
+
+def test_a_snapshot_written_behind_a_poll_has_no_bound_either(tmp_path):
+    """The poll went first, so the snapshot is the row that waited.
+
+    It waited in `parser->writer`, the hop the poll skipped entirely, and that
+    hop drains at the speed of blocking gzip I/O — the same unmeasured rate that
+    takes the bound off a WS frame in this position. So the class follows the
+    direction and not the streams: a snapshot behind a poll is the poller class
+    for exactly the reason a book tick behind a poll is.
+    """
+    d = um_poll_against_snapshot(tmp_path, "um-snapshot-behind-poll", True, 20 * SEC)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "binancefuturesum")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_excess"] is None
+    assert symbol["interleave_inversion"] is None
+    record = symbol["interleave_inversion_poller"]
+    assert record["previous_stream"] == "premiumIndex"
+    assert record["stream"] == "depthSnapshot"
+    assert record["max_delta_ns"] == 20 * SEC
+    detail = next(
+        i
+        for i in issues_of(report, "binancefuturesum")
+        if i["check"] == "interleave_inversion_poller"
+    )["detail"]
+    assert "poller->writer" in detail, "the mechanism named must be the one that decided"
+
+
+@pytest.mark.parametrize(
+    "delta_ns,expected_code,expected_check",
+    [
+        (3 * MS, 0, "interleave_inversion"),
+        (qr.POLLER_HOP_CEILING_NS, 0, "interleave_inversion"),
+        (20 * SEC, 1, "interleave_excess"),
+    ],
+)
+def test_a_poll_written_behind_a_snapshot_keeps_its_bound(
+    tmp_path, delta_ns, expected_code, expected_check
+):
+    """The same two streams the other way round, and it is a different question.
+
+    Here the poll is the row that waited, and `poller->writer` is the only queue
+    it can have waited in — the snapshot's own hop cannot hold it, since a FIFO
+    delays the rows behind it and this row is not in it. So the pair keeps a
+    bound in this direction, and a 20s wait on a hop that carries a dozen
+    elements once every ten seconds is a defect, not an interleave.
+    """
+    d = um_poll_against_snapshot(
+        tmp_path, f"um-poll-behind-snapshot-{delta_ns}", False, delta_ns
+    )
+    out = tmp_path / f"r-{delta_ns}.json"
+    code, report = run(d, out=out)
+
+    assert code == expected_code, issues_of(report, "binancefuturesum")
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert "interleave_inversion_poller" not in symbol
+    record = symbol[expected_check]
+    assert record["previous_stream"] == "depthSnapshot"
+    assert record["stream"] == "premiumIndex"
+    assert record["max_delta_ns"] == delta_ns
+
+
+def test_the_poller_finding_explains_why_no_bound_could_hold(tmp_path):
+    """The text is the whole finding: nothing downstream acts on a yellow.
+
+    It has to say which hand-off the row took (the thing that makes this class
+    a class), that the recording is intact rather than merely tolerated, and
+    where to look if the number is large — the same shape the interleave text
+    has always had, which an operator reads on a red day.
+    """
+    d = um_poller_day(tmp_path, "um-poller-detail", 1_034_729_563)
+    out = tmp_path / "r.json"
+    _, report = run(d, out=out)
+    detail = next(
+        i
+        for i in issues_of(report, "binancefuturesum")
+        if i["check"] == "interleave_inversion_poller"
+    )["detail"]
+
+    assert "poller->writer" in detail, "the hop is what defines this class"
+    # Formatted by the same `fmt_short` every other duration in the report goes
+    # through; the exact nanoseconds are in the JSON, where a consumer reads them.
+    assert "1.034s" in detail
+    # Why it is not red, and what it is not claiming.
+    assert "no bound" in detail
+    assert "u/pu" in detail, "where a lost frame would show instead"
+    assert "queue_overflow" in detail, "what to look at when the number is large"
+    # The sentence must not still be reciting the bound it no longer applies.
+    assert "beyond the" not in detail
+
+
+def test_the_poller_still_has_a_hand_off_of_its_own(tmp_path):
+    """The model reads the collector; if the collector moves, this must fail.
+
+    `interleave_inversion_poller` exists because `premiumIndex` rows reach the
+    writer on `queue::POLLER_HOP` while everything else arrives on
+    `queue::WRITER_HOP`. Merge the two — hand the poller a clone of `writer_tx`
+    — and the pair is back to sharing a FIFO, the socket hop is all that
+    separates them again, and the bound this exemption removed is the right one
+    once more. Reading the Rust here is what makes that a failing test rather
+    than a stale comment.
+    """
+    queue_rs = (Path(__file__).resolve().parent.parent / "src" / "queue.rs").read_text()
+
+    def hop_name(const):
+        match = re.search(rf'pub const {const}: &str = "([^"]+)";', queue_rs)
+        assert match, f"{const} is no longer a &str constant of collector/src/queue.rs"
+        return match.group(1)
+
+    writer_hop, poller_hop = hop_name("WRITER_HOP"), hop_name("POLLER_HOP")
+    assert writer_hop != poller_hop
+    assert qr._SECOND_PRODUCER["depthSnapshot"].hop == writer_hop
+    assert qr._SECOND_PRODUCER["premiumIndex"].hop == poller_hop
+
+    # And the poller really is handed that hop, rather than a clone of the
+    # writer's: `main` claims `POLLER_HOP` for one backend and passes it in.
+    main_rs = (Path(__file__).resolve().parent.parent / "src" / "main.rs").read_text()
+    assert "queue::bounded(POLLER_HOP" in main_rs
+    um_rs = (
+        Path(__file__).resolve().parent.parent / "src" / "binancefuturesum" / "mod.rs"
+    ).read_text()
+    assert re.search(
+        r"pub async fn run_collection\((?:[^)]*\n)*?[^)]*writer_tx: Tx<Record>,\s*"
+        r"poller_tx: Tx<Record>,\s*\)",
+        um_rs,
+    ), "binancefuturesum::run_collection no longer takes a poller hop of its own"
+
+
+#: The per-symbol JSON key set a venue with no poller has always had, in order.
+#:
+#: Frozen from the report `quality_report.py` produced before the poller class
+#: existed (`git show HEAD~:...`, regated over the real Hyperliquid recording of
+#: 2026-07-28). It is a literal rather than a computed list on purpose: the
+#: point is to fail when the schema moves, and a list derived from the module
+#: would move with it.
+NO_POLLER_SYMBOL_KEYS = [
+    "file",
+    "lines",
+    "truncated",
+    "malformed_lines",
+    "unclassified_frames",
+    "monotonic_violation",
+    "interleave_inversion",
+    "interleave_excess",
+    "sequence_breaks",
+    "sequence_break_examples",
+    "streams",
+    "missing_required",
+    "missing_optional",
+    "missing_informational",
+    "coverage",
+]
+
+
+def test_a_venue_with_no_poller_gets_the_report_it_always_got(tmp_path, capsys):
+    """The poller class must be invisible where no poller runs.
+
+    Hyperliquid, Bybit and Lighter have one WS reader and no second producer of
+    any kind, so `interleave_inversion_poller` cannot fire on them — and a
+    finding that cannot fire must not change their report either. Both ways it
+    leaked when this class was added were unrelated to the model and cost the
+    same thing: a regate over the real 2026-07-28 Hyperliquid recording differed
+    from the previous release in every symbol of the JSON (an unconditional
+    `"interleave_inversion_poller": null`) and in every issue line of the text
+    (the check-name column widened from 19 to 27 to fit the new name).
+
+    Neither is caught by asserting on findings, because neither is one. So this
+    asserts on the *shape*: the key list, verbatim and in order, and the column
+    an issue line puts its detail in.
+    """
+    d = hl_dir(tmp_path)
+    # One yellow, so there is an issue row to measure the column on.
+    write_gz(
+        d / f"btc_{DAY}.gz",
+        [
+            (ns(0), hl_trade("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0))),
+            (ns(0), hl_l2("BTC", ns(0), fast=True)),
+            (ns(1), hl_bbo("BTC", ns(1))),
+            (ns(61), hl_bbo("BTC", ns(61))),
+            (ns(61), hl_l2("BTC", ns(61), fast=True)),
+        ],
+    )
+
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+
+    symbol = report["venues"]["hyperliquid"]["days"][DAY]["symbols"]["btc"]
+    assert list(symbol) == NO_POLLER_SYMBOL_KEYS
+
+    text = capsys.readouterr().out
+    row = next(line for line in text.splitlines() if "cadence_gap" in line)
+    assert row.startswith("     [yellow] cadence_gap         btc/bbo:"), (
+        "the check-name column is shared by every venue; widening it for a "
+        "Binance-only finding rewrites every line of every other venue's report"
+    )
+
+
+def test_a_venue_with_a_poller_carries_the_key_where_the_class_fires(tmp_path):
+    """The other half: absent is only ever "this did not happen here".
+
+    A key that appears in some binancefuturesum files and not others would be a
+    schema nobody could read. What decides it is the finding, not the venue —
+    which is also what makes it invisible above, since the class cannot fire
+    where no poller writes.
+    """
+    d = tmp_path / "um-poller-key"
+    d.mkdir()
+    poll, late = ns(10), ns(10) - 2 * SEC
+    write_gz(
+        d / f"btcusdt_{DAY}.gz",
+        [
+            (ns(0), um_book_ticker("BTCUSDT", ns(0))),
+            (ns(0), um_trade("BTCUSDT", ns(0))),
+            (ns(0), um_depth("BTCUSDT", ns(0), u=100, pu=99)),
+            (poll, um_premium_index("BTCUSDT", poll)),
+            (late, um_book_ticker("BTCUSDT", late, u=2)),
+        ],
+    )
+    write_meta(d, "binancefuturesum", DAY, [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
+
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+    assert code == 0
+    symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert symbol["interleave_inversion_poller"]["max_delta_ns"] == 2 * SEC
+    # And it sits between the two it belongs with, not appended after them.
+    keys = [k for k in symbol if k.startswith("interleave_")]
+    assert keys == ["interleave_inversion", "interleave_inversion_poller", "interleave_excess"]
+
+
+REAL_DAY = "20260729"
+FIXTURE = Path(__file__).resolve().parent / "testdata" / "quality_report"
+
+
+def test_the_real_1330_burst_is_yellow_and_intact(tmp_path):
+    """301 lines cut verbatim out of the recording the gate got wrong.
+
+    `tiausdt_20260729.gz`, lines 1069700-1070000 of the real file, around
+    2026-07-29T13:30:03 UTC: the US-session open burst. One `premiumIndex` row
+    stamped 13:30:03.059903387 sits in front of a book tick stamped
+    13:30:02.025173824 — 1.034729563s of `local_ts` going backwards between two
+    streams, which the gate called `interleave_excess` and red, in this and
+    twelve other symbol files at the same instant.
+
+    Nothing was lost: the `pu` chain steps straight across the inversion
+    (…241997 -> …241997) and the report finds no sequence break in the window.
+    That is the fact the verdict has to agree with.
+    """
+    d = tmp_path / "binancefuturesum-b"
+    d.mkdir()
+    shutil.copy(FIXTURE / f"tiausdt_{REAL_DAY}.gz", d / f"tiausdt_{REAL_DAY}.gz")
+    # The recording's own sidecar is the whole day (~1 MB); only the symbol list
+    # matters here, and the market data is what the fixture is for.
+    write_meta(
+        d,
+        "binancefuturesum",
+        REAL_DAY,
+        [(1_785_331_801_374_026_979, session_start("binancefuturesum", ["TIAUSDT"]))],
+    )
+
+    out = tmp_path / "r.json"
+    code, report = run(d, day=REAL_DAY, out=out)
+
+    assert code == 0, issues_of(report, "binancefuturesum", day=REAL_DAY)
+    day = report["venues"]["binancefuturesum"]["days"][REAL_DAY]
+    assert day["verdict"] == "yellow"
+    symbol = day["symbols"]["tiausdt"]
     assert symbol["interleave_excess"] is None
     assert symbol["monotonic_violation"] is None
-    assert symbol["interleave_inversion"]["previous_stream"] == "premiumIndex"
+    assert not any(symbol["sequence_breaks"].values()), "nothing was lost behind the burst"
+    record = symbol["interleave_inversion_poller"]
+    assert record["previous_stream"] == "premiumIndex"
+    assert record["stream"] == "bookTicker"
+    assert record["previous_local_ts"] == 1_785_331_803_059_903_387
+    assert record["local_ts"] == 1_785_331_802_025_173_824
+    assert record["max_delta_ns"] == 1_034_729_563
+    assert record["violations"] == 1, (
+        "one inversion in 301 lines; a fixture that grew a second one would be "
+        "measuring something other than the incident"
+    )
 
+
+def test_the_real_recordings_poll_late_inversions_stay_yellow(tmp_path):
+    """The other direction, also cut verbatim from the recording.
+
+    `seiusdt_20260729.gz`, lines 545900-546200, around 09:56:02 UTC: a
+    `premiumIndex` row stamped 09:56:02.742099774 written *after* a book tick
+    stamped 09:56:02.743982641 — 1.882867ms the other way, and the worst of the
+    38 such inversions in that whole symbol-day (tiausdt's worst is 3.128ms).
+
+    This is the measurement the kept bound rests on. Keeping the ceiling on this
+    direction has to cost the real recording nothing, or the fix would be the
+    2026-07-29 failure again with the sign flipped — and 1.9ms against a 1.000s
+    ceiling is the margin that says so.
+    """
+    d = tmp_path / "binancefuturesum-b"
+    d.mkdir()
+    shutil.copy(FIXTURE / f"seiusdt_{REAL_DAY}.gz", d / f"seiusdt_{REAL_DAY}.gz")
+    write_meta(
+        d,
+        "binancefuturesum",
+        REAL_DAY,
+        [(1_785_318_960_080_451_082, session_start("binancefuturesum", ["SEIUSDT"]))],
+    )
+
+    out = tmp_path / "r.json"
+    code, report = run(d, day=REAL_DAY, out=out)
+
+    assert code == 0, issues_of(report, "binancefuturesum", day=REAL_DAY)
+    symbol = report["venues"]["binancefuturesum"]["days"][REAL_DAY]["symbols"]["seiusdt"]
+    assert symbol["interleave_excess"] is None, "the ceiling must not fire on a real day"
+    assert "interleave_inversion_poller" not in symbol
+    assert symbol["monotonic_violation"] is None
+    record = symbol["interleave_inversion"]
+    assert record["previous_stream"] == "bookTicker"
+    assert record["stream"] == "premiumIndex"
+    assert record["previous_local_ts"] == 1_785_318_962_743_982_641
+    assert record["local_ts"] == 1_785_318_962_742_099_774
+    assert record["max_delta_ns"] == 1_882_867
+    assert record["violations"] == 1
+    assert record["max_delta_ns"] * 300 < qr.POLLER_HOP_CEILING_NS, (
+        "the ceiling is kept because it is orders of magnitude over what the "
+        "poller's own hand-off does; if that stops being true, measure the hop"
+    )
     detail = next(
-        i for i in issues_of(report, "binancefuturesum") if i["check"] == "interleave_inversion"
+        i
+        for i in issues_of(report, "binancefuturesum", day=REAL_DAY)
+        if i["check"] == "interleave_inversion"
     )["detail"]
-    assert "premiumIndex" in detail and "producer" in detail
+    assert "the poll was written last" in detail
 
 
 def test_a_premium_index_stream_going_backwards_within_itself_is_red(tmp_path):

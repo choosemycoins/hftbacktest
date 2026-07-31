@@ -211,12 +211,18 @@ broken, and the collector stops with the files closed, exactly as everywhere
 else.
 
 One consequence for anything reading these files: the poller is a **second
-producer**. It writes straight to the writer while WebSocket frames queue
-through the socket hop first, so a `premiumIndex` line can be written ahead of a
-book tick stamped microseconds earlier. That is an interleave, not a defect, and
-the offline report knows it (`_SECOND_PRODUCER` in `tools/quality_report.py`) —
-it is the same situation the REST depth snapshot has always been in, but now at
-8640 writes a day instead of a dozen.
+producer**, and the only one with a hand-off of its own (`POLLER_HOP`). A
+WebSocket frame queues through the socket hop and then the writer hop; a poll
+crosses neither, so a `premiumIndex` line can be written ahead of a book tick
+stamped earlier — by however long that tick was waiting in the two of them. That
+is an interleave, not a defect, and the offline report grades it as its own
+finding, yellow at any size (`interleave_kind` in `tools/quality_report.py`,
+where the reasoning and the rejected alternatives are). Only in that direction,
+though: a poll written *after* a frame stamped later waited on its own hop and
+nowhere else, and that keeps a bound — it is the one place a `premiumIndex`
+stamp taken anywhere but at receive would show. The REST depth snapshot is the
+milder version of the same thing: it skips the socket hop but shares the writer
+hop, so one queue still describes the pair and it keeps a bound either way.
 
 The Python converter (`hftbacktest.data.utils.binancefutures`) skips these lines
 the same way it already skips the REST depth snapshots: at its default
@@ -1308,7 +1314,14 @@ it was 1 while the hop was 4096. Set it lower and the watchdog wins the race,
 so the operator gets "silence" instead of the hop that broke.
 One consequence reaches the offline gate: the deeper hop widens the largest
 honest cross-stream overtake to 819 ms, so `quality_report.py`'s interleave
-tolerance moved from 250 ms to 1s with it.
+tolerance moved from 250 ms to 1s with it. That tolerance covers the pair this
+hop actually separates — a REST depth snapshot against a WebSocket frame. A
+WebSocket frame written behind a `premiumIndex` poll waited in this hop and the
+writer's alike, so nothing over these capacities bounds it and the gate grades
+it without one. The other way round — a poll written behind a frame stamped
+later — keeps a ceiling of the same 1s, but a constant of its own
+(`POLLER_HOP_CEILING_NS`), read off what the poller's hand-off has actually been
+seen doing: raising this capacity again must not widen that one.
 
 One case escapes all of it. If a write blocks for ever in the kernel — a hung
 mount, a device that stops answering — the main loop never gets back to notice
