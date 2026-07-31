@@ -29,6 +29,12 @@ pub struct Instrument<MD> {
     /// report the snapshot as ready until the first marker arrives — this is the signal myhft
     /// uses to safely begin placing orders after startup/restart.
     snapshot_ready: bool,
+    /// Set to `true` by the first [`LiveEvent::Position`](crate::types::LiveEvent::Position) this
+    /// instrument receives, and never cleared. Distinct from `snapshot_ready` on purpose: the
+    /// marker rides the registration round trip while the connector's venue-side
+    /// `cancel_all_orders` + `get_position` are still in flight, so the position round trip
+    /// answers strictly later (`docs/snapshot-complete-marker.md`, "Known gap").
+    position_observed: bool,
 }
 
 impl<MD> Instrument<MD> {
@@ -59,6 +65,7 @@ impl<MD> Instrument<MD> {
             last_order_latency: None,
             state: Default::default(),
             snapshot_ready: false,
+            position_observed: false,
         }
     }
 }

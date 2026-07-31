@@ -257,6 +257,10 @@ Bybit/Binance получили шов `serve(write, read)`: `connect` тольк
 
 Design note поправлена; гонка остаётся **открытой в коде**. Если будешь закрывать — варианты и их цена перечислены в «Possible follow-ups» самой ноты, и не удаляй документацию гонки ни там, ни здесь: она load-bearing.
 
+**Второй сигнал теперь наблюдаем (2026-07-31).** Совет ноты «подожди дополнительно первый `Position`» потребитель выполнить не мог: `LiveEvent::Position` присваивает `state.position` и следа не оставляет, так что «плоско» и «мне ещё никто не сказал» для бота были одним и тем же. `Bot::position_observed(asset_no) -> bool` защёлкивается на первом position-апдейте этого ассета и не сбрасывается. Это **отдельный** сигнал, а не усиленный `snapshot_ready`: пин `the_snapshot_marker_alone_reports_no_position` держит их различимыми — схлопни их в один, и любой гейт поверх станет вакуумным. В коннекторе внутри спавна два REST идут последовательно (`cancel_all(...).await`, затем `get_position(...).await` — обе точки вызова в `private_stream.rs`), и публикует позицию именно `get_position`, поэтому наблюдённый апдейт означает, что cancel-раунд-трип **вернулся**.
+
+Чего он не означает — знать обязательно, иначе гейт поверх него врёт: (1) что sweep **удался** — ошибка `cancel_all` только логируется, `get_position` бежит следом, так что флаг может встать над нетронутой книгой; (2) что апдейт пришёл именно от sweep-а — приватный стрим шлёт позицию и сам, и филл по ордеру прошлой инкарнации в окне гонки поднимет флаг раньше времени; окно сужается, но не закрывается; (3) что площадка вообще отдаёт строку позиции на плоском аккаунте — Bybit V5 отдаёт (`side: "None"`, size 0 — ровно поэтому в матче `get_position` есть нулевая ветка), но это свойство одной площадки, а не провода. **Ждать этот флаг можно только с ограниченным бюджетом.** Потребитель — `myhft`, разбор политики и вывод таймаута — в его `docs/bot-overview.md` §4.
+
 ### 4.5 `Backtest::submit_order` игнорирует сторону ордера — **починено апстримом, в дереве с 2026-07-30**
 
 Было: перегрузка `submit_order(asset_no, order: OrderRequest, wait)` передавала в `local.submit_order` жёстко `Side::Sell` и не смотрела на `order.side` — бэктест-стратегия на `OrderRequest` молча слала только продажи, а в live та же стратегия работала как задумано. Закрыто upstream-коммитом `3a3d1be` (#298), приехал мерджем `ed96480` (см. историю секции про ревизию `myhft` ниже — обе стороны теперь согласованы).
@@ -366,7 +370,7 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 
 | Крейт | Тесты |
 |---|---|
-| `hftbacktest` | 47 `#[test]` в 8 файлах: `types.rs`, `depth/{hashmap,btree,roivector,fuse}marketdepth.rs`, `backtest/models/queue.rs`, `backtest/mod.rs` (10: `skips_unseen_events` + 9 на учёт филлов, см. §4.6), `live/bot.rs` |
+| `hftbacktest` | 54 `#[test]` в 8 файлах: `types.rs`, `depth/{hashmap,btree,roivector,fuse}marketdepth.rs`, `backtest/models/queue.rs`, `backtest/mod.rs` (11: `skips_unseen_events`, 9 на учёт филлов — см. §4.6 — и готовность бэктеста с первого тика), `live/bot.rs` (+6 на `position_observed`, §4.4) |
 | `connector` | 173 `#[test]` (171 прогон + 2 `#[ignore]`). Крейт **bin-only**: `cargo test -p connector --bins`. Исторически тестов тут не было вовсе — `src/utils.rs` был единственным файлом с ними. Крупнейшие модули: `supervision.rs` (21 — реестр ботов, порядок остановки, коды выхода), `hyperliquid/{ordermanager,depth}.rs` (по 21), `rest.rs`/`public_stream.rs` (по 14). Дыры на месте: **у bybit и обоих Binance тестов нет вообще**, и в `main.rs` нет `#[cfg(test)]` — `run_publish_task`/`run_receive_task` проверяются только через вынесенные в `supervision.rs` чистые функции |
 | `collector` | 166 `#[test]`: `file.rs`, `disk.rs`, `hyperliquid/mod.rs`, плюс модули Фазы 1 дизайн-дока многобиржевого сбора — `queue.rs` (ограниченные хенд-оффы), `pump.rs` (владение отправителем, один цикл на все пять бэкендов), `watchdog.rs` (сторож молчания), `lock.rs` (flock директории), `backoff.rs`, `meta.rs` (единый словарь lifecycle-записей `_meta`), `clock.rs` (adjtimex-гейдж дисциплины часов), `liveness.rs` (per-symbol возраст записи), premiumIndex-поллер и по два теста в каждом бэкенде. Крейт **bin-only**: `cargo test -p collector --bins` (`--lib --bins` для него ошибка «no library targets») |
 | `collector/tools` (Python) | 459 pytest (451 прогон + 8 skip): `test_quality_report.py` (123), `test_build_dataset.py` (129+4 skip), `test_backtest_first.py` (120+4 skip), `test_rerank_metrics.py` (65), `test_build_hl_dataset.py` (14). Запуск: `.venv/bin/pytest collector/tools/` — тулинг Фаз 2–4 `docs/design-multi-venue-collection.md` |
@@ -382,14 +386,16 @@ cargo +nightly fmt                        # именно nightly, см. ниже
 - **`develop` — интеграционная ветка форка и рабочая по умолчанию.** Вся форк-работа ведётся в ней или в фичевых ветках от неё. Создана из `feat/hyperliquid-connector` (вся multi-venue/HL/§4.x-работа) и содержит его целиком.
 - **`master` — зеркало upstream (`nkaz001/hftbacktest`), форк-коммитов в нём нет и не будет.** Обновляется только fast-forward-ом с `upstream/master` (remote `upstream` прописан). Апстримные изменения въезжают в `develop` мерджем master → develop.
 - **`upstream-pr/*` — ветки для PR в апстрим**, базируются на `upstream/master`, а не на `develop`; форк-специфика туда не попадает.
-- Исторические ветки (`feat/snapshot-marker` = `ed96480`, который пинит `myhft`; `feat/hyperliquid-connector`; `feat/order-id-link`; `bybit-run`; `fix/*`) заморожены — не удалять, пока `myhft` пинит `ed96480`.
+- Исторические ветки (`feat/snapshot-marker` = `ed96480`; `feat/hyperliquid-connector`; `feat/order-id-link`; `bybit-run`; `fix/*`) заморожены — не удалять.
 - `task-brief-connector-snapshot-marker.md` в корне — **не в git**. Это документ из `myhft`, оказавшийся здесь; на него нельзя ссылаться как на общий контекст.
 
-#### Ревизия, которую собирает `myhft` — **согласовано 2026-07-30**
+#### Ревизия, которую собирает `myhft` — **обновлено 2026-07-31**
 
-`myhft/Cargo.toml` пинит `rev = "ed96480"` (`# branch feat/snapshot-marker`). Разгадка тревожной версии этой секции: `ed96480` — это мердж upstream master в `feat/snapshot-marker`, сделанный на GitHub («Sync fork»); несвежим был локальный клон, а не origin. 2026-07-30 сделан `git fetch`, локальная `feat/snapshot-marker` подтянута на `ed96480`, и он же смерджен в `feat/hyperliquid-connector` (конфликты: `collector/Cargo.toml` — взята наша сторона, rustls/env-filter/raw_value там load-bearing; `bybit/public_stream.rs` — взята наша сторона, upstream-овский хардкод `orderbook.1000` покрывается конфигом `orderbook_depths`). Версия `hftbacktest` теперь 0.9.4, MSRV 1.91.1 — как в проде.
+`myhft/Cargo.toml` пинит **коммит на `develop`** (комментарий `# branch develop` там же). Историческая справка, чтобы прежняя тревожная редакция этой секции не воскресла: до 2026-07-30 пин стоял на `ed96480` (`# branch feat/snapshot-marker`) — это мердж upstream master в `feat/snapshot-marker`, сделанный на GitHub («Sync fork»); несвежим был локальный клон, а не origin. Тогда же `ed96480` был смерджен в `feat/hyperliquid-connector` (конфликты: `collector/Cargo.toml` — взята наша сторона, rustls/env-filter/raw_value там load-bearing; `bybit/public_stream.rs` — взята наша сторона, upstream-овский хардкод `orderbook.1000` покрывается конфигом `orderbook_depths`). Версия `hftbacktest` 0.9.4, MSRV 1.91.1 — как в проде.
 
-Остаётся верным навсегда: прежде чем менять здесь что-то в расчёте на `myhft`, сверь пин в `myhft/Cargo.toml` с этим деревом.
+**Хеш здесь не записан намеренно.** Он двигается каждый раз, когда форк-правка едет в бота, и записанный тут литерал протухал бы молча. Сверяйся `grep hftbacktest ~/RustroverProjects/myhft/Cargo.toml`, а не этой секцией.
+
+Остаётся верным навсегда: прежде чем менять здесь что-то в расчёте на `myhft`, сверь пин в `myhft/Cargo.toml` с этим деревом. И обратное, с 2026-07-31: правка в этом дереве, на которую бот **опирается** (как `position_observed` из §4.4), обязана приезжать вместе с бампом пина — иначе бот собирается против дерева без неё и падает на `cargo build`, а не в проде.
 
 ---
 

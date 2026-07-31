@@ -847,6 +847,28 @@ where
     /// * `asset_no` - Asset number to query.
     fn snapshot_ready(&self, asset_no: usize) -> bool;
 
+    /// Returns whether at least one position update has been received for this asset.
+    ///
+    /// In live mode this latches on the first [`LiveEvent::Position`] and never clears. It is a
+    /// strictly later signal than [`snapshot_ready`](Self::snapshot_ready), and that ordering is
+    /// the whole point of exposing it: the Bybit connector publishes
+    /// [`LiveEvent::SnapshotComplete`] synchronously with the registration round trip, while the
+    /// venue-side `cancel_all_orders` + `get_position` it kicked off run on a spawned task. The
+    /// position update is what closes that round trip, so a strategy that must not quote on top
+    /// of a not-yet-swept book waits for this in addition to the marker
+    /// (`docs/snapshot-complete-marker.md`, "Known gap").
+    ///
+    /// What it does **not** promise: that the sweep succeeded (a failed `cancel_all_orders` is
+    /// logged and the position fetch runs anyway), that the reported position is still current,
+    /// or that any particular venue publishes a position row for a flat account. Consumers must
+    /// bound their wait rather than block on it forever.
+    ///
+    /// In backtest mode this always returns `true` — the position is authoritative from the
+    /// first tick and there is no round trip to wait for.
+    ///
+    /// * `asset_no` - Asset number to query.
+    fn position_observed(&self, asset_no: usize) -> bool;
+
     /// Returns the state's values such as balance, fee, and so on.
     fn state_values(&self, asset_no: usize) -> &StateValues;
 

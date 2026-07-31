@@ -316,9 +316,9 @@ where
                 }
             }
             LiveEvent::Position { qty, .. } => {
-                unsafe { self.instruments.get_unchecked_mut(inst_no) }
-                    .state
-                    .position = qty;
+                let instrument = unsafe { self.instruments.get_unchecked_mut(inst_no) };
+                instrument.state.position = qty;
+                instrument.position_observed = true;
             }
             LiveEvent::Error(error) => {
                 if let Some(handler) = self.error_handler.as_mut() {
@@ -561,6 +561,14 @@ where
         self.instruments
             .get(asset_no)
             .map(|i| i.snapshot_ready)
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn position_observed(&self, asset_no: usize) -> bool {
+        self.instruments
+            .get(asset_no)
+            .map(|i| i.position_observed)
             .unwrap_or(false)
     }
 
@@ -1007,6 +1015,81 @@ mod tests {
         bot.elapse(1_000_000).unwrap();
         assert!(bot.snapshot_ready(0));
         assert_eq!(bot.orders(0).len(), 0);
+    }
+
+    fn position_event(symbol: &str, qty: f64) -> LiveEvent {
+        LiveEvent::Position {
+            symbol: symbol.into(),
+            qty,
+            exch_ts: 1_700_000_000_000_000_000,
+        }
+    }
+
+    #[test]
+    fn position_observed_starts_false() {
+        let bot = make_bot(&["BTCUSDT"], vec![]);
+        assert!(!bot.position_observed(0));
+    }
+
+    /// **The two signals must not collapse into one.** The connector publishes
+    /// `SnapshotComplete` synchronously with the registration round trip while
+    /// `cancel_all_orders` + `get_position` are still in flight on a spawned task
+    /// (`docs/snapshot-complete-marker.md`, "Known gap"; `AGENTS.md` §4.4). A consumer that
+    /// wants the sweep behind it therefore has to be able to tell "the marker arrived" from
+    /// "the position round trip answered". If this assertion ever fails, the second signal
+    /// has been wired to the first and every gate built on it is vacuous.
+    #[test]
+    fn the_snapshot_marker_alone_reports_no_position() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![(0, snapshot_complete("BTCUSDT"))]);
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.snapshot_ready(0));
+        assert!(!bot.position_observed(0));
+    }
+
+    #[test]
+    fn a_position_event_marks_the_asset_observed() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![(0, position_event("BTCUSDT", -1.5))]);
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.position_observed(0));
+        assert_eq!(bot.position(0), -1.5);
+    }
+
+    /// A flat account answers `get_position` with a zero quantity, and that answer is exactly
+    /// as informative as a non-zero one: the REST round trip returned. Keying the flag off
+    /// `position != 0.0` instead of "an event arrived" would leave the common case — a bot
+    /// restarting flat — waiting forever.
+    #[test]
+    fn a_zero_position_event_marks_the_asset_observed() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![(0, position_event("BTCUSDT", 0.0))]);
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.position_observed(0));
+    }
+
+    #[test]
+    fn the_position_observation_is_per_asset() {
+        let mut bot = make_bot(
+            &["BTCUSDT", "ETHUSDT"],
+            vec![(0, position_event("BTCUSDT", 1.0))],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.position_observed(0));
+        assert!(!bot.position_observed(1));
+    }
+
+    /// The flag latches: it answers "has this asset ever reported a position", so later
+    /// updates — including one that takes the position back to flat — cannot un-observe it.
+    #[test]
+    fn the_position_observation_latches() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, position_event("BTCUSDT", 2.0)),
+                (0, position_event("BTCUSDT", 0.0)),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+        assert!(bot.position_observed(0));
+        assert_eq!(bot.position(0), 0.0);
     }
 
     #[test]

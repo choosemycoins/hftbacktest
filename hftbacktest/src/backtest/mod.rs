@@ -891,6 +891,13 @@ where
     }
 
     #[inline]
+    fn position_observed(&self, _asset_no: usize) -> bool {
+        // The local state owns the position from the first tick; there is no venue round trip
+        // whose completion a strategy could be waiting on.
+        true
+    }
+
+    #[inline]
     fn state_values(&self, asset_no: usize) -> &StateValues {
         self.local.get(asset_no).unwrap().state_values()
     }
@@ -1384,6 +1391,17 @@ mod test {
             "fee: expected {fee}, got {}",
             values.fee
         );
+    }
+
+    /// A backtest has no registration phase and no venue round trip to wait for: its position is
+    /// authoritative from the first tick. Both readiness signals therefore answer `true` before
+    /// anything has elapsed, so a strategy that gates on them in live mode runs unchanged here.
+    #[test]
+    fn a_backtest_is_ready_and_reports_its_position_from_the_start() -> Result<(), Box<dyn Error>> {
+        let bt = backtest(ExchangeKind::NoPartialFillExchange, &feed(&[]))?;
+        assert!(bt.snapshot_ready(0));
+        assert!(bt.position_observed(0));
+        Ok(())
     }
 
     /// [`PartialFillExchange`] reports each execution of an order separately, and `exec_qty` is the

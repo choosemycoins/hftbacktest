@@ -161,6 +161,37 @@ must tolerate those, or wait additionally for the first `Position` event.
 (Separately, the marker never promised a populated book — see AGENTS.md
 §4.1.)
 
+**The second signal is exposed, 2026-07-31.** "Wait additionally for the
+first `Position` event" used to be advice a consumer could not act on:
+`LiveEvent::Position` assigns `state.position` and leaves no trace that it
+happened, so a bot could not distinguish "flat" from "nobody has told me
+yet". `Bot::position_observed(asset_no) -> bool` now latches on the first
+position update for that asset and never clears. It is deliberately a
+*separate* signal from `snapshot_ready`, not a stronger version of it —
+`the_snapshot_marker_alone_reports_no_position` pins that they cannot be
+collapsed into one, which is what would make any gate built on it vacuous.
+
+What the new flag buys, precisely: in the connector's spawned task the two
+REST calls are sequential — `cancel_all(...).await` then
+`get_position(...).await` (`bybit/private_stream.rs`, both the subscribe-ack
+and the registration call site) — and `get_position` is what publishes the
+position update. So observing it means the cancel round trip has *returned*.
+
+What it does not buy, and a consumer must handle:
+
+- **It does not mean the sweep succeeded.** A `cancel_all` error is logged
+  and `get_position` runs regardless, so the flag can flip with the venue's
+  book untouched.
+- **It is not proof the update came from the sweep.** The private stream
+  pushes position updates too; a fill on a previous incarnation's order
+  during the race window would flip the flag early. That is a narrower
+  window than the one it closes, not zero.
+- **A venue that returns no position row for a flat account never flips
+  it.** Bybit V5 returns a row with `side: "None"` and size 0 — the reason
+  `get_position`'s side match has a zero-size arm — but that is one venue's
+  behaviour, not a property of the wire. Gate with a bounded wait, never an
+  unbounded one.
+
 Possible follow-ups (not in scope of this change):
 
 1. Sequence the marker after the sweep: plumb the spawned round-trip's
@@ -201,6 +232,15 @@ budget and fail closed (log + exit) if any asset is still not ready. That
 timeout logic lives in the consumer, not in `hftbacktest` — keeping it
 policy-free on the receiver side.
 
+A consumer that also wants the venue-side sweep behind it — see the known
+gap above — extends the same loop with the second signal, and must bound
+*that* wait separately, because no venue guarantees a position row:
+
+```rust
+let ready = (0..hbt.num_assets())
+    .all(|i| hbt.snapshot_ready(i) && hbt.position_observed(i));
+```
+
 ## Test coverage
 
 `hftbacktest/src/live/bot.rs` tests with an in-memory `MockChannel`:
@@ -212,18 +252,31 @@ policy-free on the receiver side.
 - `orders_then_complete_exposes_all_orders_at_ready_time`
 - `empty_snapshot_still_signals_ready`
 - `timeout_without_complete_keeps_ready_false`
+- `position_observed_starts_false`
+- `the_snapshot_marker_alone_reports_no_position` — the two signals stay
+  distinct; collapsing them makes every consumer gate vacuous
+- `a_position_event_marks_the_asset_observed`
+- `a_zero_position_event_marks_the_asset_observed` — a flat account's
+  answer is as informative as any other; keying off `position != 0.0`
+  would hang the common restart case
+- `the_position_observation_is_per_asset`
+- `the_position_observation_latches`
+
+`hftbacktest/src/backtest/mod.rs`:
+
+- `a_backtest_is_ready_and_reports_its_position_from_the_start`
 
 ## Files touched
 
 - `hftbacktest/src/types.rs` — new `LiveEvent::SnapshotComplete` variant;
-  new trait method `Bot::snapshot_ready`.
-- `hftbacktest/src/live/mod.rs` — `snapshot_ready: bool` field on
-  `Instrument`, default `false`.
-- `hftbacktest/src/live/bot.rs` — `process_event` sets the flag;
-  `LiveBot::snapshot_ready` impl; tests.
+  new trait methods `Bot::snapshot_ready` and `Bot::position_observed`.
+- `hftbacktest/src/live/mod.rs` — `snapshot_ready: bool` and
+  `position_observed: bool` fields on `Instrument`, both default `false`.
+- `hftbacktest/src/live/bot.rs` — `process_event` sets both flags;
+  `LiveBot::snapshot_ready` / `LiveBot::position_observed` impls; tests.
 - `hftbacktest/src/live/ipc/iceoryx.rs` — route `SnapshotComplete` by
   symbol.
-- `hftbacktest/src/backtest/mod.rs` — `Backtest::snapshot_ready` returns
-  `true`.
+- `hftbacktest/src/backtest/mod.rs` — `Backtest::snapshot_ready` and
+  `Backtest::position_observed` return `true`.
 - `connector/src/main.rs` — emit `SnapshotComplete` after the registration
   frame's `BatchEnd`.
