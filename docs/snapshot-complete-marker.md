@@ -171,11 +171,12 @@ position update for that asset and never clears. It is deliberately a
 `the_snapshot_marker_alone_reports_no_position` pins that they cannot be
 collapsed into one, which is what would make any gate built on it vacuous.
 
-What the new flag buys, precisely: in the connector's spawned task the two
-REST calls are sequential — `cancel_all(...).await` then
-`get_position(...).await` (`bybit/private_stream.rs`, both the subscribe-ack
-and the registration call site) — and `get_position` is what publishes the
-position update. So observing it means the cancel round trip has *returned*.
+What the new flag buys, precisely: **when the registration actually starts a
+sweep**, the spawned task runs its two REST calls in sequence —
+`cancel_all(...).await` then `get_position(...).await`
+(`bybit/private_stream.rs`, both the subscribe-ack and the registration call
+site) — and `get_position` is what publishes the position update. On that
+path, observing the update means the cancel round trip has *returned*.
 
 What it does not buy, and a consumer must handle:
 
@@ -191,6 +192,22 @@ What it does not buy, and a consumer must handle:
   `get_position`'s side match has a zero-size arm — but that is one venue's
   behaviour, not a property of the wire. Gate with a bounded wait, never an
   unbounded one.
+- **On a warm connector the flag is already true when the marker lands, and
+  no round trip happened at all.** The `RegisterInstrument` handler replays
+  the connector's cached position for that symbol — `LiveEvent::Position`
+  sent from `position.get(&symbol)` — *inside* the registration batch, i.e.
+  before `BatchEnd` and before `SnapshotComplete` (`connector/src/main.rs`).
+  And `Connector::register` is a no-op for an already-registered symbol
+  (`bybit/mod.rs`: `if !symbols.contains(&symbol)`), so no `symbol_tx`
+  wake-up and no new `cancel_all` + `get_position` are triggered. A gate of
+  the form "marker, then first position update" therefore opens with zero
+  delay on any connector that already knows the symbol — a bot-only restart,
+  or a second bot joining a shared connector. The outcome is benign (there is
+  no sweep in flight to race), but the contract is not "the cancel round trip
+  returned" on that path, and a consumer must not report it as such. It also
+  means a bot-only restart gets **no** venue-side sweep: the previous
+  incarnation's orders are still live and it is the strategy's first tick,
+  not the connector, that cancels them.
 
 Possible follow-ups (not in scope of this change):
 
