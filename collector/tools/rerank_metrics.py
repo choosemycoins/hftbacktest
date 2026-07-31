@@ -52,6 +52,14 @@ What is measured, and the decision each number exists to make:
 6. **lead-lag against Binance** — §8.9's admitted gap: the HL/UM volume ratio is
    a proxy for cross-venue exposure and nothing measured it. Cross-correlation of
    50ms mid returns does.
+7. **traversals** — how far the mid walked and how often it came back, as
+   round trips of 5/10/20/30bps. Metrics 1-6 all measure the *shape of the book*;
+   the 2026-07-30 sweep says the only grid shape that pays on this venue earns
+   SPACING, and spacing is paid by a price that moves through the rungs, not by a
+   book that sits still being narrow. `traversal_of` carries the argument. The
+   round trips are the part that ranks coins — they converge as the sampling is
+   refined; `path_bps` and `path_efficiency` in the same block do not and are
+   labelled as the within-row diagnostics they are.
 
 **Reading and channel classification are `quality_report.py`'s.** `iter_gz_lines`
 handles the multi-member gzip a collector restart appends; `classify` tells the
@@ -133,6 +141,40 @@ MIN_VOL_WINDOWS = 5
 
 DEPTH_RUNGS_BPS = (10, 20, 30)
 
+#: The grid spacings metric 7 counts traversals at. 5bps is below anything the
+#: 2026-07-30 sweep found tradeable and is kept as the bottom of the ladder: the
+#: oscillation a coin has that the fee eats.
+#:
+#: It is NOT a control that separates coins, and the earlier comment here said it
+#: was. Measured over the shortlist, the 5->10bps collapse ratio sits in a band of
+#: 2.2-2.9x on every coin of both recorded days — 1.3x of spread against the 12x
+#: spread in the rate itself — so it ranks nothing. Worse, it is not the same
+#: measurement on every coin: see `MIN_SPACING_MID_STEPS`.
+TRAVERSAL_SPACINGS_BPS = (5, 10, 20, 30)
+
+#: A spacing worth fewer than this many mid steps is at the book's flicker floor:
+#: the smallest oscillation the price grid can print already clears it, so the
+#: count there is a property of the tick as much as of the path.
+#:
+#: The mid moves in half-ticks (one side requoting moves it half a tick), and the
+#: tick is a fixed share of the price on this venue, so the share differs by an
+#: order of magnitude across the shortlist: PUMP's measured tick is 5.4bps of its
+#: mid — two mid steps clear 5bps — against HYPE's 0.18bps, which needs ~55.
+#: Three steps is the smallest oscillation that is not one wiggle, and rungs below
+#: it are reported `at_flicker_floor` rather than dropped: the number is still the
+#: right one for a grid quoted that tight, it just is not comparable across coins.
+MIN_SPACING_MID_STEPS = 3
+
+#: The block the round-trip rate's spread is measured over. One hour, because the
+#: rate is published per hour: a block's round-trip count then *is* its rate.
+TRAVERSAL_BLOCK_NS = 3600 * SEC
+
+#: Below this many whole blocks there is no spread to report — two numbers are a
+#: pair, not a range. Same refusal as `MIN_VOL_WINDOWS`, and the rate itself still
+#: ships: a three-hour fragment is normal here and per-hour is the only way to
+#: compare it with a whole day.
+MIN_TRAVERSAL_BLOCKS = 3
+
 LEADLAG_CELL_NS = 50 * MS
 LEADLAG_MAX_AGE_NS = 1 * SEC
 LEADLAG_MAX_LAG_MS = 2000
@@ -185,6 +227,38 @@ CONDITIONAL_CAVEAT = (
     "it is measured from. The comparison this feeds (research-symbol-selection "
     "§8.3) is rising-versus-flat ACROSS coins, which survives a coupling common "
     "to all of them; the level of a single coin's ratio does not."
+)
+
+TRAVERSAL_CAVEAT = (
+    "`gross_capture_potential_bps` is a CEILING and not a forecast: it credits "
+    "every round trip with the whole rung and charges nothing for the fee, the "
+    "adverse fill, the queue the rung may never have reached, or the inventory the "
+    "unfinished traversal left behind. It is the most a one-rung grid at that "
+    "spacing could have grossed on this recording — a number a strategy's P&L is "
+    "compared against, never added to. "
+    "RANK COINS ON THE ROUND TRIPS, NOT ON `path_bps` OR `path_efficiency`. "
+    "`path_bps` is the first-order variation of a sampled path: it grows with the "
+    "frame rate instead of converging (VVV 20260730 LOCF-resampled 4s -> raw: "
+    "31936 -> 90183 bps, still climbing at the raw feed, while round trips at "
+    "30bps settled at 75-76), and bbo frame rates differ 5x across the shortlist, "
+    "so `frames_per_hour` is printed beside it and the two are read together or "
+    "not at all. `path_efficiency` = path/|net| is dominated by its denominator "
+    "and therefore ranks by how little the price DRIFTED, not by how much it "
+    "oscillated: over the ten coin-days of 20260730 it correlates +0.79 with "
+    "1/|net_bps| and -0.13 with the round-trip rate, and it swings 16-31x between "
+    "3h blocks of a single coin-day. Read it within one row as 'did this session "
+    "go anywhere', never across rows. "
+    "The rate itself is a rate over the whole recording: `round_trips_per_hour_min"
+    "/max` are the same rate over each whole hour of it, and one coin-day's hours "
+    "routinely spread 2-4x, so a rate whose range is null (under "
+    f"{MIN_TRAVERSAL_BLOCKS} whole hours) has nothing behind it but its own "
+    "session length. "
+    "`at_flicker_floor` marks a rung the coin's own tick makes trivial — under "
+    f"{MIN_SPACING_MID_STEPS} mid steps, where the smallest wiggle the book can "
+    "print already counts; that column is not comparable with another coin's. "
+    "A recording hole is not bridged specially: the jump across it is "
+    "one price move like any other, so a hole both hides the traversals inside it "
+    "and can invent one across it — `warnings` names the holes."
 )
 
 COUNT_KEYS = (
@@ -1087,6 +1161,292 @@ def summarize_leadlag(acc: np.ndarray, cadence_ms=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 7. traversals
+# ---------------------------------------------------------------------------
+
+
+def traversals_at(mid, spacing_bps: int) -> int:
+    """Confirmed moves of at least `spacing_bps` alternating in direction.
+
+    The classic zig-zag / turning-point scan. The state is the running extreme
+    since the last confirmation; a traversal is confirmed at the first price that
+    has moved `spacing_bps` away from that extreme, and that price becomes the new
+    extreme — which is exact rather than an approximation, because every price
+    between the extreme and the confirming one was inside the threshold by
+    definition and so cannot be past the confirming price.
+
+    Causal by construction. The confirming frame is the frame that counts it, no
+    frame is counted from a later one, and the move still in progress when the
+    session ends is not counted at all. Before the first confirmation both
+    extremes are tracked from the opening quote and whichever fires first sets the
+    direction; the two cannot fire on the same frame, since while neither has
+    fired every seen price is inside the threshold of both.
+
+    `mid` is a sequence of positive integers **in any fixed scale** — the test is
+    `(extreme - px) * 10_000 >= spacing_bps * extreme`, so a factor common to both
+    sides cancels. That is what lets the caller pass the exact integer
+    `bid_px + ask_px` rather than a float mid, and it is not a detail: on a coin
+    like PUMP (0.0018 quoted on a 1e-6 tick) a whole-bps threshold lands exactly on
+    a tick boundary all day, and in float64 that tie falls the wrong way. Python
+    ints and not `int64`, because `spacing_bps * extreme` at BTC scale overflows.
+
+    The threshold is measured against the extreme the move started from, so it is
+    asymmetric in price: a 10bps rise followed by a fall back to exactly where it
+    started is 9.99bps of the high, and not a traversal.
+    """
+    values = mid.tolist() if isinstance(mid, np.ndarray) else mid
+    if len(values) < 2 or spacing_bps <= 0:
+        return 0
+    count = 0
+    trend = 0
+    high = low = values[0]
+    for px in values[1:]:
+        if trend > 0:
+            if px > high:
+                high = px
+            elif (high - px) * 10_000 >= spacing_bps * high:
+                count += 1
+                trend = -1
+                low = px
+        elif trend < 0:
+            if px < low:
+                low = px
+            elif (px - low) * 10_000 >= spacing_bps * low:
+                count += 1
+                trend = 1
+                high = px
+        else:
+            if px > high:
+                high = px
+            elif px < low:
+                low = px
+            if (high - px) * 10_000 >= spacing_bps * high:
+                count += 1
+                trend = -1
+                low = px
+            elif (px - low) * 10_000 >= spacing_bps * low:
+                count += 1
+                trend = 1
+                high = px
+    return count
+
+
+def round_trips_at(mid, spacing_bps: int) -> int:
+    """Completed round trips: non-overlapping pairs of consecutive traversals.
+
+    Two consecutive traversals — down then up, or up then down — are exactly what
+    a one-rung grid at that spacing needs to earn its rung once: the price reaches
+    the rung, and then reaches the price one spacing away. Pairing them without
+    overlap is what makes the count a number of *excursions*: seven alternating
+    traversals are three round trips and one open position, not six.
+    """
+    return traversals_at(mid, spacing_bps) // 2
+
+
+@dataclass
+class Traversal:
+    """One session's traversal accumulators. Every field is additive.
+
+    Per session and never per concatenation, for the reason the price runs are:
+    joining two days puts a jump between the last quote of one and the first of
+    the next, and that jump is movement no market made. `path_bps` and `net_bps`
+    are already bps of their own session's opening mid, which is what makes adding
+    them across days meaningful; `net_bps` stays signed so two days that undid
+    each other do not pool into a walk.
+    """
+
+    traversals: dict = field(
+        default_factory=lambda: dict.fromkeys(TRAVERSAL_SPACINGS_BPS, 0)
+    )
+    round_trips: dict = field(
+        default_factory=lambda: dict.fromkeys(TRAVERSAL_SPACINGS_BPS, 0)
+    )
+    #: Per spacing, the round trips of each whole `TRAVERSAL_BLOCK_NS` block of
+    #: the session, in order — what the published rate is an average of. A list
+    #: because pooling two days is one longer list of hours, and because these
+    #: deliberately do NOT sum to `round_trips`: the traversal spanning a block
+    #: boundary belongs to no block. They are the rate's dispersion, not its
+    #: decomposition.
+    hour_blocks: dict = field(
+        default_factory=lambda: {s: [] for s in TRAVERSAL_SPACINGS_BPS}
+    )
+    path_bps: float = 0.0
+    net_bps: float = 0.0
+    seconds: float = 0.0
+    frames: int = 0
+
+
+def traversal_of(series: BboSeries, spacings: Sequence[int] = TRAVERSAL_SPACINGS_BPS) -> Traversal:
+    """How far the mid actually walked, and how often it came back.
+
+    **Why this metric exists.** The 2026-07-30 grid-geometry sweep put the
+    touch-capture margin on Hyperliquid at about 0.3bp — at the touch, what a
+    maker can capture is gone by the time the fee and the adverse fill are paid.
+    The only grid shape that came out of that sweep with a profitable cell earns
+    SPACING: rungs several bps apart. A rung several bps wide is not paid by a
+    narrow book sitting still; it is paid only when the price WALKS down through
+    the rung and back up through the one above it.
+
+    Metrics 1–6 cannot see that. Every one of them is a shape-of-the-book
+    measurement — the spread, its behaviour under volatility, the queue at the
+    touch, the depth at the rungs, who leads whom — and a coin can win all six
+    while never going anywhere. VVV was the reason to suspect that: the best
+    microstructure on the shortlist and not one profitable cell in the sweep, and
+    "its recorded days did not move" was the obvious candidate explanation.
+
+    **It is not the explanation, and this metric is how that was settled.** Run
+    over VVV's own recordings, VVV oscillates as much as the shortlist's middle:
+    18.5 round trips per hour at 10bps on 20260730 — 4th of ten coin-days that
+    day, above HYPE, JTO, INJ, NEAR, SUI and CRV — and 22.0 on the 20260729
+    fragment, at the top of that day's group bar KAITO. Whatever cost VVV the
+    sweep, a still price path was not it. Do not re-derive the old story from the
+    fact that this metric exists; it exists because the story was checkable, and
+    it came out false.
+
+    Three numbers, all from the `bbo` mid and all causal:
+
+    * `traversals` / `round_trips` per spacing — `traversals_at`,
+      `round_trips_at`. **This is the part that ranks coins**: it converges under
+      resampling, so it measures the path and not the recording.
+    * `path_bps` — every `|dmid|` summed, in bps of the session's opening mid.
+      The first-order variation of a *sampled* path, which grows with the sampling
+      rate rather than converging to anything (measured: VVV 20260730 LOCF-resampled
+      4s -> 2s -> 1s -> 500ms -> raw gives 31936 -> 38735 -> 47325 -> 65390 ->
+      90183 bps, still rising at the raw feed, while round trips at 30bps settle at
+      75-76 from 1s down). Since `bbo` frame rates differ 5x across the shortlist,
+      it is a within-row diagnostic and NOT a cross-coin number; `frames_per_hour`
+      is published beside it so that is visible.
+    * `net_bps` — signed `close - open` in the same unit. `path_bps / |net_bps|`
+      is a pure ratio of price sums, and it is dominated by its denominator: it
+      ranks sessions by how little the price drifted, not by how much it
+      oscillated. Over the ten coin-days of 20260730 it correlates +0.79 with
+      1/|net_bps| and -0.13 with the round-trip rate — the richest oscillator of
+      that sample ranked 5th on it, below the poorest. Read within one row as "did
+      this session go anywhere"; never across rows.
+
+    The mid is the exact integer `bid_px + ask_px`, i.e. twice the scaled mid; the
+    factor two cancels out of both the threshold test and the ratio. A frame
+    missing a side arrives as a zero price and is dropped rather than halving the
+    mid — an `l2Book` side can empty on a thin coin, and a 5000bps round trip that
+    never happened is worse than a missing frame.
+    """
+    usable = (series.bid_px > 0) & (series.ask_px > 0)
+    mid = series.bid_px[usable] + series.ask_px[usable]
+    out = Traversal(
+        traversals=dict.fromkeys(spacings, 0),
+        round_trips=dict.fromkeys(spacings, 0),
+        hour_blocks={s: [] for s in spacings},
+        frames=int(mid.size),
+    )
+    if mid.size < 2:
+        return out
+    values = mid.tolist()
+    for spacing in spacings:
+        count = traversals_at(values, spacing)
+        out.traversals[spacing] = count
+        out.round_trips[spacing] = count // 2
+    ts = series.ts[usable]
+    out.seconds = (int(ts[-1]) - int(ts[0])) / SEC
+    # Whole blocks only, and the trailing part-hour is dropped rather than
+    # divided: a rate published beside its own spread must not have a short block
+    # in that spread pretending to be a quiet one.
+    t0, t1 = int(ts[0]), int(ts[-1])
+    n_blocks = (t1 - t0) // TRAVERSAL_BLOCK_NS
+    if n_blocks:
+        edges = np.searchsorted(
+            ts, [t0 + b * TRAVERSAL_BLOCK_NS for b in range(int(n_blocks) + 1)]
+        )
+        for spacing in spacings:
+            out.hour_blocks[spacing] = [
+                traversals_at(values[int(edges[b]):int(edges[b + 1])], spacing) // 2
+                for b in range(int(n_blocks))
+            ]
+    opening = values[0]
+    out.path_bps = int(np.abs(np.diff(mid)).sum()) / opening * 1e4
+    out.net_bps = (values[-1] - opening) / opening * 1e4
+    return out
+
+
+def merge_traversals(parts: Sequence[Traversal]) -> Traversal:
+    """Several sessions as one. Addition, term by term — see `Traversal`."""
+    parts = list(parts)
+    if not parts:
+        return Traversal()
+    out = Traversal(traversals={}, round_trips={}, hour_blocks={})
+    for part in parts:
+        for spacing, count in part.traversals.items():
+            out.traversals[spacing] = out.traversals.get(spacing, 0) + count
+        for spacing, count in part.round_trips.items():
+            out.round_trips[spacing] = out.round_trips.get(spacing, 0) + count
+        for spacing, blocks in part.hour_blocks.items():
+            out.hour_blocks.setdefault(spacing, []).extend(blocks)
+        out.path_bps += part.path_bps
+        out.net_bps += part.net_bps
+        out.seconds += part.seconds
+        out.frames += part.frames
+    return out
+
+
+def summarize_traversal(traversal: Traversal, tick_bps: Optional[float] = None) -> dict:
+    """The row. Per session and per hour, because a partial day is the norm here.
+
+    The 2026-07-29 recording began at 21:00 UTC, and a coin measured over three
+    hours has three hours' worth of round trips. Only the per-hour column compares
+    it with a coin measured over a whole day — and that is exactly why the rate
+    ships with the spread of the hours it averages. Measured on whole days of the
+    shortlist, one coin-day's own 3h blocks span 2.0-4.7x in round trips per hour
+    (HYPE 20260730 at 30bps: 1.00-4.67 against a whole-day 2.29), which is as wide
+    as the cross-coin spread this tool exists to resolve. A bare rate off a
+    fragment would look like a measurement and rank like a coin flip;
+    `round_trips_per_hour_min`/`_max` are the same rate over each whole hour, and
+    they are null below `MIN_TRAVERSAL_BLOCKS` hours rather than computed from a
+    pair.
+
+    `tick_bps` is the coin's measured tick as bps of its own mid — from the `tick`
+    block of the same row. It is what makes the ladder comparable across coins:
+    the mid moves in half-ticks, so a spacing worth under
+    `MIN_SPACING_MID_STEPS` mid steps counts the smallest wiggle the book can
+    print (PUMP: 5bps is 1.9 steps). Absent, the row says `None` rather than
+    implying the rungs are fine.
+    """
+    hours = traversal.seconds / 3600.0
+    mid_step_bps = tick_bps / 2.0 if tick_bps else None
+    by_spacing = {}
+    for spacing in sorted(traversal.traversals):
+        round_trips = traversal.round_trips.get(spacing, 0)
+        gross = float(round_trips * spacing)
+        blocks = traversal.hour_blocks.get(spacing) or []
+        ranged = len(blocks) >= MIN_TRAVERSAL_BLOCKS
+        steps = None if mid_step_bps is None else spacing / mid_step_bps
+        by_spacing[str(spacing)] = {
+            "traversals": int(traversal.traversals[spacing]),
+            "round_trips": int(round_trips),
+            "round_trips_per_hour": _num(round_trips / hours) if hours > 0 else None,
+            "round_trips_per_hour_min": _num(min(blocks)) if ranged else None,
+            "round_trips_per_hour_max": _num(max(blocks)) if ranged else None,
+            "gross_capture_potential_bps": gross,
+            "gross_capture_potential_bps_per_hour": _num(gross / hours) if hours > 0 else None,
+            "mid_steps": _num(steps),
+            "at_flicker_floor": None if steps is None else bool(steps < MIN_SPACING_MID_STEPS),
+        }
+    return {
+        "frames": traversal.frames,
+        "frames_per_hour": _num(traversal.frames / hours) if hours > 0 else None,
+        "seconds": _num(traversal.seconds),
+        "hours": _num(hours),
+        "hour_blocks": max((len(b) for b in traversal.hour_blocks.values()), default=0),
+        "mid_step_bps": _num(mid_step_bps),
+        "path_bps": _num(traversal.path_bps),
+        "net_bps": _num(traversal.net_bps),
+        "path_efficiency": (
+            _num(traversal.path_bps / abs(traversal.net_bps)) if traversal.net_bps else None
+        ),
+        "by_spacing": by_spacing,
+        "caveat": TRAVERSAL_CAVEAT,
+    }
+
+
+# ---------------------------------------------------------------------------
 # reading a coin-day
 # ---------------------------------------------------------------------------
 
@@ -1123,6 +1483,9 @@ class DaySamples:
     um_ts: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
     um_mid: np.ndarray = field(default_factory=lambda: np.zeros(0))
     leadlag: Optional[np.ndarray] = None
+    #: Counted per day for the same reason as the lifetimes: a traversal must not
+    #: be made out of the jump from one day's last quote to the next day's first.
+    traversal: Traversal = field(default_factory=Traversal)
 
 
 def _hl_path(hl_dir, coin: str, day: str) -> Path:
@@ -1375,6 +1738,7 @@ def read_day(hl_dir, coin, um_dirs, um_symbol, day) -> DaySamples:
     samples.leadlag = leadlag_accum(
         samples.bbo.ts, samples.bbo.mid, samples.um_ts, samples.um_mid
     )
+    samples.traversal = traversal_of(samples.bbo)
     samples.warnings.extend(_channel_warnings(samples))
     return samples
 
@@ -1474,8 +1838,9 @@ def pool_days(days: Sequence[DaySamples]) -> DaySamples:
     """Every day's observations as one sample set.
 
     Per-day quantities that must not bridge midnight are already computed:
-    frame weights (the last frame of a day has none), price-run lifetimes, and
-    the lead-lag sums, which are added per lag. Everything else concatenates.
+    frame weights (the last frame of a day has none), price-run lifetimes, the
+    lead-lag sums, which are added per lag, and the traversal accumulators, which
+    are added term by term. Everything else concatenates.
     """
     pooled = DaySamples(day="pooled")
     for key in COUNT_KEYS:
@@ -1504,6 +1869,7 @@ def pool_days(days: Sequence[DaySamples]) -> DaySamples:
     pooled.um_ts = np.concatenate([d.um_ts for d in days])
     pooled.um_mid = np.concatenate([d.um_mid for d in days])
     pooled.leadlag = sum(d.leadlag for d in days)
+    pooled.traversal = merge_traversals([d.traversal for d in days])
     return pooled
 
 
@@ -1560,6 +1926,16 @@ def summarize(samples: DaySamples) -> dict:
             ),
         ),
         "depth": summarize_depth(samples.fast, samples.slow),
+        # The tick as a share of this coin's own mid is what tells the reader
+        # which rungs of the traversal ladder are above the book's flicker floor.
+        "traversal": summarize_traversal(
+            samples.traversal,
+            tick_bps=(
+                None
+                if not used or not tick["median_px"]
+                else used / tick["median_px"] * 1e4
+            ),
+        ),
         "leadlag": summarize_leadlag(
             samples.leadlag,
             cadence_ms=(
@@ -1628,6 +2004,39 @@ def build_report(hl_dir, coin, um_dirs, um_symbol, days) -> dict:
                     "reported as `runs_dropped_to_gaps` rather than dropped "
                     "silently. Hyperliquid publishes `bbo` on change, so silence "
                     "shorter than that is a quote that stood, not an absent feed"
+                ),
+                "traversal": (
+                    "from the bbo mid, held as the exact integer bid+ask. A "
+                    "traversal is a move of at least the spacing away from the "
+                    "running extreme, counted by the frame that confirms it and "
+                    "never by a later one; it is measured against the price the "
+                    "move started from, so the threshold is asymmetric in price and "
+                    "a 10bps rise followed by a fall back to where it started is "
+                    "9.99bps and not a traversal. Two consecutive opposite "
+                    "traversals are one round trip — what a one-rung grid at that "
+                    "spacing needs to earn the rung once — so seven alternating "
+                    "traversals are three round trips and one open position. "
+                    "Counted per session and added across days, never over the "
+                    "concatenation, since a jump from one day's last quote to the "
+                    "next day's first is movement no market made. "
+                    "`round_trips_per_hour` is over the whole recording and "
+                    "`_min`/`_max` are the same rate over each whole hour of it, "
+                    f"null under {MIN_TRAVERSAL_BLOCKS} hours; the blocks do not "
+                    "sum to the session count, a traversal spanning a boundary "
+                    "belonging to no block, and they are the rate's dispersion "
+                    "rather than its decomposition. `mid_steps` is the spacing in "
+                    "half-ticks of the coin's own measured tick and "
+                    "`at_flicker_floor` marks the rungs under "
+                    f"{MIN_SPACING_MID_STEPS} of them, where the count is a "
+                    "property of the tick as much as of the path. `path_bps` and "
+                    "`net_bps` are bps of their own session's opening mid, which is "
+                    "what makes them additive, and `net_bps` keeps its sign; "
+                    "`path_bps` is the first-order variation of a sampled path and "
+                    "grows with `frames_per_hour` instead of converging, and "
+                    "`path_efficiency` (path over |net|) is dominated by its "
+                    "denominator — it ranks by absence of drift, not by "
+                    "oscillation. Neither is a cross-coin number; the round trips "
+                    "are"
                 ),
                 "pooled_row": (
                     "the same metrics recomputed over every day's observations, not "
@@ -1758,8 +2167,85 @@ def render_text(report: dict) -> str:
     )
 
     lines.append("")
+    lines.append(
+        "  traversals of the bbo mid — round trips at each grid spacing. "
+        "`!` = the rung is under "
+        f"{MIN_SPACING_MID_STEPS} mid steps of this coin's tick, so its count is "
+        "not comparable with another coin's"
+    )
+    lines += _table(
+        ["day", "hours", "rt@5", "rt@10", "rt@20", "rt@30",
+         "rt/h@5", "rt/h@10", "rt/h@20", "rt/h@30"],
+        [
+            [r["day"], _cell(r["traversal"]["hours"], ".2f")]
+            + [
+                _cell(r["traversal"]["by_spacing"][str(s)]["round_trips"])
+                + ("!" if r["traversal"]["by_spacing"][str(s)]["at_flicker_floor"] else "")
+                for s in TRAVERSAL_SPACINGS_BPS
+            ]
+            + [
+                _cell(r["traversal"]["by_spacing"][str(s)]["round_trips_per_hour"], ".1f")
+                for s in TRAVERSAL_SPACINGS_BPS
+            ]
+            for r in rows
+        ],
+        [11, 7, 8, 8, 8, 8, 9, 9, 9, 9],
+    )
+
+    lines.append("")
+    lines.append(
+        "  how precise those rates are: the same rate over each whole hour of the "
+        f"recording (lo-hi), and how many whole hours — under {MIN_TRAVERSAL_BLOCKS} "
+        "there is no range and the rate above stands on its own"
+    )
+    lines += _table(
+        ["day", "blocks", "rt/h@5", "rt/h@10", "rt/h@20", "rt/h@30"],
+        [
+            [r["day"], _cell(r["traversal"]["hour_blocks"])]
+            + [
+                "-"
+                if r["traversal"]["by_spacing"][str(s)]["round_trips_per_hour_min"] is None
+                else "{}-{}".format(
+                    _cell(r["traversal"]["by_spacing"][str(s)]["round_trips_per_hour_min"], ".0f"),
+                    _cell(r["traversal"]["by_spacing"][str(s)]["round_trips_per_hour_max"], ".0f"),
+                )
+                for s in TRAVERSAL_SPACINGS_BPS
+            ]
+            for r in rows
+        ],
+        [11, 7, 12, 12, 12, 12],
+    )
+
+    lines.append("")
+    lines.append(
+        "  grid arithmetic from those traversals (gross bps per session — a "
+        "ceiling, not a forecast). path_bps and path/net are within-row "
+        "diagnostics: both move with frames/h, neither ranks coins"
+    )
+    lines += _table(
+        ["day", "gross@5", "gross@10", "gross@20", "gross@30", "path_bps", "net_bps",
+         "path/net", "frames/h"],
+        [
+            [r["day"]]
+            + [
+                _cell(r["traversal"]["by_spacing"][str(s)]["gross_capture_potential_bps"], ".0f")
+                for s in TRAVERSAL_SPACINGS_BPS
+            ]
+            + [
+                _cell(r["traversal"]["path_bps"], ".0f"),
+                _cell(r["traversal"]["net_bps"], ".0f"),
+                _cell(r["traversal"]["path_efficiency"], ".1f"),
+                _cell(r["traversal"]["frames_per_hour"], ".0f"),
+            ]
+            for r in rows
+        ],
+        [11, 10, 11, 11, 11, 10, 10, 10, 9],
+    )
+
+    lines.append("")
     lines.append(f"  caveat: {CONDITIONAL_CAVEAT}")
     lines.append(f"  caveat: {LEADLAG_CAVEAT}")
+    lines.append(f"  caveat: {TRAVERSAL_CAVEAT}")
     lines.append("")
     lines.append("  warnings")
     any_warning = False

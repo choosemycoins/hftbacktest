@@ -934,6 +934,510 @@ def test_too_few_overlapping_cells_leaves_the_lead_lag_null():
 
 
 # ---------------------------------------------------------------------------
+# 7. traversals
+# ---------------------------------------------------------------------------
+
+
+def walk(mids, step_seconds=1.0, half_spread=0.01, day=DAY) -> "rm.BboSeries":
+    """A `bbo` series whose mid is exactly the given sequence.
+
+    The two sides are placed symmetrically around each mid, so the integer the
+    metric reconstructs — the sum of the two scaled sides — is twice the number
+    written here and nothing has been lost to the quote.
+    """
+    return quotes(
+        [
+            (ns_on(day, i * step_seconds), f"{m - half_spread:.6f}", f"{m + half_spread:.6f}")
+            for i, m in enumerate(mids)
+        ]
+    )
+
+
+def test_a_square_walk_has_one_traversal_per_move_and_a_round_trip_per_pair():
+    """Eight points alternating 50bps apart: seven moves, seven traversals, three
+    round trips.
+
+    A one-rung grid at those two prices earns the rung on each completed
+    down-then-up excursion — moves 2-3, 4-5 and 6-7. The opening up-move is not
+    one, since nothing had traversed down to the rung yet, and pairing from the
+    other end leaves the seventh move dangling instead. Either way seven
+    traversals are three round trips and never four. Every spacing at or under the
+    amplitude sees the same walk.
+    """
+    series = walk([100.00, 100.50] * 4)
+    t = rm.traversal_of(series)
+    for spacing in rm.TRAVERSAL_SPACINGS_BPS:
+        assert t.traversals[spacing] == 7, spacing
+        assert t.round_trips[spacing] == 3, spacing
+
+
+def test_a_monotone_trend_is_zero_round_trips_and_a_path_equal_to_its_net():
+    """Grid poison: 300bps of movement, not one rung round-tripped.
+
+    The one traversal is the move away from the opening price, confirmed as soon
+    as the price is a spacing above where the session started. After that the
+    running high simply keeps extending and nothing ever confirms a turn.
+    """
+    series = walk([100.0 + 0.1 * i for i in range(31)])
+    t = rm.traversal_of(series)
+    for spacing in rm.TRAVERSAL_SPACINGS_BPS:
+        assert t.traversals[spacing] == 1, spacing
+        assert t.round_trips[spacing] == 0, spacing
+    out = rm.summarize_traversal(t)
+    assert out["path_bps"] == pytest.approx(300.0)
+    assert out["net_bps"] == pytest.approx(300.0)
+    assert out["path_efficiency"] == pytest.approx(1.0)
+
+
+def test_a_traversal_counts_only_where_the_opposite_move_confirms_it():
+    """Causality. A 30bps fall that never comes back is not a round trip: the
+    grid bought and is still holding."""
+    down = walk([100.00, 99.90, 99.80, 99.70])
+    assert rm.traversal_of(down).traversals[20] == 1
+    assert rm.traversal_of(down).round_trips[20] == 0
+    back = walk([100.00, 99.90, 99.80, 99.70, 99.90, 100.00])
+    assert rm.traversal_of(back).traversals[20] == 2
+    assert rm.traversal_of(back).round_trips[20] == 1
+
+
+def test_no_traversal_is_counted_before_the_frame_that_confirms_it():
+    """The scan is causal: a prefix of the session holds exactly the traversals
+    confirmed inside it.
+
+    An implementation reaching for the session's global high and low — the
+    natural way to write this wrong — passes every count above and fails here,
+    because it would credit frame 2 with a fall it only learns about at frame 3.
+    """
+    mids = [100.00, 99.90, 99.80, 99.70, 99.90, 100.00]
+    counts = [rm.traversal_of(walk(mids[:k])).traversals[20] for k in range(1, len(mids) + 1)]
+    assert counts == [0, 0, 1, 1, 2, 2]
+
+
+def test_the_threshold_is_an_exact_integer_comparison_at_the_boundary():
+    """Ten bps of 10_000 units is 10 units, and `>=` means the tenth one counts.
+
+    The primitive takes prices in any fixed scale — the threshold is relative, so
+    a common factor cancels — which is what lets the series-level metric hand it
+    the exact integer `bid + ask` instead of a float mid.
+    """
+    assert rm.traversals_at([10_000, 10_010], 10) == 1
+    assert rm.traversals_at([10_000, 10_009], 10) == 0
+
+
+def test_a_move_far_enough_to_overflow_int64_still_counts():
+    """The cross-multiplication leaves `int64` on a six-figure coin.
+
+    `(extreme - px) * 10_000` on a mid held at `PX_SCALE` passes 9.2e18 once the
+    move is large, and numpy wraps around silently rather than raising. The scan
+    runs on Python ints, which cannot.
+    """
+    high = 2 * rm.scaled_px("120000.0")  # a six-figure mid, as bid + ask
+    low = high // 2  # halved, which is 5000bps and a traversal at any spacing
+    assert (high - low) * 10_000 > np.iinfo(np.int64).max
+    assert rm.traversals_at([high, low], 30) == 1
+    assert rm.traversals_at(np.array([high, low], dtype=np.int64), 30) == 1
+
+
+def test_the_return_leg_is_measured_against_the_price_it_starts_from():
+    """A threshold in bps is asymmetric in price: 10bps of the high is more
+    absolute movement than 10bps of the low, so a fall back to where an up-move
+    started is 9.99bps and not a traversal. One unit further is."""
+    assert rm.traversals_at([10_000, 10_010, 10_000], 10) == 1
+    assert rm.traversals_at([10_000, 10_010, 9_999], 10) == 2
+    assert rm.round_trips_at([10_000, 10_010, 9_999], 10) == 1
+
+
+def test_a_move_of_exactly_the_spacing_counts_where_float_arithmetic_loses_it():
+    """One 1e-6 tick on a mid of exactly 0.001 is exactly 10.000bps.
+
+    A whole-bps threshold is an exact tie wherever the tick divides the price that
+    way, which is not a contrivance on a venue whose tick is a fixed fraction of
+    the quote: PUMP is quoted in the 0.001s on a 1e-6 tick. In float64 the same
+    comparison comes out just under and the traversal is lost — the last assertion
+    is that arithmetic, spelled out. In the scaled integers it is a tie, and `>=`
+    counts it.
+    """
+    series = quotes(
+        [
+            (ns(0), "0.000999", "0.001001"),  # mid 0.001000 exactly
+            (ns(1), "0.000998", "0.001000"),  # one tick lower: exactly 10bps
+        ]
+    )
+    t = rm.traversal_of(series)
+    assert t.traversals[10] == 1
+    assert t.traversals[20] == 0
+    assert (0.002 - 0.001998) * 1e4 < 10 * 0.002  # the float route, and it is wrong
+
+
+def test_a_wider_spacing_can_only_ever_see_fewer_traversals():
+    """A walk carrying wiggles of every size: each spacing filters the one below
+    it, so the counts fall monotonically and no two of them are the same."""
+    mids = [100.0]
+    for step in (0.30, -0.50, 0.08, -0.08, 0.22, -0.12, 0.40, -0.60, 0.07, -0.07,
+                 0.35, -0.20, 0.15, -0.45, 0.13, -0.13, 0.25):
+        mids.append(round(mids[-1] + step, 2))
+    t = rm.traversal_of(walk(mids))
+    counts = [t.traversals[s] for s in rm.TRAVERSAL_SPACINGS_BPS]
+    assert counts == [17, 13, 7, 6]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_round_trips_are_reported_per_session_and_per_hour():
+    """Half an hour of a walk is comparable with a whole day of one only through
+    the per-hour column, and a recording that started at 21:00 is the normal case
+    here — the 2026-07-29 run did."""
+    series = walk([100.00, 100.50] * 4 + [100.00], step_seconds=225.0)  # 8 moves, 1800s
+    out = rm.summarize_traversal(rm.traversal_of(series))
+    assert out["seconds"] == pytest.approx(1800.0)
+    assert out["hours"] == pytest.approx(0.5)
+    cell = out["by_spacing"]["30"]
+    assert cell["round_trips"] == 4
+    assert cell["round_trips_per_hour"] == pytest.approx(8.0)
+
+
+def test_the_gross_capture_ceiling_is_the_round_trips_times_the_spacing():
+    """And says in the output that it is a ceiling: it credits every round trip
+    with the full rung and charges nothing for fees, adverse selection or the
+    queue the rung never reached."""
+    series = walk([100.00, 100.50] * 4 + [100.00], step_seconds=225.0)
+    out = rm.summarize_traversal(rm.traversal_of(series))
+    for spacing in rm.TRAVERSAL_SPACINGS_BPS:
+        cell = out["by_spacing"][str(spacing)]
+        assert cell["gross_capture_potential_bps"] == pytest.approx(cell["round_trips"] * spacing)
+        assert cell["gross_capture_potential_bps_per_hour"] == pytest.approx(
+            cell["round_trips_per_hour"] * spacing
+        )
+    assert out["by_spacing"]["30"]["gross_capture_potential_bps"] == pytest.approx(120.0)
+    assert "ceiling" in out["caveat"].lower()
+
+
+def test_path_efficiency_is_the_walked_distance_over_the_net_move():
+    """Up 100bps, back 60, up 20: 180bps walked to get 60bps done."""
+    series = walk([100.00, 101.00, 100.40, 100.60])
+    out = rm.summarize_traversal(rm.traversal_of(series))
+    assert out["path_bps"] == pytest.approx(180.0)
+    assert out["net_bps"] == pytest.approx(60.0)
+    assert out["path_efficiency"] == pytest.approx(3.0)
+
+
+def test_a_session_that_ends_where_it_started_reports_no_ratio():
+    """Pure oscillation is the limit case of grid food, and its ratio is a
+    division by zero — which a JSON report may not carry."""
+    series = walk([100.00, 100.50, 100.00])
+    out = rm.summarize_traversal(rm.traversal_of(series))
+    assert out["path_bps"] == pytest.approx(100.0)
+    assert out["net_bps"] == 0.0
+    assert out["path_efficiency"] is None
+
+
+def test_a_falling_session_reports_a_signed_net_and_an_unsigned_ratio():
+    series = walk([100.00, 99.00, 99.40])
+    out = rm.summarize_traversal(rm.traversal_of(series))
+    assert out["net_bps"] == pytest.approx(-60.0)
+    assert out["path_bps"] == pytest.approx(140.0)
+    assert out["path_efficiency"] == pytest.approx(140.0 / 60.0)
+
+
+def test_a_repeated_quote_changes_nothing():
+    """A venue that publishes on change still repeats a quote after a reconnect,
+    and a standing price is not movement."""
+    plain = rm.traversal_of(walk([100.00, 100.50, 100.00, 100.50]))
+    repeated = rm.traversal_of(walk([100.00, 100.00, 100.50, 100.50, 100.00, 100.00, 100.50]))
+    assert plain.traversals == repeated.traversals
+    assert plain.path_bps == pytest.approx(repeated.path_bps)
+
+
+def test_a_quote_missing_a_side_is_not_a_price_halving():
+    """An empty side arrives as a zero and a mid taken from it is half the price —
+    a 5000bps round trip that never happened. Skipped, as the tick metric skips
+    them."""
+    series = quotes(
+        [
+            (ns(0), "100.00", "100.02"),
+            (ns(1), "0", "100.02"),
+            (ns(2), "100.00", "100.02"),
+        ]
+    )
+    t = rm.traversal_of(series)
+    assert t.frames == 2
+    assert t.traversals[30] == 0
+    assert t.path_bps == pytest.approx(0.0)
+
+
+def test_a_day_with_nothing_in_it_traverses_nothing():
+    """No frames, and one frame: neither is a division by zero and neither is a
+    NaN in the JSON."""
+    for series in (bbo([]), quotes([(ns(0), "100.00", "100.02")])):
+        out = rm.summarize_traversal(rm.traversal_of(series))
+        assert out["seconds"] == 0.0
+        assert out["path_bps"] == 0.0
+        assert out["path_efficiency"] is None
+        assert out["by_spacing"]["10"]["round_trips"] == 0
+        assert out["by_spacing"]["10"]["round_trips_per_hour"] is None
+        assert out["by_spacing"]["10"]["gross_capture_potential_bps"] == 0.0
+        assert out["by_spacing"]["10"]["round_trips_per_hour_min"] is None
+        assert out["hour_blocks"] == 0
+        assert out["frames_per_hour"] is None
+
+
+# --- the state machine itself, pinned by mutation ---------------------------
+#
+# The four tests below exist because the fixtures above cannot fail without
+# them. Every synthetic traversal fixture in this file is either a two-level
+# square walk — where the running extreme can never reach past the price that
+# confirmed the turn, and the extreme before the turn already equals the price
+# the walk returns to — or a monotone trend, which never turns at all. Both
+# shapes are blind by construction to how the scan carries its state, and the
+# real two-minute fixture at the end of this file was asserted only as
+# `round_trips >= 1`.
+#
+# Measured by mutating `traversals_at` and running this whole file (AGENTS.md
+# §1.3, §4.2's precedent): freezing the running high in the `trend > 0` branch,
+# keeping the older extreme instead of the confirming price, and either `>=`
+# turned into `>` all survived a green suite, while changing every published
+# count on real recordings by up to -99.5% and +108%. Each assertion below is
+# the smallest exact-integer path that separates the shipped scan from one of
+# those mutants; the prices are unit-free, since the threshold is relative.
+#
+# Ten of the scan's twelve branch mutants now fail. The two that do not are
+# equivalent, not uncovered: in the neutral branch the confirming price is
+# always already the running extreme, so `low = px` and `low = min(low, px)`
+# cannot differ there. Proof: if the down-check fires at a price P inside
+# [L, H], then whichever of the two extremes was set later would itself have
+# fired when it arrived, so (H-L) is inside the threshold and P < L —
+# contradiction. Brute-forced over 200k random walks x 6 spacings as well: zero
+# differences. Do not go looking for a test for those two.
+
+
+def test_the_running_extreme_extends_while_the_trend_holds():
+    """The next leg is measured from the furthest price since the turn.
+
+    Not from the price that confirmed the turn: the third point here extends the
+    extreme, and the fourth clears the threshold from the extended one and from
+    nothing else. Freezing the running high collapses PUMP 20260730 at 5bps from
+    1709 round trips to 8.
+    """
+    # up: +10bps confirms, +20bps extends the high, then 10bps back off THAT.
+    assert rm.traversals_at([100_000, 100_100, 100_200, 100_099], 10) == 2
+    # and the mirror, which the `trend < 0` branch already had covered.
+    assert rm.traversals_at([100_000, 99_900, 99_800, 99_901], 10) == 2
+    # one unit short of the extended extreme is not a turn either way.
+    assert rm.traversals_at([100_000, 100_100, 100_200, 100_100], 10) == 1
+    # 99_900 would be one, the return leg being cheaper in price than the way
+    # down — 10bps of the low, not of the high (see the asymmetry test above).
+    assert rm.traversals_at([100_000, 99_900, 99_800, 99_899], 10) == 1
+
+
+def test_the_confirming_price_replaces_the_extreme_it_confirmed_against():
+    """The turn starts the next leg from where it was confirmed, not from the
+    old extreme.
+
+    Keeping the older one (`low = min(low, px)`) starts the next leg further
+    away and confirms it on a smaller move — +108% round trips on PUMP 20260730
+    at 5bps. The last price here is inside the threshold of the confirming price
+    and outside the threshold of the extreme before it.
+    """
+    assert rm.traversals_at([100_000, 99_800, 99_900, 100_000, 99_899, 99_998], 10) == 3
+    assert rm.traversals_at([100_000, 100_200, 100_100, 100_000, 100_101, 100_002], 10) == 3
+
+
+def test_a_leg_of_exactly_the_spacing_confirms_in_every_state_of_the_scan():
+    """`>=`, and in all three states — not only the opening one.
+
+    The existing boundary test enters the scan neutral, so both mid-scan
+    thresholds could be `>` with every other test in this file still green.
+    """
+    # trend > 0: exactly 10bps below the running high, and one unit short of it.
+    assert rm.traversals_at([99_000, 100_000, 99_900], 10) == 2
+    assert rm.traversals_at([99_000, 100_000, 99_901], 10) == 1
+    # trend < 0: exactly 10bps above the running low, and one unit short.
+    assert rm.traversals_at([101_000, 100_000, 100_100], 10) == 2
+    assert rm.traversals_at([101_000, 100_000, 100_099], 10) == 1
+
+
+def test_the_extreme_extends_before_the_first_turn_as_well():
+    """Both extremes are tracked from the opening quote until one of them fires.
+
+    The intermediate price is what makes the last one a traversal: on its own it
+    is half the threshold from the open.
+    """
+    assert rm.traversals_at([100_000, 100_050, 99_949], 10) == 1
+    assert rm.traversals_at([100_000, 99_949], 10) == 0
+    assert rm.traversals_at([100_000, 99_950, 100_051], 10) == 1
+    assert rm.traversals_at([100_000, 100_051], 10) == 0
+
+
+# --- what path_bps is, and what it is not -----------------------------------
+
+
+def test_flicker_between_the_same_turns_moves_path_bps_and_no_round_trip():
+    """`path_bps` is the first-order variation of a *sampled* path, so it counts
+    the frames it was summed over.
+
+    Both series here hold the same four excursions over the same 404 seconds and
+    turn at the same four prices; the second one simply prints more often, with a
+    1bp shiver far below any spacing. Nothing tradeable differs, and `path_bps`
+    triples. On a real recording it does not converge either: LOCF-resampling VVV
+    20260730 from 4s down to the raw feed took `path_bps` from 31936 to 90183,
+    still climbing at the finest grid, while round trips at 30bps settled at
+    75-76 from 1s down. `bbo` frame counts across the shortlist differ 5x, which
+    is why the row also reports `frames_per_hour`: the two numbers must be read
+    together or not at all.
+    """
+    turns = [100.00, 100.50, 100.00, 100.50, 100.00]
+    shivered = []
+    for i, px in enumerate(turns):
+        shivered.append(px)
+        if i < len(turns) - 1:
+            aside = round(px + (0.01 if turns[i + 1] > px else -0.01), 2)
+            shivered += [aside, px] * 50
+
+    coarse = rm.summarize_traversal(rm.traversal_of(walk(turns, step_seconds=101.0)))
+    fine = rm.summarize_traversal(rm.traversal_of(walk(shivered, step_seconds=1.0)))
+
+    assert coarse["seconds"] == fine["seconds"] == pytest.approx(404.0)
+    assert coarse["frames"] == 5
+    assert fine["frames"] == 405
+    assert coarse["path_bps"] == pytest.approx(200.0)  # 4 legs of 50bps
+    assert fine["path_bps"] == pytest.approx(600.0)  # + 50 shivers of 2bps each
+    assert coarse["frames_per_hour"] == pytest.approx(5 / (404 / 3600))
+    assert fine["frames_per_hour"] == pytest.approx(405 / (404 / 3600))
+    for spacing in rm.TRAVERSAL_SPACINGS_BPS:
+        assert coarse["by_spacing"][str(spacing)]["round_trips"] == 2, spacing
+        assert fine["by_spacing"][str(spacing)]["round_trips"] == 2, spacing
+
+
+def test_path_efficiency_ranks_the_still_day_above_the_oscillating_one():
+    """Which is why it is not the oscillation number and the row must not be read
+    as if it were.
+
+    `path / |net|` is dominated by its denominator: the first series here round
+    trips 50bps nineteen times and then drifts 500bps away, the second wanders
+    10bps and comes back to within 0.01bp of where it opened. The second scores
+    two hundred times higher while holding not one round trip at any tradeable
+    spacing. Measured across the ten coin-days of 20260730 the same way:
+    spearman(path_efficiency, 1/|net_bps|) = +0.79, spearman(path_efficiency,
+    round trips per hour at 10bps) = -0.13.
+    """
+    oscillating = rm.summarize_traversal(
+        rm.traversal_of(walk([100.00, 100.50] * 20 + [105.00]))
+    )
+    still = rm.summarize_traversal(rm.traversal_of(walk([100.00, 100.05, 100.0001])))
+
+    assert oscillating["by_spacing"]["30"]["round_trips"] == 19
+    assert still["by_spacing"]["10"]["round_trips"] == 0
+    assert oscillating["path_efficiency"] == pytest.approx(2400.0 / 500.0)
+    assert still["path_efficiency"] > 500.0
+    assert still["path_efficiency"] > oscillating["path_efficiency"]
+
+
+# --- how precise the per-hour rate is ---------------------------------------
+
+
+def busy_hour(at_second, quiet=False):
+    """One hour: eight alternating 50bps quotes in its first eight minutes, or
+    one standing quote."""
+    if quiet:
+        return [(ns(at_second), "99.99", "100.01")]
+    return [
+        (ns(at_second + i * 60.0),
+         "99.99" if i % 2 == 0 else "100.49",
+         "100.01" if i % 2 == 0 else "100.51")
+        for i in range(8)
+    ]
+
+
+def test_the_round_trip_rate_ships_with_the_range_of_the_hours_it_averages():
+    """A bare rate cannot be checked by its reader.
+
+    Four hours, two of them busy and two standing still: the whole-session rate
+    is 2/h and no hour of the session ran at it. That is the shape of the real
+    thing — 3h blocks of one coin-day at 30bps span 1.00-4.67/h against a
+    whole-day 2.29 (HYPE 20260730), and the cross-coin spread this tool exists to
+    resolve is no wider. The rest of this file already refuses under-powered
+    numbers (`MIN_VOL_WINDOWS`, `runs_dropped_to_gaps`); the rate is not exempt.
+    """
+    rows = (
+        busy_hour(0.0)
+        + busy_hour(3600.0, quiet=True)
+        + busy_hour(2 * 3600.0, quiet=True)
+        + busy_hour(3 * 3600.0)
+        + [(ns(4 * 3600.0), "99.99", "100.01")]
+    )
+    out = rm.summarize_traversal(rm.traversal_of(quotes(rows)))
+    assert out["hours"] == pytest.approx(4.0)
+    assert out["hour_blocks"] == 4
+    cell = out["by_spacing"]["30"]
+    assert cell["round_trips"] == 8
+    assert cell["round_trips_per_hour"] == pytest.approx(2.0)
+    assert cell["round_trips_per_hour_min"] == pytest.approx(0.0)
+    assert cell["round_trips_per_hour_max"] == pytest.approx(3.0)
+
+
+def test_a_recording_too_short_for_a_range_reports_none_and_still_reports_the_rate():
+    """Two blocks are two numbers, not a range — the same refusal as
+    `MIN_VOL_WINDOWS`. The rate itself still ships: a three-hour fragment is the
+    normal case here, and per-hour is the only way to compare it with a day."""
+    out = rm.summarize_traversal(rm.traversal_of(walk([100.00, 100.50] * 8, step_seconds=600.0)))
+    assert out["hours"] == pytest.approx(2.5)
+    assert out["hour_blocks"] == 2 < rm.MIN_TRAVERSAL_BLOCKS
+    cell = out["by_spacing"]["30"]
+    assert cell["round_trips_per_hour"] == pytest.approx(7 / 2.5)
+    assert cell["round_trips_per_hour_min"] is None
+    assert cell["round_trips_per_hour_max"] is None
+
+
+def test_pooling_pools_the_hours_and_not_the_rates():
+    """Two days' blocks are one longer list of blocks, so the pooled range covers
+    the still day as well as the busy one."""
+    busy = rm.traversal_of(quotes(
+        busy_hour(0.0) + busy_hour(3600.0) + busy_hour(2 * 3600.0)
+        + [(ns(3 * 3600.0), "99.99", "100.01")]
+    ))
+    still = rm.traversal_of(quotes(
+        busy_hour(0.0, quiet=True) + busy_hour(3600.0, quiet=True)
+        + busy_hour(2 * 3600.0, quiet=True) + [(ns(3 * 3600.0), "99.99", "100.01")]
+    ))
+    out = rm.summarize_traversal(rm.merge_traversals([busy, still]))
+    assert out["hour_blocks"] == 6
+    cell = out["by_spacing"]["30"]
+    assert cell["round_trips_per_hour_min"] == pytest.approx(0.0)
+    assert cell["round_trips_per_hour_max"] == pytest.approx(3.0)
+
+
+# --- what a spacing is worth in the coin's own tick --------------------------
+
+
+def test_a_spacing_is_reported_in_the_mid_steps_the_tick_allows():
+    """5bps means something different on a coin whose tick is 5.4bps of its mid.
+
+    The mid moves in half-ticks, so PUMP's mid moves 2.7bps at a time and the
+    smallest two-step wiggle its book can print already clears 5bps; HYPE's tick
+    is 0.18bps, needing ~55 mid steps for the same threshold. Nothing else in the
+    row relates the ladder to the tick, though the tick is measured two sections
+    earlier.
+    """
+    series = rm.traversal_of(walk([100.00, 100.50]))
+    out = rm.summarize_traversal(series, tick_bps=5.38)
+    assert out["mid_step_bps"] == pytest.approx(2.69)
+    assert out["by_spacing"]["5"]["mid_steps"] == pytest.approx(5 / 2.69)
+    assert out["by_spacing"]["5"]["at_flicker_floor"] is True
+    assert out["by_spacing"]["30"]["mid_steps"] == pytest.approx(30 / 2.69)
+    assert out["by_spacing"]["30"]["at_flicker_floor"] is False
+    # A liquid coin's ladder is above the floor at every rung.
+    fine = rm.summarize_traversal(series, tick_bps=0.18)
+    assert all(
+        fine["by_spacing"][str(s)]["at_flicker_floor"] is False
+        for s in rm.TRAVERSAL_SPACINGS_BPS
+    )
+    # No tick, no claim — not a claim of "fine".
+    bare = rm.summarize_traversal(series)
+    assert bare["mid_step_bps"] is None
+    assert bare["by_spacing"]["5"]["mid_steps"] is None
+    assert bare["by_spacing"]["5"]["at_flicker_floor"] is None
+
+
+# ---------------------------------------------------------------------------
 # reading, unions, warnings
 # ---------------------------------------------------------------------------
 
@@ -1255,6 +1759,81 @@ def test_pooling_does_not_credit_a_quote_with_the_time_between_days(tmp_path):
     )
 
 
+def a_walking_day(tmp_path, day, mids, step_seconds=1.0, coin="PUMP", symbol="PUMPUSDT"):
+    """A day whose mid follows `mids`, one `bbo` frame per step.
+
+    Only the two quote channels are written. The traversal metric reads nothing
+    else, and a fixture that also had to keep the depth and lead-lag metrics happy
+    could not be checked against a walk by hand.
+    """
+    hl = []
+    um = []
+    for i, m in enumerate(mids):
+        t = ns_on(day, i * step_seconds)
+        bid, ask = f"{m - 0.01:.6f}", f"{m + 0.01:.6f}"
+        hl.append((t, hl_bbo(coin, t, bid, ask)))
+        um.append((t, um_book_ticker(symbol, t, 1000 + i, bid, ask)))
+    return a_day(tmp_path, hl, um, coin=coin, symbol=symbol, day=day)
+
+
+def test_pooling_adds_the_days_traversals_and_does_not_bridge_midnight(tmp_path):
+    """Traversals are per-session and pool by addition, like the price runs.
+
+    Day one squares 50bps around 100 and ends high; day two squares 99bps around
+    201 and ends low. Re-scanning the two days concatenated finds 49 round trips
+    rather than 48 — it reads the jump from 100.50 to 202.00 as movement the
+    market never made — and a path over 10000bps longer than the two days walked.
+    """
+    hl_dir, um_dir = a_walking_day(tmp_path, "20260729", [100.0, 100.5] * 30)
+    a_walking_day(tmp_path, "20260730", [202.0, 200.0] * 20)
+    one, two = [
+        rm.read_day(hl_dir, "PUMP", [um_dir], "PUMPUSDT", d)
+        for d in ("20260729", "20260730")
+    ]
+    pooled = rm.pool_days([one, two])
+
+    for spacing in rm.TRAVERSAL_SPACINGS_BPS:
+        assert one.traversal.round_trips[spacing] == 29, spacing
+        assert two.traversal.round_trips[spacing] == 19, spacing
+        assert pooled.traversal.round_trips[spacing] == 48, spacing
+        assert pooled.traversal.traversals[spacing] == 59 + 39, spacing
+
+    assert one.traversal.path_bps == pytest.approx(2950.0)
+    assert two.traversal.path_bps == pytest.approx(78.0 / 202.0 * 1e4)
+    assert pooled.traversal.path_bps == pytest.approx(
+        one.traversal.path_bps + two.traversal.path_bps
+    )
+    # Signed, so two days that undid each other do not read as a walk.
+    assert one.traversal.net_bps == pytest.approx(50.0)
+    assert two.traversal.net_bps == pytest.approx(-2.0 / 202.0 * 1e4)
+    assert pooled.traversal.net_bps == pytest.approx(
+        one.traversal.net_bps + two.traversal.net_bps
+    )
+    assert pooled.traversal.seconds == pytest.approx(59.0 + 39.0)
+    assert pooled.traversal.frames == 100
+
+
+def test_the_traversal_metric_reaches_the_row_the_json_and_the_table(tmp_path):
+    hl_dir, um_dir = a_walking_day(tmp_path, DAY, [100.0, 100.5] * 30)
+    report = rm.build_report(hl_dir, "PUMP", [um_dir], "PUMPUSDT", [DAY])
+    block = report["rows"][0]["traversal"]
+    assert sorted(block["by_spacing"], key=int) == ["5", "10", "20", "30"]
+    assert block["by_spacing"]["30"]["round_trips"] == 29
+    assert block["by_spacing"]["30"]["gross_capture_potential_bps"] == pytest.approx(29 * 30)
+    assert block["path_efficiency"] == pytest.approx(2950.0 / 50.0)
+    assert "ceiling" in block["caveat"].lower()
+    assert "traversal" in json.dumps(report["conventions"])
+
+    # Through `json.dumps`: the per-spacing keys are strings already, so a round
+    # trip cannot silently renumber them.
+    again = json.loads(json.dumps(report))["rows"][0]["traversal"]
+    assert again["by_spacing"]["5"]["round_trips"] == 29
+
+    text = rm.render_text(report)
+    assert "traversal" in text
+    assert "ceiling" in text
+
+
 def test_the_report_names_its_schema_and_states_its_conventions(tmp_path):
     hl_dir, um_dir = a_two_window_day(tmp_path)
     report = rm.build_report(hl_dir, "PUMP", [um_dir], "PUMPUSDT", [DAY])
@@ -1393,6 +1972,27 @@ def test_the_whole_tool_runs_over_two_real_minutes_of_pump():
     assert row["touch"]["bid"]["n_orders_p50"] >= 1
     assert row["leadlag"]["cells"] > rm.MIN_LEADLAG_CELLS
     assert -2000 <= row["leadlag"]["lag_ms"] <= 2000
+    # Every real `bbo` frame carried both sides, so none was dropped from the walk.
+    assert row["traversal"]["frames"] == row["counts"]["bbo"]
+    # Exact, not `>= 1`: real prices are the only fixture here that discriminates
+    # between the shipped zig-zag scan and its mutants, and a floor assertion let
+    # every one of them through. Freezing the running high gives [3, 1, 1, 1] on
+    # these same two minutes and keeping the stale extreme gives [9, 2, 1, 1].
+    assert [
+        row["traversal"]["by_spacing"][s]["round_trips"] for s in ("5", "10", "20", "30")
+    ] == [6, 1, 1, 1]
+    # PUMP's measured tick is 1e-6 on a 0.0018 mid — 5.5bps, so the mid moves in
+    # 2.8bps steps and a 5bps round trip is two of them. That column counts the
+    # smallest wiggle this book can print, and the row says so.
+    assert row["traversal"]["by_spacing"]["5"]["at_flicker_floor"] is True
+    assert row["traversal"]["by_spacing"]["30"]["at_flicker_floor"] is False
+    # Two minutes: a rate over the whole recording, and no whole hour to spread it
+    # over. Published anyway, with nothing standing behind it but its length.
+    assert row["traversal"]["hour_blocks"] == 0
+    assert row["traversal"]["by_spacing"]["5"]["round_trips_per_hour"] > 0
+    assert row["traversal"]["by_spacing"]["5"]["round_trips_per_hour_min"] is None
+    assert row["traversal"]["path_efficiency"] > 1.0
+    assert row["traversal"]["frames_per_hour"] > 0
     assert rm.render_text(report)
 
 
