@@ -75,9 +75,23 @@ pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// below the keepalive interval instead, and a resolve that exceeds it drops the connection
 /// — which costs ~1.2 s on this venue and is retried with everything re-derived.
 const RESOLVE_BUDGET: Duration = Duration::from_secs(20);
-/// Reconnect ladder. Measured recovery after a CDN drop is ~1.2 s, so the floor is 1 s.
+/// Reconnect ladder for **genuine** drops. Measured recovery after a CDN half-open drop is
+/// ~1.2 s, so the floor is 1 s: reconnecting sooner spends rate limit against a socket that
+/// is not back yet.
+///
+/// A **clean scheduled close** is the exception, and it is not a CDN half-open drop:
+/// Hyperliquid retires a socket on its ~10 min TTL with a code-1000 "Expired" frame, and the
+/// replacement session is accepted immediately. That case is fast-pathed by [`reconnect_delay`]
+/// with [`CLEAN_CLOSE_BACKOFF`], outside this ladder; the 1 s floor still governs every
+/// genuine drop.
 pub(crate) const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// The delay before the **first** reconnect after a clean scheduled close (code 1000).
+///
+/// A real floor, not zero: far below the 1 s fault floor so a scheduled retirement barely
+/// shows as a gap, yet non-zero so a pathological "clean-close-on-open" venue cannot spin
+/// reconnects at no delay. In the 100–250 ms band the task specifies.
+pub(crate) const CLEAN_CLOSE_BACKOFF: Duration = Duration::from_millis(250);
 /// How often the feed counters are logged.
 pub(crate) const COUNTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Share of a reporting interval's frames that may be refused before the feed is reported
@@ -87,6 +101,29 @@ const REFUSED_RATE_ALARM: f64 = 0.05;
 const REFUSED_RATE_MIN_FRAMES: u64 = 20;
 /// The keepalive the venue understands.
 pub(crate) const PING_FRAME: &str = r#"{"method":"ping"}"#;
+
+/// How long to wait before the next reconnect, given the error that ended the connection.
+///
+/// A clean scheduled close ([`HyperliquidError::is_clean_close`] — code 1000 "Expired", the
+/// venue's ~10 min TTL retirement) is fast-pathed with [`CLEAN_CLOSE_BACKOFF`] and **does
+/// not touch** `backoff`: it neither advances the ladder (a run of scheduled closes cannot
+/// escalate the delay) nor resets it (a genuine fault straddling a clean close still climbs,
+/// which is the fail-safe direction). Every other error — transport failure, idle timeout,
+/// a non-1000 close, a rejected subscribe — takes the normal exponential ladder, so a
+/// rate-limit or transport storm still backs off 1 s → 2 s → … → 30 s.
+///
+/// Shared by both stream loops and imported by `private_stream` exactly as
+/// `BACKOFF_MIN`/`BACKOFF_MAX` are, so the two cannot drift onto different policies.
+pub(crate) fn reconnect_delay(
+    error: &HyperliquidError,
+    backoff: &mut ExponentialBackoff,
+) -> Duration {
+    if error.is_clean_close() {
+        CLEAN_CLOSE_BACKOFF
+    } else {
+        backoff.backoff()
+    }
+}
 
 /// What has been observed since the connector started.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -411,7 +448,7 @@ impl PublicStream {
             );
             self.report(&mut last_counts, counts);
             publish_error(&self.ev_tx, ErrorKind::ConnectionInterrupted, &error);
-            let delay = backoff.backoff();
+            let delay = reconnect_delay(&error, &mut backoff);
             info!(?delay, "Reconnecting to the Hyperliquid public stream.");
             time::sleep(delay).await;
         }
@@ -494,9 +531,12 @@ impl PublicStream {
                             send(&mut write, Message::Pong(Bytes::default())).await?;
                         }
                         Some(Ok(Message::Close(frame))) => {
-                            return Err(HyperliquidError::ConnectionAbort(
-                                frame.map(|f| f.to_string()).unwrap_or_default(),
-                            ));
+                            // Read the close code before `to_string()` consumes the frame:
+                            // a clean code-1000 "Expired" close is a scheduled TTL
+                            // retirement and reconnects fast (§B1).
+                            let code = frame.as_ref().map(|f| u16::from(f.code));
+                            let reason = frame.map(|f| f.to_string()).unwrap_or_default();
+                            return Err(HyperliquidError::ConnectionAbort { reason, code });
                         }
                         Some(Ok(_)) => {}
                         Some(Err(error)) => return Err(HyperliquidError::from(error)),
@@ -1118,6 +1158,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(degraded(&before, &after), Some((20, 20)));
+    }
+
+    /// **B1: a clean scheduled close reconnects fast and leaves the fault ladder alone.**
+    /// A code-1000 "Expired" close is HL retiring the socket on its ~10 min TTL, and the
+    /// replacement session is accepted immediately — so it takes the fast path, well below
+    /// the 1 s fault floor. Because the fast path never calls `backoff.backoff()`, it
+    /// neither advances nor resets the genuine-fault ladder: a fault after a clean close
+    /// resumes exactly where it left off. `reconnect_delay` is pure, so this needs no
+    /// socket and no clock (`start_paused` does not drive `ExponentialBackoff`'s
+    /// `std::time::Instant` anyway; the reset guarantee is covered by `utils.rs`).
+    #[test]
+    fn a_clean_scheduled_close_reconnects_fast_and_does_not_climb_the_ladder() {
+        use std::time::Duration;
+
+        use super::{BACKOFF_MAX, BACKOFF_MIN, CLEAN_CLOSE_BACKOFF, reconnect_delay};
+        use crate::utils::ExponentialBackoff;
+
+        let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
+        let clean = || HyperliquidError::ConnectionAbort {
+            reason: "Expired (1000)".into(),
+            code: Some(1000),
+        };
+        let genuine = || HyperliquidError::ConnectionInterrupted;
+
+        // The fast path, and it really is faster than the fault floor.
+        assert_eq!(reconnect_delay(&clean(), &mut backoff), CLEAN_CLOSE_BACKOFF);
+        assert!(CLEAN_CLOSE_BACKOFF < BACKOFF_MIN);
+
+        // A genuine fault climbs from the 1 s floor.
+        assert_eq!(
+            reconnect_delay(&genuine(), &mut backoff),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            reconnect_delay(&genuine(), &mut backoff),
+            Duration::from_secs(2)
+        );
+
+        // A clean close in the middle takes the fast path…
+        assert_eq!(reconnect_delay(&clean(), &mut backoff), CLEAN_CLOSE_BACKOFF);
+
+        // …and left the ladder exactly where it was: the next genuine fault is 4 s — not a
+        // reset to 1 s, and not an extra doubling to 8 s.
+        assert_eq!(
+            reconnect_delay(&genuine(), &mut backoff),
+            Duration::from_secs(4)
+        );
     }
 
     /// A restated book must be uncrossed and applicable in the order it is published — it

@@ -90,12 +90,13 @@ use crate::{
             PING_FRAME,
             PING_INTERVAL,
             local_now,
+            reconnect_delay,
             send,
         },
         publish_error,
         rest::{OpenOrder, SymbolInfo, open_orders, positions, resolve_symbols},
     },
-    utils::{BackoffStrategy, ExponentialBackoff},
+    utils::ExponentialBackoff,
 };
 
 /// The whole reconciliation round trip, bounded for the same reason the public stream's
@@ -225,7 +226,7 @@ impl PrivateStream {
                 tracked_orders, replayed_fills, "The Hyperliquid account stream disconnected."
             );
             publish_error(&self.ev_tx, ErrorKind::ConnectionInterrupted, &error);
-            let delay = backoff.backoff();
+            let delay = reconnect_delay(&error, &mut backoff);
             info!(?delay, "Reconnecting to the Hyperliquid account stream.");
             time::sleep(delay).await;
         }
@@ -318,9 +319,12 @@ impl PrivateStream {
                             send(&mut write, Message::Pong(Bytes::default())).await?;
                         }
                         Some(Ok(Message::Close(frame))) => {
-                            return Err(HyperliquidError::ConnectionAbort(
-                                frame.map(|f| f.to_string()).unwrap_or_default(),
-                            ));
+                            // Read the close code before `to_string()` consumes the frame:
+                            // a clean code-1000 "Expired" close is a scheduled TTL
+                            // retirement and reconnects fast (§B1).
+                            let code = frame.as_ref().map(|f| u16::from(f.code));
+                            let reason = frame.map(|f| f.to_string()).unwrap_or_default();
+                            return Err(HyperliquidError::ConnectionAbort { reason, code });
                         }
                         Some(Ok(_)) => {}
                         Some(Err(error)) => return Err(HyperliquidError::from(error)),
@@ -905,7 +909,12 @@ pub fn cancel_order(
         .mark_requested(&cloid, Status::Canceled);
 
     tokio::spawn(async move {
-        let action = CancelByCloidAction::new(vec![wire]);
+        // `.fast()` opts into fast-cancel. It has no latency effect today (future mempool
+        // prioritisation only); it is safe here because this path cancels the bot's own
+        // cloid orders, which are Gtc/Alo/Ioc limits — never triggers, which the venue
+        // would reject with `f: true`. The sweep's bulk `CancelAction` deliberately omits
+        // it (it can name a human's UI trigger order).
+        let action = CancelByCloidAction::new(vec![wire]).fast();
         let failure = match exchange.post(&action).await {
             Ok(outcomes) => match outcomes.first() {
                 Some(ActionOutcome::Success) | None => None,

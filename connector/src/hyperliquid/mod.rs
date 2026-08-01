@@ -75,8 +75,13 @@ pub const MAX_DECIMALS: u32 = 6;
 pub enum HyperliquidError {
     #[error("ConnectionInterrupted")]
     ConnectionInterrupted,
-    #[error("ConnectionAbort: {0}")]
-    ConnectionAbort(String),
+    /// A close frame from the venue. `code` is the RFC6455 close code when the frame
+    /// carried one; Hyperliquid retires a socket on its ~10 min TTL with code 1000
+    /// ("Expired"), which [`Self::is_clean_close`] fast-paths. The `#[error]` message is
+    /// deliberately the reason alone — unchanged from the old tuple form — so the log line
+    /// and the 512-byte IPC payload stay byte-identical.
+    #[error("ConnectionAbort: {reason}")]
+    ConnectionAbort { reason: String, code: Option<u16> },
     #[error("ConnectTimeout: no connection within {0:?}")]
     ConnectTimeout(std::time::Duration),
     #[error("WriteTimeout: the socket did not accept a write within {0:?}")]
@@ -180,6 +185,24 @@ impl HyperliquidError {
     /// and a re-quote on top of it is real duplicated exposure (design note §11.7).
     pub fn is_venue_verdict(&self) -> bool {
         matches!(self, Self::ExchangeRejected(_))
+    }
+
+    /// Whether this disconnect was a **clean, intentional** close: RFC6455 Normal Closure
+    /// (code 1000), which Hyperliquid uses to retire a socket on its ~10 min TTL (reason
+    /// "Expired"), and whose replacement session the venue accepts immediately.
+    ///
+    /// The reconnect fast-paths exactly this one case ([`public_stream::reconnect_delay`])
+    /// instead of paying the 1 s fault floor for a socket that was retired on schedule.
+    /// **Fail closed:** a close with no readable code (`None`), a close with any other code,
+    /// and every other error are all treated as genuine and take the normal ladder.
+    pub fn is_clean_close(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionAbort {
+                code: Some(1000),
+                ..
+            }
+        )
     }
 }
 
@@ -1155,5 +1178,47 @@ mod tests {
             panic!("the rejection must still be reported");
         };
         assert_eq!(error.kind, ErrorKind::OrderError);
+    }
+
+    /// **Only RFC6455 Normal Closure (1000) is a clean close.** Hyperliquid retires a socket
+    /// on its ~10 min TTL with a code-1000 "Expired" frame whose replacement session is
+    /// accepted immediately, so that one may reconnect fast (§B1). Every other disconnect
+    /// climbs the fault ladder, and a close frame carrying no readable code fails closed to
+    /// "not clean" rather than being guessed at.
+    #[test]
+    fn only_a_normal_code_1000_close_is_treated_as_clean() {
+        use std::time::Duration;
+
+        assert!(
+            HyperliquidError::ConnectionAbort {
+                reason: "Expired (1000)".into(),
+                code: Some(1000),
+            }
+            .is_clean_close()
+        );
+        // Any other close code is a real close, not a scheduled retirement — going away
+        // (1001), abnormal (1006), policy (1008), server error (1011), overload (1013).
+        for code in [1001u16, 1006, 1008, 1011, 1013] {
+            assert!(
+                !HyperliquidError::ConnectionAbort {
+                    reason: String::new(),
+                    code: Some(code),
+                }
+                .is_clean_close(),
+                "close code {code} must not be treated as clean"
+            );
+        }
+        // Fail closed: a close frame with no code at all is not clean.
+        assert!(
+            !HyperliquidError::ConnectionAbort {
+                reason: String::new(),
+                code: None,
+            }
+            .is_clean_close()
+        );
+        // No other error variant is ever clean.
+        assert!(!HyperliquidError::ConnectionInterrupted.is_clean_close());
+        assert!(!HyperliquidError::IdleTimeout(Duration::from_secs(90)).is_clean_close());
+        assert!(!HyperliquidError::ConnectTimeout(Duration::from_secs(15)).is_clean_close());
     }
 }

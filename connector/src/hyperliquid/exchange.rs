@@ -10,8 +10,14 @@
 //! `msgpack_bytes_match_the_official_sdk` pins the exact bytes for that reason.
 //!
 //! Two omissions are also protocol: an order without a client id must **omit** `c` rather
-//! than send `null`, and a cancel's `f` flag must be omitted rather than sent as `false`.
-//! This backend never sets `f`, so the field does not exist here at all.
+//! than send `null`, and a cancel's `f` flag must be omitted rather than sent as `false` —
+//! the venue rejects an action hashed with `f: false`. Both cancel actions carry an `f`
+//! field guarded by `skip_serializing_if`, so it appears on the wire only when set to
+//! `true`; the default `new()` leaves it false and therefore absent, byte-for-byte the
+//! shape the signature fixtures pin. `f: true` is fast-cancel — future mempool
+//! prioritisation, with **no effect today** — and only the per-order `cancelByCloid` path
+//! opts into it (`.fast()`); the sweep's `cancel` never does, because `f: true` on a
+//! trigger order is rejected and a sweep can name a human's UI trigger.
 //!
 //! # What a 200 means
 //!
@@ -97,12 +103,29 @@ pub struct CancelWire {
     pub o: u64,
 }
 
-/// `{"type":"cancel","cancels":[…]}`.
+/// serde `skip_serializing_if` predicate: omit a `bool` when it is false.
+///
+/// A plain `bool` cannot express the forbidden `Some(false)` an `Option<bool>` could, and
+/// its default is the safe (omitted) value. serde's derive pre-counts the non-skipped
+/// fields, so `rmp_serde` still emits the correct fixmap header — `0x82` with `f` skipped,
+/// `0x83` with it present — which is exactly why skipping preserves the signature.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// `{"type":"cancel","cancels":[…]}`, plus an optional `f` when fast-cancel is set.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CancelAction {
     #[serde(rename = "type")]
     pub action_type: &'static str,
     pub cancels: Vec<CancelWire>,
+    /// Fast-cancel flag — see the module docs and [`CancelByCloidAction::f`]. The sweep
+    /// builds this action and **never** sets it: a sweep cancels whatever the account
+    /// holds on a coin, which can include a human's UI **trigger** order, and `f: true` on
+    /// a trigger is rejected. It therefore stays false and is omitted, keeping the sweep's
+    /// signed bytes byte-identical. Field order is protocol: `f` is last, after `cancels`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub f: bool,
 }
 
 impl CancelAction {
@@ -110,6 +133,7 @@ impl CancelAction {
         Self {
             action_type: "cancel",
             cancels,
+            f: false,
         }
     }
 }
@@ -123,12 +147,25 @@ pub struct CancelByCloidWire {
     pub cloid: String,
 }
 
-/// `{"type":"cancelByCloid","cancels":[…]}`.
+/// `{"type":"cancelByCloid","cancels":[…]}`, plus an optional `f` when fast-cancel is set.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CancelByCloidAction {
     #[serde(rename = "type")]
     pub action_type: &'static str,
     pub cancels: Vec<CancelByCloidWire>,
+    /// Fast-cancel: future mempool prioritisation, with **no effect today** per the venue's
+    /// docs — a cancel with `f: true` is scheduled ahead of others *iff* a coming network
+    /// upgrade ships it, and behaves identically until then. It MUST be omitted rather than
+    /// sent as `false`: an action hashed with `f: false` is rejected, and the signature
+    /// covers `msgpack(action)`, so [`is_false`] skips it when unset. Field order is
+    /// protocol — `f` is last, after `cancels`.
+    ///
+    /// Never set on a cancel that could name a **trigger** order (the venue rejects
+    /// `f: true` on triggers). The per-order path that opts in ([`Self::fast`]) cancels
+    /// only this backend's own `Gtc`/`Alo`/`Ioc` limits — `tif_of` admits no trigger kind —
+    /// so it is always safe there.
+    #[serde(skip_serializing_if = "is_false")]
+    pub f: bool,
 }
 
 impl CancelByCloidAction {
@@ -136,7 +173,15 @@ impl CancelByCloidAction {
         Self {
             action_type: "cancelByCloid",
             cancels,
+            f: false,
         }
+    }
+
+    /// Opts this cancel into fast-cancel (`f: true`). See the [`f`](Self::f) field: safe
+    /// only because the sole caller cancels non-trigger limit orders.
+    pub fn fast(mut self) -> Self {
+        self.f = true;
+        self
     }
 }
 
@@ -719,6 +764,58 @@ mod tests {
         assert_eq!(body["type"], "cancel");
         assert_eq!(body["cancels"][0]["a"], 3);
         assert_eq!(body["cancels"][0]["o"], 57118842019u64);
+    }
+
+    /// **The fast-cancel flag serialises when set.** `f: true` is future mempool
+    /// prioritisation with no effect today, but the byte it adds is signed — so the exact
+    /// bytes are pinned the same way every other action's are. Mechanically this is the
+    /// base `cancelByCloid` fixture with the leading fixmap header `82`→`83` (two entries
+    /// become three) and the pair `a166 c3` — key `"f"`, value `true` — appended after
+    /// `cancels`.
+    #[test]
+    fn a_fast_cancel_serialises_the_f_flag_true() {
+        let cancel = CancelByCloidAction::new(vec![CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1b2000000000000000000000000dead".into(),
+        }])
+        .fast();
+        assert_eq!(
+            hex(&rmp_serde::to_vec_named(&cancel).unwrap()),
+            concat!(
+                "83a474797065ad63616e63656c4279436c6f6964a763616e63656c739182a5617373657403a563",
+                "6c6f6964d92230786131623230303030303030303030303030303030303030303030303064656164",
+                "a166c3"
+            )
+        );
+        // `f` is a sibling of `cancels`, not nested inside a cancel — and it is `true`.
+        let body = serde_json::to_value(&cancel).unwrap();
+        assert_eq!(body["type"], "cancelByCloid");
+        assert_eq!(body["f"], true);
+        assert!(body["cancels"][0].get("f").is_none(), "{body}");
+    }
+
+    /// **The signing-critical half: a plain cancel omits `f` entirely.** The wire rule is
+    /// "omit when false, present only when true" — an action hashed with `f: false` is
+    /// rejected, and the signature covers `msgpack(action)`. So the default `new()` must
+    /// produce bytes byte-identical to the pre-`f` fixture: leading `82`, no `a166` tail.
+    #[test]
+    fn a_plain_cancel_omits_the_f_flag() {
+        let cancel = CancelByCloidAction::new(vec![CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1b2000000000000000000000000dead".into(),
+        }]);
+        assert_eq!(
+            hex(&rmp_serde::to_vec_named(&cancel).unwrap()),
+            concat!(
+                "82a474797065ad63616e63656c4279436c6f6964a763616e63656c739182a5617373657403a563",
+                "6c6f6964d92230786131623230303030303030303030303030303030303030303030303064656164"
+            )
+        );
+        let body = serde_json::to_value(&cancel).unwrap();
+        assert!(
+            body.get("f").is_none(),
+            "a false f must not appear at all: {body}"
+        );
     }
 
     /// An `ok` whose per-item shape this backend has never seen is **not** counted as a
