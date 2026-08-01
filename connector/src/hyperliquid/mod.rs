@@ -38,6 +38,7 @@ use tokio::{
     sync::{broadcast, broadcast::Sender, mpsc::UnboundedSender},
     task::JoinHandle,
 };
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -187,24 +188,55 @@ impl HyperliquidError {
         matches!(self, Self::ExchangeRejected(_))
     }
 
-    /// Whether this disconnect was a **clean, intentional** close: RFC6455 Normal Closure
-    /// (code 1000), which Hyperliquid uses to retire a socket on its ~10 min TTL (reason
-    /// "Expired"), and whose replacement session the venue accepts immediately.
+    /// Whether this disconnect was the **measured, scheduled** close: RFC6455 Normal Closure
+    /// (code 1000) **whose reason is "Expired"**, which is how Hyperliquid retires a socket on
+    /// its ~10 min TTL, and whose replacement session the venue accepts immediately (design
+    /// note §11.14, observed on both streams 2026-07-28).
     ///
-    /// The reconnect fast-paths exactly this one case ([`public_stream::reconnect_delay`])
+    /// The reconnect fast-paths exactly this one case ([`public_stream::ReconnectPolicy`])
     /// instead of paying the 1 s fault floor for a socket that was retired on schedule.
-    /// **Fail closed:** a close with no readable code (`None`), a close with any other code,
-    /// and every other error are all treated as genuine and take the normal ladder.
+    ///
+    /// **Code 1000 alone is not enough, on purpose.** The venue also sends code 1000 with the
+    /// reason "Inactive" when a socket has sent nothing for 60 s (design note §11.14) — a
+    /// maintenance/idle close, not a scheduled retirement. Fast-pathing every 1000 would give
+    /// a repeated "Inactive" (or a maintenance close) the 250 ms path indefinitely and never
+    /// let the backoff ladder engage — the reconnect storm this gate exists to prevent.
+    ///
+    /// **Fail closed:** a close with no readable code (`None`), any code other than 1000, and
+    /// a 1000 whose reason does not name the scheduled retirement are all treated as genuine
+    /// and take the normal ladder. The `reason` field is `CloseFrame::to_string()` —
+    /// `"{reason} ({code})"` — so the scheduled retirement reads as `"Expired (1000)"`; a
+    /// substring test tolerates the trailing `" (1000)"` without hard-coding it.
     pub fn is_clean_close(&self) -> bool {
         matches!(
             self,
-            Self::ConnectionAbort {
-                code: Some(1000),
-                ..
-            }
+            Self::ConnectionAbort { code: Some(1000), reason }
+                if reason.contains(SCHEDULED_CLOSE_REASON)
         )
     }
+
+    /// Builds the abort error from a WebSocket close frame, reading the RFC6455 close **code**
+    /// before `to_string()` consumes the frame — the code is what [`Self::is_clean_close`]
+    /// keys on, and `to_string()` would drop the numeric part into text.
+    ///
+    /// Both stream `connect()` loops build the error through this one function, and the
+    /// reconnect-decision test drives it on a real `CloseFrame` rather than a hand-built
+    /// error, so nulling the extracted code here fails a test rather than only being caught
+    /// in review. The `#[error]` message stays the reason alone (`ConnectionAbort: {reason}`),
+    /// so the log line and the 512-byte IPC payload are byte-identical to the old tuple form.
+    pub(crate) fn from_close_frame(frame: Option<CloseFrame>) -> Self {
+        let code = frame.as_ref().map(|f| u16::from(f.code));
+        let reason = frame.map(|f| f.to_string()).unwrap_or_default();
+        Self::ConnectionAbort { reason, code }
+    }
 }
+
+/// The reason text Hyperliquid sends on its scheduled ~10-min TTL retirement, the one close
+/// [`HyperliquidError::is_clean_close`] fast-paths. Gating on this exact word — not on close
+/// code 1000 alone — keeps the venue's code-1000 "Inactive" (60-s-silent) close and any other
+/// code-1000 maintenance close off the fast path. Measured on both streams (design note
+/// §11.14).
+const SCHEDULED_CLOSE_REASON: &str = "Expired";
 
 /// Truncates a message to [`MAX_ERROR_BYTES`], on a character boundary.
 fn clamp_message(message: String) -> String {
@@ -1180,15 +1212,21 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::OrderError);
     }
 
-    /// **Only RFC6455 Normal Closure (1000) is a clean close.** Hyperliquid retires a socket
-    /// on its ~10 min TTL with a code-1000 "Expired" frame whose replacement session is
-    /// accepted immediately, so that one may reconnect fast (§B1). Every other disconnect
-    /// climbs the fault ladder, and a close frame carrying no readable code fails closed to
-    /// "not clean" rather than being guessed at.
+    /// **Only the *measured* clean close is clean: code 1000 AND reason "Expired".** Hyperliquid
+    /// retires a socket on its ~10 min TTL with a code-1000 "Expired" frame whose replacement
+    /// session is accepted immediately, so that one may reconnect fast (§B1). Code 1000 alone
+    /// is not enough: the venue also closes with code 1000 **"Inactive"** when a socket has
+    /// sent nothing for 60 s (design note §11.14), which is a maintenance/idle close, not a
+    /// scheduled retirement. Fast-pathing every 1000 would give a repeated "Inactive" the
+    /// 250 ms path for ever and never let the backoff ladder engage. Every other disconnect —
+    /// a different code, a 1000 with a different reason, no code at all — fails closed to "not
+    /// clean" and climbs the fault ladder.
     #[test]
     fn only_a_normal_code_1000_close_is_treated_as_clean() {
         use std::time::Duration;
 
+        // The reason string is `CloseFrame::to_string()` = "{reason} ({code})", so the
+        // scheduled retirement arrives as "Expired (1000)".
         assert!(
             HyperliquidError::ConnectionAbort {
                 reason: "Expired (1000)".into(),
@@ -1196,12 +1234,32 @@ mod tests {
             }
             .is_clean_close()
         );
-        // Any other close code is a real close, not a scheduled retirement — going away
-        // (1001), abnormal (1006), policy (1008), server error (1011), overload (1013).
+        // Code 1000 with a reason that is **not** "Expired" is not a scheduled retirement.
+        // "Inactive (1000)" is the venue's 60-s-silent close (design note §11.14); a repeated
+        // one must take the ladder, not the fast path.
+        assert!(
+            !HyperliquidError::ConnectionAbort {
+                reason: "Inactive (1000)".into(),
+                code: Some(1000),
+            }
+            .is_clean_close(),
+            "code 1000 alone is not clean — the reason must say Expired"
+        );
+        // …and a 1000 with no reason text at all is likewise not clean (fail closed).
+        assert!(
+            !HyperliquidError::ConnectionAbort {
+                reason: " (1000)".into(),
+                code: Some(1000),
+            }
+            .is_clean_close()
+        );
+        // Any other close code is a real close, not a scheduled retirement — even carrying
+        // an "Expired" reason: going away (1001), abnormal (1006), policy (1008), server
+        // error (1011), overload (1013).
         for code in [1001u16, 1006, 1008, 1011, 1013] {
             assert!(
                 !HyperliquidError::ConnectionAbort {
-                    reason: String::new(),
+                    reason: format!("Expired ({code})"),
                     code: Some(code),
                 }
                 .is_clean_close(),

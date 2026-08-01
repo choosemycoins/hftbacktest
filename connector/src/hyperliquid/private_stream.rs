@@ -75,6 +75,7 @@ use crate::{
             ActionOutcome,
             CancelAction,
             CancelByCloidAction,
+            CancelByCloidWire,
             CancelWire,
             ExchangeClient,
             OrderAction,
@@ -82,21 +83,18 @@ use crate::{
         msg::{Frame, OrderUpdate, UserFills, parse_frame},
         ordermanager::{FillDisposition, OrderExt, SharedOrderManager},
         public_stream::{
-            BACKOFF_MAX,
-            BACKOFF_MIN,
             CONNECT_TIMEOUT,
             IDLE_CHECK_INTERVAL,
             IDLE_TIMEOUT,
             PING_FRAME,
             PING_INTERVAL,
+            ReconnectPolicy,
             local_now,
-            reconnect_delay,
             send,
         },
         publish_error,
         rest::{OpenOrder, SymbolInfo, open_orders, positions, resolve_symbols},
     },
-    utils::ExponentialBackoff,
 };
 
 /// The whole reconciliation round trip, bounded for the same reason the public stream's
@@ -205,12 +203,16 @@ impl PrivateStream {
 
     /// Connects, and keeps reconnecting. Never returns.
     pub async fn run(&mut self) {
-        let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
+        let mut policy = ReconnectPolicy::new();
         loop {
+            let connected_at = Instant::now();
             let error = match self.connect().await {
                 Ok(()) => HyperliquidError::ConnectionInterrupted,
                 Err(error) => error,
             };
+            // How long this connection was up — the clean-close fast path is granted only to
+            // a session that actually lasted (see `ReconnectPolicy`).
+            let session = connected_at.elapsed();
             // One lock, taken once and released before the macro. Two
             // `lock()` calls inside a single `error!` invocation deadlock the
             // thread against itself: both `MutexGuard` temporaries live to the
@@ -226,8 +228,12 @@ impl PrivateStream {
                 tracked_orders, replayed_fills, "The Hyperliquid account stream disconnected."
             );
             publish_error(&self.ev_tx, ErrorKind::ConnectionInterrupted, &error);
-            let delay = reconnect_delay(&error, &mut backoff);
-            info!(?delay, "Reconnecting to the Hyperliquid account stream.");
+            let delay = policy.delay(&error, session);
+            info!(
+                ?delay,
+                ?session,
+                "Reconnecting to the Hyperliquid account stream."
+            );
             time::sleep(delay).await;
         }
     }
@@ -319,12 +325,10 @@ impl PrivateStream {
                             send(&mut write, Message::Pong(Bytes::default())).await?;
                         }
                         Some(Ok(Message::Close(frame))) => {
-                            // Read the close code before `to_string()` consumes the frame:
-                            // a clean code-1000 "Expired" close is a scheduled TTL
-                            // retirement and reconnects fast (§B1).
-                            let code = frame.as_ref().map(|f| u16::from(f.code));
-                            let reason = frame.map(|f| f.to_string()).unwrap_or_default();
-                            return Err(HyperliquidError::ConnectionAbort { reason, code });
+                            // A clean code-1000 "Expired" close is a scheduled TTL retirement
+                            // and reconnects fast (§B1); `from_close_frame` reads the close
+                            // code before `to_string()` consumes the frame.
+                            return Err(HyperliquidError::from_close_frame(frame));
                         }
                         Some(Ok(_)) => {}
                         Some(Err(error)) => return Err(HyperliquidError::from(error)),
@@ -863,6 +867,22 @@ pub fn submit_order(
     });
 }
 
+/// The exact `cancelByCloid` action the per-order cancel path signs and sends.
+///
+/// Both `cancel_order` and its test build the action through this one function, and
+/// `cancel_order` posts the result verbatim, so the wire shape is pinned by a test rather
+/// than by review. **`f` (fast-cancel) stays off here.** The flag has no effect today
+/// (`CancelByCloidAction::fast` — future mempool prioritisation only), and we have **no
+/// evidence the venue accepts an `f: true` direct-signed cancel**: the official API docs and
+/// python-SDK describe cancel without it, and the only testnet capture sent a plain cancel.
+/// Enabling it on the money path unverified risks every cancel being rejected — the order
+/// then stays live — for zero present benefit. Turning it on is gated on a testnet
+/// direct-signing capture that proves the venue accepts an `f: true` cancel (or a primary
+/// venue contract); until then it is omitted. See `the_per_order_cancel_omits_the_fast_flag`.
+fn cancel_action_for_order(wire: CancelByCloidWire) -> CancelByCloidAction {
+    CancelByCloidAction::new(vec![wire])
+}
+
 /// Cancels one order, off the caller's thread.
 ///
 /// A refused cancel leaves the order **live**: the usual reason is that it has already gone,
@@ -909,12 +929,10 @@ pub fn cancel_order(
         .mark_requested(&cloid, Status::Canceled);
 
     tokio::spawn(async move {
-        // `.fast()` opts into fast-cancel. It has no latency effect today (future mempool
-        // prioritisation only); it is safe here because this path cancels the bot's own
-        // cloid orders, which are Gtc/Alo/Ioc limits — never triggers, which the venue
-        // would reject with `f: true`. The sweep's bulk `CancelAction` deliberately omits
-        // it (it can name a human's UI trigger order).
-        let action = CancelByCloidAction::new(vec![wire]).fast();
+        // The action is built by `cancel_action_for_order` and posted verbatim; fast-cancel
+        // (`f`) stays off there — the flag is a no-op today and unverified against the venue,
+        // so it is not enabled on the money path (see that function).
+        let action = cancel_action_for_order(wire);
         let failure = match exchange.post(&action).await {
             Ok(outcomes) => match outcomes.first() {
                 Some(ActionOutcome::Success) | None => None,
@@ -992,10 +1010,11 @@ mod tests {
         connector::{GetOrders, PublishEvent},
         hyperliquid::{
             HyperliquidError,
-            exchange::{ActionOutcome, CancelWire},
+            exchange::{ActionOutcome, CancelByCloidWire, CancelWire},
             ordermanager::OrderManager,
             private_stream::{
                 ConnectPolicy,
+                cancel_action_for_order,
                 cancels_for,
                 confirmed_cancels,
                 expire_and_report,
@@ -1011,6 +1030,29 @@ mod tests {
             oid,
             cloid: cloid.map(str::to_string),
         }
+    }
+
+    /// **The live per-order cancel must not set fast-cancel.** `cancel_order` posts exactly
+    /// what `cancel_action_for_order` returns, so this pins the wire the money path signs:
+    /// the `f` flag has no effect today and is unverified against the venue, so enabling it
+    /// on every user cancel risks the venue rejecting the request (leaving the order live)
+    /// for zero present benefit. Re-adding `.fast()` to the production cancel — the reviewer's
+    /// named mutation — puts `f: true` back on the wire and fails this test. The dormant
+    /// `exchange::tests::a_fast_cancel_serialises_the_f_flag_true` still pins that the wire
+    /// *would* be correct if the flag were ever activated.
+    #[test]
+    fn the_per_order_cancel_omits_the_fast_flag() {
+        let action = cancel_action_for_order(CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1b2000000000000000000000000dead".into(),
+        });
+        let body = serde_json::to_value(&action).unwrap();
+        assert_eq!(body["type"], "cancelByCloid");
+        assert!(
+            body.get("f").is_none(),
+            "the live cancel must not set fast-cancel until the venue is shown to accept it: \
+             {body}"
+        );
     }
 
     /// **The sweep must come from the venue, not from this process's own map.** A connector

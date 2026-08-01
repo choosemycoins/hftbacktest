@@ -15,8 +15,14 @@
 //! field guarded by `skip_serializing_if`, so it appears on the wire only when set to
 //! `true`; the default `new()` leaves it false and therefore absent, byte-for-byte the
 //! shape the signature fixtures pin. `f: true` is fast-cancel — future mempool
-//! prioritisation, with **no effect today** — and only the per-order `cancelByCloid` path
-//! opts into it (`.fast()`); the sweep's `cancel` never does, because `f: true` on a
+//! prioritisation, with **no effect today**, and it is **dormant: no production path sets
+//! it.** The [`CancelByCloidAction::fast`] builder and its serialisation test keep the wire
+//! shape correct for the day it is activated, but activating it on the live cancel path is
+//! gated on a testnet direct-signing capture proving the venue accepts an `f: true` cancel
+//! (or a primary venue contract). Until then it stays off: the official API docs and
+//! python-SDK describe cancel without `f`, so an unverified field on the money path could get
+//! every cancel rejected — leaving the order live — for a flag that buys nothing today. The
+//! sweep's `cancel` never sets it either, and additionally must not, because `f: true` on a
 //! trigger order is rejected and a sweep can name a human's UI trigger.
 //!
 //! # What a 200 means
@@ -160,10 +166,16 @@ pub struct CancelByCloidAction {
     /// covers `msgpack(action)`, so [`is_false`] skips it when unset. Field order is
     /// protocol — `f` is last, after `cancels`.
     ///
-    /// Never set on a cancel that could name a **trigger** order (the venue rejects
-    /// `f: true` on triggers). The per-order path that opts in ([`Self::fast`]) cancels
-    /// only this backend's own `Gtc`/`Alo`/`Ioc` limits — `tif_of` admits no trigger kind —
-    /// so it is always safe there.
+    /// **Dormant: no production path sets it.** [`Self::fast`] can, and the serialisation
+    /// test pins that the wire would be correct if it did, but the live cancel path
+    /// (`private_stream::cancel_action_for_order`) leaves it off. Two reasons, in order of
+    /// weight: (1) we have no evidence the venue accepts an `f: true` direct-signed cancel —
+    /// the docs and python-SDK omit `f` — so enabling it on every user cancel risks the venue
+    /// rejecting the request and the order staying live, for zero benefit today; activation is
+    /// gated on a testnet capture that proves acceptance. (2) It must never name a **trigger**
+    /// order (the venue rejects `f: true` on triggers); the per-order path cancels only this
+    /// backend's own `Gtc`/`Alo`/`Ioc` limits — `tif_of` admits no trigger kind — so that
+    /// hazard alone would not have blocked it.
     #[serde(skip_serializing_if = "is_false")]
     pub f: bool,
 }
@@ -177,8 +189,13 @@ impl CancelByCloidAction {
         }
     }
 
-    /// Opts this cancel into fast-cancel (`f: true`). See the [`f`](Self::f) field: safe
-    /// only because the sole caller cancels non-trigger limit orders.
+    /// Opts this cancel into fast-cancel (`f: true`) — see the [`f`](Self::f) field.
+    ///
+    /// **No production caller today.** Kept, with its serialisation test, so the wire is
+    /// ready the day fast-cancel is activated; activation is gated on a testnet capture
+    /// proving the venue accepts an `f: true` direct-signed cancel (see
+    /// `private_stream::cancel_action_for_order`). Only ever safe on a cancel that cannot
+    /// name a trigger order.
     pub fn fast(mut self) -> Self {
         self.f = true;
         self
@@ -772,6 +789,11 @@ mod tests {
     /// base `cancelByCloid` fixture with the leading fixmap header `82`→`83` (two entries
     /// become three) and the pair `a166 c3` — key `"f"`, value `true` — appended after
     /// `cancels`.
+    ///
+    /// **This is a dormant "would-be-correct-if-activated" pin, not the production path.** It
+    /// builds `.fast()` on its own object; no production cancel sets `f` today
+    /// (`private_stream::the_per_order_cancel_omits_the_fast_flag` pins that). Its value is
+    /// that the wire is already correct the day fast-cancel is activated against the venue.
     #[test]
     fn a_fast_cancel_serialises_the_f_flag_true() {
         let cancel = CancelByCloidAction::new(vec![CancelByCloidWire {

@@ -81,17 +81,37 @@ const RESOLVE_BUDGET: Duration = Duration::from_secs(20);
 ///
 /// A **clean scheduled close** is the exception, and it is not a CDN half-open drop:
 /// Hyperliquid retires a socket on its ~10 min TTL with a code-1000 "Expired" frame, and the
-/// replacement session is accepted immediately. That case is fast-pathed by [`reconnect_delay`]
+/// replacement session is accepted immediately. That case is fast-pathed by [`ReconnectPolicy`]
 /// with [`CLEAN_CLOSE_BACKOFF`], outside this ladder; the 1 s floor still governs every
 /// genuine drop.
 pub(crate) const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// The delay before the **first** reconnect after a clean scheduled close (code 1000).
+/// The delay before a fast reconnect after a clean scheduled close (code 1000 "Expired").
 ///
 /// A real floor, not zero: far below the 1 s fault floor so a scheduled retirement barely
 /// shows as a gap, yet non-zero so a pathological "clean-close-on-open" venue cannot spin
 /// reconnects at no delay. In the 100–250 ms band the task specifies.
 pub(crate) const CLEAN_CLOSE_BACKOFF: Duration = Duration::from_millis(250);
+/// How long a connection must have been up for its end to count as a **stable session** that
+/// refreshes the clean-close fast budget ([`ReconnectPolicy`]).
+///
+/// Set between the two populations it separates. A benign steady state is a ~10 min TTL
+/// (600 s) session ending in "Expired"; a storm is a close arriving within the dial + a
+/// fraction of a second of accepting the socket (the dial alone is bounded by
+/// [`CONNECT_TIMEOUT`] = 15 s). 60 s sits an order of magnitude above the storm and an order
+/// of magnitude below the TTL, so a real session always clears it and a storm never does.
+/// Erring high is the safe direction: a benign retirement misjudged as unstable merely pays
+/// the 1 s floor once instead of 250 ms, whereas a storm misjudged as stable is the reconnect
+/// storm this whole mechanism exists to prevent.
+pub(crate) const STABLE_SESSION_MIN: Duration = Duration::from_secs(60);
+/// How many consecutive fast reconnects are allowed without a stable session in between.
+///
+/// One: the reviewer's "one retry, after which a stable session or normal backoff is
+/// required." The first clean close takes the fast path; a second, with no stable session
+/// between them, falls to the fault ladder. A stable session ([`STABLE_SESSION_MIN`]) resets
+/// the count, so a healthy steady state — every ~10 min session ending in a clean close — is
+/// fast every time.
+pub(crate) const MAX_CONSECUTIVE_FAST: u32 = 1;
 /// How often the feed counters are logged.
 pub(crate) const COUNTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Share of a reporting interval's frames that may be refused before the feed is reported
@@ -102,26 +122,59 @@ const REFUSED_RATE_MIN_FRAMES: u64 = 20;
 /// The keepalive the venue understands.
 pub(crate) const PING_FRAME: &str = r#"{"method":"ping"}"#;
 
-/// How long to wait before the next reconnect, given the error that ended the connection.
+/// The reconnect timing policy: the genuine-fault ladder, and the bounded decision of when a
+/// clean scheduled close may take the fast path.
 ///
 /// A clean scheduled close ([`HyperliquidError::is_clean_close`] — code 1000 "Expired", the
 /// venue's ~10 min TTL retirement) is fast-pathed with [`CLEAN_CLOSE_BACKOFF`] and **does
-/// not touch** `backoff`: it neither advances the ladder (a run of scheduled closes cannot
-/// escalate the delay) nor resets it (a genuine fault straddling a clean close still climbs,
-/// which is the fail-safe direction). Every other error — transport failure, idle timeout,
-/// a non-1000 close, a rejected subscribe — takes the normal exponential ladder, so a
-/// rate-limit or transport storm still backs off 1 s → 2 s → … → 30 s.
+/// not touch** the ladder: it neither advances it (a run of scheduled closes cannot escalate
+/// the delay) nor resets it (a genuine fault straddling a clean close still climbs, which is
+/// the fail-safe direction). Every other error — transport failure, idle timeout, a non-1000
+/// close, a 1000 close whose reason is not "Expired", a rejected subscribe — takes the normal
+/// exponential ladder, so a rate-limit or transport storm still backs off 1 s → 2 s → … →
+/// 30 s.
+///
+/// The fast path is **bounded**, not unconditional. Code 1000 "Expired" is the reason gate
+/// (§4.1a of the venue's own behaviour), but a venue that closes cleanly the instant it
+/// accepts a socket would otherwise be handed the 250 ms path for ever — up to four
+/// reconnects a second, the storm the ladder exists to damp. So a clean close is fast-pathed
+/// only while [`MAX_CONSECUTIVE_FAST`] has not been spent, and a spent budget is refreshed
+/// only by a session that actually lasted ([`STABLE_SESSION_MIN`]). A storm never produces a
+/// stable session, so after its one allowed fast retry it climbs the ladder like any other
+/// fault; a healthy steady state produces a stable session every time and is fast every time.
 ///
 /// Shared by both stream loops and imported by `private_stream` exactly as
 /// `BACKOFF_MIN`/`BACKOFF_MAX` are, so the two cannot drift onto different policies.
-pub(crate) fn reconnect_delay(
-    error: &HyperliquidError,
-    backoff: &mut ExponentialBackoff,
-) -> Duration {
-    if error.is_clean_close() {
-        CLEAN_CLOSE_BACKOFF
-    } else {
-        backoff.backoff()
+pub(crate) struct ReconnectPolicy {
+    backoff: ExponentialBackoff,
+    /// Fast reconnects taken since the last stable session. Capped at [`MAX_CONSECUTIVE_FAST`].
+    consecutive_fast: u32,
+}
+
+impl ReconnectPolicy {
+    pub(crate) fn new() -> Self {
+        Self {
+            backoff: ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX),
+            consecutive_fast: 0,
+        }
+    }
+
+    /// How long to wait before the next reconnect, given the error that ended the connection
+    /// and how long that connection had been up.
+    pub(crate) fn delay(&mut self, error: &HyperliquidError, session: Duration) -> Duration {
+        // A session that actually lasted refreshes the fast budget — however it ended. Only a
+        // storm of near-instant closes fails to, and that is exactly what must not be fast.
+        if session >= STABLE_SESSION_MIN {
+            self.consecutive_fast = 0;
+        }
+        if error.is_clean_close() && self.consecutive_fast < MAX_CONSECUTIVE_FAST {
+            self.consecutive_fast += 1;
+            CLEAN_CLOSE_BACKOFF
+        } else {
+            // A genuine fault, or a clean close whose fast budget is spent: the ladder. The
+            // fast path never reaches here, so it never advances or resets the ladder.
+            self.backoff.backoff()
+        }
     }
 }
 
@@ -429,13 +482,18 @@ impl PublicStream {
     /// The market state lives here, outside the connect loop, which is what makes the fill
     /// window and the book mirror survive a reconnect.
     pub async fn run(&mut self) {
-        let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
+        let mut policy = ReconnectPolicy::new();
         let mut last_counts = FeedCounts::default();
         loop {
+            let connected_at = Instant::now();
             let error = match self.connect().await {
                 Ok(()) => HyperliquidError::ConnectionInterrupted,
                 Err(error) => error,
             };
+            // How long this connection was up. It gates the clean-close fast path: only a
+            // session that actually lasted refreshes the fast budget, so a venue that closes
+            // cleanly the instant it accepts a socket cannot spin the fast path into a storm.
+            let session = connected_at.elapsed();
             // Counters go out with the disconnect, not only on the periodic tick: the
             // tick lives inside a connection, so on a venue that drops a socket every few
             // seconds the periodic log would never fire and the feed would be unobservable
@@ -448,8 +506,12 @@ impl PublicStream {
             );
             self.report(&mut last_counts, counts);
             publish_error(&self.ev_tx, ErrorKind::ConnectionInterrupted, &error);
-            let delay = reconnect_delay(&error, &mut backoff);
-            info!(?delay, "Reconnecting to the Hyperliquid public stream.");
+            let delay = policy.delay(&error, session);
+            info!(
+                ?delay,
+                ?session,
+                "Reconnecting to the Hyperliquid public stream."
+            );
             time::sleep(delay).await;
         }
     }
@@ -531,12 +593,10 @@ impl PublicStream {
                             send(&mut write, Message::Pong(Bytes::default())).await?;
                         }
                         Some(Ok(Message::Close(frame))) => {
-                            // Read the close code before `to_string()` consumes the frame:
-                            // a clean code-1000 "Expired" close is a scheduled TTL
-                            // retirement and reconnects fast (§B1).
-                            let code = frame.as_ref().map(|f| u16::from(f.code));
-                            let reason = frame.map(|f| f.to_string()).unwrap_or_default();
-                            return Err(HyperliquidError::ConnectionAbort { reason, code });
+                            // A clean code-1000 "Expired" close is a scheduled TTL retirement
+                            // and reconnects fast (§B1); `from_close_frame` reads the close
+                            // code before `to_string()` consumes the frame.
+                            return Err(HyperliquidError::from_close_frame(frame));
                         }
                         Some(Ok(_)) => {}
                         Some(Err(error)) => return Err(HyperliquidError::from(error)),
@@ -1165,17 +1225,20 @@ mod tests {
     /// replacement session is accepted immediately — so it takes the fast path, well below
     /// the 1 s fault floor. Because the fast path never calls `backoff.backoff()`, it
     /// neither advances nor resets the genuine-fault ladder: a fault after a clean close
-    /// resumes exactly where it left off. `reconnect_delay` is pure, so this needs no
-    /// socket and no clock (`start_paused` does not drive `ExponentialBackoff`'s
-    /// `std::time::Instant` anyway; the reset guarantee is covered by `utils.rs`).
+    /// resumes exactly where it left off. `ReconnectPolicy::delay` is a pure computation over
+    /// its own state, so this needs no socket and no clock (the ladder's own reset guarantee
+    /// is covered by `utils.rs`). Every clean close here follows a full ~10-min session, so
+    /// the fast budget is available each time — the storm bound is exercised separately.
     #[test]
     fn a_clean_scheduled_close_reconnects_fast_and_does_not_climb_the_ladder() {
         use std::time::Duration;
 
-        use super::{BACKOFF_MAX, BACKOFF_MIN, CLEAN_CLOSE_BACKOFF, reconnect_delay};
-        use crate::utils::ExponentialBackoff;
+        use super::{BACKOFF_MIN, CLEAN_CLOSE_BACKOFF, ReconnectPolicy};
 
-        let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
+        // A full session: comfortably above `STABLE_SESSION_MIN`, so each clean close is
+        // granted the fast path.
+        let full_session = Duration::from_secs(600);
+        let mut policy = ReconnectPolicy::new();
         let clean = || HyperliquidError::ConnectionAbort {
             reason: "Expired (1000)".into(),
             code: Some(1000),
@@ -1183,27 +1246,125 @@ mod tests {
         let genuine = || HyperliquidError::ConnectionInterrupted;
 
         // The fast path, and it really is faster than the fault floor.
-        assert_eq!(reconnect_delay(&clean(), &mut backoff), CLEAN_CLOSE_BACKOFF);
+        assert_eq!(policy.delay(&clean(), full_session), CLEAN_CLOSE_BACKOFF);
         assert!(CLEAN_CLOSE_BACKOFF < BACKOFF_MIN);
 
         // A genuine fault climbs from the 1 s floor.
         assert_eq!(
-            reconnect_delay(&genuine(), &mut backoff),
+            policy.delay(&genuine(), full_session),
             Duration::from_secs(1)
         );
         assert_eq!(
-            reconnect_delay(&genuine(), &mut backoff),
+            policy.delay(&genuine(), full_session),
             Duration::from_secs(2)
         );
 
         // A clean close in the middle takes the fast path…
-        assert_eq!(reconnect_delay(&clean(), &mut backoff), CLEAN_CLOSE_BACKOFF);
+        assert_eq!(policy.delay(&clean(), full_session), CLEAN_CLOSE_BACKOFF);
 
         // …and left the ladder exactly where it was: the next genuine fault is 4 s — not a
         // reset to 1 s, and not an extra doubling to 8 s.
         assert_eq!(
-            reconnect_delay(&genuine(), &mut backoff),
+            policy.delay(&genuine(), full_session),
             Duration::from_secs(4)
+        );
+    }
+
+    /// **B1 bound: a clean-close storm gets one fast retry, then the fault ladder.** The
+    /// benign pattern is a fast reconnect → a full ~10-min session → the next "Expired". A
+    /// storm is a fast reconnect → immediate close → fast reconnect → … A fast reconnect is
+    /// granted only while the fast budget holds, and only a *stable* session refreshes the
+    /// budget, so a venue that closes the instant it accepts a socket gets exactly one
+    /// near-instant retry and then the ordinary 1 s → 30 s ladder — never the up-to-four-per-
+    /// second storm that fast-pathing every code-1000 close would allow. Removing the bound
+    /// makes the second `delay` below take the fast path instead of the floor.
+    #[test]
+    fn repeated_clean_closes_without_a_stable_session_fall_back_to_backoff() {
+        use std::time::Duration;
+
+        use super::{BACKOFF_MIN, CLEAN_CLOSE_BACKOFF, ReconnectPolicy};
+
+        let clean = || HyperliquidError::ConnectionAbort {
+            reason: "Expired (1000)".into(),
+            code: Some(1000),
+        };
+        // A close that arrives the instant the socket is accepted: no real session.
+        let no_session = Duration::from_millis(0);
+        // A full ~10-min session, comfortably above `STABLE_SESSION_MIN`.
+        let full_session = Duration::from_secs(600);
+
+        let mut policy = ReconnectPolicy::new();
+
+        // One fast retry is allowed even without a preceding stable session.
+        assert_eq!(policy.delay(&clean(), no_session), CLEAN_CLOSE_BACKOFF);
+        // A second immediate clean close, with no stable session in between, is a storm:
+        // fall back to the ladder floor, then climb it.
+        assert_eq!(policy.delay(&clean(), no_session), BACKOFF_MIN);
+        assert_eq!(policy.delay(&clean(), no_session), BACKOFF_MIN * 2);
+
+        // A stable session refreshes the budget: the next clean close is fast again…
+        assert_eq!(policy.delay(&clean(), full_session), CLEAN_CLOSE_BACKOFF);
+        // …and the fast path did not touch the ladder — the next storm close resumes at 4 s,
+        // not a reset to the floor.
+        assert_eq!(policy.delay(&clean(), no_session), BACKOFF_MIN * 4);
+    }
+
+    /// **B1 end to end, from a real close frame through the production reconnect decision.**
+    /// Both `connect()` loops turn a `Message::Close(frame)` into the abort error via
+    /// [`HyperliquidError::from_close_frame`] and hand it to [`ReconnectPolicy::delay`]; this
+    /// drives that exact seam on real [`CloseFrame`]s rather than a hand-built error, so the
+    /// reviewer's two named mutations each fail *here*, not only in review:
+    ///
+    /// - **Nulling the extracted close code** (`from_close_frame` returning `code: None`)
+    ///   makes the "Expired" case not clean, so its delay becomes the ladder floor.
+    /// - **Dropping the reason gate** (`is_clean_close` keying on code alone) makes the
+    ///   "Inactive (1000)" case clean, so its delay becomes the fast path.
+    #[test]
+    fn the_close_frame_drives_the_reconnect_decision() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+        use super::{BACKOFF_MIN, CLEAN_CLOSE_BACKOFF, ReconnectPolicy, STABLE_SESSION_MIN};
+
+        let close = |code, reason: &str| {
+            HyperliquidError::from_close_frame(Some(CloseFrame {
+                code,
+                reason: reason.into(),
+            }))
+        };
+
+        // The extraction reads the numeric code from the frame; the reason keeps the text and,
+        // via `CloseFrame::to_string()`, the "(1000)" suffix.
+        match close(CloseCode::Normal, "Expired") {
+            HyperliquidError::ConnectionAbort { code, reason } => {
+                assert_eq!(
+                    code,
+                    Some(1000),
+                    "the RFC6455 close code must be read from the frame"
+                );
+                assert_eq!(reason, "Expired (1000)");
+            }
+            other => panic!("a close frame must abort with ConnectionAbort, got {other:?}"),
+        }
+
+        // Expired / 1000 -> clean -> the fast path.
+        let mut policy = ReconnectPolicy::new();
+        assert_eq!(
+            policy.delay(&close(CloseCode::Normal, "Expired"), STABLE_SESSION_MIN),
+            CLEAN_CLOSE_BACKOFF
+        );
+
+        // Inactive / 1000 -> the reason gate rejects it -> the ladder floor.
+        let mut policy = ReconnectPolicy::new();
+        assert_eq!(
+            policy.delay(&close(CloseCode::Normal, "Inactive"), STABLE_SESSION_MIN),
+            BACKOFF_MIN
+        );
+
+        // A non-1000 code is never clean, even carrying an "Expired" reason -> the ladder.
+        let mut policy = ReconnectPolicy::new();
+        assert_eq!(
+            policy.delay(&close(CloseCode::Away, "Expired"), STABLE_SESSION_MIN),
+            BACKOFF_MIN
         );
     }
 

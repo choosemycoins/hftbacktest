@@ -210,7 +210,7 @@ impl ExponentialBackoff {
     /// That 1 s floor is for **genuine** drops. A clean scheduled close is a different case
     /// — Hyperliquid retires a socket on its ~10 min TTL with a code-1000 "Expired" frame,
     /// whose replacement session it accepts immediately — and the HL stream fast-paths it
-    /// *outside* this ladder (`hyperliquid::public_stream::reconnect_delay`) rather than
+    /// *outside* this ladder (`hyperliquid::public_stream::ReconnectPolicy`) rather than
     /// paying the floor. For that case this ladder is not consulted, advanced, or reset.
     pub fn with_bounds(min_delay: Duration, max_delay: Duration) -> Self {
         Self {
