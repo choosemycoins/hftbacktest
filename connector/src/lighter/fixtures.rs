@@ -104,3 +104,94 @@ pub const ERROR_ALREADY_SUBSCRIBED: &str =
 /// repair the venue does honour. Byte for byte from the wire, spaces included: this is the
 /// one frame the venue spells with them.
 pub const UNSUBSCRIBED_ETH: &str = r#"{"type": "unsubscribed", "channel": "order_book:0"}"#;
+
+// ============================================================================================
+// Phase 2 PRIVATE-channel frames, captured live on testnet 2026-07-30 (account_index 516).
+//
+// Source: `docs/lighter-phase0-artifacts/step6b_out.json`, one real order object out of each
+// captured `account_all_orders` frame (the frame carried two; one is kept for size, byte for
+// byte). These carry no key and no auth token — verified by grep before the artifacts were
+// committed (their README) and again here: the only account identifier is the public index
+// 516. They exist to pin the three traps that live in these bodies (design note §4.12–§4.14):
+//
+//   * the SAME order's `integrator_*` fields are `""` in the snapshot and `"0"` in the delta
+//     (§4.13) — a serde struct that types them as numbers loses the whole snapshot, on the
+//     reconnect path, where it is dearest;
+//   * `side` is always the empty string; the side lives in `is_ask` (§4.13);
+//   * `updated_at` is block-granular seconds and non-monotone across a state change, so it is
+//     useless as an ordering key; `transaction_time` (microseconds) is the only one (§4.12);
+//   * the in-order `nonce` field (2^48-ish) is NOT the slot's tx-nonce (§4.14).
+
+/// `subscribed/account_all_orders`: one resting PostOnly bid, `status:"open"`, integrator
+/// fields `""`. Auth was required to receive it (§3.4).
+pub const PRIVATE_ORDERS_SNAPSHOT: &str = r#"{"channel":"account_all_orders:516","orders":{"1":[{"order_index":844424914280027,"client_order_index":424242424242,"order_id":"844424914280027","client_order_id":"424242424242","market_index":1,"owner_account_index":516,"initial_base_amount":"0.00100","price":"58300.0","nonce":281474960858715,"remaining_base_amount":"0.00100","is_ask":false,"base_size":100,"base_price":583000,"filled_base_amount":"0.00000","filled_quote_amount":"0.000000","side":"","type":"limit","time_in_force":"post-only","reduce_only":false,"trigger_price":"0.0","order_expiry":1787850973695,"status":"open","trigger_status":"na","trigger_time":0,"parent_order_index":0,"parent_order_id":"0","to_trigger_order_id_0":"0","to_trigger_order_id_1":"0","to_cancel_order_id_0":"0","integrator_fee_collector_index":"","integrator_taker_fee":"","integrator_maker_fee":"","order_flags":0,"block_height":510820,"timestamp":1785431769,"created_at":1785431769,"updated_at":1785431769,"transaction_time":1785431774184833}]},"type":"subscribed/account_all_orders"}"#;
+
+/// `update/account_all_orders`: the SAME order (COI 424242424242, order_index
+/// 844424914280027) after a `CancelAllOrders`, `status:"canceled"`, `base_size:0`,
+/// `remaining_base_amount:"0.00000"` — and integrator fields now `"0"` rather than `""`
+/// (§4.13). Its `transaction_time` is strictly greater than the snapshot's; its `updated_at`
+/// moved only because a new block sealed it (§4.12).
+pub const PRIVATE_ORDERS_UPDATE_CANCELED: &str = r#"{"channel":"account_all_orders:516","orders":{"1":[{"order_index":844424914280027,"client_order_index":424242424242,"order_id":"844424914280027","client_order_id":"424242424242","market_index":1,"owner_account_index":516,"initial_base_amount":"0.00100","price":"58300.0","nonce":281474960858715,"remaining_base_amount":"0.00000","is_ask":false,"base_size":0,"base_price":583000,"filled_base_amount":"0.00000","filled_quote_amount":"0.000000","side":"","type":"limit","time_in_force":"post-only","reduce_only":false,"trigger_price":"0.0","order_expiry":1787850973695,"status":"canceled","trigger_status":"na","trigger_time":0,"parent_order_index":0,"parent_order_id":"0","to_trigger_order_id_0":"0","to_trigger_order_id_1":"0","to_cancel_order_id_0":"0","integrator_fee_collector_index":"0","integrator_taker_fee":"0","integrator_maker_fee":"0","order_flags":0,"block_height":510869,"timestamp":1785431903,"created_at":1785431769,"updated_at":1785431903,"transaction_time":1785431906364320}]},"type":"update/account_all_orders"}"#;
+
+/// `update/account_all_positions`, flat account: `open_order_count` fell to 0 after the
+/// cancel. Position comes from here, never from replaying fills (§3.4).
+pub const PRIVATE_POSITIONS_UPDATE_FLAT: &str = r#"{"channel":"account_all_positions:516","positions":{"1":{"market_id":1,"symbol":"BTC","initial_margin_fraction":"5.00","open_order_count":0,"pending_order_count":0,"position_tied_order_count":0,"sign":1,"position":"0.00000","avg_entry_price":"0.0","position_value":"-0.000000","unrealized_pnl":"0.000000","realized_pnl":"0.000000","liquidation_price":"0","margin_mode":0,"margin_set_flag":1,"allocated_margin":"0.000000"}},"shares":[],"type":"update/account_all_positions"}"#;
+
+/// `subscribed/account_all_trades` — the snapshot is **always empty** (§3.4, confirmed): the
+/// fill history does not replay, so a restart cannot rebuild the past from it.
+pub const PRIVATE_TRADES_SNAPSHOT_EMPTY: &str = r#"{"channel":"account_all_trades:516","daily_volume":0,"monthly_volume":0,"total_volume":0,"trades":{},"type":"subscribed/account_all_trades","weekly_volume":0}"#;
+
+/// The refusal to `subscribe account_all_orders` with no auth token (§3.4, both networks):
+/// code 20001. Carries neither `type` nor `channel`, like every venue error frame.
+pub const PRIVATE_ERROR_AUTH_REQUIRED: &str = r#"{"error":{"code":20001,"message":"invalid param : auth field is required: account_all_orders:1"}}"#;
+
+/// `subscribed/account_all_orders` with an **empty** book — the shape a (re)connect gets when
+/// the venue holds nothing (`docs/lighter-phase0-artifacts/step3_out.json`). The clean-slate
+/// reconciliation must read this as "nothing to sweep" and spend no nonce (§3.4).
+pub const PRIVATE_ORDERS_SNAPSHOT_EMPTY: &str =
+    r#"{"channel":"account_all_orders:516","orders":{},"type":"subscribed/account_all_orders"}"#;
+
+// --------------------------------------------------------------------------------------------
+// Phase 2 (Fix) `GET /api/v1/accountActiveOrders` bodies — the REST mirror of the WS
+// `account_all_orders` list the slot reads an ambiguous send's fate off (§3.3). Unlike the WS
+// frame (a map of arrays keyed by market-index string), the REST body is a flat `orders` array
+// under the venue's `code: 200` envelope; the per-order fields are identical (same
+// `client_order_index` / `order_index` / string amounts / `transaction_time` in microseconds,
+// and the same §4.13 `integrator_*` drift). All three were captured **byte for byte** off the
+// live testnet endpoint during the Fix+Testnet round-trip (2026-08-01): `_ONE` is a real
+// resting PostOnly bid on BTC (COI 178554256601, placed far below mid and confirmed here),
+// `_EMPTY` is the flat account, and `_AUTH_REQUIRED` is the exact refusal with no token.
+
+/// `GET /api/v1/accountActiveOrders` with one resting order — a **real** testnet PostOnly BTC
+/// bid (our COI 178554256601), captured live 2026-08-01. `code 200`, a flat `orders` array; the
+/// fate-check reads `client_order_index` to learn a landed order and `order_index` to cancel it.
+pub const REST_ACTIVE_ORDERS_ONE: &str = r#"{"code":200,"orders":[{"order_index":844424912956320,"client_order_index":178554256601,"order_id":"844424912956320","client_order_id":"178554256601","market_index":1,"owner_account_index":516,"initial_base_amount":"0.00100","price":"56608.2","nonce":281474959535008,"remaining_base_amount":"0.00100","is_ask":false,"base_size":100,"base_price":566082,"filled_base_amount":"0.00000","filled_quote_amount":"0.000000","side":"","type":"limit","time_in_force":"post-only","reduce_only":false,"trigger_price":"0.0","order_expiry":1787961767927,"status":"open","trigger_status":"na","trigger_time":0,"parent_order_index":0,"parent_order_id":"0","to_trigger_order_id_0":"0","to_trigger_order_id_1":"0","to_cancel_order_id_0":"0","integrator_fee_collector_index":"","integrator_taker_fee":"","integrator_maker_fee":"","order_flags":0,"block_height":543323,"timestamp":1785542568,"created_at":1785542568,"updated_at":1785542568,"transaction_time":1785542568396486}]}"#;
+
+/// `GET /api/v1/accountActiveOrders` on a flat account: `code 200`, empty `orders` — captured
+/// live off the flat testnet account (2026-08-01). The venue positively holds nothing, so an
+/// ambiguous order absent from this never landed (§3.3).
+pub const REST_ACTIVE_ORDERS_EMPTY: &str = r#"{"code":200,"orders":[]}"#;
+
+/// `GET /api/v1/accountActiveOrders` with no token — `20001`, exactly like the WS subscribe. An
+/// `Err`, never an empty list: the fate is unknown, and reading it as "no orders" would expire
+/// a possibly-resting order (§3.3, §1.1).
+pub const REST_ACTIVE_ORDERS_AUTH_REQUIRED: &str = r#"{"code":20001,"message":"invalid param : auth query param and Authorization header are empty"}"#;
+
+// --------------------------------------------------------------------------------------------
+// Phase 2 auth-token verification bodies, captured live on testnet 2026-07-30
+// (`docs/lighter-phase0-artifacts/step3_out.json`). The 8 h token ceiling is checked ONLY by
+// the server (§3.4): a 9 h token mints without error on the `.so` and is rejected `20013` only
+// at use. So a freshly minted token is verified with one cheap authorized GET
+// (`GET /api/v1/accountLimits`) before the connector relies on it. These are the two answers
+// that GET gives, byte for byte off the wire.
+
+/// `GET /api/v1/accountLimits` with a **valid** (8 h) token: HTTP 200. Carries the fee tier
+/// too, but the verification only reads the 200 (§3.4). No key or token is in this body — the
+/// only account identifier is the public tier metadata.
+pub const ACCOUNT_LIMITS_OK: &str = r#"{"code":200,"max_llp_percentage":100,"max_llp_amount":"0.000000","user_tier":"standard","can_create_public_pool":false,"user_tier_name":"standard","current_maker_fee_tick":0,"current_taker_fee_tick":0,"leased_lit":"0.00000000","effective_lit_stakes":"0.00000000","user_tier_last_update":0}"#;
+
+/// `GET /api/v1/accountLimits` with a token whose deadline is over the 8 h ceiling: HTTP 401
+/// `20013 invalid deadline` — the §3.4 trap, the one the cheap GET exists to catch before the
+/// connector switches to a doomed token.
+pub const ACCOUNT_LIMITS_INVALID_DEADLINE: &str =
+    r#"{"code":20013,"message":"invalid auth: invalid deadline"}"#;

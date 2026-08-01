@@ -1,11 +1,15 @@
-//! Lighter (zkLighter) perpetuals backend — **Phase 1: public market data only**.
+//! Lighter (zkLighter) perpetuals backend.
 //!
 //! Subscribes `order_book` and `trade` for every registered symbol and publishes kind-1
-//! depth events and trade events. It holds no key, signs nothing, and **refuses every
-//! order**; the order path is Phase 2 (design note
-//! [`docs/design-lighter-connector.md`](../../../docs/design-lighter-connector.md) §5).
+//! depth events and trade events. The **order path is opt-in** (design note
+//! [`docs/design-lighter-connector.md`](../../../docs/design-lighter-connector.md) §3.2–§3.4):
+//! with a `[order_path]` config section it signs, places and cancels through the sidecar,
+//! nonce slot and private stream ([`order_path`]); without one it holds no key, signs nothing
+//! and **refuses every order** ([`reject_order`]) — the fail-closed default, because on this
+//! venue a `sendTx` 200 is not acceptance and only a live round trip proves the path (§4.11).
 //!
-//! Five facts about this venue shape the module, and every one of them fails silently:
+//! Five facts about this venue's **market data** shape the module, and every one fails
+//! silently:
 //!
 //! 1. **A subscription is asked for as `order_book/36` and every frame comes back as
 //!    `order_book:36`** (§2.1). Routing on the request spelling leaves the connector
@@ -45,15 +49,30 @@ use tracing::{error, info, warn};
 
 use crate::{
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
-    lighter::public_stream::PublicStream,
+    lighter::{
+        order_path::{OrderPath, OrderPathConfig},
+        public_stream::PublicStream,
+    },
 };
 
 pub mod depth;
 #[cfg(test)]
 pub mod fixtures;
 pub mod msg;
+/// Phase 2 order-path: the sequential tx-nonce owner for one api-key slot (§3.3).
+pub mod nonce;
+/// Phase 2 order-path: order-id mapping and the order-state machine (§3.5, §4.11–§4.13).
+pub mod order;
+/// Phase 2 order-path: the async carriage — signer sidecar, slot task, private stream (§3.2–§3.4).
+pub mod order_path;
+/// Phase 2 order-path: the private account channels' wire shapes (§3.4, §4.12–§4.14).
+pub mod private_msg;
 pub mod public_stream;
 pub mod rest;
+/// Phase 2 order-path signing: client to the out-of-process signer sidecar (§3.2).
+pub mod signer;
+/// Phase 2 order-path: the slot owner's nonce/placement decisions (§3.3, §4.11).
+pub mod slot;
 pub mod trades;
 
 #[derive(Error, Debug)]
@@ -155,9 +174,15 @@ pub struct Config {
     /// a bot's own `register()` is added dynamically either way.
     #[serde(default)]
     pub symbols: Vec<String>,
+    /// The order path (§3.2–§3.4). **Absent ⇒ market-data only, orders refused** — the
+    /// fail-closed default, because acceptance on this venue is only provable by a live round
+    /// trip (§4.11) that the Fix+Testnet phase, not deployment, performs. Present ⇒ the signer
+    /// sidecar, nonce slot and private stream are armed.
+    #[serde(default)]
+    pub order_path: Option<OrderPathConfig>,
 }
 
-type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
+pub(crate) type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
 
 /// What a market-data-only connector reports: nothing, because it holds nothing.
 ///
@@ -176,7 +201,12 @@ pub struct Lighter {
     config: Config,
     symbols: SharedSymbolSet,
     symbol_tx: Sender<String>,
+    /// Reported to bots when the order path is **not** armed — an empty list, which is the
+    /// truth, because [`Self::submit`] refuses every order in that mode.
     no_orders: Arc<Mutex<NoOrders>>,
+    /// The armed order path, or `None` for market-data-only. When present it owns the real
+    /// [`order::OrderManager`], and `order_manager()` reports from it.
+    order_path: Option<OrderPath>,
     /// The stream task, kept so an orderly stop can end it and its `PublishEvent` sender
     /// can be dropped — which is what lets the publish task stop last. `AGENTS.md` §4.7.
     tasks: Vec<JoinHandle<()>>,
@@ -195,12 +225,24 @@ impl ConnectorBuilder for Lighter {
                 set.insert(symbol.clone());
             }
         }
-        warn!("The Lighter backend is Phase 1: it serves market data and refuses every order.");
+        if config.order_path.is_some() {
+            info!(
+                "The Lighter order path is ARMED (an [order_path] section is present): it will \
+                 sign, place and cancel orders. Acceptance is confirmed off the private channel, \
+                 not the sendTx 200 (§4.11)."
+            );
+        } else {
+            warn!(
+                "The Lighter backend is market-data only: no [order_path] section, so it serves \
+                 the feed and refuses every order. This is the fail-closed default."
+            );
+        }
         Ok(Lighter {
             config,
             symbols,
             symbol_tx,
             no_orders: Arc::new(Mutex::new(NoOrders)),
+            order_path: None,
             tasks: Vec::new(),
         })
     }
@@ -224,7 +266,13 @@ impl Connector for Lighter {
     }
 
     fn order_manager(&self) -> Arc<Mutex<dyn GetOrders + Send + 'static>> {
-        self.no_orders.clone()
+        // When armed, the truth is the order path's own manager; otherwise nothing rests, and
+        // an empty list is the truth (this backend refuses every order in that mode).
+        if let Some(order_path) = &self.order_path {
+            order_path.order_manager()
+        } else {
+            self.no_orders.clone()
+        }
     }
 
     fn run(&mut self, ev_tx: UnboundedSender<PublishEvent>) {
@@ -233,19 +281,39 @@ impl Connector for Lighter {
             self.config.rest_url.clone(),
             self.symbols.clone(),
             self.symbol_tx.subscribe(),
-            ev_tx,
+            ev_tx.clone(),
         );
         self.tasks.push(tokio::spawn(async move {
             public.run().await;
         }));
+        if let Some(config) = self.config.order_path.clone() {
+            info!(
+                api_key_index = config.api_key_index,
+                account_index = config.account_index,
+                "Arming the Lighter order path."
+            );
+            self.order_path = Some(OrderPath::spawn(
+                config,
+                self.config.rest_url.clone(),
+                self.config.public_url.clone(),
+                self.symbols.clone(),
+                ev_tx,
+            ));
+        }
     }
 
     fn submit(&self, symbol: String, order: Order, ev_tx: UnboundedSender<PublishEvent>) {
-        reject_order(&symbol, &order, ev_tx);
+        match &self.order_path {
+            Some(order_path) => order_path.submit(&symbol, &order, &ev_tx),
+            None => reject_order(&symbol, &order, ev_tx),
+        }
     }
 
     fn cancel(&self, symbol: String, order: Order, ev_tx: UnboundedSender<PublishEvent>) {
-        reject_order(&symbol, &order, ev_tx);
+        match &self.order_path {
+            Some(order_path) => order_path.cancel(&symbol, &order, &ev_tx),
+            None => reject_order(&symbol, &order, ev_tx),
+        }
     }
 
     /// Nothing to sweep: this backend has never placed an order.
@@ -260,20 +328,52 @@ impl Connector for Lighter {
         &self,
         symbols: Vec<String>,
         reason: SweepReason,
-        _ev_tx: UnboundedSender<PublishEvent>,
+        ev_tx: UnboundedSender<PublishEvent>,
     ) -> Option<JoinHandle<()>> {
+        let Some(order_path) = &self.order_path else {
+            // Market-data only: nothing was ever placed, so there is nothing resting to sweep.
+            info!(
+                ?reason,
+                ?symbols,
+                "The Lighter backend is market-data only, so it has nothing resting to sweep."
+            );
+            return None;
+        };
+        // One `CancelAllOrders` per resolved market (§3.4) — scoped to the swept symbols rather
+        // than the whole account, so a dead bot's sweep cannot flatten a live bot's markets.
+        let market_indices: Vec<i32> = {
+            let manager = order_path.order_manager();
+            let manager = manager.lock().unwrap();
+            symbols
+                .iter()
+                .filter_map(|symbol| {
+                    manager
+                        .market_info(symbol)
+                        .map(|info| info.market_id as i32)
+                })
+                .collect()
+        };
         info!(
             ?reason,
             ?symbols,
-            "The Lighter backend is market-data only, so it has nothing resting to sweep."
+            ?market_indices,
+            "Sweeping Lighter orders with CancelAllOrders (§3.4)."
         );
-        None
+        // The private stream holds its own publish sender and reports the cancel confirmations;
+        // this sender is not needed to carry them, so it is dropped rather than parked.
+        drop(ev_tx);
+        Some(order_path.sweep(market_indices))
     }
 
     /// Ends the stream task, so its sender is dropped and the publish task can see the
     /// channel close and stop **last**. Without it an orderly stop waits out
     /// `shutdown.grace_ms` in full — `AGENTS.md` §4.7.
     fn shutdown(&mut self) {
+        // Called after `sweep` (`connector/src/connector.rs`), so an in-flight sweep is not
+        // cut off by aborting the slot task here.
+        if let Some(order_path) = &mut self.order_path {
+            order_path.shutdown();
+        }
         let count = self.tasks.len();
         for task in self.tasks.drain(..) {
             task.abort();

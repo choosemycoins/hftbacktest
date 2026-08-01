@@ -1,0 +1,22 @@
+# Lighter signer sidecar config — the file the sidecar opens ITSELF to read its key.
+# The key never rides on the command line and never enters the connector process
+# (design note docs/design-lighter-connector.md §3.2). Keep this file mode 0600.
+#
+# TESTNET ONLY for testnet keys: chain_id 300, base https://testnet.zklighter.elliot.ai.
+# Never point a testnet key at mainnet (chain_id 304).
+
+url = "https://testnet.zklighter.elliot.ai"
+chain_id = 300           # optional; inferred from url when omitted (300 testnet / 304 mainnet)
+account_index = 516      # this account's index on the venue
+
+# One api-key slot. Parallelism is MORE slots, not a nonce window (§3.3, §4.12):
+# each slot is an independent nonce chain and gets its own sidecar + SignerClient.
+# The submit path and the cancel path should use DIFFERENT slots so a stuck submit
+# cannot block a cancel/sweep (§3.3).
+api_key_index = 5
+private_key = "0x<40-byte-le-schnorr-key-hex>"   # 80 hex chars; NEVER commit a real key
+
+# Several slots (when provisioned) — repeat the [[key]] table:
+# [[key]]
+# api_key_index = 6
+# private_key = "0x..."

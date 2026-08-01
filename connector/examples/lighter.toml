@@ -1,9 +1,16 @@
-# Lighter (zkLighter) connector — PHASE 1: PUBLIC MARKET DATA ONLY.
+# Lighter (zkLighter) connector.
 #
 # This backend subscribes `order_book` + `trade` for every registered symbol and publishes
-# depth and trade events. It holds no key, signs nothing, and REJECTS every order with
-# ErrorKind::OrderError. Do not point a trading bot at it expecting fills; the order path
-# (signing, nonce slots, sweep) is Phase 2 — docs/design-lighter-connector.md §5.
+# depth and trade events. The ORDER PATH is OPT-IN: without an [order_path] section (the
+# bottom of this file) it holds no key, signs nothing, and REJECTS every order with
+# ErrorKind::OrderError — the fail-closed default. With an [order_path] section it drives the
+# signer sidecar, a per-slot nonce owner, submit/cancel, a `CancelAllOrders` sweep, and the
+# authenticated private stream (docs/design-lighter-connector.md §3.2–§3.4).
+#
+# Whether the order path actually places orders end-to-end is proven by the LIVE TESTNET
+# round trip of the Fix+Testnet phase (design note §5 gate), not by deployment: on this venue
+# a sendTx HTTP 200 is NOT acceptance — a rejected tx gets 200, spends a nonce and produces
+# no order, and the only verdict is event_info.ae (§4.11). Arm it on TESTNET first.
 #
 # Run:
 #   cargo run -p connector -- <connector-name> lighter connector/examples/lighter.toml
@@ -96,10 +103,10 @@ symbols = ["CRV", "HYPE"]
 #   collector until the per-connection reading is confirmed. Under the per-IP reading the
 #   second process starts from the remainder, not from 200.
 #
-# * ORDERS. There are no keys here, by design. Signing is Schnorr over ECgFp5 with
-#   Poseidon2-Goldilocks, supplied by the venue as a native library; the connector will
-#   drive it through a sidecar in Phase 2 (§3.2). Until then submit and cancel are refused
-#   loudly, and `sweep` is a documented no-op because there is nothing resting to sweep.
+# * ORDERS are OPT-IN via the [order_path] section below. Without it there are no keys and
+#   submit/cancel are refused loudly (`sweep` a no-op). Signing is Schnorr over ECgFp5 with
+#   Poseidon2-Goldilocks, supplied by the venue as a native library the connector drives
+#   through an out-of-process SIDECAR — the private key lives ONLY in the sidecar (§3.2).
 
 # --- Supervision (generic; every backend reads these from its own config file) ---------
 #
@@ -141,3 +148,61 @@ enabled = true
 # clear is the bot's HEARTBEAT INTERVAL (one second by default), not the duration of its
 # `elapse` calls.
 timeout_ms = 10000
+
+# --- Order path (§3.2–§3.4) — OPT-IN, and OFF above. Uncomment to arm. -----------------
+#
+# ABSENT ⇒ market-data only, every order refused (the fail-closed default). PRESENT ⇒ the
+# connector signs, places and cancels orders. ARM THIS ON TESTNET FIRST: the venue's testnet
+# is chain id 300 (base https://testnet.zklighter.elliot.ai, WS wss://testnet.../stream) and
+# lists only BTC/ETH/SOL, but that is enough to prove the plumbing. NEVER point testnet keys
+# at mainnet or vice versa (chain id is signed into every tx — §4.10).
+#
+# The private KEY never appears here. It lives only in the sidecar's own config file, which
+# the sidecar reads and this process never sees (§3.2). This section only names WHERE the
+# sidecar is and WHICH account/slot to act as.
+#
+# [order_path]
+# # The account to act as. A subaccount per bot is the scoping unit for cancels (§3.4).
+# account_index = 516
+#
+# # The api-key slot to sign with. MUST be >= 4: indices 0-3 are reserved for desktop/mobile
+# # (§3.3), and the connector must provision its own. One slot signs both submits and cancels
+# # for now; a dedicated cancel slot (§3.3) is a multi-key/mainnet concern (§6.В.3).
+# api_key_index = 5
+#
+# # The signer sidecar (§3.2): the Python interpreter, the sidecar script, and the sidecar's
+# # OWN config file (which holds the key — see connector/lighter-signer/signer.example.toml).
+# # On THIS host the Linux native signer is lighter-signer-linux-amd64.so, bundled in
+# # lighter-sdk==1.1.2; the sidecar loads it via the SDK's platform dispatch.
+# signer_python = "/path/to/venv/bin/python"
+# signer_script = "connector/lighter-signer/sidecar.py"
+# signer_config = "/path/to/lighter-signer.toml"
+#
+# # How long account_all_orders has to confirm a placement before the connector asks GET /tx
+# # for the event_info.ae verdict (§4.11). Optional; default 5000 ms, generous over the
+# # measured ~200 ms channel appearance.
+# confirm_deadline_ms = 5000
+#
+# # What to do about orders ALREADY RESTING when the private stream (re)connects (§3.4).
+# # Optional; default "reconcile".
+# #
+# #   "reconcile" (default) — adopt what the venue's snapshot lists, and only expire orders
+# #     this connector believed were resting that the venue no longer lists. Cancelling on
+# #     every connect would turn a transient blip into a round trip through an empty book and
+# #     spend the 60-sendTx/min Standard budget (§4.3) that only trading replenishes, so the
+# #     safe default reconciles — exactly as the Hyperliquid backend does.
+# #
+# #   "cancel_all" — cancel EVERYTHING the connect-time snapshot lists, then reconcile: the
+# #     clean-slate discipline (AGENTS.md §4.4) that makes a `myhft` restart free of duplicate
+# #     orders. On this venue orders survive both a socket drop and the death of the process
+# #     (§2.7 — two bids came back in a fresh process's snapshot ~90 s after a kill), and the
+# #     sweep is built from the venue's OWN snapshot, not this process's map (empty after a
+# #     restart). SCOPE CAVEAT (§3.4): CancelAllOrders on a market clears every order the
+# #     ACCOUNT holds there, so the isolation unit is a subaccount per bot.
+# connect_policy = "reconcile"
+#
+# # AUTH TOKEN: minted by the sidecar, clamped below the venue's 8 h server ceiling, and
+# # REFRESHED automatically before it expires by a clean reconnect (§3.4) — no config. The
+# # 8 h ceiling is enforced only by the server (a longer token mints without error and is
+# # rejected 20013 at use), so every freshly minted token is verified with one cheap
+# # authorized GET /accountLimits before the connector relies on it.
