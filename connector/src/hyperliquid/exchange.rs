@@ -19,10 +19,13 @@
 //! it.** The [`CancelByCloidAction::fast`] builder and its serialisation test keep the wire
 //! shape correct for the day it is activated, but activating it on the live cancel path is
 //! gated on a testnet direct-signing capture proving the venue accepts an `f: true` cancel
-//! (or a primary venue contract). Until then it stays off: the official API docs and
-//! python-SDK describe cancel without `f`, so an unverified field on the money path could get
-//! every cancel rejected — leaving the order live — for a flag that buys nothing today. The
-//! sweep's `cancel` never sets it either, and additionally must not, because `f: true` on a
+//! (or a primary venue contract). Until then the live path is not merely "left off" but
+//! **sealed**: it signs a [`PlainCancelByCloid`], a wrapper with no `.fast()`, so no money-path
+//! call site can set `f` — the reason being that the official API docs and python-SDK describe
+//! cancel without `f`, so an unverified field on the money path could get every cancel
+//! rejected — leaving the order live — for a flag that buys nothing today. The `.fast()`
+//! builder stays reachable only from the capture tool (`smoke.rs`) that would earn that proof.
+//! The sweep's `cancel` never sets it either, and additionally must not, because `f: true` on a
 //! trigger order is rejected and a sweep can name a human's UI trigger.
 //!
 //! # What a 200 means
@@ -167,15 +170,17 @@ pub struct CancelByCloidAction {
     /// protocol — `f` is last, after `cancels`.
     ///
     /// **Dormant: no production path sets it.** [`Self::fast`] can, and the serialisation
-    /// test pins that the wire would be correct if it did, but the live cancel path
-    /// (`private_stream::cancel_action_for_order`) leaves it off. Two reasons, in order of
-    /// weight: (1) we have no evidence the venue accepts an `f: true` direct-signed cancel —
-    /// the docs and python-SDK omit `f` — so enabling it on every user cancel risks the venue
-    /// rejecting the request and the order staying live, for zero benefit today; activation is
-    /// gated on a testnet capture that proves acceptance. (2) It must never name a **trigger**
-    /// order (the venue rejects `f: true` on triggers); the per-order path cancels only this
-    /// backend's own `Gtc`/`Alo`/`Ioc` limits — `tif_of` admits no trigger kind — so that
-    /// hazard alone would not have blocked it.
+    /// test pins that the wire would be correct if it did, but the live cancel path is
+    /// **sealed** against it: `private_stream::cancel_action_for_order` returns
+    /// [`PlainCancelByCloid`], which wraps a plain `new()` action and exposes no `.fast()`, so
+    /// no money-path call site can set `f`. Two reasons, in order of weight: (1) we have no
+    /// evidence the venue accepts an `f: true` direct-signed cancel — the docs and python-SDK
+    /// omit `f` — so enabling it on every user cancel risks the venue rejecting the request and
+    /// the order staying live, for zero benefit today; activation is gated on a testnet capture
+    /// that proves acceptance. (2) It must never name a **trigger** order (the venue rejects
+    /// `f: true` on triggers); the per-order path cancels only this backend's own
+    /// `Gtc`/`Alo`/`Ioc` limits — `tif_of` admits no trigger kind — so that hazard alone would
+    /// not have blocked it.
     #[serde(skip_serializing_if = "is_false")]
     pub f: bool,
 }
@@ -193,12 +198,45 @@ impl CancelByCloidAction {
     ///
     /// **No production caller today.** Kept, with its serialisation test, so the wire is
     /// ready the day fast-cancel is activated; activation is gated on a testnet capture
-    /// proving the venue accepts an `f: true` direct-signed cancel (see
-    /// `private_stream::cancel_action_for_order`). Only ever safe on a cancel that cannot
+    /// proving the venue accepts an `f: true` direct-signed cancel. The capture tool that
+    /// would produce such proof (`smoke.rs`) builds a `CancelByCloidAction` directly and may
+    /// call this; the live cancel path deliberately cannot — it goes through
+    /// [`PlainCancelByCloid`], which has no `.fast()`. Only ever safe on a cancel that cannot
     /// name a trigger order.
     pub fn fast(mut self) -> Self {
         self.f = true;
         self
+    }
+}
+
+/// A `cancelByCloid` action **sealed against fast-cancel**, for the live money path.
+///
+/// It wraps a [`CancelByCloidAction`] built by `new()` (so `f` is unset) and serialises
+/// byte-for-byte identically — `#[serde(transparent)]` forwards `Serialize` straight to the
+/// inner action — so the msgpack the signature covers is unchanged
+/// (`the_sealed_live_cancel_is_byte_identical_and_carries_no_f`). What it deliberately does
+/// **not** offer is any way to set `f`: the inner action is private to this module, and there
+/// is no `.fast()`. The live per-order cancel (`private_stream::cancel_action_for_order`)
+/// returns this type and `private_stream::cancel_order` posts it, so **no call site on the
+/// money path can chain `.fast()` onto the action it signs** — re-adding it, the review's
+/// named mutation, is a compile error rather than a silently-green one. The invariant
+/// "`cancel_order` posts the built action verbatim" is thus enforced by the compiler, not by
+/// review.
+///
+/// This is not a general seal on fast-cancel: the dormant [`CancelByCloidAction::fast`]
+/// builder stays available so the testnet capture tool (`smoke.rs`) can probe whether the
+/// venue accepts an `f: true` cancel. Until such a capture proves acceptance, the live path
+/// stays sealed — an unverified field on the money path could get every cancel rejected,
+/// leaving the order live, for a flag that has no effect today. See the module docs.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct PlainCancelByCloid(CancelByCloidAction);
+
+impl PlainCancelByCloid {
+    /// Builds the sealed live-cancel action from its cancels. `f` is unset and, by the type's
+    /// construction, cannot be set — see the type docs.
+    pub fn new(cancels: Vec<CancelByCloidWire>) -> Self {
+        Self(CancelByCloidAction::new(cancels))
     }
 }
 
@@ -473,6 +511,7 @@ mod tests {
         OrderAction,
         OrderKind,
         OrderWire,
+        PlainCancelByCloid,
         parse_exchange_response,
         tif_of,
     };
@@ -837,6 +876,36 @@ mod tests {
         assert!(
             body.get("f").is_none(),
             "a false f must not appear at all: {body}"
+        );
+    }
+
+    /// **The sealed live-cancel action is byte-identical to a plain `cancelByCloid`, and
+    /// carries no `f`.** The live money path signs [`PlainCancelByCloid`], not a bare
+    /// [`CancelByCloidAction`], precisely so no call site can chain `.fast()` onto the action
+    /// it posts (`private_stream::cancel_action_for_order`). The seal must not change what the
+    /// venue signs: these msgpack bytes are exactly what `CancelByCloidAction::new` produces —
+    /// the `f`-omitted shape pinned against the SDK by `msgpack_bytes_match_the_official_sdk`
+    /// and `a_plain_cancel_omits_the_f_flag` — so the signature is unaffected. If the
+    /// `#[serde(transparent)]` seal ever diverged (an added wrapper key, or a `.fast()` folded
+    /// into the constructor), the byte comparison and the `f`-absent assertion each fail here.
+    #[test]
+    fn the_sealed_live_cancel_is_byte_identical_and_carries_no_f() {
+        let wires = vec![CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1b2000000000000000000000000dead".into(),
+        }];
+        let sealed = PlainCancelByCloid::new(wires.clone());
+        let plain = CancelByCloidAction::new(wires);
+        assert_eq!(
+            hex(&rmp_serde::to_vec_named(&sealed).unwrap()),
+            hex(&rmp_serde::to_vec_named(&plain).unwrap()),
+            "the seal must sign byte-for-byte what a plain cancelByCloid signs"
+        );
+        let body = serde_json::to_value(&sealed).unwrap();
+        assert_eq!(body["type"], "cancelByCloid");
+        assert!(
+            body.get("f").is_none(),
+            "the sealed live cancel must omit f: {body}"
         );
     }
 

@@ -74,11 +74,11 @@ use crate::{
         exchange::{
             ActionOutcome,
             CancelAction,
-            CancelByCloidAction,
             CancelByCloidWire,
             CancelWire,
             ExchangeClient,
             OrderAction,
+            PlainCancelByCloid,
         },
         msg::{Frame, OrderUpdate, UserFills, parse_frame},
         ordermanager::{FillDisposition, OrderExt, SharedOrderManager},
@@ -870,17 +870,21 @@ pub fn submit_order(
 /// The exact `cancelByCloid` action the per-order cancel path signs and sends.
 ///
 /// Both `cancel_order` and its test build the action through this one function, and
-/// `cancel_order` posts the result verbatim, so the wire shape is pinned by a test rather
-/// than by review. **`f` (fast-cancel) stays off here.** The flag has no effect today
+/// `cancel_order` posts the result verbatim. The return type is [`PlainCancelByCloid`], a seal
+/// with **no `.fast()`**, so "`cancel_order` posts the built action verbatim" is a compile-time
+/// invariant, not a review-time one: a caller cannot chain `.fast()` onto what this returns.
+///
+/// **`f` (fast-cancel) stays off here.** The flag has no effect today
 /// (`CancelByCloidAction::fast` — future mempool prioritisation only), and we have **no
 /// evidence the venue accepts an `f: true` direct-signed cancel**: the official API docs and
 /// python-SDK describe cancel without it, and the only testnet capture sent a plain cancel.
 /// Enabling it on the money path unverified risks every cancel being rejected — the order
 /// then stays live — for zero present benefit. Turning it on is gated on a testnet
 /// direct-signing capture that proves the venue accepts an `f: true` cancel (or a primary
-/// venue contract); until then it is omitted. See `the_per_order_cancel_omits_the_fast_flag`.
-fn cancel_action_for_order(wire: CancelByCloidWire) -> CancelByCloidAction {
-    CancelByCloidAction::new(vec![wire])
+/// venue contract); until then it is sealed off. See `the_per_order_cancel_omits_the_fast_flag`
+/// and `exchange::PlainCancelByCloid`.
+fn cancel_action_for_order(wire: CancelByCloidWire) -> PlainCancelByCloid {
+    PlainCancelByCloid::new(vec![wire])
 }
 
 /// Cancels one order, off the caller's thread.
@@ -929,9 +933,10 @@ pub fn cancel_order(
         .mark_requested(&cloid, Status::Canceled);
 
     tokio::spawn(async move {
-        // The action is built by `cancel_action_for_order` and posted verbatim; fast-cancel
-        // (`f`) stays off there — the flag is a no-op today and unverified against the venue,
-        // so it is not enabled on the money path (see that function).
+        // The action is built by `cancel_action_for_order` and posted verbatim. Its type,
+        // `PlainCancelByCloid`, has no `.fast()`, so this call site *cannot* re-enable
+        // fast-cancel (`f`) on the money path — the flag is a no-op today and unverified
+        // against the venue (see that function and `exchange::PlainCancelByCloid`).
         let action = cancel_action_for_order(wire);
         let failure = match exchange.post(&action).await {
             Ok(outcomes) => match outcomes.first() {
@@ -1033,13 +1038,19 @@ mod tests {
     }
 
     /// **The live per-order cancel must not set fast-cancel.** `cancel_order` posts exactly
-    /// what `cancel_action_for_order` returns, so this pins the wire the money path signs:
-    /// the `f` flag has no effect today and is unverified against the venue, so enabling it
-    /// on every user cancel risks the venue rejecting the request (leaving the order live)
-    /// for zero present benefit. Re-adding `.fast()` to the production cancel — the reviewer's
-    /// named mutation — puts `f: true` back on the wire and fails this test. The dormant
+    /// what `cancel_action_for_order` returns — and, because that return type is the sealed
+    /// [`PlainCancelByCloid`], it *can only* post that, verbatim: there is no `.fast()` to
+    /// chain onto it. So this asserts on the very bytes the money path signs, not on a
+    /// stand-in the call site is free to transform. The `f` flag has no effect today and is
+    /// unverified against the venue, so enabling it on every user cancel risks the venue
+    /// rejecting the request (leaving the order live) for zero present benefit.
+    ///
+    /// Two mutation classes are covered, between this test and the seal: re-adding `.fast()`
+    /// *at the call site* — the review's named mutation `cancel_action_for_order(wire).fast()`
+    /// — no longer compiles (`PlainCancelByCloid` has no such method), and folding `.fast()`
+    /// *into* the builder puts `f: true` on the wire and fails this test. The dormant
     /// `exchange::tests::a_fast_cancel_serialises_the_f_flag_true` still pins that the wire
-    /// *would* be correct if the flag were ever activated.
+    /// *would* be correct if the flag were ever activated for a capture tool.
     #[test]
     fn the_per_order_cancel_omits_the_fast_flag() {
         let action = cancel_action_for_order(CancelByCloidWire {
