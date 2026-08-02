@@ -124,6 +124,15 @@ pub enum ErrorKind {
 }
 
 /// Events occurring in a live bot sent by a [`Connector`](`crate::connector::Connector`).
+///
+/// **Variants may only be appended.** Like [`LiveRequest`], this is `bincode`-encoded with no
+/// version field, so the discriminant is a varint of the *positional* index, not the `#[repr]`
+/// literal. Inserting a variant anywhere but the end silently renumbers every one after it, and a
+/// bot would decode one connector event as another. The enums this carries inside [`Order`] and
+/// [`LiveError`] (`Status`, `Side`, `OrdType`, `TimeInForce`, `ErrorKind`, `Value`) are wire-
+/// reachable for the same reason and under the same rule — their `#[repr(..)]` values are decoys
+/// (`Status::Unsupported` rides as `8`, not `255`). `AGENTS.md` §2 names this rule; the
+/// `*_variants_are_append_only_on_the_wire` tests enforce it byte-for-byte.
 #[derive(Clone, Debug, Decode, Encode)]
 pub enum LiveEvent {
     BatchStart,
@@ -1162,5 +1171,238 @@ mod tests {
                 bincode::decode_from_slice(bytes, bincode::config::standard()).unwrap();
             assert_eq!(encode(&decoded), *bytes);
         }
+    }
+
+    /// The wire-ordinal is the *positional* index bincode writes as the leading varint, which
+    /// for every variant here is a single byte equal to that index. It is emphatically **not**
+    /// the `#[repr(..)]` discriminant: `Status::Unsupported = 255`, `Side::Sell = -1`, etc. are
+    /// decoys, and a test that asserted the repr would pass while the wire silently disagreed.
+    /// Encoding each enum directly is faithful to how it rides on the wire — `Order`'s manual
+    /// `Encode` delegates to each field's own `Encode`, which writes exactly this leading byte.
+    ///
+    /// These mirror [`live_request_variants_are_append_only_on_the_wire`] for every other
+    /// wire-reachable enum: [`LiveEvent`] itself, and the enums that ride inside [`Order`]
+    /// (`Status`/`Side`/`OrdType`/`TimeInForce`) and [`LiveError`] (`ErrorKind`/`Value`).
+    /// A silent variant reorder fails at least two assertions; a variant may only be appended.
+    #[test]
+    fn live_event_variants_are_append_only_on_the_wire() {
+        use crate::types::{
+            ErrorKind,
+            Event,
+            LiveError,
+            LiveEvent,
+            OrdType,
+            Order,
+            Side,
+            TimeInForce,
+        };
+
+        let ord =
+            |ev: &LiveEvent| bincode::encode_to_vec(ev, bincode::config::standard()).unwrap()[0];
+
+        let zero_event = Event {
+            ev: 0,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        };
+        let an_order = Order::new(
+            1,
+            100,
+            0.01,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+
+        assert_eq!(
+            ord(&LiveEvent::BatchStart),
+            0,
+            "BatchStart must stay variant 0"
+        );
+        assert_eq!(ord(&LiveEvent::BatchEnd), 1, "BatchEnd must stay variant 1");
+        assert_eq!(
+            ord(&LiveEvent::Feed {
+                symbol: "BTC".to_string(),
+                event: zero_event,
+            }),
+            2,
+            "Feed must stay variant 2"
+        );
+        assert_eq!(
+            ord(&LiveEvent::Order {
+                symbol: "BTC".to_string(),
+                order: an_order,
+            }),
+            3,
+            "Order must stay variant 3"
+        );
+        assert_eq!(
+            ord(&LiveEvent::Position {
+                symbol: "BTC".to_string(),
+                qty: 0.0,
+                exch_ts: 0,
+            }),
+            4,
+            "Position must stay variant 4"
+        );
+        assert_eq!(
+            ord(&LiveEvent::Error(LiveError::new(
+                ErrorKind::ConnectionInterrupted
+            ))),
+            5,
+            "Error must stay variant 5"
+        );
+        assert_eq!(
+            ord(&LiveEvent::SnapshotComplete {
+                symbol: "BTC".to_string(),
+                snapshot_time_ns: 0,
+            }),
+            6,
+            "SnapshotComplete must stay variant 6, and any new event appended after it"
+        );
+    }
+
+    #[test]
+    fn status_variants_are_append_only_on_the_wire() {
+        use crate::types::Status;
+
+        let ord = |s: &Status| bincode::encode_to_vec(s, bincode::config::standard()).unwrap()[0];
+
+        assert_eq!(ord(&Status::None), 0, "None must stay variant 0");
+        assert_eq!(ord(&Status::New), 1, "New must stay variant 1");
+        assert_eq!(ord(&Status::Expired), 2, "Expired must stay variant 2");
+        assert_eq!(ord(&Status::Filled), 3, "Filled must stay variant 3");
+        assert_eq!(ord(&Status::Canceled), 4, "Canceled must stay variant 4");
+        assert_eq!(
+            ord(&Status::PartiallyFilled),
+            5,
+            "PartiallyFilled must stay variant 5"
+        );
+        assert_eq!(ord(&Status::Rejected), 6, "Rejected must stay variant 6");
+        assert_eq!(ord(&Status::Replaced), 7, "Replaced must stay variant 7");
+        // Decoy: `#[repr(u8)] Unsupported = 255` is not what rides on the wire. bincode writes
+        // the positional index, so this is 8. A future `Uncertain` (design item S3) appended
+        // after it would be 9 — not 8 — whatever literal is written next to it.
+        assert_eq!(
+            ord(&Status::Unsupported),
+            8,
+            "Unsupported rides as positional 8, never its repr 255"
+        );
+    }
+
+    #[test]
+    fn side_variants_are_append_only_on_the_wire() {
+        use crate::types::Side;
+
+        let ord = |s: &Side| bincode::encode_to_vec(s, bincode::config::standard()).unwrap()[0];
+
+        // `#[repr(i8)] Buy = 1, Sell = -1, None = 0, Unsupported = 127` are all decoys: the wire
+        // carries the positional index. Sell's negative repr is the sharpest trap — it rides as
+        // 1, not 255/-1 — and None rides as 2, not 0.
+        assert_eq!(
+            ord(&Side::Buy),
+            0,
+            "Buy rides as positional 0, not its repr 1"
+        );
+        assert_eq!(
+            ord(&Side::Sell),
+            1,
+            "Sell rides as positional 1, not its repr -1"
+        );
+        assert_eq!(
+            ord(&Side::None),
+            2,
+            "None rides as positional 2, not its repr 0"
+        );
+        assert_eq!(
+            ord(&Side::Unsupported),
+            3,
+            "Unsupported rides as positional 3, not its repr 127"
+        );
+    }
+
+    #[test]
+    fn ord_type_variants_are_append_only_on_the_wire() {
+        use crate::types::OrdType;
+
+        let ord = |t: &OrdType| bincode::encode_to_vec(t, bincode::config::standard()).unwrap()[0];
+
+        assert_eq!(ord(&OrdType::Limit), 0, "Limit must stay variant 0");
+        assert_eq!(ord(&OrdType::Market), 1, "Market must stay variant 1");
+        assert_eq!(
+            ord(&OrdType::Unsupported),
+            2,
+            "Unsupported rides as positional 2, not its repr 255"
+        );
+    }
+
+    #[test]
+    fn time_in_force_variants_are_append_only_on_the_wire() {
+        use crate::types::TimeInForce;
+
+        let ord =
+            |t: &TimeInForce| bincode::encode_to_vec(t, bincode::config::standard()).unwrap()[0];
+
+        assert_eq!(ord(&TimeInForce::GTC), 0, "GTC must stay variant 0");
+        assert_eq!(ord(&TimeInForce::GTX), 1, "GTX must stay variant 1");
+        assert_eq!(ord(&TimeInForce::FOK), 2, "FOK must stay variant 2");
+        assert_eq!(ord(&TimeInForce::IOC), 3, "IOC must stay variant 3");
+        assert_eq!(
+            ord(&TimeInForce::Unsupported),
+            4,
+            "Unsupported rides as positional 4, not its repr 255"
+        );
+    }
+
+    #[test]
+    fn error_kind_variants_are_append_only_on_the_wire() {
+        use crate::types::ErrorKind;
+
+        let ord =
+            |e: &ErrorKind| bincode::encode_to_vec(e, bincode::config::standard()).unwrap()[0];
+
+        assert_eq!(
+            ord(&ErrorKind::ConnectionInterrupted),
+            0,
+            "must stay variant 0"
+        );
+        assert_eq!(
+            ord(&ErrorKind::CriticalConnectionError),
+            1,
+            "must stay variant 1"
+        );
+        assert_eq!(ord(&ErrorKind::OrderError), 2, "must stay variant 2");
+        assert_eq!(ord(&ErrorKind::Custom(0)), 3, "Custom must stay variant 3");
+    }
+
+    #[test]
+    fn value_variants_are_append_only_on_the_wire() {
+        use std::collections::HashMap;
+
+        use crate::types::Value;
+
+        let ord = |v: &Value| bincode::encode_to_vec(v, bincode::config::standard()).unwrap()[0];
+
+        assert_eq!(
+            ord(&Value::String(String::new())),
+            0,
+            "String must stay variant 0"
+        );
+        assert_eq!(ord(&Value::Int(0)), 1, "Int must stay variant 1");
+        assert_eq!(ord(&Value::Float(0.0)), 2, "Float must stay variant 2");
+        assert_eq!(ord(&Value::Bool(false)), 3, "Bool must stay variant 3");
+        assert_eq!(ord(&Value::List(Vec::new())), 4, "List must stay variant 4");
+        assert_eq!(
+            ord(&Value::Map(HashMap::new())),
+            5,
+            "Map must stay variant 5"
+        );
+        assert_eq!(ord(&Value::Empty), 6, "Empty must stay variant 6");
     }
 }
