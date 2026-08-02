@@ -2,6 +2,13 @@
 
 Everything runs on synthetic fixtures in tmp_path; no test touches the real
 ~/.claude, the real repos, or the real database.
+
+`tmp_path` alone does not make that true, because both collectors search
+UPWARDS for a repository and /tmp is nobody's: `project_of_path` walks
+`Path.parents` in Python and `resolve_repo` asks git, and either will happily
+answer with a repository above the base temp dir. Two devices bound the
+searches — the `no_ancestor_repo` fixture for git's, a relative path for
+Python's — each documented where it is used.
 """
 
 import json
@@ -117,6 +124,27 @@ def claude_root(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return root
+
+
+@pytest.fixture(autouse=True)
+def no_ancestor_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop git's upward repository search at `tmp_path`.
+
+    pytest hands out temporary directories under /tmp, and /tmp belongs to
+    nobody: a real repository above the base temp dir makes `git rev-parse`
+    inside a fixture directory report THAT repository, so a test asserting
+    "this directory is outside any repo" fails on a machine differing only in
+    what someone left lying around. Reproduced with a repo above the base
+    temp dir: `test_non_repo_directory_is_reported_as_missing` collected the
+    ancestor's commits instead of nothing.
+
+    `GIT_CEILING_DIRECTORIES` is git's own mechanism for exactly this and
+    costs nothing when no such repository exists. Autouse because the hazard
+    belongs to every test that runs git inside `tmp_path`, not only to the two
+    that happen to trip on it today. Resolved because git compares the ceiling
+    against paths it has already resolved symlinks in.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.resolve()))
 
 
 @pytest.fixture()
@@ -307,8 +335,24 @@ def test_docstring_project_is_the_owning_repo_not_the_parent_dir(git_repo: Path)
         "docstrings must be attributed to the repo so --project matches commits"
 
 
-def test_docstring_project_falls_back_to_parent_dir_outside_a_repo(tmp_path: Path):
-    d = tmp_path / "jansen" / "studies"
+def test_docstring_project_falls_back_to_parent_dir_outside_a_repo(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Outside a repo the project is the parent directory's name.
+
+    Reaching that fallback branch at all requires no `.git` ANYWHERE above the
+    directory, and `tmp_path` cannot promise that: `project_of_path` walks
+    `[path] + path.parents`, so an absolute path under /tmp walks to `/` and
+    the first repository someone left on the way — a stray /tmp/.git, a
+    dotfiles repo at $HOME — answers instead. Reproduced: with a repo above
+    the base temp dir this asserted `['fakeroot'] == ['jansen']`.
+
+    A relative path with the cwd inside `tmp_path` bounds the chain to
+    `jansen/studies`, `jansen`, `.` — every link inside the fixture. The
+    ceiling in `no_ancestor_repo` cannot help here: this walk is Python's, not
+    git's, and git's variable means nothing to it.
+    """
+    monkeypatch.chdir(tmp_path)
+    d = Path("jansen") / "studies"
     d.mkdir(parents=True)
     (d / "s.py").write_text('"""doc"""\n')
     rows, _ = kbindex.collect_docstring_rows([d])
