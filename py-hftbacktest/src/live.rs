@@ -12,6 +12,11 @@ use hftbacktest::{
 pub type HashMapMarketDepthLiveBot = LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth>;
 pub type ROIVectorMarketDepthLiveBot = LiveBot<IceoryxUnifiedChannel, ROIVectorMarketDepth>;
 
+/// Flattens a bot result into the FFI return code Python reads back as a raw `int64`.
+///
+/// The match is deliberately **exhaustive** — no wildcard arm. Adding a `BotError` variant must
+/// therefore break this build rather than silently collapse the new variant into someone else's
+/// code. Every error maps to a distinct nonzero value; `0..=3` are the [`ElapseResult`] variants.
 fn handle_result(result: Result<ElapseResult, BotError>) -> i64 {
     match result {
         Ok(ElapseResult::Ok) => 0,
@@ -27,6 +32,10 @@ fn handle_result(result: Result<ElapseResult, BotError>) -> i64 {
         Err(BotError::Custom(error)) => {
             println!("BotError::Custom: {error:?}");
             19
+        },
+        Err(BotError::Unsupported) => {
+            println!("BotError::Unsupported: this operation is not available in live trading");
+            20
         },
     }
 }
@@ -82,6 +91,10 @@ pub extern "C" fn hashmaplive_close(hbt_ptr: *mut HashMapMarketDepthLiveBot) -> 
         Err(BotError::Timeout) => 17,
         Err(BotError::Interrupted) => 18,
         Err(BotError::Custom(_)) => 19,
+        Err(BotError::Unsupported) => {
+            println!("BotError::Unsupported: this operation is not available in live trading");
+            20
+        },
     }
 }
 
@@ -325,6 +338,10 @@ pub extern "C" fn roiveclive_close(hbt_ptr: *mut ROIVectorMarketDepthLiveBot) ->
         Err(BotError::Timeout) => 17,
         Err(BotError::Interrupted) => 18,
         Err(BotError::Custom(_)) => 19,
+        Err(BotError::Unsupported) => {
+            println!("BotError::Unsupported: this operation is not available in live trading");
+            20
+        },
     }
 }
 
