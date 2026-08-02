@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, pkcs8::DecodePrivateKey};
 use hashbrown::Equivalent;
-use hftbacktest::prelude::OrderId;
+use hftbacktest::{prelude::OrderId, types::Status};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{
@@ -261,6 +261,34 @@ impl Nanos {
             .map(Self)
             .ok_or(Overflow { value: millis.0 })
     }
+}
+
+/// A venue order-status string, classified.
+///
+/// A connector's status mapper returns this instead of a bare [`Status`] so that a status the
+/// venue reports but this connector does not recognise is a **distinct case the order manager
+/// must handle**, not a value silently folded into a terminal `Status`. A terminal status frees
+/// the order id and drops the order from the manager; the strategy then re-submits and stands a
+/// **duplicate** live order at the venue — exactly the fail-open `AGENTS.md` §1.1 forbids
+/// (correctness-by-construction §1.6, invariant S1).
+///
+/// Because the arms are different shapes, a manager's removal path cannot reach a drop for
+/// [`StatusVerdict::Unrecognised`]: it must destructure the verdict, and only the
+/// [`StatusVerdict::Known`] arm yields a `Status` that [`Status::is_terminal`] can send to
+/// removal. The compiler enforces it — a mapper written `_ => Status::Unsupported` (the Lighter
+/// drop this closes) no longer type-checks against a `-> StatusVerdict` return.
+///
+/// This is **not** a wire `Status` variant: carrying the uncertainty to the bot as a
+/// first-class `Status::Uncertain` is the deferred, wire-touching item S3. `StatusVerdict` is
+/// connector-internal and never crosses the bincode boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusVerdict {
+    /// A status this connector recognises, mapped onto the wire [`Status`].
+    Known(Status),
+    /// A status string the venue sent that this connector does not recognise. Carries the raw
+    /// text for the operator log. The manager keeps the order tracked and lets reconnect
+    /// reconciliation resolve it, rather than dropping a possibly-live order.
+    Unrecognised(String),
 }
 
 pub type PxQty = (f64, f64);

@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     connector::GetOrders,
@@ -43,7 +43,7 @@ use crate::{
         rest::MarketInfo,
         signer::CreateOrder,
     },
-    utils::{Micros, Nanos},
+    utils::{Micros, Nanos, StatusVerdict},
 };
 
 /// 0 is `NilClientOrderIndex` and reserved; the allocator never hands it out (§3.5).
@@ -325,7 +325,7 @@ impl OrderManager {
     /// rewound. A terminal status (canceled/filled) takes the order out of tracking.
     pub fn apply_order_update(&mut self, update: &AccountOrder) -> Option<(String, Order)> {
         let coi = update.client_order_index;
-        let (active, symbol, order, order_id) = {
+        let (status, symbol, order, order_id) = {
             // A COI this connector never minted — a human's order, or a previous run's — is
             // ignored, not published as ours (§4.11 / HL model).
             let tracked = self.orders.get_mut(&coi)?;
@@ -340,11 +340,29 @@ impl OrderManager {
                 );
                 return None;
             }
+            // Classify before mutating. An unrecognised status is kept, never dropped: folding
+            // it into a terminal `Status` would free the id and let the strategy stand a
+            // duplicate at the venue (S1, §1.1). The order is left exactly as last known —
+            // watermark not advanced, status unchanged, not dropped — so a later recognised
+            // update applies normally, and reconnect reconciliation resolves it if truly gone.
+            let status = match map_status(&update.status) {
+                StatusVerdict::Known(status) => status,
+                StatusVerdict::Unrecognised(raw) => {
+                    error!(
+                        coi,
+                        status = %raw,
+                        "An unrecognised Lighter order status; keeping the order tracked so it \
+                         is not dropped and re-submitted as a duplicate. Reconnect \
+                         reconciliation expires it if it is truly gone."
+                    );
+                    return None;
+                }
+            };
             tracked.update_ts_us = update.transaction_time_us;
             tracked.order_index = Some(update.order_index);
             tracked.confirmed = true;
             tracked.order.req = Status::None;
-            tracked.order.status = map_status(&update.status);
+            tracked.order.status = status;
             // §4.4/T1: the venue states `transaction_time` in microseconds; the money-path
             // `exch_timestamp` is nanoseconds. Convert through the one checked bridge. On the
             // (year-2262) overflow, fail closed by leaving the timestamp unadvanced rather than
@@ -375,13 +393,16 @@ impl OrderManager {
                 tracked.order.exec_qty = 0.0;
             }
             (
-                tracked.order.active(),
+                status,
                 tracked.symbol.clone(),
                 tracked.order.clone(),
                 tracked.order.order_id,
             )
         };
-        if !active {
+        // Drop (free the id) iff terminal. One definition of "terminal"
+        // ([`Status::is_terminal`], exhaustive with no wildcard), so a future non-terminal
+        // variant cannot fall through to this removal — it must be ruled there first (S2).
+        if status.is_terminal() {
             self.by_order_id.remove(&(symbol.clone(), order_id));
             self.orders.remove(&coi);
         }
@@ -480,14 +501,22 @@ fn tif_of(tif: TimeInForce) -> Result<u8, OrderError> {
     }
 }
 
-/// Maps a Lighter order status string onto the wire `Status`.
-fn map_status(status: &str) -> Status {
+/// Classifies a Lighter order status string as a [`StatusVerdict`].
+///
+/// The `_ => Status::Unsupported` this replaces was the drop-on-unknown bug: an unrecognised
+/// status became `Unsupported`, `!active()`, and [`OrderManager::apply_order_update`] freed the
+/// order id — so the strategy re-submitted and stood a duplicate at the venue (`AGENTS.md`
+/// §1.1, invariant S1). Returning a `StatusVerdict` forces the caller to keep an unrecognised
+/// status's order tracked: there is no `Status` value it can be folded into that drops it.
+fn map_status(status: &str) -> StatusVerdict {
     match status {
-        "open" | "pending" | "in-progress" => Status::New,
-        "canceled" | "cancelled" => Status::Canceled,
-        "filled" => Status::Filled,
-        "partially-filled" | "partially_filled" | "partial" => Status::PartiallyFilled,
-        _ => Status::Unsupported,
+        "open" | "pending" | "in-progress" => StatusVerdict::Known(Status::New),
+        "canceled" | "cancelled" => StatusVerdict::Known(Status::Canceled),
+        "filled" => StatusVerdict::Known(Status::Filled),
+        "partially-filled" | "partially_filled" | "partial" => {
+            StatusVerdict::Known(Status::PartiallyFilled)
+        }
+        other => StatusVerdict::Unrecognised(other.to_string()),
     }
 }
 
@@ -690,6 +719,40 @@ mod tests {
         assert!(m.new_order("BTC", &btc(), &bid(1, 58200.0, 0.001)).is_ok());
     }
 
+    /// **An unrecognised status must not drop the order** (S1). A venue status this connector
+    /// does not map is not a licence to free the order id: dropping a possibly-live order lets
+    /// the strategy re-submit and stand a duplicate at the venue (`AGENTS.md` §1.1). The order
+    /// stays tracked with its last known status, and reconnect reconciliation resolves it if it
+    /// is truly gone. This is the pin a re-added `_ => Status::Unsupported`-then-drop fails.
+    #[test]
+    fn an_unrecognised_status_keeps_the_order_and_does_not_drop_it() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        m.mark_requested(coi, Status::New);
+        m.apply_order_update(&account_order(coi, 5, "open", 1_000));
+        assert_eq!(m.tracked(), 1);
+
+        // A status string this connector does not recognise, on a fresh (non-stale) frame.
+        let applied = m.apply_order_update(&account_order(coi, 5, "some-new-venue-status", 2_000));
+        assert!(
+            applied.is_none(),
+            "an unrecognised status publishes nothing"
+        );
+        assert_eq!(
+            m.tracked(),
+            1,
+            "an unrecognised status must not free the order id"
+        );
+        // Still resting and still cancellable from the bot's point of view.
+        assert_eq!(m.orders(None).len(), 1);
+        // A later recognised terminal update still resolves it normally.
+        let (_, done) = m
+            .apply_order_update(&account_order(coi, 5, "canceled", 3_000))
+            .expect("a recognised terminal update after the unknown one still applies");
+        assert_eq!(done.status, Status::Canceled);
+        assert_eq!(m.tracked(), 0);
+    }
+
     /// A frame for a COI this connector never minted — a human's order, or a previous run's —
     /// is ignored, not an error and above all not published as one of ours (§4.11 / HL model).
     #[test]
@@ -872,9 +935,23 @@ mod tests {
 
     #[test]
     fn status_mapping_covers_the_observed_vocabulary() {
-        assert_eq!(map_status("open"), Status::New);
-        assert_eq!(map_status("canceled"), Status::Canceled);
-        assert_eq!(map_status("filled"), Status::Filled);
-        assert_eq!(map_status("what"), Status::Unsupported);
+        use crate::utils::StatusVerdict;
+
+        assert_eq!(map_status("open"), StatusVerdict::Known(Status::New));
+        assert_eq!(
+            map_status("canceled"),
+            StatusVerdict::Known(Status::Canceled)
+        );
+        assert_eq!(map_status("filled"), StatusVerdict::Known(Status::Filled));
+        assert_eq!(
+            map_status("partially-filled"),
+            StatusVerdict::Known(Status::PartiallyFilled)
+        );
+        // A status this connector does not recognise is Unrecognised, carrying its raw text —
+        // never `Status::Unsupported`, which `apply_order_update` would drop (invariant S1).
+        assert_eq!(
+            map_status("what"),
+            StatusVerdict::Unrecognised("what".to_string())
+        );
     }
 }

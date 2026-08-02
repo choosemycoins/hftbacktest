@@ -12,9 +12,12 @@
 
 use hftbacktest::types::Status;
 use serde::Deserialize;
-use tracing::{error, warn};
+use tracing::warn;
 
-use crate::{hyperliquid::HyperliquidError, utils::from_str_to_f64};
+use crate::{
+    hyperliquid::HyperliquidError,
+    utils::{StatusVerdict, from_str_to_f64},
+};
 
 /// One price level, as `l2Book` and `bbo` both encode it.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -191,28 +194,32 @@ pub enum Frame {
     Other(String),
 }
 
-/// The venue's status string as an order status, and whether it is the last word.
+/// Classifies the venue's status string as a [`StatusVerdict`].
 ///
-/// **Unknown means terminal.** Hyperliquid documents around thirty status strings and
-/// **adds to the set over time** — Hummingbot shipped a production bug precisely by
-/// hardcoding the list and then meeting `perpMarginRejected`. An unrecognised status
-/// cannot be assumed to mean "still resting": that is how a bot ends up quoting against
-/// orders that no longer exist, which `AGENTS.md` §1.1 rules out. It is mapped to
-/// `Status::Expired`, dropped from the order manager, and logged at `error!`.
+/// **Unknown is [`StatusVerdict::Unrecognised`], never a terminal `Status`.** Hyperliquid
+/// documents around thirty status strings and **adds to the set over time** — Hummingbot
+/// shipped a production bug precisely by hardcoding the list and then meeting
+/// `perpMarginRejected`. A status this backend does not map must not be folded into a
+/// terminal `Status`: a terminal status drops the order from the manager and frees its id, so
+/// the strategy re-submits and stands a **duplicate** live order at the venue — the fail-open
+/// `AGENTS.md` §1.1 rules out. The verdict forces the caller to keep the order tracked
+/// instead; reconnect reconciliation is what expires it if it truly vanished (invariant S1).
 ///
-/// The suffix rules below are what keep that path rare rather than routine: every
-/// `…Canceled` and every `…Rejected` the venue invents is classified correctly without a
-/// code change, and only a genuinely new *kind* of status reaches the catch-all.
-pub fn map_order_status(raw: &str) -> Status {
+/// The suffix rules below keep the `Unrecognised` path rare rather than routine: every
+/// `…Canceled` and every `…Rejected` the venue invents is classified correctly without a code
+/// change, and only a genuinely new *kind* of status reaches the catch-all — which is then
+/// surfaced with the raw text, at `error!`, by the order manager (with the order's `cloid`),
+/// not swallowed here.
+pub fn map_order_status(raw: &str) -> StatusVerdict {
     match raw {
         // Still live.
-        "open" => Status::New,
+        "open" => StatusVerdict::Known(Status::New),
         // A trigger order that has become a live limit order. Not submitted by this
         // backend, but documented as live, so it must not be treated as terminal.
-        "triggered" => Status::New,
-        "filled" => Status::Filled,
-        "canceled" | "cancelled" => Status::Canceled,
-        "rejected" => Status::Rejected,
+        "triggered" => StatusVerdict::Known(Status::New),
+        "filled" => StatusVerdict::Known(Status::Filled),
+        "canceled" | "cancelled" => StatusVerdict::Known(Status::Canceled),
+        "rejected" => StatusVerdict::Known(Status::Rejected),
         other => {
             // The venue's own naming convention, used rather than a list that will go
             // stale: `marginCanceled`, `vaultWithdrawalCanceled`, `siblingFilledCanceled`,
@@ -222,18 +229,13 @@ pub fn map_order_status(raw: &str) -> Status {
                 || other == "scheduledCancel"
             {
                 warn!(status = %other, "Hyperliquid cancelled an order for a reason this backend does not name individually.");
-                Status::Canceled
+                StatusVerdict::Known(Status::Canceled)
             } else if other.ends_with("Rejected") {
                 warn!(status = %other, "Hyperliquid rejected an order for a reason this backend does not name individually.");
-                Status::Rejected
+                StatusVerdict::Known(Status::Rejected)
             } else {
-                error!(
-                    status = %other,
-                    "An unrecognised Hyperliquid order status; treating the order as gone. \
-                     Assuming it still rests is how a bot quotes against orders that do not \
-                     exist."
-                );
-                Status::Expired
+                // Not terminal, not silently dropped: the manager keeps the order and logs it.
+                StatusVerdict::Unrecognised(other.to_string())
             }
         }
     }
@@ -519,17 +521,32 @@ mod tests {
 
     /// **The Hummingbot bug, pinned.** The venue documents around thirty status strings and
     /// keeps adding to them; hardcoding the list shipped a production failure when
-    /// `perpMarginRejected` appeared. The suffix rules classify the whole family, and
-    /// anything genuinely new is terminal rather than optimistically "still resting".
+    /// `perpMarginRejected` appeared. The suffix rules classify the whole family, and anything
+    /// genuinely new is [`StatusVerdict::Unrecognised`] — kept for the manager to handle, never
+    /// folded into a terminal `Status` that would drop a possibly-live order (invariant S1).
     #[test]
-    fn every_status_family_maps_and_an_invented_one_is_terminal() {
+    fn every_status_family_maps_and_an_invented_one_is_unrecognised() {
         use hftbacktest::types::Status;
 
-        assert_eq!(map_order_status("open"), Status::New);
-        assert_eq!(map_order_status("filled"), Status::Filled);
-        assert_eq!(map_order_status("canceled"), Status::Canceled);
-        assert_eq!(map_order_status("cancelled"), Status::Canceled);
-        assert_eq!(map_order_status("rejected"), Status::Rejected);
+        use crate::utils::StatusVerdict;
+
+        assert_eq!(map_order_status("open"), StatusVerdict::Known(Status::New));
+        assert_eq!(
+            map_order_status("filled"),
+            StatusVerdict::Known(Status::Filled)
+        );
+        assert_eq!(
+            map_order_status("canceled"),
+            StatusVerdict::Known(Status::Canceled)
+        );
+        assert_eq!(
+            map_order_status("cancelled"),
+            StatusVerdict::Known(Status::Canceled)
+        );
+        assert_eq!(
+            map_order_status("rejected"),
+            StatusVerdict::Known(Status::Rejected)
+        );
 
         // Documented in the venue's list today, and none of them are named individually
         // above — the suffix is what classifies them.
@@ -544,7 +561,11 @@ mod tests {
             "liquidatedCanceled",
             "scheduledCancel",
         ] {
-            assert_eq!(map_order_status(cancelled), Status::Canceled, "{cancelled}");
+            assert_eq!(
+                map_order_status(cancelled),
+                StatusVerdict::Known(Status::Canceled),
+                "{cancelled}"
+            );
         }
         for rejected in [
             "tickRejected",
@@ -558,30 +579,27 @@ mod tests {
             "oracleRejected",
             "perpMaxPositionRejected",
         ] {
-            assert_eq!(map_order_status(rejected), Status::Rejected, "{rejected}");
+            assert_eq!(
+                map_order_status(rejected),
+                StatusVerdict::Known(Status::Rejected),
+                "{rejected}"
+            );
         }
 
         // A trigger order becoming live is documented as *still resting*, so it must not be
         // swept up as terminal — that would drop a live order from the manager.
-        assert_eq!(map_order_status("triggered"), Status::New);
+        assert_eq!(
+            map_order_status("triggered"),
+            StatusVerdict::Known(Status::New)
+        );
 
-        // …and a status nobody has seen before is assumed gone, not assumed alive.
+        // …and a status nobody has seen before is Unrecognised — carried with its raw text so
+        // the manager keeps the order and logs it, never assumed gone and dropped.
         for invented in ["somethingEntirelyNew", "", "OPEN", "Filled"] {
-            let status = map_order_status(invented);
-            assert_eq!(status, Status::Expired, "{invented:?}");
-            assert!(
-                !hftbacktest::types::Order::new(
-                    1,
-                    1,
-                    1.0,
-                    1.0,
-                    hftbacktest::types::Side::Buy,
-                    hftbacktest::types::OrdType::Limit,
-                    hftbacktest::types::TimeInForce::GTC,
-                )
-                .active()
-                    || status != Status::New,
-                "{invented:?} must not leave the order active"
+            assert_eq!(
+                map_order_status(invented),
+                StatusVerdict::Unrecognised(invented.to_string()),
+                "{invented:?}"
             );
         }
     }

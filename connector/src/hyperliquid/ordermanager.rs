@@ -32,20 +32,20 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use hftbacktest::types::{Order, OrderId, Side, Status};
+use hftbacktest::types::{OrdType, Order, OrderId, Side, Status};
 use rand::Rng;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     connector::GetOrders,
     hyperliquid::{
         HyperliquidError,
-        exchange::{CancelByCloidWire, OrderWire, tif_of, wire_numbers},
+        exchange::{CancelByCloidWire, LimitKind, OrderKind, OrderWire, tif_of, wire_numbers},
         msg::{OrderUpdate, UserFill, map_order_status},
         normalize::{normalize_price, normalize_size},
         rest::{OpenOrder, SymbolInfo},
     },
-    utils::{RefSymbolOrderId, SymbolOrderId},
+    utils::{RefSymbolOrderId, StatusVerdict, SymbolOrderId},
 };
 
 pub type SharedOrderManager = Arc<Mutex<OrderManager>>;
@@ -160,6 +160,46 @@ pub struct OrderManager {
     orders: HashMap<Cloid, OrderExt>,
     order_id_map: HashMap<SymbolOrderId, Cloid>,
     fills: FillDedup,
+}
+
+/// The order kind this backend can put on the Hyperliquid wire. The venue's only resting order
+/// here is a limit with a time-in-force; there is no market-order wire form (a "market" on HL
+/// is an IOC limit at an aggressive price, which this backend does not construct). A market or
+/// unsupported order therefore has no `VenueOrderKind` — it is refused rather than silently
+/// placed as a resting limit the strategy never asked for (invariant C1).
+enum VenueOrderKind {
+    /// A resting limit with the given time-in-force wire code.
+    Limit { tif: &'static str },
+}
+
+impl VenueOrderKind {
+    /// Decides the venue order kind for a bot [`OrdType`], refusing the kinds this backend has
+    /// no wire form for. **Exhaustive over `OrdType` with no wildcard**: a new order type does
+    /// not compile until it is decided here, so none can silently fall through to "build a
+    /// limit" (C1 / structural #4). `new_order` cannot construct the order wire without one.
+    fn resolve(order_type: OrdType, tif: &'static str) -> Result<Self, HyperliquidError> {
+        match order_type {
+            OrdType::Limit => Ok(VenueOrderKind::Limit { tif }),
+            OrdType::Market => Err(HyperliquidError::InvalidOrder(
+                "a market order has no resting-limit wire form on this Hyperliquid backend; \
+                 refusing it rather than silently placing a limit the strategy never asked for"
+                    .to_string(),
+            )),
+            OrdType::Unsupported => Err(HyperliquidError::InvalidOrder(
+                "an order with an unsupported order type".to_string(),
+            )),
+        }
+    }
+
+    /// The wire `OrderKind` this venue kind serialises to. A new [`VenueOrderKind`] variant
+    /// does not compile until it is given a wire form here.
+    fn into_wire(self) -> OrderKind {
+        match self {
+            VenueOrderKind::Limit { tif } => OrderKind {
+                limit: LimitKind { tif },
+            },
+        }
+    }
 }
 
 impl OrderManager {
@@ -280,6 +320,10 @@ impl OrderManager {
             }
         };
         let tif = tif_of(order.time_in_force)?;
+        // Consume `OrdType` here, before any state is minted: a market/unsupported order is
+        // refused rather than silently placed as a resting limit (C1). Nothing below can build
+        // the order wire without this having succeeded.
+        let venue_kind = VenueOrderKind::resolve(order.order_type, tif)?;
 
         let requested_price = order.price_tick as f64 * order.tick_size;
         let price = normalize_price(requested_price, info, order.side)?;
@@ -314,9 +358,7 @@ impl OrderManager {
             p,
             s,
             r: false,
-            t: crate::hyperliquid::exchange::OrderKind {
-                limit: crate::hyperliquid::exchange::LimitKind { tif },
-            },
+            t: venue_kind.into_wire(),
             c: Some(cloid.clone()),
         };
 
@@ -381,6 +423,26 @@ impl OrderManager {
             return None;
         };
 
+        // Classify before touching the order. An unrecognised status is kept, never dropped:
+        // folding it into a terminal `Status` would free the id and let the strategy stand a
+        // duplicate at the venue (S1, `AGENTS.md` §1.1). The order is left exactly as last
+        // known — watermark not advanced, status unchanged, not dropped — so a later
+        // recognised update applies normally; reconnect reconciliation expires it if it is
+        // truly gone.
+        let status = match map_order_status(&update.status) {
+            StatusVerdict::Known(status) => status,
+            StatusVerdict::Unrecognised(raw) => {
+                error!(
+                    %cloid,
+                    status = %raw,
+                    "An unrecognised Hyperliquid order status; keeping the order tracked so it \
+                     is not dropped and re-submitted as a duplicate. Reconnect reconciliation \
+                     expires it if it is truly gone."
+                );
+                return None;
+            }
+        };
+
         let exch_ts = update.status_timestamp.checked_mul(1_000_000)?;
         // Out-of-order updates are possible and a stale one must not overwrite a newer
         // state. `LiveBot` guards its own copy the same way (`live/bot.rs`), but the
@@ -403,7 +465,6 @@ impl OrderManager {
         tracked.settled_at.get_or_insert_with(Instant::now);
 
         tracked.oid = Some(update.order.oid);
-        let status = map_order_status(&update.status);
         tracked.order.req = Status::None;
         tracked.order.status = status;
         // Never rewound: `LiveBot::process_event` drops an order update older than its own
@@ -413,14 +474,17 @@ impl OrderManager {
             tracked.order.leaves_qty = update.order.sz;
         }
 
-        if tracked.order.active() {
-            Some(tracked.clone())
-        } else {
+        // Drop (free the id) iff the status is terminal. One definition of "terminal"
+        // ([`Status::is_terminal`], exhaustive with no wildcard), so a future non-terminal
+        // variant cannot fall through to this removal — it must be ruled there first (S2).
+        if status.is_terminal() {
             let symbol = tracked.symbol.clone();
             let order_id = tracked.order.order_id;
             self.order_id_map
                 .remove(&RefSymbolOrderId::new(&symbol, order_id));
             self.orders.remove(cloid)
+        } else {
+            Some(tracked.clone())
         }
     }
 
@@ -640,6 +704,7 @@ mod tests {
     use crate::{
         connector::GetOrders,
         hyperliquid::{
+            HyperliquidError,
             fixtures::{ORDER_UPDATE_CANCELED, ORDER_UPDATE_OPEN, USER_FILLS_INCREMENT},
             msg::{Frame, parse_frame},
             ordermanager::{FillDisposition, OrderManager, PREFIX_LEN},
@@ -884,6 +949,78 @@ mod tests {
         assert!(
             manager
                 .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.001, Side::Buy))
+                .is_ok()
+        );
+    }
+
+    /// **An unrecognised status must not drop the order** (S1). Hyperliquid adds status strings
+    /// over time; one this connector does not map is not proof the order is gone. Dropping it
+    /// frees the id and the strategy re-submits — a duplicate at the venue (`AGENTS.md` §1.1).
+    /// The order is kept tracked; reconnect reconciliation resolves it if it truly vanished.
+    #[test]
+    fn an_unrecognised_status_keeps_the_order_tracked() {
+        let mut manager = manager();
+        manager
+            .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
+            .unwrap();
+        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+
+        let mut open = updates(ORDER_UPDATE_OPEN);
+        open[0].order.cloid = Some(cloid.clone());
+        manager.apply_order_update(&open[0]).unwrap();
+        assert_eq!(manager.orders(None).len(), 1);
+
+        // A status this backend does not recognise, on a newer frame.
+        let mut weird = updates(ORDER_UPDATE_OPEN);
+        weird[0].order.cloid = Some(cloid);
+        weird[0].status = "someBrandNewLifecycleState".to_string();
+        weird[0].status_timestamp = open[0].status_timestamp + 1;
+        assert!(
+            manager.apply_order_update(&weird[0]).is_none(),
+            "an unrecognised status publishes nothing"
+        );
+        assert_eq!(
+            manager.tracked(),
+            1,
+            "an unrecognised status must not free the order id"
+        );
+        assert_eq!(
+            manager.orders(None).len(),
+            1,
+            "the order is still resting from the bot's view"
+        );
+    }
+
+    /// **A market order is refused, never silently placed as a resting limit** (C1).
+    /// Hyperliquid has no market-order wire form in this backend; the builder used to ignore
+    /// `order_type` and always build a limit, so a market order became a resting limit the
+    /// strategy never asked for. The builder now consumes `OrdType` exhaustively and errors on
+    /// Market/Unsupported; a limit still builds.
+    #[test]
+    fn a_market_order_is_refused_not_silently_placed_as_a_limit() {
+        let mut manager = manager();
+
+        let mut market = bot_order(7, 31700.0, 0.001, Side::Buy);
+        market.order_type = OrdType::Market;
+        assert!(
+            matches!(
+                manager.new_order("BTC", &btc(), 3, market),
+                Err(HyperliquidError::InvalidOrder(_))
+            ),
+            "a market order must be refused, not coerced to a limit"
+        );
+
+        let mut unsupported = bot_order(8, 31700.0, 0.001, Side::Buy);
+        unsupported.order_type = OrdType::Unsupported;
+        assert!(matches!(
+            manager.new_order("BTC", &btc(), 3, unsupported),
+            Err(HyperliquidError::InvalidOrder(_))
+        ));
+
+        // A limit still builds — the refusal is specific to the kinds without a wire form.
+        assert!(
+            manager
+                .new_order("BTC", &btc(), 3, bot_order(9, 31700.0, 0.001, Side::Buy))
                 .is_ok()
         );
     }
