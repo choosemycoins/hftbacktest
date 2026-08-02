@@ -28,6 +28,7 @@ use crate::{
         EXCH_EVENT,
         EXCH_SELL_TRADE_EVENT,
         Event,
+        ExecDelta,
         Liquidity,
         Order,
         OrderId,
@@ -176,15 +177,18 @@ where
             return Err(BacktestError::InvalidOrderStatus);
         }
 
-        order.set_liquidity(Some(liquidity));
-        if liquidity == Liquidity::Maker {
-            order.exec_price_tick = order.price_tick;
+        // The single writer (E5). This exchange fills the whole remainder in one go, so the
+        // delta *is* `leaves_qty` — and recording it drives `leaves_qty` to exactly zero.
+        let filled_at = if liquidity == Liquidity::Maker {
+            order.price_tick
         } else {
-            order.exec_price_tick = exec_price_tick;
-        }
-
-        order.exec_qty = order.leaves_qty;
-        order.leaves_qty = 0.0;
+            exec_price_tick
+        };
+        order.record_execution(
+            ExecDelta::of_execution(order.leaves_qty),
+            filled_at,
+            Some(liquidity),
+        );
         order.status = Status::Filled;
         order.exch_timestamp = timestamp;
 

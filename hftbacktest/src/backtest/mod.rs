@@ -1189,6 +1189,7 @@ mod test {
             EXCH_BID_DEPTH_EVENT,
             EXCH_BUY_TRADE_EVENT,
             EXCH_EVENT,
+            ExecDelta,
             LOCAL_ASK_DEPTH_EVENT,
             LOCAL_BID_ADD_ORDER_EVENT,
             LOCAL_BID_DEPTH_EVENT,
@@ -1455,21 +1456,21 @@ mod test {
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::PartiallyFilled);
         assert_eq!(order.leaves_qty, 7.0);
-        assert_eq!(order.exec_qty, 3.0);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(3.0));
         assert_sold(&bt, 3.0, 1);
 
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::PartiallyFilled);
         assert_eq!(order.leaves_qty, 3.0);
-        assert_eq!(order.exec_qty, 4.0);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(4.0));
         assert_sold(&bt, 7.0, 2);
 
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::Filled);
         assert_eq!(order.leaves_qty, 0.0);
-        assert_eq!(order.exec_qty, 3.0);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(3.0));
         assert_sold(&bt, ORDER_QTY, 3);
 
         Ok(())
@@ -1614,7 +1615,7 @@ mod test {
         assert_eq!(order.status, Status::Filled);
         assert_eq!(order.leaves_qty, 0.0);
         // Only 3 of the traded 8 was executable by queue position, yet the whole order fills.
-        assert_eq!(order.exec_qty, ORDER_QTY);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(ORDER_QTY));
         assert_sold(&bt, ORDER_QTY, 1);
 
         Ok(())
@@ -1694,7 +1695,7 @@ mod test {
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::Filled);
         assert_eq!(order.leaves_qty, 0.0);
-        assert_eq!(order.exec_qty, 7.0);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(7.0));
         assert_sold(&bt, ORDER_QTY, 2);
 
         // The order is gone from the exchange, so the next trade at its price passes it by.
@@ -1759,7 +1760,7 @@ mod test {
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::New);
         assert_eq!(order.leaves_qty, 5.0);
-        assert_eq!(order.exec_qty, 0.0);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(0.0));
         assert_sold(&bt, 3.0, 1);
 
         Ok(())

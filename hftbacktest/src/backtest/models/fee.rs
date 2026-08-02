@@ -103,9 +103,9 @@ impl<Fees> TradingQtyFeeModel<Fees> {
 impl FeeModel for TradingQtyFeeModel<CommonFees> {
     fn amount(&self, order: &Order, _amount: f64) -> f64 {
         if order.maker {
-            self.fees.maker_fee * order.exec_qty
+            self.fees.maker_fee * order.exec_qty.get()
         } else {
-            self.fees.taker_fee * order.exec_qty
+            self.fees.taker_fee * order.exec_qty.get()
         }
     }
 }
@@ -114,16 +114,20 @@ impl FeeModel for TradingQtyFeeModel<DirectionalFees> {
     fn amount(&self, order: &Order, amount: f64) -> f64 {
         match (order.maker, order.side) {
             (true, Side::Buy) => {
-                self.fees.common_fees.maker_fee * order.exec_qty + self.fees.buyer_fee * amount
+                self.fees.common_fees.maker_fee * order.exec_qty.get()
+                    + self.fees.buyer_fee * amount
             }
             (false, Side::Buy) => {
-                self.fees.common_fees.taker_fee * order.exec_qty + self.fees.buyer_fee * amount
+                self.fees.common_fees.taker_fee * order.exec_qty.get()
+                    + self.fees.buyer_fee * amount
             }
             (true, Side::Sell) => {
-                self.fees.common_fees.maker_fee * order.exec_qty + self.fees.seller_fee * amount
+                self.fees.common_fees.maker_fee * order.exec_qty.get()
+                    + self.fees.seller_fee * amount
             }
             (false, Side::Sell) => {
-                self.fees.common_fees.taker_fee * order.exec_qty + self.fees.seller_fee * amount
+                self.fees.common_fees.taker_fee * order.exec_qty.get()
+                    + self.fees.seller_fee * amount
             }
             _ => unreachable!(),
         }

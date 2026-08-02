@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
+use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
@@ -43,7 +43,7 @@ use crate::{
         rest::MarketInfo,
         signer::CreateOrder,
     },
-    utils::{Micros, Nanos, StatusVerdict},
+    utils::{CumulativeFilled, Micros, Nanos, StatusVerdict},
 };
 
 /// 0 is `NilClientOrderIndex` and reserved; the allocator never hands it out (§3.5).
@@ -98,9 +98,10 @@ struct Tracked {
     /// stale and must not rewind the order. Typed [`Micros`] (like the frame it is compared to)
     /// so it can never be confused with the nanosecond `exch_timestamp` (T1).
     update_ts_us: Micros,
-    /// Cumulative filled base amount seen, so a fill's `exec_qty` is reported as the delta of
-    /// *this* execution, not the running total (`AGENTS.md` §4.6, `Order::exec_qty`).
-    filled: f64,
+    /// Cumulative filled base amount seen — the watermark
+    /// [`CumulativeFilled::advance`] subtracts from, so a fill's `exec_qty` is the delta of
+    /// *this* execution and never the running total (`AGENTS.md` §4.6, `Order::exec_qty`).
+    filled: CumulativeFilled,
     /// Whether the venue has ever confirmed this order on the channel. Until it has, a
     /// reconnect reconciliation must not expire it — its fate is the slot task's deadline to
     /// decide (§4.11), not a snapshot's silence.
@@ -278,7 +279,7 @@ impl OrderManager {
                 order: accepted,
                 order_index: None,
                 update_ts_us: Micros::new(0),
-                filled: 0.0,
+                filled: CumulativeFilled::ZERO,
                 confirmed: false,
             },
         );
@@ -373,7 +374,7 @@ impl OrderManager {
                     let mut uncertain = tracked.order.clone();
                     uncertain.status = Status::Uncertain;
                     uncertain.req = Status::None;
-                    uncertain.exec_qty = 0.0;
+                    uncertain.exec_qty = ExecDelta::ZERO;
                     uncertain.exec_price_tick = 0;
                     return Some((tracked.symbol.clone(), uncertain));
                 }
@@ -402,25 +403,29 @@ impl OrderManager {
             }
             tracked.order.leaves_qty = update.remaining_base_amount;
             // §4.6: `exec_qty` is the amount executed by THIS update, the delta of the
-            // cumulative `filled_base_amount`, not the running total.
-            if update.filled_base_amount > tracked.filled {
-                tracked.order.exec_qty = update.filled_base_amount - tracked.filled;
-                tracked.order.exec_price_tick =
-                    (update.price / tracked.order.tick_size).round() as i64;
-                // C2: `account_all_orders` states how much of the order is filled and nothing
-                // about which side of the book provided it — the frame carries no per-execution
-                // maker field. `None` is therefore the measurement, and it claims nothing; the
-                // previous unconditional `maker = true` made the flag a constant that fee and
-                // fill-quality attribution read as the venue's word (`AGENTS.md` §1.1).
-                //
-                // The public `trade` channel does carry `is_maker_ask`, but it says which side
-                // of *that* trade rested, not which account did — it cannot attribute our own
-                // execution. Reading a real per-fill flag needs an account trade feed this
-                // backend does not subscribe to.
-                tracked.order.set_liquidity(None);
-                tracked.filled = update.filled_base_amount;
-            } else {
-                tracked.order.exec_qty = 0.0;
+            // cumulative `filled_base_amount`, not the running total. The subtraction used to
+            // be written out here by hand; `CumulativeFilled::advance` is the same arithmetic
+            // as the one bridge out of a running total, so the watermark cannot be forgotten
+            // and the total cannot reach `exec_qty` without it (E5).
+            match update.filled_base_amount.advance(&mut tracked.filled) {
+                Some(delta) => {
+                    tracked.order.exec_qty = delta;
+                    tracked.order.exec_price_tick =
+                        (update.price / tracked.order.tick_size).round() as i64;
+                    // C2: `account_all_orders` states how much of the order is filled and
+                    // nothing about which side of the book provided it — the frame carries no
+                    // per-execution maker field. `None` is therefore the measurement, and it
+                    // claims nothing; the previous unconditional `maker = true` made the flag
+                    // a constant that fee and fill-quality attribution read as the venue's
+                    // word (`AGENTS.md` §1.1).
+                    //
+                    // The public `trade` channel does carry `is_maker_ask`, but it says which
+                    // side of *that* trade rested, not which account did — it cannot attribute
+                    // our own execution. Reading a real per-fill flag needs an account trade
+                    // feed this backend does not subscribe to.
+                    tracked.order.set_liquidity(None);
+                }
+                None => tracked.order.exec_qty = ExecDelta::ZERO,
             }
             (
                 status,
@@ -568,7 +573,7 @@ impl GetOrders for OrderManager {
 
 #[cfg(test)]
 mod tests {
-    use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
+    use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
 
     use super::{MAX_COI, OrderError, OrderManager, map_status};
     use crate::{
@@ -577,7 +582,7 @@ mod tests {
             private_msg::{AccountOrder, AccountPosition},
             rest::MarketInfo,
         },
-        utils::Micros,
+        utils::{CumulativeFilled, Micros},
     };
 
     fn btc() -> MarketInfo {
@@ -614,7 +619,7 @@ mod tests {
             price: 58300.0,
             initial_base_amount: 0.001,
             remaining_base_amount: if status == "open" { 0.001 } else { 0.0 },
-            filled_base_amount: 0.0,
+            filled_base_amount: CumulativeFilled::ZERO,
             transaction_time_us: Micros::new(txn_us),
         }
     }
@@ -764,13 +769,17 @@ mod tests {
         m.apply_order_update(&account_order(coi, 5, "open", 1_000));
 
         let mut filled = account_order(coi, 5, "filled", 2_000);
-        filled.filled_base_amount = 0.001;
+        filled.filled_base_amount = CumulativeFilled::new(0.001);
         filled.remaining_base_amount = 0.0;
         let (_, order) = m
             .apply_order_update(&filled)
             .expect("our order, fully executed");
 
-        assert_eq!(order.exec_qty, 0.001, "the execution itself is reported");
+        assert_eq!(
+            order.exec_qty,
+            ExecDelta::of_execution(0.001),
+            "the execution itself is reported"
+        );
         assert!(
             !order.maker,
             "Lighter reports no per-execution liquidity, so the flag must claim none"
@@ -843,7 +852,8 @@ mod tests {
             "publishing the last known status would re-assert a claim the venue undermined"
         );
         assert_eq!(
-            published.exec_qty, 0.0,
+            published.exec_qty,
+            ExecDelta::ZERO,
             "an update that reports no execution must not re-report the previous delta"
         );
         assert_eq!(

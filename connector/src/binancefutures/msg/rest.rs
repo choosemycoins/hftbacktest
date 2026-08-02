@@ -2,7 +2,13 @@ use hftbacktest::types::{OrdType, Side, Status, TimeInForce};
 use serde::Deserialize;
 
 use super::{from_str_to_side, from_str_to_status, from_str_to_tif, from_str_to_type};
-use crate::utils::{from_str_to_f64, from_str_to_f64_opt, to_lowercase};
+use crate::utils::{
+    CumulativeFilled,
+    from_str_to_cumulative_filled,
+    from_str_to_f64,
+    from_str_to_f64_opt,
+    to_lowercase,
+};
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
@@ -15,9 +21,11 @@ pub enum OrderResponseResult {
 pub struct OrderResponse {
     #[serde(rename = "clientOrderId")]
     pub client_order_id: String,
+    /// The order's **running total** filled, not a per-execution quantity — hence
+    /// [`CumulativeFilled`], which has no route into `Order::exec_qty` (E5).
     #[serde(rename = "cumQty")]
-    #[serde(deserialize_with = "from_str_to_f64")]
-    pub cum_qty: f64,
+    #[serde(deserialize_with = "from_str_to_cumulative_filled")]
+    pub cum_qty: CumulativeFilled,
     /// New Order and Cancel Order responses only field
     #[serde(rename = "cumQuote")]
     #[serde(default)]
@@ -28,9 +36,12 @@ pub struct OrderResponse {
     #[serde(default)]
     #[serde(deserialize_with = "from_str_to_f64_opt")]
     pub cum_base: Option<f64>,
+    /// The order's **running total** filled. Writing this into `Order::exec_qty` — which is
+    /// a per-execution delta — re-reported every earlier fill on each REST reconcile, and is
+    /// what [`CumulativeFilled`] now makes impossible to express (E5).
     #[serde(rename = "executedQty")]
-    #[serde(deserialize_with = "from_str_to_f64")]
-    pub executed_qty: f64,
+    #[serde(deserialize_with = "from_str_to_cumulative_filled")]
+    pub executed_qty: CumulativeFilled,
     #[serde(rename = "orderId")]
     pub order_id: i64,
     /// New Order and Modify Order responses only field

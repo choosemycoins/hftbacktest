@@ -28,6 +28,7 @@ use crate::{
         EXCH_EVENT,
         EXCH_SELL_TRADE_EVENT,
         Event,
+        ExecDelta,
         Liquidity,
         Order,
         OrderId,
@@ -241,15 +242,18 @@ where
             return Err(BacktestError::InvalidOrderStatus);
         }
 
-        order.set_liquidity(Some(liquidity));
-        if liquidity == Liquidity::Maker {
-            order.exec_price_tick = order.price_tick;
+        // The single writer: the delta and the remainder move together, so a cumulative
+        // quantity cannot be recorded here without driving `leaves_qty` negative (E5).
+        let filled_at = if liquidity == Liquidity::Maker {
+            order.price_tick
         } else {
-            order.exec_price_tick = exec_price_tick;
-        }
-
-        order.exec_qty = exec_qty;
-        order.leaves_qty -= exec_qty;
+            exec_price_tick
+        };
+        order.record_execution(
+            ExecDelta::of_execution(exec_qty),
+            filled_at,
+            Some(liquidity),
+        );
         if (order.leaves_qty / self.depth.lot_size()).round() > 0f64 {
             order.status = Status::PartiallyFilled;
         } else {

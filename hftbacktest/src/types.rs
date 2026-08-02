@@ -471,6 +471,58 @@ pub enum Liquidity {
     Taker,
 }
 
+/// The quantity executed by **one** execution — a delta, never a running total.
+///
+/// [`Order::exec_qty`] has always meant "how much this particular execution filled", so that
+/// an order filling in parts reports each part and the parts sum to the filled quantity.
+/// Nothing enforced it: the field was a bare `f64`, and a venue that reports a *cumulative*
+/// filled quantity — most REST APIs do — could be assigned straight into it. Both Binance
+/// backends did exactly that with Binance REST's `executedQty`, so a second partial fill
+/// re-reported everything filled before it (invariant E5, `AGENTS.md` §4.6).
+///
+/// **There is deliberately no `ExecDelta::new(f64)` and no `From<f64>`.** A value gets in
+/// only through:
+///
+/// * [`ExecDelta::ZERO`] — "this update reports no execution", the honest answer for a status
+///   change or a rejected request;
+/// * [`ExecDelta::of_execution`] — a quantity computed *as* one execution, which in the
+///   backtest exchanges is `qty.min(order.leaves_qty)` and is a delta by construction;
+/// * a venue's cumulative total advanced against a watermark (`CumulativeFilled::advance` in
+///   the connector), which is the only place a running total is turned into a difference.
+///
+/// `#[repr(transparent)]` over the `f64` that was already on the wire, so the encoding and
+/// the `#[repr(C)] Order` layout are byte-identical — pinned by
+/// `an_order_encodes_to_the_bytes_it_has_always_encoded_to` and
+/// `the_order_layout_the_python_dtype_mirrors_is_unchanged`.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Decode, Encode)]
+#[repr(transparent)]
+pub struct ExecDelta(f64);
+
+impl ExecDelta {
+    /// No execution was reported by this update.
+    pub const ZERO: Self = Self(0.0);
+
+    /// The quantity filled by a single execution.
+    ///
+    /// The name is the contract: pass what *this* execution filled. Passing a running total
+    /// compiles — a delta and a total are both quantities — but [`Order::record_execution`]
+    /// subtracts it from `leaves_qty`, so a total drives the remainder negative rather than
+    /// quietly over-reporting a position.
+    pub const fn of_execution(qty: f64) -> Self {
+        Self(qty)
+    }
+
+    /// The quantity, for arithmetic that has to leave the type.
+    pub const fn get(&self) -> f64 {
+        self.0
+    }
+
+    /// Whether this update reported an execution at all.
+    pub fn is_some(&self) -> bool {
+        self.0 > 0.0
+    }
+}
+
 /// Order status
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(u8)]
@@ -687,7 +739,11 @@ pub struct Order {
     /// cumulative quantity executed by the order: an order that fills in several parts reports
     /// each part separately, and the parts sum to the order's executed quantity. Backtesting
     /// relies on this to accumulate an order's fills without double-counting them.
-    pub exec_qty: f64,
+    ///
+    /// The [`ExecDelta`] wrapper is what makes that structural rather than a convention —
+    /// a cumulative total has no constructor that reaches this field. Write it through
+    /// [`Order::record_execution`], which moves `leaves_qty` by the same amount.
+    pub exec_qty: ExecDelta,
     /// Executed price in ticks (`executed_price / tick_size`), only available when this order is
     /// executed. It is the price of the execution [`Order::exec_qty`] reports.
     pub exec_price_tick: i64,
@@ -748,7 +804,7 @@ impl Order {
             local_timestamp: 0,
             req: Status::None,
             exec_price_tick: 0,
-            exec_qty: 0.0,
+            exec_qty: ExecDelta::ZERO,
             order_id,
             q: Box::new(()),
             maker: false,
@@ -764,6 +820,30 @@ impl Order {
     /// Returns the executed price, only available when this order is executed.
     pub fn exec_price(&self) -> f64 {
         self.exec_price_tick as f64 * self.tick_size
+    }
+
+    /// Records one execution against this order: the delta it filled, the price it filled at,
+    /// and the liquidity it was on.
+    ///
+    /// **The single writer of [`Order::exec_qty`], and the reason the delta and the remainder
+    /// cannot be written apart.** `leaves_qty` moves by exactly the amount recorded, in the
+    /// same call, so "how much did this execution fill" and "how much is left" can no longer
+    /// disagree — which is the temporal half of the fill-accounting identity that the
+    /// property test and the debug-only `ExecutionLedger` check from the other side
+    /// (`AGENTS.md` §1.6).
+    ///
+    /// It is also what turns a cumulative total from a silent over-report into an arithmetic
+    /// contradiction: pass one and `leaves_qty` goes negative.
+    pub fn record_execution(
+        &mut self,
+        delta: ExecDelta,
+        exec_price_tick: i64,
+        liquidity: Option<Liquidity>,
+    ) {
+        self.exec_qty = delta;
+        self.exec_price_tick = exec_price_tick;
+        self.leaves_qty -= delta.get();
+        self.set_liquidity(liquidity);
     }
 
     /// Records the liquidity of the execution being applied to this order.
@@ -1577,6 +1657,49 @@ mod tests {
         );
     }
 
+    /// An execution and the remainder it leaves **move together**, by construction.
+    ///
+    /// [`Order::exec_qty`] is a *per-execution delta*, never a running total — an order that
+    /// fills in three parts reports three deltas that sum to the filled quantity, and
+    /// backtesting adds them up. That was previously a convention held by a doc-comment and
+    /// by every writer independently remembering it, and the two Binance backends did not:
+    /// they wrote Binance REST's cumulative `executedQty` straight into the field.
+    ///
+    /// [`Order::record_execution`] is the single writer, and it lowers `leaves_qty` by exactly
+    /// the delta it records. Writing a *cumulative* total through it does not merely
+    /// mis-report the fill, it drives the remainder negative — the arithmetic itself rejects
+    /// it, rather than a reviewer having to.
+    #[test]
+    fn an_execution_and_the_remainder_move_together() {
+        use crate::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+
+        let mut order = Order::new(
+            1,
+            100,
+            0.01,
+            10.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        assert_eq!(order.leaves_qty, 10.0);
+        assert_eq!(order.exec_qty, ExecDelta::ZERO);
+
+        order.record_execution(ExecDelta::of_execution(3.0), 100, None);
+        assert_eq!(order.exec_qty, ExecDelta::of_execution(3.0));
+        assert_eq!(order.leaves_qty, 7.0, "the remainder moved by the delta");
+
+        // A second execution reports its **own** size, not the 5.0 cumulative.
+        order.record_execution(ExecDelta::of_execution(2.0), 100, None);
+        assert_eq!(
+            order.exec_qty,
+            ExecDelta::of_execution(2.0),
+            "each execution reports itself; the parts sum to the order's filled quantity"
+        );
+        assert_eq!(order.leaves_qty, 5.0);
+    }
+
     /// An uncertain order is **kept**: neither terminal nor droppable.
     ///
     /// [`Status::Uncertain`] means "the venue said something about this order that this
@@ -1748,7 +1871,7 @@ mod tests {
     /// `#[repr(..)]` literal (`Side::Sell` is repr `-1` but rides as `1`).
     #[test]
     fn an_order_encodes_to_the_bytes_it_has_always_encoded_to() {
-        use crate::types::{OrdType, Order, Side, Status, TimeInForce};
+        use crate::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
 
         let mut order = Order::new(
             300,
@@ -1760,7 +1883,7 @@ mod tests {
             TimeInForce::IOC,
         );
         order.leaves_qty = 0.5;
-        order.exec_qty = 1.0;
+        order.exec_qty = ExecDelta::of_execution(1.0);
         order.exec_price_tick = -4;
         order.exch_timestamp = 1_700_000_000_000_000_000;
         order.local_timestamp = 1_700_000_000_000_000_001;

@@ -27,7 +27,7 @@ use crate::{
         state::State,
     },
     depth::HashMapMarketDepth,
-    types::{Liquidity, OrdType, Order, OrderId, Side, Status, TimeInForce},
+    types::{ExecDelta, Liquidity, OrdType, Order, OrderId, Side, Status, TimeInForce},
 };
 
 const TICK_SIZE: f64 = 0.01;
@@ -110,10 +110,11 @@ impl ScriptedExchange {
 
         // Every execution in this script is a resting one, and it says so the way the real
         // exchanges do — through the liquidity supplied when the fill is applied (C2).
-        order.set_liquidity(Some(Liquidity::Maker));
-        order.exec_price_tick = order.price_tick;
-        order.exec_qty = exec_qty;
-        order.leaves_qty -= exec_qty;
+        order.record_execution(
+            ExecDelta::of_execution(exec_qty),
+            order.price_tick,
+            Some(Liquidity::Maker),
+        );
         order.status = if order.leaves_qty > 0.0 {
             Status::PartiallyFilled
         } else {

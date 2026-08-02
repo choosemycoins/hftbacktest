@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use hashbrown::HashMap;
 use hftbacktest::{
     prelude::get_precision,
-    types::{OrdType, Order, OrderId, Side, Status, TimeInForce},
+    types::{ExecDelta, OrdType, Order, OrderId, Side, Status, TimeInForce},
 };
 
 use crate::{
@@ -71,7 +71,7 @@ impl OrderManager {
             .ok_or(BybitError::OrderNotFound)?;
         order_info.order.exec_price_tick =
             (data.exec_price / order_info.order.price_tick as f64).round() as i64;
-        order_info.order.exec_qty = data.exec_qty;
+        order_info.order.exec_qty = ExecDelta::of_execution(data.exec_qty);
         order_info.order.exch_timestamp = data.exec_time * 1_000_000;
         Ok(order_info.clone())
     }
@@ -87,7 +87,7 @@ impl OrderManager {
             .ok_or(BybitError::OrderNotFound)?;
         order_info.order.exec_price_tick =
             (data.exec_price / order_info.order.price_tick as f64).round() as i64;
-        order_info.order.exec_qty = data.exec_qty;
+        order_info.order.exec_qty = ExecDelta::of_execution(data.exec_qty);
         order_info.order.exch_timestamp = data.exec_time * 1_000_000;
         Ok(order_info.clone())
     }

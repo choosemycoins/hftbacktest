@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use hashbrown::HashMap;
-use hftbacktest::types::{Order, OrderId, Status};
+use hftbacktest::types::{ExecDelta, Order, OrderId, Status};
 use tracing::error;
 
 use crate::{
@@ -64,7 +64,8 @@ impl OrderManager {
             order_ext.order.status = resp.order_status;
             order_ext.order.exec_price_tick =
                 (resp.last_filled_price / order_ext.order.tick_size).round() as i64;
-            order_ext.order.exec_qty = resp.order_last_filled_quantity;
+            // `order_last_filled_quantity` is Binance's per-fill quantity — already a delta.
+            order_ext.order.exec_qty = ExecDelta::of_execution(resp.order_last_filled_quantity);
             order_ext.order.order_type = resp.order_type;
         }
 
@@ -192,14 +193,23 @@ impl OrderManager {
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
         if resp.transact_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = resp.orig_qty;
-            order_ext.order.leaves_qty = resp.orig_qty - resp.executed_qty;
+            order_ext.order.leaves_qty = resp.orig_qty - resp.executed_qty.get();
             order_ext.order.side = resp.side;
             order_ext.order.time_in_force = resp.time_in_force;
             order_ext.order.exch_timestamp = resp.transact_time * 1_000_000;
             order_ext.order.status = resp.status;
-            // The last filled price isn't available in the REST response.
-            // Execution details are expected to be received via the WebSocket stream.
-            order_ext.order.exec_qty = resp.executed_qty;
+            // The last filled price isn't available in the REST response, and neither is
+            // any per-execution quantity: `executedQty` is the order's **running total**. It
+            // used to be written into `exec_qty` regardless, so every REST reconcile
+            // re-reported everything the order had filled so far (invariant E5). Execution
+            // details arrive on the WebSocket stream, which is what the comment above always
+            // said; `CumulativeFilled` is what now makes writing the total here impossible.
+            //
+            // Zeroed rather than merely left alone: the tracked order still carries the delta
+            // of the last execution the WebSocket stream reported, and republishing it on an
+            // update that observed no execution reports that fill a second time — the same
+            // trap, one step further along. An update that saw no execution says so.
+            order_ext.order.exec_qty = ExecDelta::ZERO;
             order_ext.order.order_type = resp.order_type;
             order_ext.order.req = Status::None;
         }
@@ -335,5 +345,86 @@ impl GetOrders for OrderManager {
             .map(|(_, order)| &order.order)
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+
+    use super::*;
+
+    /// A REST order response reports **no execution** (invariant E5).
+    ///
+    /// The spot twin of the Binance-futures pin, and it is a separate test because these are
+    /// two independent backends that made the same mistake independently: Binance REST's
+    /// `executedQty` is the order's *running total*, and it was assigned straight into
+    /// `Order::exec_qty`, a per-execution delta. A REST reconcile therefore republished every
+    /// fill the bot had already accounted for.
+    ///
+    /// Zeroing rather than merely not-writing matters just as much: the tracked order still
+    /// holds the last WebSocket execution's delta, so leaving the field alone republishes
+    /// *that* — the same double-report one step further along.
+    #[test]
+    fn a_rest_order_response_reports_no_execution() {
+        let mut manager = OrderManager::new("test");
+        let mut order = Order::new(
+            1,
+            30_000_00,
+            0.01,
+            0.005,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::PartiallyFilled;
+        order.leaves_qty = 0.002;
+        // The last execution the WebSocket stream reported, already applied by the bot.
+        order.exec_qty = ExecDelta::of_execution(0.003);
+        manager.orders.insert(
+            "test_abc".to_string(),
+            OrderExt {
+                symbol: "btcusdt".to_string(),
+                order,
+                removed_by_ws: false,
+                removed_by_rest: false,
+            },
+        );
+
+        let resp: OrderResponse = serde_json::from_str(
+            r#"{
+                "symbol": "BTCUSDT",
+                "orderId": 1,
+                "orderListId": -1,
+                "clientOrderId": "test_abc",
+                "transactTime": 1700000000000,
+                "price": "30000.0",
+                "origQty": "0.005",
+                "executedQty": "0.005",
+                "origQuoteOrderQty": "0.0",
+                "cummulativeQuoteQty": "150.0",
+                "status": "FILLED",
+                "timeInForce": "GTC",
+                "type": "LIMIT",
+                "side": "BUY",
+                "workingTime": 1700000000000,
+                "selfTradePreventionMode": "NONE",
+                "fills": []
+            }"#,
+        )
+        .unwrap();
+
+        let published = manager
+            .update_from_rest(&"test_abc".to_string(), &resp)
+            .unwrap();
+
+        assert_eq!(
+            published.exec_qty,
+            ExecDelta::ZERO,
+            "a REST response carries no per-execution quantity; publishing its cumulative \
+             executedQty re-reports fills the bot has already accounted for"
+        );
+        assert_eq!(published.leaves_qty, 0.0);
+        assert_eq!(published.status, Status::Filled);
     }
 }

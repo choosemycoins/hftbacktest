@@ -32,7 +32,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use hftbacktest::types::{OrdType, Order, OrderId, Side, Status};
+use hftbacktest::types::{ExecDelta, OrdType, Order, OrderId, Side, Status};
 use rand::Rng;
 use tracing::{debug, error, warn};
 
@@ -457,7 +457,7 @@ impl OrderManager {
                 let mut uncertain = tracked.order.clone();
                 uncertain.status = Status::Uncertain;
                 uncertain.req = Status::None;
-                uncertain.exec_qty = 0.0;
+                uncertain.exec_qty = ExecDelta::ZERO;
                 uncertain.exec_price_tick = 0;
                 let mut published = tracked.clone();
                 published.order = uncertain;
@@ -528,13 +528,18 @@ impl OrderManager {
             .flatten()
             .and_then(|cloid| self.orders.get_mut(cloid))
             .map(|tracked| {
-                tracked.order.exec_qty = fill.sz;
+                // `fill.sz` is the size of **this** fill — Hyperliquid reports fills
+                // individually, so it is already a delta (E5). The liquidity is the venue's
+                // own word, carried no further than this fill: a fill that states none leaves
+                // the flag unset rather than claiming the maker side (C2).
+                //
+                // NOTE: this deliberately does not use `Order::record_execution`, which also
+                // lowers `leaves_qty`. Here `leaves_qty` is owned by the `orderUpdates`
+                // stream (`update.order.sz`), a different venue channel; moving it from both
+                // would double-count the remainder.
+                tracked.order.exec_qty = ExecDelta::of_execution(fill.sz);
                 tracked.order.exec_price_tick = (fill.px / tracked.order.tick_size).round() as i64;
                 tracked.order.exch_timestamp = tracked.order.exch_timestamp.max(exch_ts);
-                // The venue's own word on the liquidity, carried no further than this fill: a
-                // fill that states none leaves the flag unset rather than claiming the maker
-                // side (C2). Passed at the moment the fill is applied, which is the only
-                // moment it is known.
                 tracked.order.set_liquidity(fill.liquidity());
                 tracked.order.clone()
             });
@@ -726,7 +731,7 @@ impl GetOrders for OrderManager {
 mod tests {
     use std::time::Instant;
 
-    use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
+    use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
 
     use crate::{
         connector::GetOrders,
@@ -1062,7 +1067,8 @@ mod tests {
             "publishing the last known status would re-assert a claim the venue undermined"
         );
         assert_eq!(
-            published.order.exec_qty, 0.0,
+            published.order.exec_qty,
+            ExecDelta::ZERO,
             "an update that reports no execution must not re-report the previous delta"
         );
         assert_eq!(
@@ -1238,14 +1244,18 @@ mod tests {
             panic!("the first delivery of a fill is not a replay");
         };
         assert_eq!(symbol, "BTC");
-        assert_eq!(order.unwrap().exec_qty, 0.00016);
+        assert_eq!(order.unwrap().exec_qty, ExecDelta::of_execution(0.00016));
         assert_eq!(position, 0.00016, "startPosition 0 plus a 0.00016 buy");
         assert_eq!(exch_ts, 1785261290000 * 1_000_000);
 
         // The same fill again — which is exactly what a reconnect delivers.
         assert!(manager.apply_fill(&fill).is_replay());
         assert_eq!(manager.replayed_fills(), 1);
-        assert_eq!(manager.orders(None)[0].exec_qty, 0.00016, "not doubled");
+        assert_eq!(
+            manager.orders(None)[0].exec_qty,
+            ExecDelta::of_execution(0.00016),
+            "not doubled"
+        );
     }
 
     /// **The liquidity a fill reports is the venue's word, and the only thing that may set the

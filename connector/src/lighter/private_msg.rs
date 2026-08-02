@@ -35,7 +35,10 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::{lighter::LighterError, utils::Micros};
+use crate::{
+    lighter::LighterError,
+    utils::{CumulativeFilled, Micros},
+};
 
 /// One order as `account_all_orders` states it — only the fields the order path keys on.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,7 +56,10 @@ pub struct AccountOrder {
     pub price: f64,
     pub initial_base_amount: f64,
     pub remaining_base_amount: f64,
-    pub filled_base_amount: f64,
+    /// The order's **running total** filled. Typed [`CumulativeFilled`] so it reaches a
+    /// per-execution `Order::exec_qty` only through `CumulativeFilled::advance` against the
+    /// tracked watermark — a direct assignment does not compile (E5, `AGENTS.md` §4.6).
+    pub filled_base_amount: CumulativeFilled,
     /// **The only monotone ordering key** (§4.12). Never order by `updated_at`. Typed
     /// [`Micros`] so it reaches the nanosecond `exch_timestamp` only through the checked
     /// [`crate::utils::Nanos::from_micros`] — a raw assignment does not compile (T1).
@@ -252,7 +258,7 @@ fn account_orders_from(
             price: parse_number(&order.price)?,
             initial_base_amount: parse_number(&order.initial_base_amount)?,
             remaining_base_amount: parse_number(&order.remaining_base_amount)?,
-            filled_base_amount: parse_number(&order.filled_base_amount)?,
+            filled_base_amount: CumulativeFilled::new(parse_number(&order.filled_base_amount)?),
             transaction_time_us: Micros::new(order.transaction_time),
         });
     }

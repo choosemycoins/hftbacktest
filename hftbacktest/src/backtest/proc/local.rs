@@ -118,7 +118,7 @@ where
             // — so a request the exchange hands back, on a rejection or on an acknowledgement,
             // cannot be mistaken for one.
             if (order.status == Status::Filled || order.status == Status::PartiallyFilled)
-                && order.exec_qty > 0.0
+                && order.exec_qty.is_some()
             {
                 #[cfg(debug_assertions)]
                 debug_assert!(

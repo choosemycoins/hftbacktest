@@ -1225,7 +1225,7 @@ mod tests {
             private_msg::AccountOrder,
             rest::MarketInfo,
         },
-        utils::Micros,
+        utils::{CumulativeFilled, Micros},
     };
 
     /// **The 8 h auth ceiling is server-only (§3.4): a 9 h token mints without error and is
@@ -1283,7 +1283,7 @@ mod tests {
             price: 58300.0,
             initial_base_amount: 0.001,
             remaining_base_amount: 0.001,
-            filled_base_amount: 0.0,
+            filled_base_amount: CumulativeFilled::ZERO,
             transaction_time_us: Micros::new(1785431774184833),
         }
     }

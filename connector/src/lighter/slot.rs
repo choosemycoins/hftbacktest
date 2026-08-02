@@ -159,7 +159,7 @@ mod tests {
             private_msg::AccountOrder,
             rest::{SendOutcome, SendTxAck, TxVerdict},
         },
-        utils::Micros,
+        utils::{CumulativeFilled, Micros},
     };
 
     fn ack() -> SendTxAck {
@@ -261,7 +261,7 @@ mod tests {
             price: 58300.0,
             initial_base_amount: 0.001,
             remaining_base_amount: 0.001,
-            filled_base_amount: 0.0,
+            filled_base_amount: CumulativeFilled::ZERO,
             transaction_time_us: Micros::new(1785431774184833),
         }
     }

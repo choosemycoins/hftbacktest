@@ -16,6 +16,7 @@ use crate::{
         BuildError,
         ElapseResult,
         Event,
+        ExecDelta,
         LOCAL_ASK_DEPTH_EVENT,
         LOCAL_BID_DEPTH_EVENT,
         LOCAL_BUY_TRADE_EVENT,
@@ -541,7 +542,7 @@ where
             req: Status::New,
             exec_price_tick: 0,
             exch_timestamp: 0,
-            exec_qty: 0.0,
+            exec_qty: ExecDelta::ZERO,
             // Invalid information
             q: Box::new(()),
             maker: false,

@@ -1,6 +1,9 @@
 use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc};
 
-use crate::{backtest::models::LatencyModel, types::Order};
+use crate::{
+    backtest::models::LatencyModel,
+    types::{ExecDelta, Order},
+};
 
 /// Provides a bus for transporting backtesting orders between the exchange and the local model
 /// based on the given timestamp.
@@ -146,7 +149,7 @@ where
     where
         F: FnMut(&mut Order),
     {
-        order.exec_qty = 0.0;
+        order.exec_qty = ExecDelta::ZERO;
         order.exec_price_tick = 0;
 
         let order_entry_latency = self.order_latency.entry(order.local_timestamp, &order);

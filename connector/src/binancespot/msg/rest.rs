@@ -2,7 +2,12 @@ use hftbacktest::types::{OrdType, Side, Status, TimeInForce};
 use serde::{Deserialize, Serialize};
 
 use super::{from_str_to_side, from_str_to_status, from_str_to_tif, from_str_to_type};
-use crate::utils::{from_str_to_f64, to_lowercase};
+use crate::utils::{
+    CumulativeFilled,
+    from_str_to_cumulative_filled,
+    from_str_to_f64,
+    to_lowercase,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -32,8 +37,10 @@ pub struct OrderResponse {
     pub price: f64,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub orig_qty: f64,
-    #[serde(deserialize_with = "from_str_to_f64")]
-    pub executed_qty: f64,
+    /// The order's **running total** filled, not a per-execution quantity — hence
+    /// [`CumulativeFilled`], which has no route into `Order::exec_qty` (E5).
+    #[serde(deserialize_with = "from_str_to_cumulative_filled")]
+    pub executed_qty: CumulativeFilled,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub orig_quote_order_qty: f64,
     #[serde(deserialize_with = "from_str_to_f64")]
@@ -80,8 +87,10 @@ pub struct CancelOrderResponse {
     pub price: f64,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub orig_qty: f64,
-    #[serde(deserialize_with = "from_str_to_f64")]
-    pub executed_qty: f64,
+    /// The order's **running total** filled, not a per-execution quantity — hence
+    /// [`CumulativeFilled`], which has no route into `Order::exec_qty` (E5).
+    #[serde(deserialize_with = "from_str_to_cumulative_filled")]
+    pub executed_qty: CumulativeFilled,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub orig_quote_order_qty: f64,
     #[serde(deserialize_with = "from_str_to_f64")]

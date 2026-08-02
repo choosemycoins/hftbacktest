@@ -11,7 +11,10 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, pkcs8::DecodePrivateKey};
 use hashbrown::Equivalent;
-use hftbacktest::{prelude::OrderId, types::Status};
+use hftbacktest::{
+    prelude::OrderId,
+    types::{ExecDelta, Status},
+};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{
@@ -113,6 +116,63 @@ where
     D: Deserializer<'de>,
 {
     deserializer.deserialize_option(OptionF64Visitor)
+}
+
+/// A **running total** of everything an order has filled, as the venue reports it.
+///
+/// Most REST APIs — and Lighter's order channel — state how much of an order is filled *so
+/// far*, not how much the latest execution filled. `Order::exec_qty` is the opposite: a
+/// per-execution delta (`AGENTS.md` §4.6). The two are the same number for an order's first
+/// fill and diverge for every one after it, which is what let the confusion survive — it is
+/// invisible until an order fills in parts.
+///
+/// Both Binance backends made exactly that mistake — `order.exec_qty = resp.executed_qty`,
+/// with a comment three lines above noting that execution details arrive on the WebSocket
+/// stream instead. A second partial fill re-reported everything filled before it.
+///
+/// This type is what stops it recurring: venue fields carrying a running total are typed with
+/// it, and **there is deliberately no `From<CumulativeFilled> for ExecDelta`**. The only way
+/// across is [`CumulativeFilled::advance`], which needs a watermark to subtract from — so
+/// writing a total into an execution field no longer type-checks (invariant E5).
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default)]
+pub struct CumulativeFilled(f64);
+
+impl CumulativeFilled {
+    pub const ZERO: Self = Self(0.0);
+
+    pub const fn new(total: f64) -> Self {
+        Self(total)
+    }
+
+    /// The total, for arithmetic that genuinely wants the running figure — computing
+    /// `leaves_qty` as `orig_qty - filled`, for instance, which is a cumulative question.
+    pub const fn get(&self) -> f64 {
+        self.0
+    }
+
+    /// Advances `watermark` to this total and yields what the difference executed.
+    ///
+    /// `None` when the total has not moved: the venue is restating a figure already accounted
+    /// for, and reporting an execution for it would double-count. This is the one bridge from
+    /// a running total to an [`ExecDelta`], and requiring a watermark is the point — a total
+    /// cannot become a delta without naming what it is measured against.
+    pub fn advance(self, watermark: &mut CumulativeFilled) -> Option<ExecDelta> {
+        if self.0 > watermark.0 {
+            let delta = self.0 - watermark.0;
+            *watermark = self;
+            Some(ExecDelta::of_execution(delta))
+        } else {
+            None
+        }
+    }
+}
+
+/// Deserialises a venue's string-encoded running total into a [`CumulativeFilled`].
+pub fn from_str_to_cumulative_filled<'de, D>(deserializer: D) -> Result<CumulativeFilled, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    from_str_to_f64(deserializer).map(CumulativeFilled::new)
 }
 
 pub fn to_uppercase<'de, D>(deserializer: D) -> Result<String, D::Error>

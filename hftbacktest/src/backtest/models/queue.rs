@@ -11,6 +11,7 @@ use crate::{
         AnyClone,
         BUY_EVENT,
         Event,
+        ExecDelta,
         OrdType,
         Order,
         OrderId,
@@ -671,7 +672,7 @@ where
             order_id,
             side,
             // The information below is invalid.
-            exec_qty: 0.0,
+            exec_qty: ExecDelta::ZERO,
             exec_price_tick: 0,
             local_timestamp: 0,
             maker: false,
@@ -1133,6 +1134,7 @@ mod l3_tests {
         backtest::{L3QueueModel, models::L3FIFOQueueModel},
         prelude::{
             Event,
+            ExecDelta,
             HashMapMarketDepth,
             L3MarketDepth,
             OrdType,
@@ -1185,7 +1187,7 @@ mod l3_tests {
             Order {
                 qty: 1.0,
                 leaves_qty: 0.0,
-                exec_qty: 0.0,
+                exec_qty: ExecDelta::ZERO,
                 exec_price_tick: 0,
                 price_tick: 100,
                 tick_size: 1.0,
@@ -1219,7 +1221,7 @@ mod l3_tests {
             Order {
                 qty: 1.0,
                 leaves_qty: 0.0,
-                exec_qty: 0.0,
+                exec_qty: ExecDelta::ZERO,
                 exec_price_tick: 0,
                 price_tick: 101,
                 tick_size: 1.0,
@@ -1275,7 +1277,7 @@ mod l3_tests {
             Order {
                 qty: 1.0,
                 leaves_qty: 0.0,
-                exec_qty: 0.0,
+                exec_qty: ExecDelta::ZERO,
                 exec_price_tick: 0,
                 price_tick: 100,
                 tick_size: 1.0,

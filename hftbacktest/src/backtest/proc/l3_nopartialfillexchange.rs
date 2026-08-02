@@ -21,6 +21,7 @@ use crate::{
         EXCH_FILL_EVENT,
         EXCH_MODIFY_ORDER_EVENT,
         Event,
+        ExecDelta,
         Liquidity,
         Order,
         OrderId,
@@ -95,7 +96,7 @@ where
     }
 
     fn expired(&mut self, mut order: Order, timestamp: i64) -> Result<(), BacktestError> {
-        order.exec_qty = 0.0;
+        order.exec_qty = ExecDelta::ZERO;
         order.leaves_qty = 0.0;
         order.status = Status::Expired;
         order.exch_timestamp = timestamp;
@@ -118,15 +119,18 @@ where
             return Err(BacktestError::InvalidOrderStatus);
         }
 
-        order.set_liquidity(Some(liquidity));
-        if liquidity == Liquidity::Maker {
-            order.exec_price_tick = order.price_tick;
+        // The single writer (E5), as in the L2 twin: this exchange fills the whole
+        // remainder, so the delta *is* `leaves_qty` and recording it zeroes the remainder.
+        let filled_at = if liquidity == Liquidity::Maker {
+            order.price_tick
         } else {
-            order.exec_price_tick = exec_price_tick;
-        }
-
-        order.exec_qty = order.leaves_qty;
-        order.leaves_qty = 0.0;
+            exec_price_tick
+        };
+        order.record_execution(
+            ExecDelta::of_execution(order.leaves_qty),
+            filled_at,
+            Some(liquidity),
+        );
         order.status = Status::Filled;
         order.exch_timestamp = timestamp;
 
