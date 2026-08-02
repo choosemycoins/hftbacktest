@@ -72,7 +72,10 @@ Written by ``build_dataset.py`` (Phase 3). The keys read here::
                                             --maker-fee/--taker-fee
     backtest_defaults.constant_latency_ns   {entry, response} in ns
     backtest_defaults.queue_model.kind      must be LogProbQueueModel2
-    backtest_defaults.exchange_kind.kind    must be NoPartialFillExchange
+    backtest_defaults.exchange_kind.kind    NoPartialFillExchange or
+                                            PartialFillExchange; a manifest
+                                            naming either is honoured, anything
+                                            else is refused
     collector, converter, schema            identity only
 
 Short hand-written aliases (``hl_npz``, ``signal_npz``, ``max_book_age_ns``…)

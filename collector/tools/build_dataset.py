@@ -2770,14 +2770,33 @@ def build(args: argparse.Namespace,
                 'maker_fee': float(args.maker_fee),
                 'taker_fee': float(args.taker_fee),
             },
-            # Not free choices: the harness builds exactly these, and
-            # PartialFillExchange is forbidden outright (see `forbidden`).
+            # The queue model is not a free choice — the harness builds exactly
+            # that one. The exchange model is a choice of two since the
+            # partial-fill fix; this one is merely the default (see
+            # `exchange_kind.alternative`).
             'queue_model': {'kind': 'LogProbQueueModel2'},
             'exchange_kind': {
                 'kind': 'NoPartialFillExchange',
                 'accepted_distortion': 'fills the whole leaves_qty regardless of '
                                        'the liquidity at the level '
                                        '(proc/nopartialfillexchange.rs:58-62)',
+                'alternative': {
+                    'kind': 'PartialFillExchange',
+                    'how': 'backtest_first.py --exchange partial, or '
+                           '--sweep exchange=no-partial,partial to measure the '
+                           'difference on one dataset',
+                    'why_not_default': 'continuity: every run made before the '
+                                       'partial-fill fix used '
+                                       'NoPartialFillExchange, and keeping the '
+                                       'default lets those runs stay comparable',
+                    'residual_gap': 'what it still does not model (AGENTS.md '
+                                    '§4.6): a liquidity-taking order walking '
+                                    'several price levels reports only its last '
+                                    'chunk to the local, and a partially '
+                                    'executed IOC/Market order expires without '
+                                    'reporting the executed part at all. A '
+                                    'pure-maker grid touches neither.',
+                },
             },
             'constant_latency_ns': {
                 'entry': None if args.entry_latency_ms is None
@@ -2790,9 +2809,19 @@ def build(args: argparse.Namespace,
                                    'modelled, and then it is set in pairs on the '
                                    'asset and the order-latency source '
                                    '("Политика времени" п. 4)',
-            'forbidden': ['PartialFillExchange: partial fills never reach the '
-                          'local position (proc/local.rs:102-103 applies a fill '
-                          'only on Status::Filled) — AGENTS.md §4.6'],
+            'forbidden': [],
+            'forbidden_note': 'PartialFillExchange was listed here until the '
+                              'partial-fill fix: the exchange side set '
+                              'Status::PartiallyFilled while the local side '
+                              'applied a fill only on Status::Filled, so a '
+                              'partial fill reached neither the strategy '
+                              'position nor its PnL. It does now — proc/local.rs '
+                              'and proc/l3_local.rs apply every execution '
+                              'response carrying exec_qty > 0, and exec_qty is '
+                              'the quantity of that one execution, so a series '
+                              'of partials adds up without double-counting '
+                              '(AGENTS.md §4.6). Nothing is forbidden here; the '
+                              'model is a choice, see exchange_kind.alternative.',
             'elapse_note': 'the observation interval of elapse(delta) must be '
                            'chosen explicitly and reconciled with max_signal_age_ns',
         },

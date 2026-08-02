@@ -2716,7 +2716,39 @@ def test_manifest_records_the_models_it_was_given(dataset):
     assert bt['constant_latency_ns'] == {'entry': 5_000_000, 'response': 9_000_000}
     assert bt['queue_model'] == {'kind': 'LogProbQueueModel2'}
     assert bt['exchange_kind']['kind'] == 'NoPartialFillExchange'
-    assert 'PartialFillExchange' in json.dumps(bt['forbidden'])
+
+
+def test_manifest_no_longer_forbids_the_partial_fill_exchange(dataset):
+    """`forbidden` used to ban PartialFillExchange on the ground that a partial
+    fill never reached the strategy position. True once, false since the
+    partial-fill fix (AGENTS.md §4.6): proc/local.rs and proc/l3_local.rs apply
+    every execution response carrying exec_qty > 0, not only Status::Filled.
+
+    Pinned because the claim does not merely sit in a comment — it is written
+    into a machine-readable artifact that outlives the session and is read by
+    whoever picks the models up months later. A false entry there talks a
+    reader out of the only exchange model that fills the way a venue does.
+    """
+    ds = dataset
+    bd.main(base_argv(ds), convert_fn=FakeConverter(), snapshot_fn=FakeSnapshotter())
+    bt = json.loads((ds['out'] / 'manifest.json').read_text())['backtest_defaults']
+
+    assert bt['forbidden'] == [], 'nothing is forbidden since the partial-fill fix'
+
+    # The alternative is named in the artifact, so a reader holding only the
+    # manifest learns the choice exists and how to make it.
+    alt = bt['exchange_kind']['alternative']
+    assert alt['kind'] == 'PartialFillExchange'
+    assert '--exchange partial' in alt['how']
+    assert 'continuity' in alt['why_not_default'].lower(), \
+        'NoPartialFillExchange stays the default only to keep older runs comparable'
+
+    # What PartialFillExchange still does not model is recorded as a caveat on
+    # the model — not as a ban, and not dropped on the floor.
+    assert 'IOC' in alt['residual_gap']
+
+    # The correction states what changed, and points at the code that changed.
+    assert 'proc/local.rs' in bt['forbidden_note']
 
 
 def test_manifest_models_stay_null_when_nothing_was_declared(dataset):

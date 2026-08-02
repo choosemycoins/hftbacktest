@@ -300,8 +300,8 @@ Design note поправлена; гонка остаётся **открытой
 
 **Не подхвачено (в этой правке вне scope, но должно быть поправлено):**
 
-- `collector/tools/build_dataset.py:2124` — каждый Phase-3-манифест по-прежнему пишет `'forbidden': ['PartialFillExchange: partial fills never reach the strategy position …']`, а `collector/tools/test_build_dataset.py:1966` держит это утверждение зелёным. Утверждение теперь ложно, и оно оседает в машиночитаемом артефакте, который переживёт сессию. Комментарий `build_dataset.py:2105` — о том же.
-- `docs/design-multi-venue-collection.md` строки 360, 584, 630 — запрет `PartialFillExchange` «до фикса». Фикс есть; `collector/tools/backtest_first.py` уже предлагает `--exchange partial` и `--sweep exchange=no-partial,partial`.
+- ~~`collector/tools/build_dataset.py` — Phase-3-манифест пишет `'forbidden': ['PartialFillExchange: partial fills never reach …']`~~ — **починено 2026-08-02.** `forbidden` теперь пуст, а история переехала в `forbidden_note`: что было сломано, чем починено, со ссылками на `proc/local.rs` и `proc/l3_local.rs`. Сам выбор модели записан в `exchange_kind.alternative` — `kind`, `how` (`--exchange partial`), `why_not_default` (континуитет со старыми прогонами) и `residual_gap` (чего `PartialFillExchange` по-прежнему не моделирует — см. выше в этом же §4.6). Пин — `test_manifest_no_longer_forbids_the_partial_fill_exchange`: он смотрит на **структуру** (`forbidden == []`, поля `alternative`), а не на прозу, поэтому возврат запрета его валит. Заодно поправлены комментарий над `exchange_kind` и строка 75 докстринга `backtest_first.py` («must be NoPartialFillExchange» — код там принимал обе модели с самого появления `--exchange`, расходилась только документация).
+- `docs/design-multi-venue-collection.md` строки 360, 584, 630 — запрет `PartialFillExchange` «до фикса». Фикс есть; `collector/tools/backtest_first.py` уже предлагает `--exchange partial` и `--sweep exchange=no-partial,partial`. **Остаётся открытым** — это текст дизайн-ноты, кода не касается.
 
 ### 4.7 Прочее
 
