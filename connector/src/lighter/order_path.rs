@@ -56,7 +56,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use crate::{
-    connector::PublishEvent,
+    connector::{PublishEvent, SweepOutcome},
     lighter::{
         LighterError,
         SharedSymbolSet,
@@ -231,10 +231,13 @@ enum Command {
         plan: CancelPlan,
     },
     /// Cancel-all for a market (`255` = all). `reply` fires once the sweep's `sendTx` has been
-    /// answered, so an orderly stop can wait for it before the tasks are aborted.
+    /// answered, carrying **whether it succeeded** (SW1), so an orderly stop can both wait for
+    /// it and learn whether the cancel landed. The `bool` payload is what makes "reply success
+    /// after a failed `send_cancel_all`" impossible to write — a `()` reply could only ever say
+    /// "the handler ran".
     CancelAll {
         market_index: i32,
-        reply: Option<oneshot::Sender<()>>,
+        reply: Option<oneshot::Sender<bool>>,
     },
     /// Mint a WS auth token expiring at `deadline` (absolute unix seconds). The private stream
     /// asks the slot because the slot owns the one signer.
@@ -368,13 +371,19 @@ impl OrderPath {
     }
 
     /// Sweeps the given markets with one `CancelAllOrders` tx each (§3.4), and returns a task
-    /// that completes once every sweep's `sendTx` has been answered — so an orderly stop can
-    /// wait for the cancels to be sent before the tasks are torn down. Bounded, so a wedged
-    /// slot cannot hang the stop.
-    pub fn sweep(&self, market_indices: Vec<i32>) -> JoinHandle<()> {
+    /// that resolves to the folded [`SweepOutcome`] once every sweep's `sendTx` has been
+    /// answered — so an orderly stop can both wait for the cancels and learn whether they
+    /// succeeded (SW1). Bounded, so a wedged slot cannot hang the stop.
+    ///
+    /// Fail closed ([`SweepOutcome::from_confirmations`]): a market whose `CancelAll` could not
+    /// even be queued (the slot task is gone), whose reply was dropped, or which timed out
+    /// counts as an unconfirmed cancel — [`SweepOutcome::Failed`] — because its orders may
+    /// still be resting. An empty market list is [`SweepOutcome::Cancelled`]: nothing to do.
+    pub fn sweep(&self, market_indices: Vec<i32>) -> JoinHandle<SweepOutcome> {
         let command_tx = self.command_tx.clone();
         tokio::spawn(async move {
             let mut replies = Vec::new();
+            let mut confirmations: Vec<bool> = Vec::new();
             for market_index in market_indices {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 if command_tx
@@ -385,13 +394,21 @@ impl OrderPath {
                     .is_ok()
                 {
                     replies.push(reply_rx);
+                } else {
+                    // The slot task is gone; this market cannot be swept.
+                    confirmations.push(false);
                 }
             }
             for reply in replies {
-                // A dropped sender (slot gone) resolves the await immediately; the bound keeps
-                // a slow one from hanging the stop.
-                let _ = time::timeout(Duration::from_secs(20), reply).await;
+                // A dropped sender (slot gone) or a timeout is an unconfirmed cancel; the bound
+                // keeps a slow one from hanging the stop. Only an explicit `true` confirms.
+                let confirmed = matches!(
+                    time::timeout(Duration::from_secs(20), reply).await,
+                    Ok(Ok(true))
+                );
+                confirmations.push(confirmed);
             }
+            SweepOutcome::from_confirmations(confirmations)
         })
     }
 
@@ -478,9 +495,14 @@ impl SlotTask {
                             self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
                         }
                         Some(Command::CancelAll { market_index, reply }) => {
-                            self.send_cancel_all(&mut signer, &mut nonce, market_index).await;
+                            let ok = self
+                                .send_cancel_all(&mut signer, &mut nonce, market_index)
+                                .await;
                             if let Some(reply) = reply {
-                                let _ = reply.send(());
+                                // SW1: answer with the REAL outcome, never an unconditional
+                                // success — the `bool` reply type is what makes "success after
+                                // a failed send_cancel_all" impossible to write.
+                                let _ = reply.send(ok);
                             }
                         }
                         Some(Command::MintAuth { deadline, reply }) => {
@@ -754,15 +776,19 @@ impl SlotTask {
         // here reports it, so a refused transport does not look like a cancel that took.
     }
 
+    /// Returns whether the cancel-all `sendTx` succeeded (SW1). `false` on any of the three
+    /// failures — the nonce could not be seeded, the signer refused, or the `sendTx` failed —
+    /// because in each the venue may still be holding the orders. **Fail closed** (`AGENTS.md`
+    /// §1.1).
     async fn send_cancel_all(
         &self,
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
         market_index: i32,
-    ) {
+    ) -> bool {
         let Some(reserved) = self.reserve(nonce).await else {
             warn!("Couldn't seed the nonce for a Lighter cancel-all sweep.");
-            return;
+            return false;
         };
         // CANCEL_ALL_TIF_IMMEDIATE requires time_ms = 0, or the .so refuses on the client (§3.4).
         let signed = match signer
@@ -773,18 +799,20 @@ impl SlotTask {
             Err(error) => {
                 nonce.released();
                 warn!(?error, "The signer refused the Lighter cancel-all.");
-                return;
+                return false;
             }
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
                 self.apply_nonce(nonce, &outcome).await;
                 info!(market_index, "Sent a Lighter CancelAllOrders sweep.");
+                true
             }
             Err(error) => {
                 nonce.invalidated();
                 self.reseed(nonce).await;
                 warn!(?error, "The Lighter cancel-all sendTx failed.");
+                false
             }
         }
     }

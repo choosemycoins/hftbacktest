@@ -41,7 +41,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
     hyperliquid::{
         exchange::ExchangeClient,
         ordermanager::{OrderManager, SharedOrderManager},
@@ -677,13 +677,14 @@ impl Connector for Hyperliquid {
         symbols: Vec<String>,
         reason: SweepReason,
         ev_tx: UnboundedSender<PublishEvent>,
-    ) -> Option<JoinHandle<()>> {
+    ) -> Option<JoinHandle<SweepOutcome>> {
         let Some(trading) = &self.trading else {
             info!(
                 ?reason,
                 "No Hyperliquid API wallet is configured, so this connector has nothing \
                  resting to sweep."
             );
+            // No order path at all: nothing this connector placed can be resting.
             return None;
         };
         info!(
@@ -701,8 +702,13 @@ impl Connector for Hyperliquid {
             ev_tx,
         );
         Some(tokio::spawn(async move {
-            sweeper.sweep_symbols(&symbols).await;
-            info!(?reason, "Finished sweeping Hyperliquid's open orders.");
+            let outcome = sweeper.sweep_symbols(&symbols).await;
+            info!(
+                ?reason,
+                ?outcome,
+                "Finished sweeping Hyperliquid's open orders."
+            );
+            outcome
         }))
     }
 

@@ -68,7 +68,7 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    connector::PublishEvent,
+    connector::{PublishEvent, SweepOutcome},
     hyperliquid::{
         HyperliquidError,
         exchange::{
@@ -342,7 +342,13 @@ impl PrivateStream {
                 // branch does it. Sweeping every registered coin here would cancel the
                 // resting grid of a bot that has been quoting for hours because a *second*
                 // bot attached — or because one instrument was added late.
-                Some(symbol) => self.sweeper.sweep(symbol).await,
+                Some(symbol) => {
+                    // The confirmation is discarded on the connect path: the `reconcile`
+                    // below settles any residue a failed sweep left, so this is not the
+                    // observable shutdown/bot-death sweep whose outcome the exit code reads
+                    // (SW1).
+                    let _ = self.sweeper.sweep(symbol).await;
+                }
                 // Nothing says which coin this was, and under a policy whose whole purpose
                 // is "the venue holds nothing from before", leaving one unswept is the worse
                 // of the two errors.
@@ -425,10 +431,13 @@ impl PrivateStream {
         Ok(())
     }
 
-    /// Sweeps every coin registered so far. What a `cancel_all` connect does.
+    /// Sweeps every coin registered so far. What a `cancel_all` connect does. The
+    /// [`SweepOutcome`] is discarded (SW1): on the connect path `reconcile` settles any
+    /// residue, so this is not the observable shutdown/bot-death sweep whose outcome the exit
+    /// code reads.
     async fn cancel_all_registered(&self) {
         let symbols: Vec<String> = self.symbols.lock().unwrap().iter().cloned().collect();
-        self.sweeper.sweep_symbols(&symbols).await;
+        let _ = self.sweeper.sweep_symbols(&symbols).await;
     }
 
     fn handle(&mut self, text: &str) {
@@ -567,25 +576,33 @@ impl Sweeper {
         }
     }
 
-    /// Sweeps each symbol in turn.
-    pub async fn sweep_symbols(&self, symbols: &[String]) {
+    /// Sweeps each symbol in turn and folds the per-symbol confirmations into one
+    /// [`SweepOutcome`] (SW1): [`SweepOutcome::Cancelled`] only if **every** symbol confirmed
+    /// (or there was nothing to cancel), otherwise [`SweepOutcome::Failed`] — orders may still
+    /// be resting. Fail closed, via [`SweepOutcome::from_confirmations`].
+    pub async fn sweep_symbols(&self, symbols: &[String]) -> SweepOutcome {
+        let mut confirmations = Vec::with_capacity(symbols.len());
         for symbol in symbols {
-            self.sweep(symbol).await;
+            confirmations.push(self.sweep(symbol).await);
         }
+        SweepOutcome::from_confirmations(confirmations)
     }
 
-    /// One symbol's sweep, bounded. See [`CANCEL_BUDGET`].
-    async fn sweep(&self, symbol: &str) {
-        if time::timeout(CANCEL_BUDGET, self.cancel_all(symbol))
-            .await
-            .is_err()
-        {
-            error!(
-                %symbol,
-                ?CANCEL_BUDGET,
-                "Timed out clearing Hyperliquid's open orders. Whatever was not cancelled \
-                 is still resting, and the bot has not been told otherwise."
-            );
+    /// One symbol's sweep, bounded. See [`CANCEL_BUDGET`]. `true` only when the venue confirmed
+    /// every cancel (or there was nothing to cancel); a timeout is `false` — whatever was not
+    /// cancelled may still be resting.
+    async fn sweep(&self, symbol: &str) -> bool {
+        match time::timeout(CANCEL_BUDGET, self.cancel_all(symbol)).await {
+            Ok(confirmed) => confirmed,
+            Err(_) => {
+                error!(
+                    %symbol,
+                    ?CANCEL_BUDGET,
+                    "Timed out clearing Hyperliquid's open orders. Whatever was not cancelled \
+                     is still resting, and the bot has not been told otherwise."
+                );
+                false
+            }
         }
     }
 
@@ -604,14 +621,21 @@ impl Sweeper {
     /// the orders alone: they may still be resting, and telling the bot they are cancelled
     /// invites a re-quote on top of live orders. The reconciliation that follows settles
     /// whatever this left ambiguous.
-    async fn cancel_all(&self, symbol: &str) {
+    ///
+    /// Returns `true` only when this connector can be sure nothing it placed on `symbol` is
+    /// still resting because of the sweep: the venue confirmed **every** cancel it asked for,
+    /// or there was nothing to cancel. Everything else is `false` and **fail closed** (SW1,
+    /// `AGENTS.md` §1.1) — an unknown asset index, a failed open-orders query, a failed POST,
+    /// or a confirmed count short of what was asked — because in each the orders may still be
+    /// on the venue.
+    async fn cancel_all(&self, symbol: &str) -> bool {
         let Some(asset_index) = self.asset_index(symbol).await else {
             warn!(
                 %symbol,
                 "Not sweeping Hyperliquid orders for a coin whose asset index is unknown; a \
                  cancel with a guessed index would address a different coin."
             );
-            return;
+            return false;
         };
         let open = match open_orders(&self.rest_url, &self.account_address).await {
             Ok(open) => open,
@@ -621,12 +645,13 @@ impl Sweeper {
                     ?error,
                     "Couldn't ask Hyperliquid what it is holding, so nothing was cancelled."
                 );
-                return;
+                return false;
             }
         };
         let cancels = cancels_for(&open, symbol, asset_index);
         if cancels.is_empty() {
-            return;
+            // Nothing on the venue for this coin: nothing this connector placed can be resting.
+            return true;
         }
 
         let outcomes = match self
@@ -643,11 +668,12 @@ impl Sweeper {
                     "Couldn't cancel Hyperliquid's open orders. They are left as they are — \
                      they may still be resting — and reconciliation will settle them."
                 );
-                return;
+                return false;
             }
         };
         let confirmed = confirmed_cancels(&cancels, &outcomes);
-        if confirmed.len() < cancels.len() {
+        let all_confirmed = confirmed.len() == cancels.len();
+        if !all_confirmed {
             warn!(
                 %symbol,
                 asked = cancels.len(),
@@ -665,6 +691,7 @@ impl Sweeper {
                 self.publish_order(symbol, order);
             }
         }
+        all_confirmed
     }
 
     /// This coin's index in the venue's universe, asking the venue if nothing has yet.

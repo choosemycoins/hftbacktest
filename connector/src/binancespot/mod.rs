@@ -28,7 +28,7 @@ use crate::{
         ordermanager::{OrderManager, SharedOrderManager},
         rest::BinanceSpotClient,
     },
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
     utils::{ExponentialBackoff, Retry},
 };
 
@@ -383,20 +383,27 @@ impl Connector for BinanceSpot {
         });
     }
 
-    /// **Not implemented for this backend.** See `BinanceFutures::sweep`.
+    /// **Not implemented for this backend.** See `BinanceFutures::sweep`. Reports
+    /// [`SweepOutcome::NotImplemented`], **not `None`** (SW1): the order path can leave orders
+    /// resting, so this is a documented, non-fatal gap — distinct from a backend with no order
+    /// path at all (`None`).
     fn sweep(
         &self,
         symbols: Vec<String>,
         reason: SweepReason,
-        _tx: UnboundedSender<PublishEvent>,
-    ) -> Option<JoinHandle<()>> {
+        tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<SweepOutcome>> {
         warn!(
             ?reason,
             ?symbols,
             "The Binance Spot backend does not implement a sweep, so these orders are left \
              resting on the venue."
         );
-        None
+        // Drop `tx` at once so it does not hold the publish channel open through the drain.
+        Some(tokio::spawn(async move {
+            drop(tx);
+            SweepOutcome::NotImplemented
+        }))
     }
 
     /// **Not implemented for this backend.** See `Bybit::shutdown`.

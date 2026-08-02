@@ -20,7 +20,7 @@ use crate::{
         rest::BybitClient,
         trade_stream::OrderOp,
     },
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
     utils::{ExponentialBackoff, Retry},
 };
 
@@ -400,19 +400,27 @@ impl Connector for Bybit {
     /// a bot that dies and is restarted finds a clean venue. What it does not cover is the
     /// window *between* the death and the restart — for that, this needs writing, and
     /// writing it must not disturb the connect-time sweep that `myhft` depends on.
+    ///
+    /// Reports [`SweepOutcome::NotImplemented`], **not `None`** (SW1): this backend has an
+    /// order path, so orders it placed may still be resting — that is a documented, non-fatal
+    /// gap, distinct from a backend with no order path at all (`None`).
     fn sweep(
         &self,
         symbols: Vec<String>,
         reason: SweepReason,
-        _tx: UnboundedSender<PublishEvent>,
-    ) -> Option<JoinHandle<()>> {
+        tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<SweepOutcome>> {
         warn!(
             ?reason,
             ?symbols,
             "The Bybit backend does not implement a sweep, so these orders are left resting. \
              Its connect-time `cancel_all_orders` clears them when a bot next registers."
         );
-        None
+        // Drop `tx` at once so it does not hold the publish channel open through the drain.
+        Some(tokio::spawn(async move {
+            drop(tx);
+            SweepOutcome::NotImplemented
+        }))
     }
 
     /// **Not implemented for this backend.** Its stream tasks are spawned without a handle
