@@ -17,11 +17,20 @@
 //! never dropped. [`Tx::send`] returns an error to callers that have an error
 //! path, and independently raises a signal on the fatal channel that `main`
 //! selects on — the only route open to the detached REST snapshot tasks, which
-//! have no caller to return to. `main` then leaves its loop, writes whatever is
-//! still queued (`drain_backlog`), drops the `Writer` so every gzip member is
-//! finished, and exits non-zero. The signal names which of the two failures
-//! happened, because the sidecar record is named after it and the two point a
-//! later investigation in opposite directions.
+//! have no caller to return to. `main` then leaves its loop, stops the
+//! producers and drains both hands-off to completion (`wind_down`), drops the
+//! `Writer` so every gzip member is finished, and exits non-zero. The signal
+//! names which of the two failures happened, because the sidecar record is
+//! named after it and the two point a later investigation in opposite
+//! directions.
+//!
+//! The promise reaches all the way through the shutdown, and that is the one
+//! place it is easy to lose: the drain **closes** each hand-off before it reads
+//! it, so a producer still running when the loop broke has its record refused
+//! rather than accepted into a channel that is about to be destroyed. Draining
+//! only until the queue happened to be empty — the obvious way to write it —
+//! discarded exactly those records, silently, on the ordinary `systemctl stop`
+//! path.
 //!
 //! Awaiting the send instead — real backpressure, propagated through the socket
 //! to the venue — was rejected. A market-data recording that has fallen behind

@@ -149,7 +149,62 @@ struct Args {
     no_symbol_check: bool,
 }
 
-/// Writes whatever the writer hop still holds, and reports how much that was.
+/// How long the producers get to stop before the wind-down goes on without
+/// them.
+///
+/// It is a guard against a wedged task, not a budget anything is expected to
+/// use: the collection task's cancellation lands at its next `.await`, which on
+/// every backend is a socket read. Generous against the unit's
+/// `TimeoutStopSec=30s` — the drain that follows still has to gzip whatever is
+/// queued — and short enough that a task stuck in a blocking call cannot be what
+/// SIGKILLs the process and truncates the day's file.
+const PRODUCER_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Stops the producers, and recovers the collection task's own error if it had
+/// one.
+///
+/// The drain that follows can only be honest if nothing is still handing records
+/// over, and the only handle `main` holds on five backends' worth of read loops
+/// is this one. Cancellation lands at the task's next `.await` — a socket read
+/// in every case — after which its senders are dropped with it.
+///
+/// What it does **not** stop is a detached child: the REST snapshot fetchers
+/// (`binancefutures*`, `bybit`) hold a `writer_tx` clone of their own, and
+/// `pump`'s producer task holds the socket hop. Those are why the drain closes
+/// the hand-off rather than trusting this to have emptied the field — see
+/// [`drain_to_completion`].
+///
+/// Returns the error the task returned, when it had already finished on its own.
+/// A cancelled task has none, and neither has one that outlived the grace: both
+/// leave the loop's own diagnosis in place, which is the honest answer when the
+/// task never got to say anything.
+async fn stop_collecting(
+    task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    grace: Duration,
+) -> Option<anyhow::Error> {
+    // Only a task that is still running is cancelled. Aborting one that has
+    // already returned discards its result — the error the loop is about to
+    // report — and that error is the whole reason this function returns one.
+    if !task.is_finished() {
+        task.abort();
+    }
+    match tokio::time::timeout(grace, task).await {
+        Ok(Ok(Err(error))) => Some(error),
+        Ok(_) => None,
+        Err(_) => {
+            // Nothing here can force it. The drain still runs and the files are
+            // still finished; the record says the shutdown went ahead without
+            // it, which is the only part that is actionable.
+            warn!(
+                grace_s = grace.as_secs(),
+                "the collection task did not stop in time; winding down without it"
+            );
+            None
+        }
+    }
+}
+
+/// Writes everything the hand-off ever accepted, and reports how much that was.
 ///
 /// Called once the main loop has decided to stop. Every record still queued has
 /// already been reported to its producer as accepted — that is the promise
@@ -159,26 +214,33 @@ struct Args {
 /// definition the full capacity, and it is the newest data in the recording:
 /// the window around whatever went wrong.
 ///
-/// Bounded rather than run to exhaustion. Producers do not stop because the
-/// consumer decided to: the socket keeps delivering, and an unbounded drain
-/// could be fed for as long as the venue stays up. The cap is
-/// [`WRITER_QUEUE_CAPACITY`] — **this hop's** capacity, not the socket hop's,
-/// which is half the size — so everything that was waiting is written and
-/// nothing that arrives afterwards can extend the shutdown. Capping it with the
-/// wrong constant would silently discard half of a full backlog, which
-/// `the_drain_is_bounded_even_if_the_producers_keep_pushing` exists to catch.
+/// **It closes the hand-off first, and that is what makes it correct.** The
+/// previous version drained with `try_recv` until the queue was empty, which is
+/// not the same question: producers do not stop because the consumer decided to,
+/// so an empty queue means "nothing this instant", not "nothing further". A
+/// producer that handed a record over microseconds later had it accepted into a
+/// channel that was then destroyed — silently, with no error anywhere, on the
+/// ordinary `systemctl stop` path. [`stop_collecting`] narrows that window and
+/// cannot close it, because the detached REST snapshot tasks hold senders it has
+/// no handle on.
 ///
-/// The full backlog is now ~13 MB of gzip work (32 768 records at a few hundred
-/// bytes) against the unit's `TimeoutStopSec=30s`, which is a sub-second job at
-/// the compression level in use — the deeper queue does not put the clean
-/// shutdown at risk.
-fn drain_backlog(
+/// `Receiver::close` closes it from this end: further hand-offs are **refused**
+/// — `Tx::send` returns `Closed`, raises the fatal signal and logs, so the
+/// producer knows — while everything already accepted stays readable. That
+/// turns the invariant into one with two outcomes and no third: a record is
+/// written, or its hand-off is refused. It is also what bounds the drain.
+/// `recv()` yields `None` once the channel is closed and every record sent
+/// before it was closed has been handed over, so the loop terminates by
+/// construction rather than by a cap — at most this hop's capacity of records,
+/// ~13 MB of gzip work against the unit's `TimeoutStopSec=30s`, which is a
+/// sub-second job at the compression level in use.
+async fn drain_to_completion(
     rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
     mut write: impl FnMut(queue::Record) -> Result<(), anyhow::Error>,
 ) -> usize {
+    rx.close();
     let mut written = 0;
-    for _ in 0..WRITER_QUEUE_CAPACITY {
-        let Ok(record) = rx.try_recv() else { break };
+    while let Some(record) = rx.recv().await {
         if let Err(error) = write(record) {
             // The same fault the loop was already leaving on, most likely. The
             // remaining records cannot be written either, and trying would only
@@ -192,6 +254,35 @@ fn drain_backlog(
         written += 1;
     }
     written
+}
+
+/// The wind-down, in the one order that keeps the hand-off's promise.
+///
+/// 1. **Stop the producers.** Nothing can be handed over by a task that is no
+///    longer running, and a producer left alive is one whose next record the
+///    close below would refuse for no reason — an `error!` on every clean
+///    `systemctl stop`, which is how an operator learns to ignore them.
+/// 2. **Close both hands-off and drain them to completion.** Anything the
+///    detached children still hand over is refused rather than accepted and
+///    destroyed, and the drain ends because the channel is closed rather than
+///    because it was briefly empty.
+///
+/// The writer hop is drained first because it is the larger and the more urgent
+/// of the two; the poller hop carries the collector's own periodic output.
+///
+/// One function so the order is testable at all: everything around it in `main`
+/// dials a socket.
+async fn wind_down(
+    collection_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    grace: Duration,
+    writer_rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
+    poller_rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
+    mut write: impl FnMut(queue::Record) -> Result<(), anyhow::Error>,
+) -> (Option<anyhow::Error>, usize) {
+    let task_error = stop_collecting(collection_task, grace).await;
+    let recovered = drain_to_completion(writer_rx, &mut write).await
+        + drain_to_completion(poller_rx, &mut write).await;
+    (task_error, recovered)
 }
 
 /// Writes one of `main`'s own records to the sidecar.
@@ -894,23 +985,36 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Every break above leaves records behind in the queue, and on the fatal
-    // paths that is the last data the collector ever captured. Write it before
-    // the files are closed rather than letting the channel be destroyed with
-    // it — see `drain_backlog` for why this is bounded.
-    // Both hops: the promise `queue.rs` makes — a record reported as accepted
-    // is never dropped — is made by `Tx::send`, so it covers whichever hop the
-    // sender belonged to. The poller hop is drained second because it is the
-    // smaller and the less urgent of the two.
-    let recovered = drain_backlog(&mut writer_rx, |(recv_time, symbol, data)| {
-        writer.write(recv_time, symbol, data)
-    }) + drain_backlog(&mut poller_rx, |(recv_time, symbol, data)| {
-        writer.write(recv_time, symbol, data)
-    });
+    // paths that is the last data the collector ever captured. The producers
+    // are stopped and both hands-off are then drained to completion rather than
+    // to the first instant they happen to be empty — see `wind_down`, and
+    // `drain_to_completion` for why closing the channel is what makes the
+    // promise `queue.rs` makes survive the shutdown.
+    let (task_error, recovered) = wind_down(
+        collection_task,
+        PRODUCER_STOP_GRACE,
+        &mut writer_rx,
+        &mut poller_rx,
+        |(recv_time, symbol, data)| writer.write(recv_time, symbol, data),
+    )
+    .await;
     if recovered > 0 {
         info!(
             records = recovered,
             "wrote the queued backlog before closing"
         );
+    }
+
+    // Prefer the collection task's own error. It knows the real cause — an
+    // unknown symbol, an unrecoverable stream failure — where the main loop
+    // only ever sees the channel close. Without this the process exits with a
+    // message that describes the symptom and not the fault. Only on a path that
+    // was already failing: a task cancelled by the wind-down has no error of its
+    // own, and a signal that raced a dying task is still a signal.
+    if fatal.is_some()
+        && let Some(error) = task_error
+    {
+        fatal = Some(error);
     }
 
     // Drop the writer explicitly rather than letting it fall off the end of
@@ -919,17 +1023,6 @@ async fn main() -> Result<(), anyhow::Error> {
     // attempted. A failed flush is logged by `Drop` itself and cannot be
     // reported through this return value.
     drop(writer);
-
-    // Prefer the collection task's own error. It knows the real cause — an
-    // unknown symbol, an unrecoverable stream failure — where the main loop
-    // only ever sees the channel close. Without this the process exits with a
-    // message that describes the symptom and not the fault.
-    if fatal.is_some()
-        && collection_task.is_finished()
-        && let Ok(Err(task_error)) = collection_task.await
-    {
-        fatal = Some(task_error);
-    }
 
     match fatal {
         None => {
@@ -945,6 +1038,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use crate::queue::Record;
 
@@ -959,39 +1057,290 @@ mod tests {
     /// process level, and on an overflow it would discard a full
     /// `WRITER_QUEUE_CAPACITY` of records: the newest data in the recording,
     /// which is the window around the fault.
-    #[test]
-    fn the_queued_backlog_is_written_before_the_files_are_closed() {
+    #[tokio::test]
+    async fn the_queued_backlog_is_written_before_the_files_are_closed() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(8);
         for payload in ["first", "second", "third"] {
             tx.try_send(record(payload)).unwrap();
         }
+        drop(tx);
 
         let mut written = Vec::new();
-        let count = drain_backlog(&mut rx, |(_, _, data)| {
+        let count = drain_to_completion(&mut rx, |(_, _, data)| {
             written.push(data);
             Ok(())
-        });
+        })
+        .await;
 
         assert_eq!(count, 3);
         assert_eq!(written, ["first", "second", "third"]);
     }
 
     /// The drain runs after the decision to stop, so it must not become a
-    /// reason not to. Producers may still be pushing — the socket does not stop
-    /// because the writer did — so it is capped rather than run to exhaustion.
+    /// reason not to. Producers do not stop because the consumer did — the
+    /// socket keeps delivering — so a drain that ran until the queue stayed
+    /// empty could be fed for as long as the venue stays up.
     ///
-    /// Since the two hops stopped sharing a capacity it guards the wiring as
-    /// well: capped with the socket hop's constant instead, this would recover
-    /// 16 384 of 32 768 and throw away the rest of the last data the collector
-    /// captured. Checked by temporarily swapping the constant — it fails.
-    #[test]
-    fn the_drain_is_bounded_even_if_the_producers_keep_pushing() {
+    /// It ends because the hand-off is **closed**, not because a counter ran
+    /// out. That is what makes the bound and the invariant the same mechanism:
+    /// the cap this used to carry bounded the shutdown by throwing accepted
+    /// records away, and closing the channel bounds it by refusing new ones.
+    ///
+    /// Deliberately over-full: the sender here holds twice this hop's capacity
+    /// so that a version which kept a cap of `WRITER_QUEUE_CAPACITY` — or, the
+    /// old wiring hazard, of the socket hop's half-size constant — would stop
+    /// early and be caught.
+    #[tokio::test]
+    async fn the_drain_is_bounded_even_if_the_producers_keep_pushing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(WRITER_QUEUE_CAPACITY * 2);
-        for _ in 0..(WRITER_QUEUE_CAPACITY + 100) {
+        let queued = WRITER_QUEUE_CAPACITY + 100;
+        for _ in 0..queued {
             tx.try_send(record("still arriving")).unwrap();
         }
 
-        assert_eq!(drain_backlog(&mut rx, |_| Ok(())), WRITER_QUEUE_CAPACITY);
+        // Never dropped, and still pushing when the drain starts.
+        let producer = tokio::spawn(async move {
+            while tx.try_send(record("still arriving")).is_ok() {
+                tokio::task::yield_now().await;
+            }
+            tx
+        });
+
+        let written = drain_to_completion(&mut rx, |_| Ok(())).await;
+        let tx = producer.await.unwrap();
+
+        assert!(
+            written >= queued,
+            "the drain stopped at {written} records with {queued} already accepted"
+        );
+        assert!(
+            tx.try_send(record("too late")).is_err(),
+            "the drain must leave the hand-off closed, so a straggler is refused rather \
+             than accepted into a channel that is about to be destroyed"
+        );
+    }
+
+    /// The promise `queue.rs` makes is that a record **reported as accepted** is
+    /// never dropped, and the shutdown is the last place that promise can be
+    /// broken. A producer does not stop because the main loop decided to: the
+    /// socket keeps delivering while the drain runs, so a record can be accepted
+    /// after the drain has looked and before the receiver is destroyed. Once
+    /// that receiver is dropped, whatever the queue still holds goes with it —
+    /// silently, and it is the newest data in the recording.
+    ///
+    /// So every accepted record must have one of two fates and no third:
+    /// **written**, or **refused at the hand-off** so the producer knows. The
+    /// count is the invariant; which of the two a given record gets is a matter
+    /// of timing and neither is a loss.
+    ///
+    /// A real runtime with a thread to spare, because the race is the subject:
+    /// the producer has to be able to hand a record over *while* the drain is
+    /// running, which is exactly what a single-threaded test cannot arrange.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_record_the_hand_off_accepted_is_written_or_refused() {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 64);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+
+        // The tape does not stop for the shutdown. This keeps handing records
+        // over for exactly as long as the hand-off keeps taking them.
+        let producer = tokio::spawn(async move {
+            let mut started = Some(started);
+            while tx.send(record("still arriving")).is_ok() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        // So the drain is a wind-down of something live, not of a task that
+        // never ran.
+        running.await.unwrap();
+
+        let mut written = 0;
+        let drained = drain_to_completion(&mut rx, |_| {
+            written += 1;
+            Ok(())
+        })
+        .await;
+        producer.await.unwrap();
+
+        assert_eq!(drained, written);
+        assert!(written > 0, "the producer never got to hand anything over");
+        assert_eq!(
+            written,
+            accepted.load(Ordering::SeqCst),
+            "the shutdown destroyed records the hand-off had already accepted"
+        );
+    }
+
+    /// The other half of the same invariant, and the reason the order in
+    /// [`wind_down`] is what it is.
+    ///
+    /// Closing the hand-off keeps an accepted record from being destroyed, but
+    /// on its own it would turn every clean `systemctl stop` into a refusal
+    /// storm: the tape is still arriving when the loop breaks, so the next
+    /// frame would meet a closed channel, log `a data hand-off failed` and
+    /// raise the fatal signal — on the ordinary shutdown path, where nothing is
+    /// wrong. Stopping the producers first is what makes the refusal the rare
+    /// case it is meant to be, and it is why a record handed over while the
+    /// collector is winding down still reaches the disk rather than being
+    /// refused at the door.
+    #[tokio::test]
+    async fn a_producer_still_delivering_when_the_loop_stops_is_written_not_refused() {
+        let (tx, mut writer_rx, mut fatal) = queue::test_bounded::<Record>(WRITER_HOP, 128);
+        let (_poller_tx, mut poller_rx, _poller_fatal) =
+            queue::test_bounded::<Record>(POLLER_HOP, 8);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+
+        // Stands in for a collection task: hands records over until it is
+        // stopped, and returns an error only if one is refused.
+        let collection = tokio::spawn(async move {
+            loop {
+                tx.send(record("live tape"))?;
+                counted.fetch_add(1, Ordering::SeqCst);
+                // The await point cancellation lands on, exactly as a socket
+                // read is on every backend.
+                tokio::task::yield_now().await;
+            }
+        });
+        // Let it get going, so this is a wind-down of something live rather
+        // than of a task that never ran.
+        tokio::task::yield_now().await;
+
+        let mut written = 0;
+        let (task_error, recovered) = wind_down(
+            collection,
+            PRODUCER_STOP_GRACE,
+            &mut writer_rx,
+            &mut poller_rx,
+            |_| {
+                written += 1;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(written > 0, "the producer never got to hand anything over");
+        assert_eq!(recovered, written);
+        assert_eq!(
+            written,
+            accepted.load(Ordering::SeqCst),
+            "a record the producer handed over before it was stopped was dropped"
+        );
+        assert!(
+            task_error.is_none(),
+            "a cancelled producer has no error of its own, and reporting a refusal here \
+             would make every clean stop look like a broken recording: {task_error:?}"
+        );
+        // The direct observable, and the one that survives into production: on
+        // the signal path `main` discards the task's result, so a refusal shows
+        // up only as `Tx::send` raising the fatal signal and logging `a data
+        // hand-off failed`. A clean stop must raise none.
+        //
+        // A deadline of zero is a single poll of an empty channel: it cannot
+        // wait, so it cannot flake, and the keepalive in `FatalRx` means the
+        // alternative — `recv()` on a channel with no sender left — would hang
+        // rather than answer.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, fatal.recv())
+                .await
+                .is_err(),
+            "a clean shutdown raised the fatal signal; every `systemctl stop` would log a \
+             broken hand-off and an operator would learn to ignore the one that matters"
+        );
+    }
+
+    /// A collection task that had already failed knows the real cause, and the
+    /// wind-down must not throw it away by cancelling a task that has already
+    /// returned.
+    #[tokio::test]
+    async fn the_collection_tasks_own_error_survives_the_wind_down() {
+        let (tx, mut writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
+        let (_poller_tx, mut poller_rx, _poller_fatal) =
+            queue::test_bounded::<Record>(POLLER_HOP, 8);
+
+        let collection = tokio::spawn(async move {
+            tx.send(record("the last frame before it broke")).unwrap();
+            Err::<(), _>(anyhow!("BTCUSDT is not listed on this venue"))
+        });
+        // The ordering `main` actually sees: the writer hop only reports itself
+        // closed once the task has returned and its sender went with it, so by
+        // the time the loop breaks on that the task is finished and has an
+        // error to give.
+        while !collection.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut written = 0;
+        let (task_error, _) = wind_down(
+            collection,
+            PRODUCER_STOP_GRACE,
+            &mut writer_rx,
+            &mut poller_rx,
+            |_| {
+                written += 1;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            task_error.map(|error| error.to_string()),
+            Some("BTCUSDT is not listed on this venue".to_string())
+        );
+        assert_eq!(
+            written, 1,
+            "the last record it handed over before failing is the window around the fault"
+        );
+    }
+
+    /// The grace is a guard, not a budget: a producer whose cancellation has
+    /// not landed must not be able to hold the shutdown open until systemd's
+    /// `TimeoutStopSec` SIGKILLs the process and truncates the day's gzip
+    /// member. The wind-down goes on without it, and what it had already handed
+    /// over is still written — the close is what makes that safe, since the
+    /// straggler can no longer put anything into a channel about to be dropped.
+    ///
+    /// A grace of zero is the degenerate case of the same thing and the only
+    /// one a test can reach deterministically: cancellation is delivered by the
+    /// scheduler, so a task that is pending when `stop_collecting` is called
+    /// cannot possibly have joined before a deadline that has already passed.
+    /// Virtual time, so it costs nothing and cannot flake on a busy machine.
+    #[tokio::test(start_paused = true)]
+    async fn a_producer_that_has_not_stopped_yet_does_not_hold_the_shutdown_open() {
+        let (tx, mut writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
+        let (_poller_tx, mut poller_rx, _poller_fatal) =
+            queue::test_bounded::<Record>(POLLER_HOP, 8);
+
+        tx.send(record("accepted before it stalled")).unwrap();
+        let stalled = tokio::spawn(async move {
+            let _held = tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+
+        let mut written = 0;
+        let (task_error, recovered) = wind_down(
+            stalled,
+            Duration::ZERO,
+            &mut writer_rx,
+            &mut poller_rx,
+            |_| {
+                written += 1;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(task_error.is_none());
+        assert_eq!(
+            recovered, 1,
+            "what it handed over before it stalled is still owed to the recording"
+        );
     }
 
     /// The socket hop is the one whose overflow genuinely races the stall
@@ -1078,17 +1427,18 @@ mod tests {
     /// A write that fails on the way out is the same fault the loop was already
     /// leaving on. Retrying the rest would just fail once per queued record and
     /// delay the flush that still has a chance of succeeding.
-    #[test]
-    fn a_failing_write_stops_the_drain() {
+    #[tokio::test]
+    async fn a_failing_write_stops_the_drain() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(8);
         tx.try_send(record("first")).unwrap();
         tx.try_send(record("second")).unwrap();
 
         let mut seen = 0;
-        let count = drain_backlog(&mut rx, |_| {
+        let count = drain_to_completion(&mut rx, |_| {
             seen += 1;
             Err(anyhow!("the device stopped answering"))
-        });
+        })
+        .await;
 
         assert_eq!(count, 0);
         assert_eq!(

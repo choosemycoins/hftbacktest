@@ -1295,11 +1295,13 @@ ratio. And *the rate is 2026-07-26's*: nobody counted frames at 03:30 on the
 shrinks in proportion. A third burst is worth more than another round of
 reasoning.
 
-One cost the depth does carry: `drain_backlog` empties the **writer** hop on
-the way out and nothing drains this one, so whatever is sitting here when the
-process stops is lost. That went from ~4096 unparsed frames to ~16 384 — about
-0.6s more of the ~6s hole a restart leaves anyway, which is why it did not
-change the choice.
+One cost the depth does carry: the shutdown's `wind_down` drains the **writer**
+and poller hops and nothing drains this one, so whatever is sitting here when
+the process stops is lost. That went from ~4096 unparsed frames to ~16 384 —
+about 0.6s more of the ~6s hole a restart leaves anyway, which is why it did not
+change the choice. What sits here is unparsed and belongs to no stream yet, so
+none of it is a record the writer hop ever accepted: the promise the shutdown
+keeps is about the two hops it drains.
 
 It cannot simply keep growing. This hop's overflow is the only *specific*
 diagnosis the process has for a parser that cannot keep up, and it races the
