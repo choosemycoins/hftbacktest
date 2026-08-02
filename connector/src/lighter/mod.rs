@@ -48,7 +48,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
     lighter::{
         order_path::{OrderPath, OrderPathConfig},
         public_stream::PublicStream,
@@ -329,7 +329,7 @@ impl Connector for Lighter {
         symbols: Vec<String>,
         reason: SweepReason,
         ev_tx: UnboundedSender<PublishEvent>,
-    ) -> Option<JoinHandle<()>> {
+    ) -> Option<JoinHandle<SweepOutcome>> {
         let Some(order_path) = &self.order_path else {
             // Market-data only: nothing was ever placed, so there is nothing resting to sweep.
             info!(
@@ -337,6 +337,7 @@ impl Connector for Lighter {
                 ?symbols,
                 "The Lighter backend is market-data only, so it has nothing resting to sweep."
             );
+            // No order path at all: nothing this connector placed can be resting.
             return None;
         };
         // One `CancelAllOrders` per resolved market (§3.4) — scoped to the swept symbols rather

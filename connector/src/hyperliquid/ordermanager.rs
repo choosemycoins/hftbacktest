@@ -32,12 +32,12 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use hftbacktest::types::{Order, OrderId, Side, Status};
+use hftbacktest::types::{OrdType, Order, OrderId, Side, Status};
 use rand::Rng;
 use tracing::{debug, warn};
 
 use crate::{
-    connector::GetOrders,
+    connector::{ApplyOutcome, GetOrders},
     hyperliquid::{
         HyperliquidError,
         exchange::{CancelByCloidWire, OrderWire, tif_of, wire_numbers},
@@ -279,6 +279,19 @@ impl OrderManager {
                 )));
             }
         };
+        // Finding 4: this backend places limit orders only — the wire below is always a limit
+        // (`OrderKind::limit`). A Market or Unsupported order was previously coerced to a limit
+        // at the passed price, diverging live behaviour from the strategy-facing API. Refuse it
+        // instead, before any state is minted, exactly as `tif_of` refuses FOK. The grid uses
+        // `OrdType::Limit` only, so this is safe and correct.
+        match order.order_type {
+            OrdType::Limit => {}
+            order_type => {
+                return Err(HyperliquidError::InvalidOrder(format!(
+                    "the Hyperliquid backend places limit orders only; got {order_type:?}"
+                )));
+            }
+        }
         let tif = tif_of(order.time_in_force)?;
 
         let requested_price = order.price_tick as f64 * order.tick_size;
@@ -365,23 +378,34 @@ impl OrderManager {
 
     /// Applies one `orderUpdates` entry.
     ///
-    /// Returns `None` for an order that is not this connector's — a human's on the same
-    /// account, or one placed before this process started. That is not an error: reporting
-    /// it as one would fill the log with every manual action taken on the account.
-    pub fn apply_order_update(&mut self, update: &OrderUpdate) -> Option<OrderExt> {
+    /// [`ApplyOutcome::Ignored`] for an order that is not this connector's — a human's on the
+    /// same account, or one placed before this process started — or a stale/duplicate frame.
+    /// That is not an error: reporting it would fill the log with every manual action on the
+    /// account.
+    ///
+    /// [`ApplyOutcome::Unrecognised`] when the venue's status does not map to a known
+    /// [`Status`] (Finding 3): the order is **kept exactly as it is** — not transitioned, not
+    /// removed — because an unknown status may mean it is still resting, and dropping it would
+    /// let the strategy re-quote its price level into a double position (`AGENTS.md` §1.1). The
+    /// caller escalates; reconciliation resolves the true fate.
+    pub fn apply_order_update(&mut self, update: &OrderUpdate) -> ApplyOutcome<OrderExt> {
         if !self.is_ours(update.order.cloid.as_deref()) {
-            return None;
+            return ApplyOutcome::Ignored;
         }
-        let cloid = update.order.cloid.as_deref()?;
+        let Some(cloid) = update.order.cloid.as_deref() else {
+            return ApplyOutcome::Ignored;
+        };
         let Some(tracked) = self.orders.get_mut(cloid) else {
             // Ours by prefix but unknown: an order from a previous run of this connector.
             // The reconnect reconciliation is what adopts or cancels those; a status
             // update on its own has nothing to attach to.
             debug!(%cloid, status = %update.status, "An orderUpdates entry for an order this process does not track.");
-            return None;
+            return ApplyOutcome::Ignored;
         };
 
-        let exch_ts = update.status_timestamp.checked_mul(1_000_000)?;
+        let Some(exch_ts) = update.status_timestamp.checked_mul(1_000_000) else {
+            return ApplyOutcome::Ignored;
+        };
         // Out-of-order updates are possible and a stale one must not overwrite a newer
         // state. `LiveBot` guards its own copy the same way (`live/bot.rs`), but the
         // connector's map is what answers `orders()` on registration, so it needs its own.
@@ -396,14 +420,29 @@ impl OrderManager {
                 stale_by_ns = tracked.update_ts - exch_ts,
                 "Ignoring an out-of-order Hyperliquid order update."
             );
-            return None;
+            return ApplyOutcome::Ignored;
+        }
+        // Finding 3: an unrecognised status is resolved against the venue's truth, not acted
+        // on here. Map it **before any mutation**, and if it is `Status::Unsupported` return
+        // with the order left exactly as it is — not transitioned, not removed. Treating it as
+        // terminal would drop an order that may still be resting (a re-quote into a double
+        // position); treating it as live would quote against one that is gone. §1.1 fail
+        // closed: keep it, and let the caller escalate so reconciliation settles it.
+        let status = map_order_status(&update.status);
+        if status == Status::Unsupported {
+            warn!(
+                %cloid,
+                status = %update.status,
+                "Keeping a Hyperliquid order whose status this connector does not recognise; \
+                 reconciliation will resolve it (Finding 3, §1.1)."
+            );
+            return ApplyOutcome::Unrecognised;
         }
         tracked.update_ts = exch_ts;
         // The venue is answering about this order, so whatever the submit did, it is done.
         tracked.settled_at.get_or_insert_with(Instant::now);
 
         tracked.oid = Some(update.order.oid);
-        let status = map_order_status(&update.status);
         tracked.order.req = Status::None;
         tracked.order.status = status;
         // Never rewound: `LiveBot::process_event` drops an order update older than its own
@@ -414,13 +453,16 @@ impl OrderManager {
         }
 
         if tracked.order.active() {
-            Some(tracked.clone())
+            ApplyOutcome::Publish(tracked.clone())
         } else {
             let symbol = tracked.symbol.clone();
             let order_id = tracked.order.order_id;
             self.order_id_map
                 .remove(&RefSymbolOrderId::new(&symbol, order_id));
-            self.orders.remove(cloid)
+            match self.orders.remove(cloid) {
+                Some(removed) => ApplyOutcome::Publish(removed),
+                None => ApplyOutcome::Ignored,
+            }
         }
     }
 
@@ -638,8 +680,9 @@ mod tests {
     use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
 
     use crate::{
-        connector::GetOrders,
+        connector::{ApplyOutcome, GetOrders},
         hyperliquid::{
+            HyperliquidError,
             fixtures::{ORDER_UPDATE_CANCELED, ORDER_UPDATE_OPEN, USER_FILLS_INCREMENT},
             msg::{Frame, parse_frame},
             ordermanager::{FillDisposition, OrderManager, PREFIX_LEN},
@@ -843,6 +886,72 @@ mod tests {
         );
     }
 
+    /// **The Hyperliquid backend places limit orders only (Finding 4).** `new_order` built a
+    /// limit wire regardless of `order.order_type`, so a `Market` or `Unsupported` order was
+    /// silently sent as a limit at the passed price — the "green in backtest, wrong in live"
+    /// divergence. It must refuse a non-limit type, the way `tif_of` refuses FOK, and refuse
+    /// **before** any state is minted so a refusal leaves no residue and frees the id.
+    #[test]
+    fn a_non_limit_order_type_is_refused_rather_than_silently_sent_as_a_limit() {
+        let mut manager = manager();
+
+        // A limit order is accepted, exactly as before.
+        assert!(
+            manager
+                .new_order("BTC", &btc(), 3, bot_order(1, 31700.0, 0.001, Side::Buy))
+                .is_ok()
+        );
+
+        // A market order — with a perfectly valid TIF, so it is the order type that is
+        // refused, not the time-in-force — is an error, not a silent limit.
+        let market = Order::new(
+            2,
+            (31700.0_f64 / 0.1).round() as i64,
+            0.1,
+            0.001,
+            Side::Buy,
+            OrdType::Market,
+            TimeInForce::GTC,
+        );
+        assert!(
+            matches!(
+                manager.new_order("BTC", &btc(), 3, market),
+                Err(HyperliquidError::InvalidOrder(_))
+            ),
+            "a Market order must be refused, not coerced to a limit"
+        );
+        // …and an unsupported order type likewise.
+        let unsupported = Order::new(
+            3,
+            (31700.0_f64 / 0.1).round() as i64,
+            0.1,
+            0.001,
+            Side::Buy,
+            OrdType::Unsupported,
+            TimeInForce::GTC,
+        );
+        assert!(matches!(
+            manager.new_order("BTC", &btc(), 3, unsupported),
+            Err(HyperliquidError::InvalidOrder(_))
+        ));
+
+        // Neither refusal left a residue: only the one accepted limit is tracked, and both
+        // refused order ids are free to reuse.
+        assert_eq!(manager.orders(None).len(), 1);
+        assert_eq!(manager.tracked(), 1);
+        assert!(
+            manager
+                .new_order("BTC", &btc(), 3, bot_order(2, 31650.0, 0.001, Side::Buy))
+                .is_ok(),
+            "a refused market order must not burn its order id"
+        );
+        assert!(
+            manager
+                .new_order("BTC", &btc(), 3, bot_order(3, 31640.0, 0.001, Side::Buy))
+                .is_ok()
+        );
+    }
+
     /// A cancel for something this connector never placed cannot be sent — there is no
     /// client id to send. Reported, not guessed at.
     #[test]
@@ -864,7 +973,7 @@ mod tests {
 
         let mut open = updates(ORDER_UPDATE_OPEN);
         open[0].order.cloid = Some(cloid.clone());
-        let live = manager.apply_order_update(&open[0]).unwrap();
+        let live = manager.apply_order_update(&open[0]).published().unwrap();
         assert_eq!(live.symbol, "BTC");
         assert_eq!(live.order.status, Status::New);
         assert_eq!(live.order.req, Status::None);
@@ -873,7 +982,10 @@ mod tests {
 
         let mut cancelled = updates(ORDER_UPDATE_CANCELED);
         cancelled[0].order.cloid = Some(cloid);
-        let done = manager.apply_order_update(&cancelled[0]).unwrap();
+        let done = manager
+            .apply_order_update(&cancelled[0])
+            .published()
+            .unwrap();
         assert_eq!(done.order.status, Status::Canceled);
         assert!(
             manager.orders(None).is_empty(),
@@ -886,6 +998,52 @@ mod tests {
                 .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.001, Side::Buy))
                 .is_ok()
         );
+    }
+
+    /// **Finding 3: an unrecognised status keeps the order and escalates — it does not drop
+    /// it.** An order the venue reports with a status this connector cannot classify may still
+    /// be resting; removing it (the old behaviour, which mapped the catch-all to `Expired` and
+    /// then dropped it as terminal) would let the strategy see its price level free and place a
+    /// second order — a double position (§1.1). So the order stays exactly as it was,
+    /// `orders()` still lists it active, its id stays taken, and the caller is told to
+    /// reconcile via [`ApplyOutcome::Unrecognised`].
+    #[test]
+    fn an_unrecognised_status_keeps_the_order_and_signals_reconcile() {
+        let mut manager = manager();
+        manager
+            .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
+            .unwrap();
+        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+
+        // It is live and resting.
+        let mut open = updates(ORDER_UPDATE_OPEN);
+        open[0].order.cloid = Some(cloid.clone());
+        open[0].status_timestamp = 1_000_000;
+        assert!(matches!(
+            manager.apply_order_update(&open[0]),
+            ApplyOutcome::Publish(_)
+        ));
+
+        // The venue now reports a status nobody has seen before, at a later timestamp.
+        let mut bogus = updates(ORDER_UPDATE_OPEN);
+        bogus[0].order.cloid = Some(cloid);
+        bogus[0].status = "somethingEntirelyNew".into();
+        bogus[0].status_timestamp = 2_000_000;
+        assert!(
+            matches!(
+                manager.apply_order_update(&bogus[0]),
+                ApplyOutcome::Unrecognised
+            ),
+            "an unrecognised status must signal reconcile, not publish a drop"
+        );
+
+        // Untouched: still tracked, still active (New, not rewritten to Unsupported), still
+        // cancellable — the strategy can neither re-use the id nor re-quote the price level.
+        assert_eq!(manager.tracked(), 1);
+        let live = manager.orders(None);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].status, Status::New);
+        assert!(manager.cancel_order("BTC", 7, 3).is_ok());
     }
 
     /// **A rejected order must not leave a phantom.** `LiveBot::submit_order` inserts the
@@ -941,13 +1099,13 @@ mod tests {
         let mut newer = updates(ORDER_UPDATE_OPEN);
         newer[0].order.cloid = Some(cloid.clone());
         newer[0].status_timestamp = 1_000_000;
-        manager.apply_order_update(&newer[0]).unwrap();
+        manager.apply_order_update(&newer[0]).published().unwrap();
 
         let mut older = updates(ORDER_UPDATE_CANCELED);
         older[0].order.cloid = Some(cloid);
         older[0].status_timestamp = 999_999;
         assert!(
-            manager.apply_order_update(&older[0]).is_none(),
+            manager.apply_order_update(&older[0]).published().is_none(),
             "a stale update must be ignored"
         );
         assert_eq!(manager.orders(None)[0].status, Status::New);
@@ -966,8 +1124,18 @@ mod tests {
 
         let mut cancelled = updates(ORDER_UPDATE_CANCELED);
         cancelled[0].order.cloid = Some(cloid);
-        assert!(manager.apply_order_update(&cancelled[0]).is_some());
-        assert!(manager.apply_order_update(&cancelled[0]).is_none());
+        assert!(
+            manager
+                .apply_order_update(&cancelled[0])
+                .published()
+                .is_some()
+        );
+        assert!(
+            manager
+                .apply_order_update(&cancelled[0])
+                .published()
+                .is_none()
+        );
         assert!(manager.orders(None).is_empty());
     }
 
@@ -978,11 +1146,16 @@ mod tests {
         let mut manager = manager();
         let mut foreign = updates(ORDER_UPDATE_OPEN);
         foreign[0].order.cloid = Some("0xffff000000000000000000000000dead".into());
-        assert!(manager.apply_order_update(&foreign[0]).is_none());
+        assert!(
+            manager
+                .apply_order_update(&foreign[0])
+                .published()
+                .is_none()
+        );
 
         let mut manual = updates(ORDER_UPDATE_OPEN);
         manual[0].order.cloid = None;
-        assert!(manager.apply_order_update(&manual[0]).is_none());
+        assert!(manager.apply_order_update(&manual[0]).published().is_none());
     }
 
     /// **The reconnect double-count.** `userFills` replays its whole history with
@@ -1241,7 +1414,7 @@ mod tests {
         let mut open = updates(ORDER_UPDATE_OPEN);
         open[0].order.cloid = Some(cloid.clone());
         open[0].status_timestamp = 1_000_000;
-        manager.apply_order_update(&open[0]).unwrap();
+        manager.apply_order_update(&open[0]).published().unwrap();
 
         // The fill's clock runs 2 ms ahead of the lifecycle clock.
         let mut fill = fills(USER_FILLS_INCREMENT).remove(0);
@@ -1256,6 +1429,7 @@ mod tests {
         filled[0].status_timestamp = 1_000_001;
         let done = manager
             .apply_order_update(&filled[0])
+            .published()
             .expect("the terminal update must be applied");
         assert_eq!(done.order.status, Status::Filled);
         assert!(

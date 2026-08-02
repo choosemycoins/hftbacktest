@@ -112,7 +112,7 @@ use crate::{
     binancefutures::BinanceFutures,
     binancespot::BinanceSpot,
     bybit::Bybit,
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
     hyperliquid::Hyperliquid,
     lighter::Lighter,
     supervision::{
@@ -919,12 +919,16 @@ async fn run() {
     // and nothing is counting down a deadline that was never meant to bound a sweep. A stop
     // that gives up here has left orders resting, which is the failure the sweep exists to
     // prevent, so it is loud and it is not exit 0.
-    let sweep_finished = match sweep {
+    // Finding 2: fold the task into a `SweepOutcome`, so the exit code can tell "cancelled"
+    // from "ran but may have left orders resting". A panic (`Ok(Err(_))`) or a timeout is
+    // `Failed` — orders may be on the venue — not a silent success. `None` here means no sweep
+    // task ran at all (disabled, nothing registered, or a backend with no order path).
+    let sweep = match sweep {
         Some(handle) => match tokio::time::timeout(sweep_timeout, handle).await {
-            Ok(Ok(())) => true,
+            Ok(Ok(outcome)) => Some(outcome),
             Ok(Err(error)) => {
                 error!(?error, "The shutdown sweep task failed.");
-                false
+                Some(SweepOutcome::Failed)
             }
             Err(_) => {
                 error!(
@@ -934,10 +938,10 @@ async fn run() {
                      restarting, and raise `shutdown.sweep_timeout_ms` if this is normal for \
                      this deployment."
                 );
-                false
+                Some(SweepOutcome::Failed)
             }
         },
-        None => true,
+        None => None,
     };
 
     // After the sweep, so a sweep in flight is not aborted along with the streams.
@@ -971,11 +975,7 @@ async fn run() {
         }
     };
 
-    let report = StopReport {
-        kind,
-        sweep_finished,
-        drain,
-    };
+    let report = StopReport { kind, sweep, drain };
     let code = exit_code(&report);
     info!(?report, code, "Connector stopped.");
     exit(code);

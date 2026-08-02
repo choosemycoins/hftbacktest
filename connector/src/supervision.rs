@@ -22,7 +22,7 @@ use hftbacktest::live::ipc::iceoryx::ChannelError;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::connector::PublishEvent;
+use crate::connector::{PublishEvent, SweepOutcome};
 
 /// How long the publish task waits for every [`PublishEvent`] sender to be dropped before it
 /// stops anyway.
@@ -354,8 +354,11 @@ pub enum StopKind {
 #[derive(Clone, Debug)]
 pub struct StopReport {
     pub kind: StopKind,
-    /// Whether the shutdown sweep ran to completion. `true` when none was asked for.
-    pub sweep_finished: bool,
+    /// What the shutdown sweep did (Finding 2), or `None` if none ran — sweeping was disabled,
+    /// no symbols were registered, or the backend has no order path. Only
+    /// [`SweepOutcome::Failed`] is a non-zero stop; [`SweepOutcome::Cancelled`],
+    /// [`SweepOutcome::NotImplemented`] and `None` are all clean.
+    pub sweep: Option<SweepOutcome>,
     /// How the drain ended, or `None` if the publish task went away without reporting.
     pub drain: Option<DrainOutcome>,
 }
@@ -372,9 +375,13 @@ pub struct StopReport {
 ///   orderly path. It will already have panicked into `exit(1)` under the process hook, and
 ///   the two are racing; agreeing with it is what stops the race from deciding whether the
 ///   supervisor sees a crash or a clean stop.
-/// * A sweep that did not finish leaves orders resting on the venue with nothing managing
-///   them. That is the exact condition this whole module exists to prevent, so it cannot be
-///   reported as success however orderly the rest of the stop was.
+/// * A sweep that **failed** ([`SweepOutcome::Failed`]) may have left orders resting on the
+///   venue with nothing managing them. That is the exact condition this whole module exists to
+///   prevent, so it cannot be reported as success however orderly the rest of the stop was. A
+///   sweep that confirmed ([`SweepOutcome::Cancelled`]), a documented no-op backend
+///   ([`SweepOutcome::NotImplemented`], §4.7) and no sweep at all (`None`) are all clean — the
+///   distinction a bare `JoinHandle<()>` could not make, which let a stop exit 0 with a grid
+///   still resting (Finding 2).
 ///
 /// [`DrainOutcome::GraceElapsed`] is *not* a failure: three of the four backends never drop
 /// their stream senders, so it is their normal ending.
@@ -384,8 +391,10 @@ pub fn exit_code(report: &StopReport) -> i32 {
             kind: StopKind::ReceiveLoopFailed,
             ..
         } => 1,
+        // Finding 2: a sweep that ran but could not confirm its cancels may have left orders
+        // resting. `Cancelled`/`NotImplemented`/`None` are all clean and fall through to 0.
         StopReport {
-            sweep_finished: false,
+            sweep: Some(SweepOutcome::Failed),
             ..
         } => 1,
         StopReport { drain: None, .. } => 1,
@@ -872,7 +881,7 @@ mod tests {
     fn only_a_stop_that_kept_its_promises_exits_zero() {
         let clean = StopReport {
             kind: StopKind::Orderly,
-            sweep_finished: true,
+            sweep: Some(SweepOutcome::Cancelled),
             drain: Some(DrainOutcome::SendersDropped { published: 3 }),
         };
         assert_eq!(exit_code(&clean), 0);
@@ -887,13 +896,35 @@ mod tests {
             "a backend that does not implement `shutdown` still stops cleanly"
         );
 
-        // Orders may still be resting, which is the failure the sweep exists to prevent.
+        // **Finding 2: a sweep that could not confirm its cancels may have left orders
+        // resting.** This is the exact failure a bare `JoinHandle<()>` could not report — the
+        // task finished, so the old code exited 0 — and it is the whole reason the outcome is
+        // now observable.
         assert_eq!(
             exit_code(&StopReport {
-                sweep_finished: false,
+                sweep: Some(SweepOutcome::Failed),
                 ..clean.clone()
             }),
-            1
+            1,
+            "a sweep that failed to confirm its cancels must not be reported as a clean stop"
+        );
+        // A documented no-op backend (bybit/binance, §4.7) is not a failure: it never claimed
+        // to sweep, and turning its normal stop into exit 1 would make every stop look broken.
+        assert_eq!(
+            exit_code(&StopReport {
+                sweep: Some(SweepOutcome::NotImplemented),
+                ..clean.clone()
+            }),
+            0,
+            "an unimplemented sweep is a documented gap, not a failure"
+        );
+        // No sweep ran at all — disabled, nothing registered, or a backend with no order path.
+        assert_eq!(
+            exit_code(&StopReport {
+                sweep: None,
+                ..clean.clone()
+            }),
+            0
         );
         // The publish task failed while stopping: the bots did not get everything.
         assert_eq!(

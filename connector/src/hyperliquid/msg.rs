@@ -12,7 +12,7 @@
 
 use hftbacktest::types::Status;
 use serde::Deserialize;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::{hyperliquid::HyperliquidError, utils::from_str_to_f64};
 
@@ -191,18 +191,25 @@ pub enum Frame {
     Other(String),
 }
 
-/// The venue's status string as an order status, and whether it is the last word.
+/// The venue's status string as an order status.
 ///
-/// **Unknown means terminal.** Hyperliquid documents around thirty status strings and
-/// **adds to the set over time** — Hummingbot shipped a production bug precisely by
-/// hardcoding the list and then meeting `perpMarginRejected`. An unrecognised status
-/// cannot be assumed to mean "still resting": that is how a bot ends up quoting against
-/// orders that no longer exist, which `AGENTS.md` §1.1 rules out. It is mapped to
-/// `Status::Expired`, dropped from the order manager, and logged at `error!`.
+/// **Unknown means [`Status::Unsupported`], not terminal (Finding 3).** Hyperliquid documents
+/// around thirty status strings and **adds to the set over time** — Hummingbot shipped a
+/// production bug precisely by hardcoding the list and then meeting `perpMarginRejected`. An
+/// unrecognised status cannot be assumed to mean "still resting" (a bot then quotes against
+/// orders that no longer exist), but it must **not** be assumed terminal either: mapping it to
+/// `Status::Expired` drops the order from the manager, and if it was in fact still resting the
+/// strategy sees its price level free and places a *second* order — a double position. Both
+/// are the uncertain-state trade `AGENTS.md` §1.1 forbids.
 ///
-/// The suffix rules below are what keep that path rare rather than routine: every
-/// `…Canceled` and every `…Rejected` the venue invents is classified correctly without a
-/// code change, and only a genuinely new *kind* of status reaches the catch-all.
+/// So the catch-all is `Status::Unsupported`: the order manager treats that as "keep the order
+/// exactly as it is and escalate", rather than transitioning it to a terminal state that
+/// removes it. Venue truth (periodic reconciliation) then resolves the order's real fate. See
+/// [`crate::hyperliquid::ordermanager::OrderManager::apply_order_update`].
+///
+/// The suffix rules below are what keep that path rare rather than routine: every `…Canceled`
+/// and every `…Rejected` the venue invents is classified correctly without a code change, and
+/// only a genuinely new *kind* of status reaches the catch-all.
 pub fn map_order_status(raw: &str) -> Status {
     match raw {
         // Still live.
@@ -227,13 +234,13 @@ pub fn map_order_status(raw: &str) -> Status {
                 warn!(status = %other, "Hyperliquid rejected an order for a reason this backend does not name individually.");
                 Status::Rejected
             } else {
-                error!(
+                warn!(
                     status = %other,
-                    "An unrecognised Hyperliquid order status; treating the order as gone. \
-                     Assuming it still rests is how a bot quotes against orders that do not \
-                     exist."
+                    "An unrecognised Hyperliquid order status; keeping the order in its \
+                     current state and leaving reconciliation to resolve it. Neither \
+                     'still resting' nor 'gone' can be assumed (Finding 3, §1.1)."
                 );
-                Status::Expired
+                Status::Unsupported
             }
         }
     }
@@ -519,10 +526,12 @@ mod tests {
 
     /// **The Hummingbot bug, pinned.** The venue documents around thirty status strings and
     /// keeps adding to them; hardcoding the list shipped a production failure when
-    /// `perpMarginRejected` appeared. The suffix rules classify the whole family, and
-    /// anything genuinely new is terminal rather than optimistically "still resting".
+    /// `perpMarginRejected` appeared. The suffix rules classify the whole family, and anything
+    /// genuinely new maps to [`Status::Unsupported`] — the sentinel the order manager keeps
+    /// (never drops) and escalates on, so a still-resting order is never silently forgotten
+    /// (Finding 3, `AGENTS.md` §1.1).
     #[test]
-    fn every_status_family_maps_and_an_invented_one_is_terminal() {
+    fn every_status_family_maps_and_an_invented_one_is_unsupported() {
         use hftbacktest::types::Status;
 
         assert_eq!(map_order_status("open"), Status::New);
@@ -565,23 +574,14 @@ mod tests {
         // swept up as terminal — that would drop a live order from the manager.
         assert_eq!(map_order_status("triggered"), Status::New);
 
-        // …and a status nobody has seen before is assumed gone, not assumed alive.
+        // …and a status nobody has seen before is `Unsupported` — neither "still resting"
+        // (which would quote against a dead order) nor terminal (which would drop an order
+        // that may still be live). The order manager keeps it and escalates; §1.1 fail closed.
         for invented in ["somethingEntirelyNew", "", "OPEN", "Filled"] {
-            let status = map_order_status(invented);
-            assert_eq!(status, Status::Expired, "{invented:?}");
-            assert!(
-                !hftbacktest::types::Order::new(
-                    1,
-                    1,
-                    1.0,
-                    1.0,
-                    hftbacktest::types::Side::Buy,
-                    hftbacktest::types::OrdType::Limit,
-                    hftbacktest::types::TimeInForce::GTC,
-                )
-                .active()
-                    || status != Status::New,
-                "{invented:?} must not leave the order active"
+            assert_eq!(
+                map_order_status(invented),
+                Status::Unsupported,
+                "{invented:?}"
             );
         }
     }
