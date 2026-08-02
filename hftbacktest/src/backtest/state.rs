@@ -1,7 +1,64 @@
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
+
+#[cfg(debug_assertions)]
+use crate::types::OrderId;
 use crate::{
     backtest::{assettype::AssetType, models::FeeModel},
     types::{Order, StateValues},
 };
+
+/// Quantities are sums and differences of the same lot-scaled numbers, so the delta identity is
+/// exact; this leaves room for rounding and nothing else.
+pub(crate) const QTY_TOLERANCE: f64 = 1e-9;
+
+/// Guards the delta semantics of [`Order::exec_qty`] in debug builds: it holds what each live order
+/// had left when it last reported an execution, so the next execution can be checked against it.
+///
+/// That comparison is the only way to tell a delta from a cumulative quantity. A single response
+/// cannot: a cumulative `exec_qty` equals `qty - leaves_qty` exactly, which is what a legitimate
+/// first execution reports too. The distinction is temporal, so the check has to be as well.
+///
+/// **The owner must observe the order's whole life, not just its executions.** An amendment
+/// re-rests the order with a new quantity, raising `leaves_qty` without executing anything, and a
+/// resubmitted order id starts over — both leave the recorded quantity stale, and a check against a
+/// stale quantity is a false alarm, not a finding. That is why this lives in the local processor,
+/// which submits and amends, rather than in [`State`], which only ever sees executions: measured,
+/// on a generated sequence that amended a partially filled order back up to its full quantity and
+/// then executed it (`fill_accounting_property`).
+#[cfg(debug_assertions)]
+#[derive(Debug, Default)]
+pub(crate) struct ExecutionLedger {
+    /// What each order had left as of its last execution.
+    left: HashMap<OrderId, f64>,
+}
+
+#[cfg(debug_assertions)]
+impl ExecutionLedger {
+    /// Records `order`'s execution and returns whether it lowered `leaves_qty` by exactly the
+    /// `exec_qty` it reports — that is, whether `exec_qty` is this execution's own quantity.
+    ///
+    /// An order's first execution is recorded but not checked, there being nothing to check it
+    /// against. That is also what keeps a taker order that walked several price levels out of this:
+    /// the local sees a single response for it, carrying the last level's `exec_qty` against a
+    /// `leaves_qty` that every level lowered (§4.6, a known and separate shortfall), and that
+    /// response is always the order's first.
+    pub(crate) fn record(&mut self, order: &Order) -> bool {
+        match self.left.insert(order.order_id, order.leaves_qty) {
+            Some(before) => {
+                let executed = before - order.leaves_qty;
+                (executed - order.exec_qty).abs() <= QTY_TOLERANCE * order.qty.abs().max(1.0)
+            }
+            None => true,
+        }
+    }
+
+    /// Drops what was recorded for `order_id`. The next execution of that order then starts a new
+    /// baseline instead of being checked against a quantity that no longer describes it.
+    pub(crate) fn forget(&mut self, order_id: OrderId) {
+        self.left.remove(&order_id);
+    }
+}
 
 #[derive(Debug)]
 pub struct State<AT, FM>
@@ -34,8 +91,28 @@ where
         }
     }
 
+    /// Applies to this state the execution that `order` reports.
+    ///
+    /// [`Order::exec_qty`] is the quantity executed by that one execution, not the order's
+    /// cumulative executed quantity, so an order that fills in parts is accounted for by applying
+    /// every one of its execution responses. The whole money path rests on that reading: a producer
+    /// that starts reporting the cumulative quantity, or a consumer that applies an execution
+    /// twice, inflates the position and fails nothing else (§4.6).
+    ///
+    /// What can be checked here is only what one response can say about itself. The delta itself is
+    /// checked one level up, by the [`ExecutionLedger`] the local processor keeps, because telling
+    /// a delta from a cumulative quantity takes the order's history and its amendments — neither of
+    /// which this state sees. The identity over a whole sequence,
+    /// `position == Σ(exec_qty × side)`, is a property test: `fill_accounting_property`.
     #[inline]
     pub fn apply_fill(&mut self, order: &Order) {
+        debug_assert!(
+            order.exec_qty > 0.0
+                && order.leaves_qty >= 0.0
+                && order.exec_qty <= order.qty * (1.0 + QTY_TOLERANCE),
+            "an execution reports a positive quantity that fits within the order: {order:?}"
+        );
+
         let amount = self.asset_type.amount(order.exec_price(), order.exec_qty);
         self.state_values.position += order.exec_qty * AsRef::<f64>::as_ref(&order.side);
         self.state_values.balance -= amount * AsRef::<f64>::as_ref(&order.side);

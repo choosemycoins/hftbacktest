@@ -1,5 +1,7 @@
 use std::collections::{HashMap, hash_map::Entry};
 
+#[cfg(debug_assertions)]
+use crate::backtest::state::ExecutionLedger;
 use crate::{
     backtest::{
         BacktestError,
@@ -46,6 +48,11 @@ where
     trades: Vec<Event>,
     last_feed_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
+    /// Debug-only, and carried by no release build: see [`ExecutionLedger`]. It lives here, not in
+    /// [`State`], because checking an execution against the previous one takes an owner that also
+    /// sees the order submitted and amended.
+    #[cfg(debug_assertions)]
+    executions: ExecutionLedger,
 }
 
 impl<AT, LM, MD, FM> Local<AT, LM, MD, FM>
@@ -70,6 +77,8 @@ where
             trades: Vec::with_capacity(last_trades_cap),
             last_feed_latency: None,
             last_order_latency: None,
+            #[cfg(debug_assertions)]
+            executions: ExecutionLedger::default(),
         }
     }
 
@@ -111,7 +120,18 @@ where
             if (order.status == Status::Filled || order.status == Status::PartiallyFilled)
                 && order.exec_qty > 0.0
             {
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    self.executions.record(&order),
+                    "`exec_qty` must be the quantity executed by this execution alone, not the \
+                     order's cumulative executed quantity: {order:?}"
+                );
                 self.state.apply_fill(&order);
+            }
+            // The ledger tracks live orders only, so it does not grow with the backtest.
+            #[cfg(debug_assertions)]
+            if order.status.is_terminal() {
+                self.executions.forget(order.order_id);
             }
             // Applies the received order response to the local orders.
             match self.orders.entry(order.order_id) {
@@ -181,6 +201,9 @@ where
         order.req = Status::New;
         order.local_timestamp = current_timestamp;
         self.orders.insert(order.order_id, order.clone());
+        // This id now names a new order, whatever the previous one it named had left.
+        #[cfg(debug_assertions)]
+        self.executions.forget(order_id);
 
         self.order_l2e.request(order, |order| {
             order.req = Status::Rejected;
@@ -226,6 +249,10 @@ where
             order.qty = orig_qty;
             order.leaves_qty = orig_leaves_qty;
         });
+        // The amendment re-rests the order, so what it had left before says nothing about what it
+        // has left now.
+        #[cfg(debug_assertions)]
+        self.executions.forget(order_id);
 
         Ok(())
     }

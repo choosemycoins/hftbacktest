@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1ac5d201eb1f0d4cddaa1eb12fac978159b3921a8d32d2c3a2fc3683346ccaa2 # shrinks to steps = [Rest { buy: false, lots: 1 }, Rest { buy: false, lots: 1 }, Amend { nth: 5, lots: 4 }, Rest { buy: false, lots: 1 }, CancelRacingExecution { nth: 3, lots: 1 }, Execute { nth: 5, lots: 1 }, Execute { nth: 0, lots: 1 }, Execute { nth: 0, lots: 1 }]
+cc 57acd1762ef5d803e64e7beaba17204f6a47c1c742fe27fbf7fea5a28e33d83e # shrinks to steps = [Rest { buy: false, lots: 1 }, Execute { nth: 0, lots: 1 }, Rest { buy: false, lots: 1 }, Execute { nth: 0, lots: 1 }, Execute { nth: 0, lots: 1 }, Rest { buy: false, lots: 4 }, Execute { nth: 0, lots: 1 }, Amend { nth: 2, lots: 4 }, Execute { nth: 0, lots: 1 }]

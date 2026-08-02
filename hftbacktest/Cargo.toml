@@ -52,6 +52,7 @@ aws-lc-rs = { version = "1", features = ["bindgen"] }
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.22", features = [] }
 clap = { version = "4.5.53", features = ["derive"] }
+proptest = "1.11.0"
 
 [package.metadata.docs.rs]
 all-features = true

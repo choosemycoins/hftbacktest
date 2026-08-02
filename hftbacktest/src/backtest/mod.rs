@@ -59,6 +59,10 @@ pub mod recorder;
 pub mod data;
 mod evs;
 
+/// Property tests for the fill accounting identity — see the module's own documentation.
+#[cfg(test)]
+mod fill_accounting_property;
+
 /// Errors that can occur during backtesting.
 #[derive(Error, Debug)]
 pub enum BacktestError {
