@@ -381,27 +381,39 @@ where
                 self.expired(order, event.exch_ts)?;
             }
         } else if event.is(EXCH_BID_ADD_ORDER_EVENT) {
-            let (prev_best_bid_tick, best_bid_tick) =
-                self.depth
-                    .add_buy_order(event.order_id, event.px, event.qty, event.exch_ts)?;
+            let (prev_best_bid_tick, best_bid_tick) = self.depth.add_buy_order(
+                OrderId::new(event.order_id),
+                event.px,
+                event.qty,
+                event.exch_ts,
+            )?;
             self.queue_model.add_market_feed_order(event, &self.depth)?;
             if best_bid_tick > prev_best_bid_tick {
                 self.fill_ask_orders_by_crossing(prev_best_bid_tick, best_bid_tick, event.exch_ts)?;
             }
         } else if event.is(EXCH_ASK_ADD_ORDER_EVENT) {
-            let (prev_best_ask_tick, best_ask_tick) =
-                self.depth
-                    .add_sell_order(event.order_id, event.px, event.qty, event.exch_ts)?;
+            let (prev_best_ask_tick, best_ask_tick) = self.depth.add_sell_order(
+                OrderId::new(event.order_id),
+                event.px,
+                event.qty,
+                event.exch_ts,
+            )?;
             self.queue_model.add_market_feed_order(event, &self.depth)?;
             if best_ask_tick < prev_best_ask_tick {
                 self.fill_bid_orders_by_crossing(prev_best_ask_tick, best_ask_tick, event.exch_ts)?;
             }
         } else if event.is(EXCH_MODIFY_ORDER_EVENT) {
-            let (side, prev_best_tick, best_tick) =
-                self.depth
-                    .modify_order(event.order_id, event.px, event.qty, event.exch_ts)?;
-            self.queue_model
-                .modify_market_feed_order(event.order_id, event, &self.depth)?;
+            let (side, prev_best_tick, best_tick) = self.depth.modify_order(
+                OrderId::new(event.order_id),
+                event.px,
+                event.qty,
+                event.exch_ts,
+            )?;
+            self.queue_model.modify_market_feed_order(
+                OrderId::new(event.order_id),
+                event,
+                &self.depth,
+            )?;
             if side == Side::Buy {
                 if best_tick > prev_best_tick {
                     self.fill_ask_orders_by_crossing(prev_best_tick, best_tick, event.exch_ts)?;
@@ -411,14 +423,15 @@ where
             }
         } else if event.is(EXCH_CANCEL_ORDER_EVENT) {
             let order_id = event.order_id;
-            self.depth.delete_order(order_id, event.exch_ts)?;
+            self.depth
+                .delete_order(OrderId::new(order_id), event.exch_ts)?;
             self.queue_model
-                .cancel_market_feed_order(event.order_id, &self.depth)?;
+                .cancel_market_feed_order(OrderId::new(event.order_id), &self.depth)?;
         } else if event.is(EXCH_FILL_EVENT) {
             // todo: handle properly if no side is provided.
             if event.is(BUY_EVENT) || event.is(SELL_EVENT) {
                 let filled = self.queue_model.fill_market_feed_order::<false>(
-                    event.order_id,
+                    OrderId::new(event.order_id),
                     event,
                     &self.depth,
                 )?;

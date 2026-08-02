@@ -515,7 +515,7 @@ where
     fn submit_order(
         &mut self,
         asset_no: usize,
-        order_id: u64,
+        order_id: OrderId,
         price: f64,
         qty: f64,
         time_in_force: TimeInForce,
@@ -854,7 +854,17 @@ mod tests {
     use crate::{
         depth::HashMapMarketDepth,
         live::{Instrument, ipc::Channel},
-        types::{BuildError, LiveEvent, LiveRequest, OrdType, Order, Side, Status, TimeInForce},
+        types::{
+            BuildError,
+            LiveEvent,
+            LiveRequest,
+            OrdType,
+            Order,
+            OrderId,
+            Side,
+            Status,
+            TimeInForce,
+        },
     };
 
     /// In-memory `Channel` for unit testing. `recv_timeout` drains a pre-seeded queue of events;
@@ -991,7 +1001,7 @@ mod tests {
 
     fn order_event(symbol: &str, order_id: u64, price: f64) -> LiveEvent {
         let mut order = Order::new(
-            order_id,
+            OrderId::new(order_id),
             Price::new(price).to_ticks(TickSize::new(0.01)),
             TickSize::new(0.01),
             Qty::new(1.0),
@@ -1191,7 +1201,7 @@ mod tests {
                 (0, order_event("BTCUSDT", 1, 100.0)),
                 (
                     0,
-                    uncertain_order_event("BTCUSDT", 1, 1_700_000_000_000_000_000),
+                    uncertain_order_event("BTCUSDT", OrderId::new(1), 1_700_000_000_000_000_000),
                 ),
             ],
         );
@@ -1201,7 +1211,7 @@ mod tests {
 
         let order = bot
             .orders(0)
-            .get(&1)
+            .get(&OrderId::new(1))
             .expect("an uncertain order must not be dropped: the venue may still be holding it");
         assert_eq!(
             order.status,
@@ -1238,13 +1248,13 @@ mod tests {
             vec![
                 (0, first),
                 // Same clock, not a later one.
-                (0, uncertain_order_event("BTCUSDT", 1, clock)),
+                (0, uncertain_order_event("BTCUSDT", OrderId::new(1), clock)),
             ],
         );
         bot.elapse(1_000_000).unwrap();
 
         assert_eq!(
-            bot.orders(0).get(&1).unwrap().status,
+            bot.orders(0).get(&OrderId::new(1)).unwrap().status,
             Status::Uncertain,
             "an uncertain update at an equal exchange timestamp must apply; the connector \
              cannot advance the clock on a frame it could not read"
@@ -1285,7 +1295,7 @@ mod tests {
             bot.elapse(1_000_000).unwrap();
             bot.clear_inactive_orders(None);
 
-            let survived = bot.orders(0).contains_key(&1);
+            let survived = bot.orders(0).contains_key(&OrderId::new(1));
             assert_eq!(
                 survived,
                 !status.is_terminal(),
@@ -1485,7 +1495,7 @@ mod tests {
 
         // Reaching this assertion at all proves it did not panic; the harness would report a
         // panic as a failure otherwise.
-        let result = bot.modify(0, 1, 100.0, 1.0, false);
+        let result = bot.modify(0, OrderId::new(1), 100.0, 1.0, false);
 
         assert!(
             matches!(result, Err(BotError::Unsupported)),

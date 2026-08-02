@@ -5,7 +5,7 @@ use std::{collections::HashMap, mem};
 use hftbacktest::{
     depth::{HashMapMarketDepth, ROIVectorMarketDepth},
     live::{BotError, LiveBot, ipc::iceoryx::IceoryxUnifiedChannel},
-    prelude::{Bot, ElapseResult, Event, Order, StateValues},
+    prelude::{Bot, ElapseResult, Event, Order, OrderId, StateValues},
     types::{OrdType, TimeInForce},
 };
 
@@ -231,7 +231,7 @@ pub extern "C" fn hashmaplive_clear_inactive_orders(
 pub extern "C" fn hashmaplive_orders(
     hbt_ptr: *const HashMapMarketDepthLiveBot,
     asset_no: usize,
-) -> *const HashMap<u64, Order> {
+) -> *const HashMap<OrderId, Order> {
     let hbt = unsafe { &*hbt_ptr };
     hbt.orders(asset_no) as *const _
 }
@@ -478,7 +478,7 @@ pub extern "C" fn roiveclive_clear_inactive_orders(
 pub extern "C" fn roiveclive_orders(
     hbt_ptr: *const ROIVectorMarketDepthLiveBot,
     asset_no: usize,
-) -> *const HashMap<u64, Order> {
+) -> *const HashMap<OrderId, Order> {
     let hbt = unsafe { &*hbt_ptr };
     hbt.orders(asset_no) as *const _
 }

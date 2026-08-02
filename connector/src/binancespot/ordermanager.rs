@@ -356,6 +356,7 @@ mod tests {
         ExecDelta,
         OrdType,
         Order,
+        OrderId,
         PriceTick,
         Qty,
         Side,
@@ -381,7 +382,7 @@ mod tests {
     fn a_rest_order_response_reports_no_execution() {
         let mut manager = OrderManager::new("test");
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(30_000_00),
             TickSize::new(0.01),
             Qty::new(0.005),

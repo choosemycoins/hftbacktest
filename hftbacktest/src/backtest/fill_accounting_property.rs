@@ -238,7 +238,7 @@ impl Harness {
                 orders: HashMap::new(),
             },
             declared: Declared::default(),
-            next_order_id: 1,
+            next_order_id: OrderId::new(1),
             left: HashMap::new(),
         }
     }
@@ -255,7 +255,7 @@ impl Harness {
         match step {
             Step::Rest { buy, lots } => {
                 let order_id = self.next_order_id;
-                self.next_order_id += 1;
+                self.next_order_id = OrderId::new(self.next_order_id.get() + 1);
                 let side = if buy { Side::Buy } else { Side::Sell };
                 self.local
                     .submit_order(

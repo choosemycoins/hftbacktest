@@ -806,7 +806,7 @@ impl L3MarketDepth for ROIVectorMarketDepth {
 mod tests {
     use crate::{
         depth::{INVALID_MAX, INVALID_MIN, L3MarketDepth, MarketDepth, ROIVectorMarketDepth},
-        types::Side,
+        types::{OrderId, Side},
     };
 
     macro_rules! assert_eq_qty {
@@ -823,56 +823,68 @@ mod tests {
         let lot_size = 0.001;
         let mut depth = ROIVectorMarketDepth::new(0.1, lot_size, 0.0, 2000.0);
 
-        let (prev_best, best) = depth.add_buy_order(1, 500.1, 0.001, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_buy_order(OrderId::new(1), 500.1, 0.001, 0)
+            .unwrap();
         assert_eq!(prev_best, INVALID_MIN);
         assert_eq!(best, 5001);
         assert_eq!(depth.best_bid_tick(), 5001);
         assert_eq_qty!(depth.bid_qty_at_tick(5001), 0.001, lot_size);
 
-        assert!(depth.add_buy_order(1, 500.2, 0.001, 0).is_err());
+        assert!(
+            depth
+                .add_buy_order(OrderId::new(1), 500.2, 0.001, 0)
+                .is_err()
+        );
 
-        let (prev_best, best) = depth.add_buy_order(2, 500.3, 0.005, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_buy_order(OrderId::new(2), 500.3, 0.005, 0)
+            .unwrap();
         assert_eq!(prev_best, 5001);
         assert_eq!(best, 5003);
         assert_eq!(depth.best_bid_tick(), 5003);
         assert_eq_qty!(depth.bid_qty_at_tick(5003), 0.005, lot_size);
 
-        let (prev_best, best) = depth.add_buy_order(3, 500.1, 0.005, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_buy_order(OrderId::new(3), 500.1, 0.005, 0)
+            .unwrap();
         assert_eq!(prev_best, 5003);
         assert_eq!(best, 5003);
         assert_eq!(depth.best_bid_tick(), 5003);
         assert_eq_qty!(depth.bid_qty_at_tick(5001), 0.006, lot_size);
 
-        let (prev_best, best) = depth.add_buy_order(4, 500.5, 0.005, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_buy_order(OrderId::new(4), 500.5, 0.005, 0)
+            .unwrap();
         assert_eq!(prev_best, 5003);
         assert_eq!(best, 5005);
         assert_eq!(depth.best_bid_tick(), 5005);
         assert_eq_qty!(depth.bid_qty_at_tick(5005), 0.005, lot_size);
 
-        assert!(depth.delete_order(10, 0).is_err());
+        assert!(depth.delete_order(OrderId::new(10), 0).is_err());
 
-        let (side, prev_best, best) = depth.delete_order(2, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(2), 0).unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5005);
         assert_eq!(best, 5005);
         assert_eq!(depth.best_bid_tick(), 5005);
         assert_eq_qty!(depth.bid_qty_at_tick(5003), 0.0, lot_size);
 
-        let (side, prev_best, best) = depth.delete_order(4, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(4), 0).unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5005);
         assert_eq!(best, 5001);
         assert_eq!(depth.best_bid_tick(), 5001);
         assert_eq_qty!(depth.bid_qty_at_tick(5005), 0.0, lot_size);
 
-        let (side, prev_best, best) = depth.delete_order(3, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(3), 0).unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5001);
         assert_eq!(best, 5001);
         assert_eq!(depth.best_bid_tick(), 5001);
         assert_eq_qty!(depth.bid_qty_at_tick(5001), 0.001, lot_size);
 
-        let (side, prev_best, best) = depth.delete_order(1, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(1), 0).unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5001);
         assert_eq!(best, INVALID_MIN);
@@ -885,56 +897,68 @@ mod tests {
         let lot_size = 0.001;
         let mut depth = ROIVectorMarketDepth::new(0.1, lot_size, 0.0, 2000.0);
 
-        let (prev_best, best) = depth.add_sell_order(1, 500.1, 0.001, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_sell_order(OrderId::new(1), 500.1, 0.001, 0)
+            .unwrap();
         assert_eq!(prev_best, INVALID_MAX);
         assert_eq!(best, 5001);
         assert_eq!(depth.best_ask_tick(), 5001);
         assert_eq_qty!(depth.ask_qty_at_tick(5001), 0.001, lot_size);
 
-        assert!(depth.add_sell_order(1, 500.2, 0.001, 0).is_err());
+        assert!(
+            depth
+                .add_sell_order(OrderId::new(1), 500.2, 0.001, 0)
+                .is_err()
+        );
 
-        let (prev_best, best) = depth.add_sell_order(2, 499.3, 0.005, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_sell_order(OrderId::new(2), 499.3, 0.005, 0)
+            .unwrap();
         assert_eq!(prev_best, 5001);
         assert_eq!(best, 4993);
         assert_eq!(depth.best_ask_tick(), 4993);
         assert_eq_qty!(depth.ask_qty_at_tick(4993), 0.005, lot_size);
 
-        let (prev_best, best) = depth.add_sell_order(3, 500.1, 0.005, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_sell_order(OrderId::new(3), 500.1, 0.005, 0)
+            .unwrap();
         assert_eq!(prev_best, 4993);
         assert_eq!(best, 4993);
         assert_eq!(depth.best_ask_tick(), 4993);
         assert_eq_qty!(depth.ask_qty_at_tick(5001), 0.006, lot_size);
 
-        let (prev_best, best) = depth.add_sell_order(4, 498.5, 0.005, 0).unwrap();
+        let (prev_best, best) = depth
+            .add_sell_order(OrderId::new(4), 498.5, 0.005, 0)
+            .unwrap();
         assert_eq!(prev_best, 4993);
         assert_eq!(best, 4985);
         assert_eq!(depth.best_ask_tick(), 4985);
         assert_eq_qty!(depth.ask_qty_at_tick(4985), 0.005, lot_size);
 
-        assert!(depth.delete_order(10, 0).is_err());
+        assert!(depth.delete_order(OrderId::new(10), 0).is_err());
 
-        let (side, prev_best, best) = depth.delete_order(2, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(2), 0).unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 4985);
         assert_eq!(best, 4985);
         assert_eq!(depth.best_ask_tick(), 4985);
         assert_eq_qty!(depth.ask_qty_at_tick(4993), 0.0, lot_size);
 
-        let (side, prev_best, best) = depth.delete_order(4, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(4), 0).unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 4985);
         assert_eq!(best, 5001);
         assert_eq!(depth.best_ask_tick(), 5001);
         assert_eq_qty!(depth.ask_qty_at_tick(4985), 0.0, lot_size);
 
-        let (side, prev_best, best) = depth.delete_order(3, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(3), 0).unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 5001);
         assert_eq!(best, 5001);
         assert_eq!(depth.best_ask_tick(), 5001);
         assert_eq_qty!(depth.ask_qty_at_tick(5001), 0.001, lot_size);
 
-        let (side, prev_best, best) = depth.delete_order(1, 0).unwrap();
+        let (side, prev_best, best) = depth.delete_order(OrderId::new(1), 0).unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 5001);
         assert_eq!(best, INVALID_MAX);
@@ -947,21 +971,37 @@ mod tests {
         let lot_size = 0.001;
         let mut depth = ROIVectorMarketDepth::new(0.1, lot_size, 0.0, 2000.0);
 
-        depth.add_buy_order(1, 500.1, 0.001, 0).unwrap();
-        depth.add_buy_order(2, 500.3, 0.005, 0).unwrap();
-        depth.add_buy_order(3, 500.1, 0.005, 0).unwrap();
-        depth.add_buy_order(4, 500.5, 0.005, 0).unwrap();
+        depth
+            .add_buy_order(OrderId::new(1), 500.1, 0.001, 0)
+            .unwrap();
+        depth
+            .add_buy_order(OrderId::new(2), 500.3, 0.005, 0)
+            .unwrap();
+        depth
+            .add_buy_order(OrderId::new(3), 500.1, 0.005, 0)
+            .unwrap();
+        depth
+            .add_buy_order(OrderId::new(4), 500.5, 0.005, 0)
+            .unwrap();
 
-        assert!(depth.modify_order(10, 500.5, 0.001, 0).is_err());
+        assert!(
+            depth
+                .modify_order(OrderId::new(10), 500.5, 0.001, 0)
+                .is_err()
+        );
 
-        let (side, prev_best, best) = depth.modify_order(2, 500.5, 0.001, 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 500.5, 0.001, 0)
+            .unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5005);
         assert_eq!(best, 5005);
         assert_eq!(depth.best_bid_tick(), 5005);
         assert_eq_qty!(depth.bid_qty_at_tick(5005), 0.006, lot_size);
 
-        let (side, prev_best, best) = depth.modify_order(2, 500.7, 0.002, 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 500.7, 0.002, 0)
+            .unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5005);
         assert_eq!(best, 5007);
@@ -969,15 +1009,19 @@ mod tests {
         assert_eq_qty!(depth.bid_qty_at_tick(5005), 0.005, lot_size);
         assert_eq_qty!(depth.bid_qty_at_tick(5007), 0.002, lot_size);
 
-        let (side, prev_best, best) = depth.modify_order(2, 500.6, 0.002, 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 500.6, 0.002, 0)
+            .unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5007);
         assert_eq!(best, 5006);
         assert_eq!(depth.best_bid_tick(), 5006);
         assert_eq_qty!(depth.bid_qty_at_tick(5007), 0.0, lot_size);
 
-        let _ = depth.delete_order(4, 0).unwrap();
-        let (side, prev_best, best) = depth.modify_order(2, 500.0, 0.002, 0).unwrap();
+        let _ = depth.delete_order(OrderId::new(4), 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 500.0, 0.002, 0)
+            .unwrap();
         assert_eq!(side, Side::Buy);
         assert_eq!(prev_best, 5006);
         assert_eq!(best, 5001);
@@ -991,21 +1035,37 @@ mod tests {
         let lot_size = 0.001;
         let mut depth = ROIVectorMarketDepth::new(0.1, lot_size, 0.0, 2000.0);
 
-        depth.add_sell_order(1, 500.1, 0.001, 0).unwrap();
-        depth.add_sell_order(2, 499.3, 0.005, 0).unwrap();
-        depth.add_sell_order(3, 500.1, 0.005, 0).unwrap();
-        depth.add_sell_order(4, 498.5, 0.005, 0).unwrap();
+        depth
+            .add_sell_order(OrderId::new(1), 500.1, 0.001, 0)
+            .unwrap();
+        depth
+            .add_sell_order(OrderId::new(2), 499.3, 0.005, 0)
+            .unwrap();
+        depth
+            .add_sell_order(OrderId::new(3), 500.1, 0.005, 0)
+            .unwrap();
+        depth
+            .add_sell_order(OrderId::new(4), 498.5, 0.005, 0)
+            .unwrap();
 
-        assert!(depth.modify_order(10, 500.5, 0.001, 0).is_err());
+        assert!(
+            depth
+                .modify_order(OrderId::new(10), 500.5, 0.001, 0)
+                .is_err()
+        );
 
-        let (side, prev_best, best) = depth.modify_order(2, 498.5, 0.001, 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 498.5, 0.001, 0)
+            .unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 4985);
         assert_eq!(best, 4985);
         assert_eq!(depth.best_ask_tick(), 4985);
         assert_eq_qty!(depth.ask_qty_at_tick(4985), 0.006, lot_size);
 
-        let (side, prev_best, best) = depth.modify_order(2, 497.7, 0.002, 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 497.7, 0.002, 0)
+            .unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 4985);
         assert_eq!(best, 4977);
@@ -1013,15 +1073,19 @@ mod tests {
         assert_eq_qty!(depth.ask_qty_at_tick(4985), 0.005, lot_size);
         assert_eq_qty!(depth.ask_qty_at_tick(4977), 0.002, lot_size);
 
-        let (side, prev_best, best) = depth.modify_order(2, 498.1, 0.002, 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 498.1, 0.002, 0)
+            .unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 4977);
         assert_eq!(best, 4981);
         assert_eq!(depth.best_ask_tick(), 4981);
         assert_eq_qty!(depth.ask_qty_at_tick(4977), 0.0, lot_size);
 
-        let _ = depth.delete_order(4, 0).unwrap();
-        let (side, prev_best, best) = depth.modify_order(2, 500.2, 0.002, 0).unwrap();
+        let _ = depth.delete_order(OrderId::new(4), 0).unwrap();
+        let (side, prev_best, best) = depth
+            .modify_order(OrderId::new(2), 500.2, 0.002, 0)
+            .unwrap();
         assert_eq!(side, Side::Sell);
         assert_eq!(prev_best, 4981);
         assert_eq!(best, 5001);

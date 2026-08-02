@@ -370,6 +370,7 @@ mod tests {
         ExecDelta,
         OrdType,
         Order,
+        OrderId,
         PriceTick,
         Qty,
         Side,
@@ -382,7 +383,7 @@ mod tests {
 
     fn tracked(manager: &mut OrderManager, client_order_id: &str, filled_so_far: f64) {
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(30_000_00),
             TickSize::new(0.01),
             Qty::new(0.005),

@@ -399,7 +399,7 @@ impl Connector for Lighter {
 fn reject_order(symbol: &str, order: &Order, ev_tx: UnboundedSender<PublishEvent>) {
     error!(
         %symbol,
-        order_id = order.order_id,
+        order_id = %order.order_id,
         "The Lighter backend is Phase 1, market data only; the order was rejected."
     );
     let mut order = order.clone();
@@ -441,6 +441,7 @@ mod tests {
         LiveEvent,
         OrdType,
         Order,
+        OrderId,
         PriceTick,
         Qty,
         Side,
@@ -512,7 +513,7 @@ mod tests {
 
     fn an_order() -> Order {
         Order::new(
-            7,
+            OrderId::new(7),
             PriceTick::new(100),
             TickSize::new(0.1),
             Qty::new(1.0),
@@ -538,7 +539,7 @@ mod tests {
             panic!("the order must come back first, before the error handler can abort");
         };
         assert_eq!(symbol, "CRV");
-        assert_eq!(order.order_id, 7);
+        assert_eq!(order.order_id, OrderId::new(7));
         assert_eq!(order.status, Status::Expired);
         assert_eq!(order.req, Status::None);
 

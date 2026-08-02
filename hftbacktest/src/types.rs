@@ -325,7 +325,44 @@ pub const EXCH_FILL_EVENT: u64 = EXCH_EVENT | FILL_EVENT;
 /// Indicates that one should continue until the end of the data.
 pub const UNTIL_END_OF_DATA: i64 = i64::MAX;
 
-pub type OrderId = u64;
+/// A bot's own identifier for an order.
+///
+/// A newtype rather than `type OrderId = u64` (invariant E3b), so that an order id cannot be
+/// silently interchanged with the other `u64`s it travels beside — an `asset_no`, a venue's
+/// own order id, a nonce, a timestamp. The alias made all of those the same type to the
+/// compiler while being different things to the venue.
+///
+/// `#[repr(transparent)]` over the `u64` already on the wire, so the encoding and the
+/// `#[repr(C)] Order` layout are unchanged; `py-hftbacktest`'s `order_dtype` still reads
+/// `('order_id', 'u8')` at the same offset.
+///
+/// `trait Bot` needed no signature change: it already spelled `OrderId` throughout, which is
+/// what made this cheap.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Decode, Encode)]
+#[repr(transparent)]
+pub struct OrderId(pub u64);
+
+impl OrderId {
+    pub const fn new(order_id: u64) -> Self {
+        Self(order_id)
+    }
+
+    pub const fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for OrderId {
+    fn from(order_id: u64) -> Self {
+        Self(order_id)
+    }
+}
+
+impl std::fmt::Display for OrderId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum WaitOrderResponse {
@@ -863,7 +900,7 @@ pub struct Order {
     pub exch_timestamp: i64,
     /// The time at which the local receives this order or sent this order to the exchange.
     pub local_timestamp: i64,
-    pub order_id: u64,
+    pub order_id: OrderId,
     /// Additional data used for [`QueueModel`](`crate::backtest::models::QueueModel`).
     /// This is only available in backtesting, and the type `Q` is set to `()` in a live bot.
     pub q: Box<dyn AnyClone + Send>,
@@ -891,7 +928,7 @@ pub struct Order {
 impl Order {
     /// Constructs an instance of `Order`.
     pub fn new(
-        order_id: u64,
+        order_id: OrderId,
         price_tick: PriceTick,
         tick_size: TickSize,
         qty: Qty,
@@ -1197,7 +1234,7 @@ pub enum BuildError {
 /// Used to submit an order in a live bot.
 #[derive(Decode, Encode)]
 pub struct OrderRequest {
-    pub order_id: u64,
+    pub order_id: OrderId,
     pub price: f64,
     pub qty: f64,
     pub side: Side,
@@ -1457,6 +1494,7 @@ mod tests {
             LOCAL_BID_DEPTH_EVENT,
             LOCAL_BID_DEPTH_SNAPSHOT_EVENT,
             LOCAL_BUY_TRADE_EVENT,
+            OrderId,
         },
     };
 
@@ -1557,7 +1595,7 @@ mod tests {
         };
 
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(100),
             TickSize::new(0.01),
             Qty::new(1.0),
@@ -1612,7 +1650,7 @@ mod tests {
         let order = encode(&LiveRequest::Order {
             symbol: "BTC".to_string(),
             order: Order::new(
-                1,
+                OrderId::new(1),
                 PriceTick::new(100),
                 TickSize::new(0.01),
                 Qty::new(1.0),
@@ -1691,7 +1729,7 @@ mod tests {
             fval: 0.0,
         };
         let an_order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(100),
             TickSize::new(0.01),
             Qty::new(1.0),
@@ -1785,6 +1823,55 @@ mod tests {
         );
     }
 
+    /// An order id is **not** any of the other `u64`s it travels beside (invariant E3b).
+    ///
+    /// `pub type OrderId = u64` made the bot's own order id the same type, to the compiler, as
+    /// an `asset_no`, a venue's own order id, a nonce, a timestamp and a tick count — all of
+    /// which sit next to it in the same structs and the same call signatures. The alias
+    /// documented an intention the compiler could not check.
+    ///
+    /// The newtype is byte-identical, which is what makes it affordable on a wire with no
+    /// version field: `#[repr(transparent)]` over the same `u64`, so bincode writes the same
+    /// varint and `order_dtype` reads `('order_id', 'u8')` at the same offset. The golden and
+    /// layout pins are the proof.
+    ///
+    /// **`Event::order_id` deliberately stays a raw `u64`.** It is the L3 market-by-order
+    /// feed's identifier — the *venue's*, arriving in market data — not the bot's, and it is
+    /// part of the numpy `event_dtype` that recorded files are read back through. The first
+    /// draft of this change retyped it by accident (it is declared before `Order` in this
+    /// file, and a count-limited replace found it first); the derive that builds the numpy
+    /// dtype rejected it outright, which is the sort of thing the second wire is good for.
+    #[test]
+    fn an_order_id_is_not_an_asset_number_or_a_price_tick() {
+        use crate::types::{Event, OrderId};
+
+        // It carries the number it was given, and says so the same way.
+        assert_eq!(OrderId::new(7).get(), 7);
+        assert_eq!(OrderId::from(7u64), OrderId::new(7));
+        assert_eq!(format!("{}", OrderId::new(7)), "7");
+
+        // Byte-identical to the `u64` it wraps: an older connector reading this field sees
+        // exactly what it saw before.
+        let cfg = bincode::config::standard();
+        assert_eq!(
+            bincode::encode_to_vec(OrderId::new(300), cfg).unwrap(),
+            bincode::encode_to_vec(300u64, cfg).unwrap()
+        );
+
+        // And the L3 feed's id is a different thing, still a plain u64.
+        let event = Event {
+            ev: 0,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 7,
+            ival: 0,
+            fval: 0.0,
+        };
+        assert_eq!(event.order_id, 7u64);
+    }
+
     /// A price becomes ticks **only** by being divided by a tick size (invariant C5).
     ///
     /// The idiom `(price / tick).round() as i64` is written out at roughly ten call sites, and
@@ -1851,7 +1938,7 @@ mod tests {
         };
 
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(100),
             TickSize::new(0.01),
             Qty::new(10.0),
@@ -1907,7 +1994,7 @@ mod tests {
         );
 
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(100),
             TickSize::new(0.01),
             Qty::new(1.0),
@@ -2065,7 +2152,7 @@ mod tests {
         };
 
         let mut order = Order::new(
-            300,
+            OrderId::new(300),
             PriceTick::new(-5),
             TickSize::new(0.01),
             Qty::new(1.5),

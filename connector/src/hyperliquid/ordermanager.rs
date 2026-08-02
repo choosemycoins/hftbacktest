@@ -333,7 +333,7 @@ impl OrderManager {
         if price != requested_price || size != order.qty.get() {
             debug!(
                 %symbol,
-                order_id = order.order_id,
+                order_id = %order.order_id,
                 requested_price,
                 price,
                 requested_size = order.qty.get(),
@@ -736,6 +736,7 @@ mod tests {
         ExecDelta,
         OrdType,
         Order,
+        OrderId,
         Price,
         Qty,
         Side,
@@ -774,7 +775,7 @@ mod tests {
     /// A bot order at `price_tick * tick_size`, on the finest legal BTC grid (0.1).
     fn bot_order(order_id: u64, price: f64, qty: f64, side: Side) -> Order {
         let mut order = Order::new(
-            order_id,
+            OrderId::new(order_id),
             Price::new(price).to_ticks(TickSize::new(0.1)),
             TickSize::new(0.1),
             Qty::new(qty),
@@ -915,7 +916,7 @@ mod tests {
         assert!(!wire.b);
 
         // And the cancel finds the same client id from the bot's own order id.
-        let (found, cancel) = manager.cancel_order("BTC", 7, 3).unwrap();
+        let (found, cancel) = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap();
         assert_eq!(found, cloid);
         assert_eq!(cancel.cloid, cloid);
         assert_eq!(cancel.asset, 3);
@@ -953,7 +954,7 @@ mod tests {
     #[test]
     fn cancelling_an_unknown_order_is_an_error_rather_than_a_guess() {
         let manager = manager();
-        assert!(manager.cancel_order("BTC", 99, 3).is_err());
+        assert!(manager.cancel_order("BTC", OrderId::new(99), 3).is_err());
     }
 
     /// The ordinary lifecycle: `open` leaves the order live, a terminal status removes it
@@ -965,7 +966,7 @@ mod tests {
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
         // Point the fixture's client id at the order just created.
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut open = updates(ORDER_UPDATE_OPEN);
         open[0].order.cloid = Some(cloid.clone());
@@ -1003,7 +1004,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut open = updates(ORDER_UPDATE_OPEN);
         open[0].order.cloid = Some(cloid.clone());
@@ -1053,7 +1054,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut open = updates(ORDER_UPDATE_OPEN);
         open[0].order.cloid = Some(cloid.clone());
@@ -1179,7 +1180,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut newer = updates(ORDER_UPDATE_OPEN);
         newer[0].order.cloid = Some(cloid.clone());
@@ -1205,7 +1206,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut cancelled = updates(ORDER_UPDATE_CANCELED);
         cancelled[0].order.cloid = Some(cloid);
@@ -1237,7 +1238,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut fill = fills(USER_FILLS_INCREMENT).remove(0);
         fill.cloid = Some(cloid);
@@ -1277,7 +1278,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut fill = fills(USER_FILLS_INCREMENT).remove(0);
         fill.cloid = Some(cloid.clone());
@@ -1316,7 +1317,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut fill = fills(USER_FILLS_INCREMENT).remove(0);
         fill.cloid = Some(cloid);
@@ -1391,10 +1392,10 @@ mod tests {
             queried_at,
         );
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].order.order_id, 8);
+        assert_eq!(expired[0].order.order_id, OrderId::new(8));
         assert_eq!(expired[0].order.status, Status::Expired);
         assert_eq!(manager.orders(None).len(), 1);
-        assert_eq!(manager.orders(None)[0].order_id, 7);
+        assert_eq!(manager.orders(None)[0].order_id, OrderId::new(7));
 
         // A reconciliation against an empty venue clears everything.
         assert_eq!(manager.reconcile(&[], Instant::now()).len(), 1);
@@ -1442,7 +1443,7 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].order.order_id, 8);
+        assert_eq!(expired[0].order.order_id, OrderId::new(8));
     }
 
     /// The same hazard on the other side of the clock: a query whose answer was assembled
@@ -1519,11 +1520,11 @@ mod tests {
         manager.note_venue_ack(&second, 102);
 
         let cancelled = manager.cancel_confirmed(101).unwrap();
-        assert_eq!(cancelled.order.order_id, 1);
+        assert_eq!(cancelled.order.order_id, OrderId::new(1));
         assert_eq!(cancelled.order.status, Status::Canceled);
         assert_eq!(cancelled.order.req, Status::None);
         assert_eq!(manager.orders(None).len(), 1);
-        assert_eq!(manager.orders(None)[0].order_id, 2);
+        assert_eq!(manager.orders(None)[0].order_id, OrderId::new(2));
         // The id is free again.
         assert!(
             manager
@@ -1547,7 +1548,7 @@ mod tests {
         manager
             .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
             .unwrap();
-        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+        let cloid = manager.cancel_order("BTC", OrderId::new(7), 3).unwrap().0;
 
         let mut open = updates(ORDER_UPDATE_OPEN);
         open[0].order.cloid = Some(cloid.clone());

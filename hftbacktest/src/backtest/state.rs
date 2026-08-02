@@ -159,6 +159,7 @@ mod tests {
             ExecDelta,
             OrdType,
             Order,
+            OrderId,
             PriceTick,
             Qty,
             ResolvedSide,
@@ -171,7 +172,7 @@ mod tests {
 
     fn executed(side: Side, qty: f64) -> Order {
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(10_000),
             TickSize::new(0.01),
             Qty::new(qty),

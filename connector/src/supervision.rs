@@ -464,7 +464,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use hftbacktest::types::{PriceTick, Qty, TickSize};
+    use hftbacktest::types::{OrderId, PriceTick, Qty, TickSize};
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -865,7 +865,7 @@ mod tests {
         expire_and_report(
             "BTC",
             Order::new(
-                1,
+                OrderId::new(1),
                 PriceTick::new(100),
                 TickSize::new(0.1),
                 Qty::new(1.0),

@@ -32,7 +32,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hftbacktest::types::{ExecDelta, OrdType, Order, PriceTick, Qty, Side, Status, TimeInForce};
+use hftbacktest::types::{
+    ExecDelta,
+    OrdType,
+    Order,
+    OrderId,
+    PriceTick,
+    Qty,
+    Side,
+    Status,
+    TimeInForce,
+};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
@@ -70,11 +80,11 @@ pub enum OrderError {
     #[error("time-in-force {0:?} has no Lighter equivalent (FOK is not offered)")]
     UnsupportedTif(TimeInForce),
     #[error("order_id {order_id} is already live on {symbol}")]
-    OrderIdLive { symbol: String, order_id: u64 },
+    OrderIdLive { symbol: String, order_id: OrderId },
     #[error("no live order {order_id} on {symbol}")]
-    OrderNotFound { symbol: String, order_id: u64 },
+    OrderNotFound { symbol: String, order_id: OrderId },
     #[error("order {order_id} on {symbol} is not confirmed yet; the venue order_index is unknown")]
-    NotConfirmed { symbol: String, order_id: u64 },
+    NotConfirmed { symbol: String, order_id: OrderId },
     #[error("the client-order-index allocator is exhausted (reached 2^48-1)")]
     CoiExhausted,
     #[error("the price, size or market does not fit the venue's integer wire form: {0}")]
@@ -114,7 +124,7 @@ pub struct OrderManager {
     /// Tracked orders, keyed by our COI.
     orders: HashMap<i64, Tracked>,
     /// `(symbol, order_id)` → COI. Refuses a double-live `order_id` and resolves a cancel.
-    by_order_id: HashMap<(String, u64), i64>,
+    by_order_id: HashMap<(String, OrderId), i64>,
     /// The catalog row per registered symbol — the decimals `new_order` quantises onto (§3.5).
     markets: HashMap<String, MarketInfo>,
     /// `market_index` → the symbol the bot registered, so a private frame (which carries only
@@ -155,7 +165,7 @@ impl OrderManager {
     }
 
     /// The COI a live `(symbol, order_id)` maps to, if any.
-    pub fn coi_for(&self, symbol: &str, order_id: u64) -> Option<i64> {
+    pub fn coi_for(&self, symbol: &str, order_id: OrderId) -> Option<i64> {
         self.by_order_id
             .get(&(symbol.to_string(), order_id))
             .copied()
@@ -290,7 +300,7 @@ impl OrderManager {
     ///
     /// Errors if the order is unknown, or known but not yet confirmed (no `order_index`): a
     /// cancel cannot be addressed before the order has appeared on the channel.
-    pub fn cancel_order(&self, symbol: &str, order_id: u64) -> Result<CancelPlan, OrderError> {
+    pub fn cancel_order(&self, symbol: &str, order_id: OrderId) -> Result<CancelPlan, OrderError> {
         let not_found = || OrderError::OrderNotFound {
             symbol: symbol.to_string(),
             order_id,
@@ -578,6 +588,7 @@ mod tests {
         ExecDelta,
         OrdType,
         Order,
+        OrderId,
         Price,
         Qty,
         Side,
@@ -609,7 +620,7 @@ mod tests {
     fn bid(order_id: u64, price: f64, qty: f64) -> Order {
         // tick_size and lot_size are the venue's own here, as the bot is told to register.
         Order::new(
-            order_id,
+            OrderId::new(order_id),
             Price::new(price).to_ticks(TickSize::new(0.1)),
             TickSize::new(0.1),
             Qty::new(qty),
@@ -690,7 +701,10 @@ mod tests {
         m.new_order("BTC", &btc(), &bid(7, 58300.0, 0.001)).unwrap();
         assert!(matches!(
             m.new_order("BTC", &btc(), &bid(7, 58200.0, 0.001)),
-            Err(OrderError::OrderIdLive { order_id: 7, .. })
+            Err(OrderError::OrderIdLive {
+                order_id: OrderId(7),
+                ..
+            })
         ));
     }
 
@@ -721,7 +735,7 @@ mod tests {
         );
         assert_eq!(m.is_confirmed(coi), Some(true), "the channel confirmed it");
         // The order is now cancellable — the order_index has been learned.
-        assert!(m.cancel_order("BTC", 1).is_ok());
+        assert!(m.cancel_order("BTC", OrderId::new(1)).is_ok());
     }
 
     /// **State transitions are ordered by `transaction_time` and only it** (§4.12). A frame
@@ -898,7 +912,7 @@ mod tests {
     fn cancelling_an_unknown_or_unconfirmed_order_errors() {
         let mut m = manager();
         assert!(matches!(
-            m.cancel_order("BTC", 42),
+            m.cancel_order("BTC", OrderId::new(42)),
             Err(OrderError::OrderNotFound { .. })
         ));
         let (_coi, _) = m
@@ -906,7 +920,7 @@ mod tests {
             .unwrap();
         // Placed but not yet confirmed on the channel: no order_index to address a cancel.
         assert!(matches!(
-            m.cancel_order("BTC", 42),
+            m.cancel_order("BTC", OrderId::new(42)),
             Err(OrderError::NotConfirmed { .. })
         ));
     }
@@ -953,7 +967,7 @@ mod tests {
             .apply_order_update(&account_order(coi, 844424914280027, "open", 1_000))
             .expect("a still-tracked COI is adoptable — never orphaned");
         assert_eq!(symbol, "BTC");
-        assert_eq!(order.order_id, 1);
+        assert_eq!(order.order_id, OrderId::new(1));
         assert_eq!(order.status, Status::New);
         assert_eq!(m.is_confirmed(coi), Some(true), "adopted and confirmed");
         // Contrast: submit_failed would have removed the COI, and then this adoption returns
@@ -1015,7 +1029,7 @@ mod tests {
         let expired = m.reconcile(&[]);
         assert_eq!(expired.len(), 1, "only the confirmed-then-vanished one");
         assert_eq!(expired[0].0, "BTC");
-        assert_eq!(expired[0].1.order_id, 1);
+        assert_eq!(expired[0].1.order_id, OrderId::new(1));
         assert_eq!(expired[0].1.status, Status::Expired);
         // The in-flight order is untouched.
         assert_eq!(m.tracked(), 1);

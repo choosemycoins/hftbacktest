@@ -6,31 +6,31 @@ use std::{
     ptr::null,
 };
 
-use hftbacktest::prelude::Order;
+use hftbacktest::prelude::{Order, OrderId};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn orders_get(ptr: *const HashMap<u64, Order>, order_id: u64) -> *const Order {
+pub extern "C" fn orders_get(ptr: *const HashMap<OrderId, Order>, order_id: u64) -> *const Order {
     let orders = unsafe { &*ptr };
-    match orders.get(&order_id) {
+    match orders.get(&OrderId::new(order_id)) {
         None => null(),
         Some(order) => order as *const _,
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn orders_contains(ptr: *const HashMap<u64, Order>, order_id: u64) -> bool {
+pub extern "C" fn orders_contains(ptr: *const HashMap<OrderId, Order>, order_id: u64) -> bool {
     let orders = unsafe { &*ptr };
-    orders.contains_key(&order_id)
+    orders.contains_key(&OrderId::new(order_id))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn orders_len(ptr: *const HashMap<u64, Order>) -> usize {
+pub extern "C" fn orders_len(ptr: *const HashMap<OrderId, Order>) -> usize {
     let orders = unsafe { &*ptr };
     orders.len()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn orders_values(ptr: *const HashMap<u64, Order>) -> *mut c_void {
+pub extern "C" fn orders_values(ptr: *const HashMap<OrderId, Order>) -> *mut c_void {
     let orders = unsafe { &*ptr };
     let values = orders.values();
     let boxed = Box::new(values);

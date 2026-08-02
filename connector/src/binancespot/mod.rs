@@ -374,7 +374,7 @@ impl Connector for BinanceSpot {
                 }
                 None => {
                     warn!(
-                        order_id = order.order_id,
+                        order_id = %order.order_id,
                         "client_order_id corresponding to order_id is not found; \
                         this may be due to the order already being canceled or filled."
                     );

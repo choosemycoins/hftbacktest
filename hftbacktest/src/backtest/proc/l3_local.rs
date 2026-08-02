@@ -267,15 +267,16 @@ where
             self.depth.clear_orders(Side::None);
         } else if ev.is(LOCAL_BID_ADD_ORDER_EVENT) {
             self.depth
-                .add_buy_order(ev.order_id, ev.px, ev.qty, ev.local_ts)?;
+                .add_buy_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.local_ts)?;
         } else if ev.is(LOCAL_ASK_ADD_ORDER_EVENT) {
             self.depth
-                .add_sell_order(ev.order_id, ev.px, ev.qty, ev.local_ts)?;
+                .add_sell_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.local_ts)?;
         } else if ev.is(LOCAL_MODIFY_ORDER_EVENT) {
             self.depth
-                .modify_order(ev.order_id, ev.px, ev.qty, ev.local_ts)?;
+                .modify_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.local_ts)?;
         } else if ev.is(LOCAL_CANCEL_ORDER_EVENT) {
-            self.depth.delete_order(ev.order_id, ev.local_ts)?;
+            self.depth
+                .delete_order(OrderId::new(ev.order_id), ev.local_ts)?;
         }
         // Processes a trade event
         else if ev.is(LOCAL_TRADE_EVENT) && self.trades.capacity() > 0 {

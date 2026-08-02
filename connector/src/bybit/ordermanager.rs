@@ -235,7 +235,7 @@ impl GetOrders for OrderManager {
 
 #[cfg(test)]
 mod tests {
-    use hftbacktest::types::{ExecDelta, Price, PriceTick, Qty, TickSize};
+    use hftbacktest::types::{ExecDelta, OrderId, Price, PriceTick, Qty, TickSize};
 
     use super::*;
 
@@ -288,7 +288,7 @@ mod tests {
     fn an_execution_price_is_converted_by_the_tick_size_not_by_the_price() {
         let mut manager = OrderManager::new("test");
         let mut order = Order::new(
-            1,
+            OrderId::new(1),
             PriceTick::new(1000),
             TickSize::new(0.1),
             Qty::new(1.0),

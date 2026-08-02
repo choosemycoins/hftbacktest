@@ -672,7 +672,7 @@ where
             exch_timestamp: order.exch_ts,
             q: Box::new(L3OrderSource::MarketFeed),
             tick_size: TickSize::new(tick_size),
-            order_id,
+            order_id: OrderId::new(order_id),
             side,
             // The information below is invalid.
             exec_qty: ExecDelta::ZERO,
@@ -685,7 +685,7 @@ where
             time_in_force: TimeInForce::GTC,
         });
 
-        match self.mkt_feed_orders.entry(order_id) {
+        match self.mkt_feed_orders.entry(OrderId::new(order_id)) {
             Entry::Occupied(_) => Err(BacktestError::OrderIdExist),
             Entry::Vacant(entry) => {
                 entry.insert((side, order_price_tick));
@@ -1155,6 +1155,7 @@ mod l3_tests {
             BUY_EVENT,
             EXCH_EVENT,
             FILL_EVENT,
+            OrderId,
             PriceTick,
             Qty,
             SELL_EVENT,
@@ -1179,7 +1180,7 @@ mod l3_tests {
         };
 
         depth
-            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .add_buy_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.exch_ts)
             .unwrap();
         qm.add_market_feed_order(&ev, &depth).unwrap();
 
@@ -1195,7 +1196,7 @@ mod l3_tests {
         };
 
         depth
-            .add_sell_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .add_sell_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.exch_ts)
             .unwrap();
         qm.add_market_feed_order(&ev, &depth).unwrap();
 
@@ -1209,7 +1210,7 @@ mod l3_tests {
                 tick_size: TickSize::new(1.0),
                 exch_timestamp: 0,
                 local_timestamp: 0,
-                order_id: 1,
+                order_id: OrderId::new(1),
                 q: Box::new(()),
                 maker: false,
                 order_type: OrdType::Limit,
@@ -1229,7 +1230,8 @@ mod l3_tests {
         assert_eq!(filled.len(), 1);
         assert!(
             !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
-                &qm, 1
+                &qm,
+                OrderId::new(1)
             )
         );
 
@@ -1243,7 +1245,7 @@ mod l3_tests {
                 tick_size: TickSize::new(1.0),
                 exch_timestamp: 0,
                 local_timestamp: 0,
-                order_id: 1,
+                order_id: OrderId::new(1),
                 q: Box::new(()),
                 maker: false,
                 order_type: OrdType::Limit,
@@ -1263,7 +1265,8 @@ mod l3_tests {
         assert_eq!(filled.len(), 1);
         assert!(
             !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
-                &qm, 1
+                &qm,
+                OrderId::new(1)
             )
         );
     }
@@ -1285,7 +1288,7 @@ mod l3_tests {
         };
 
         depth
-            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .add_buy_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.exch_ts)
             .unwrap();
         qm.add_market_feed_order(&ev, &depth).unwrap();
 
@@ -1299,7 +1302,7 @@ mod l3_tests {
                 tick_size: TickSize::new(1.0),
                 exch_timestamp: 0,
                 local_timestamp: 0,
-                order_id: 1,
+                order_id: OrderId::new(1),
                 q: Box::new(()),
                 maker: false,
                 order_type: OrdType::Limit,
@@ -1324,7 +1327,7 @@ mod l3_tests {
         };
 
         depth
-            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .add_buy_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.exch_ts)
             .unwrap();
         qm.add_market_feed_order(&ev, &depth).unwrap();
 
@@ -1340,11 +1343,11 @@ mod l3_tests {
         };
 
         depth
-            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .add_buy_order(OrderId::new(ev.order_id), ev.px, ev.qty, ev.exch_ts)
             .unwrap();
         qm.add_market_feed_order(&ev, &depth).unwrap();
 
-        depth.delete_order(1, 0).unwrap();
+        depth.delete_order(OrderId::new(1), 0).unwrap();
         //qm.cancel_market_feed_order(1, &depth).unwrap();
 
         let ev = Event {
@@ -1358,7 +1361,9 @@ mod l3_tests {
             fval: 0.0,
         };
 
-        let filled = qm.fill_market_feed_order::<false>(1, &ev, &depth).unwrap();
+        let filled = qm
+            .fill_market_feed_order::<false>(OrderId::new(1), &ev, &depth)
+            .unwrap();
         assert_eq!(filled.len(), 0);
 
         let ev = Event {
@@ -1372,12 +1377,15 @@ mod l3_tests {
             fval: 0.0,
         };
 
-        depth.delete_order(2, 0).unwrap();
-        let filled = qm.fill_market_feed_order::<false>(2, &ev, &depth).unwrap();
+        depth.delete_order(OrderId::new(2), 0).unwrap();
+        let filled = qm
+            .fill_market_feed_order::<false>(OrderId::new(2), &ev, &depth)
+            .unwrap();
         assert_eq!(filled.len(), 1);
         assert!(
             !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
-                &qm, 1
+                &qm,
+                OrderId::new(1)
             )
         );
     }

@@ -973,7 +973,7 @@ pub(crate) fn expire_and_report(
     error: &HyperliquidError,
     ev_tx: &UnboundedSender<PublishEvent>,
 ) {
-    error!(%symbol, order_id = order.order_id, ?error, "Refusing a Hyperliquid order.");
+    error!(%symbol, order_id = %order.order_id, ?error, "Refusing a Hyperliquid order.");
     let mut order = order;
     order.req = Status::None;
     order.status = Status::Expired;
@@ -1008,6 +1008,7 @@ mod tests {
         LiveEvent,
         OrdType,
         Order,
+        OrderId,
         PriceTick,
         Qty,
         Side,
@@ -1183,7 +1184,7 @@ mod tests {
     fn a_refused_request_expires_the_order_before_it_reports_the_error() {
         let (tx, mut rx) = unbounded_channel();
         let order = Order::new(
-            7,
+            OrderId::new(7),
             PriceTick::new(100),
             TickSize::new(0.1),
             Qty::new(1.0),
@@ -1203,7 +1204,7 @@ mod tests {
             panic!("the order must come back first");
         };
         assert_eq!(symbol, "BTC");
-        assert_eq!(order.order_id, 7);
+        assert_eq!(order.order_id, OrderId::new(7));
         assert_eq!(order.status, Status::Expired);
         assert_eq!(order.req, Status::None);
 
@@ -1220,7 +1221,7 @@ mod tests {
     fn a_venue_rejection_of_any_length_still_fits_the_ipc_payload() {
         let (tx, mut rx) = unbounded_channel();
         let order = Order::new(
-            7,
+            OrderId::new(7),
             PriceTick::new(100),
             TickSize::new(0.1),
             Qty::new(1.0),

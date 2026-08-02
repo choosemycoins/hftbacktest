@@ -686,6 +686,7 @@ mod tests {
     };
 
     use hashbrown::HashMap;
+    use hftbacktest::types::OrderId;
 
     use crate::utils::{
         BackoffStrategy,
@@ -702,12 +703,13 @@ mod tests {
     fn equivalent_symbol_order_id() {
         let mut map = HashMap::new();
         map.insert(
-            SymbolOrderId::new("key1".to_string(), 1),
+            SymbolOrderId::new("key1".to_string(), OrderId::new(1)),
             "value1".to_string(),
         );
 
         assert_eq!(
-            map.get(&RefSymbolOrderId::new("key1", 1)).unwrap(),
+            map.get(&RefSymbolOrderId::new("key1", OrderId::new(1)))
+                .unwrap(),
             "value1"
         )
     }

@@ -5,7 +5,7 @@ use std::{collections::HashMap, mem};
 use hftbacktest::{
     backtest::{Backtest, BacktestError},
     depth::{HashMapMarketDepth, ROIVectorMarketDepth},
-    prelude::{Bot, ElapseResult, Event, Order, StateValues},
+    prelude::{Bot, ElapseResult, Event, Order, OrderId, StateValues},
     types::{OrdType, TimeInForce},
 };
 
@@ -114,7 +114,7 @@ pub extern "C" fn hashmapbt_wait_order_response(
     timeout: i64,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.wait_order_response(asset_no, order_id, timeout))
+    handle_result(hbt.wait_order_response(asset_no, OrderId::new(order_id), timeout))
 }
 
 #[unsafe(no_mangle)]
@@ -142,7 +142,7 @@ pub extern "C" fn hashmapbt_submit_buy_order(
     let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
     handle_result(hbt.submit_buy_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         tif,
@@ -165,7 +165,7 @@ pub extern "C" fn hashmapbt_submit_sell_order(
     let hbt = unsafe { &mut *hbt_ptr };
     handle_result(hbt.submit_sell_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) },
@@ -184,7 +184,7 @@ pub extern "C" fn hashmapbt_modify(
     wait: bool,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.modify(asset_no, order_id, price, qty, wait))
+    handle_result(hbt.modify(asset_no, OrderId::new(order_id), price, qty, wait))
 }
 
 #[unsafe(no_mangle)]
@@ -195,7 +195,7 @@ pub extern "C" fn hashmapbt_cancel(
     wait: bool,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.cancel(asset_no, order_id, wait))
+    handle_result(hbt.cancel(asset_no, OrderId::new(order_id), wait))
 }
 
 #[unsafe(no_mangle)]
@@ -228,7 +228,7 @@ pub extern "C" fn hashmapbt_clear_inactive_orders(
 pub extern "C" fn hashmapbt_orders(
     hbt_ptr: *const HashMapMarketDepthBacktest,
     asset_no: usize,
-) -> *const HashMap<u64, Order> {
+) -> *const HashMap<OrderId, Order> {
     let hbt = unsafe { &*hbt_ptr };
     hbt.orders(asset_no) as *const _
 }
@@ -376,7 +376,7 @@ pub extern "C" fn roivecbt_wait_order_response(
     timeout: i64,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.wait_order_response(asset_no, order_id, timeout))
+    handle_result(hbt.wait_order_response(asset_no, OrderId::new(order_id), timeout))
 }
 
 #[unsafe(no_mangle)]
@@ -404,7 +404,7 @@ pub extern "C" fn roivecbt_submit_buy_order(
     let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
     handle_result(hbt.submit_buy_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         tif,
@@ -427,7 +427,7 @@ pub extern "C" fn roivecbt_submit_sell_order(
     let hbt = unsafe { &mut *hbt_ptr };
     handle_result(hbt.submit_sell_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) },
@@ -446,7 +446,7 @@ pub extern "C" fn roivecbt_modify(
     wait: bool,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.modify(asset_no, order_id, price, qty, wait))
+    handle_result(hbt.modify(asset_no, OrderId::new(order_id), price, qty, wait))
 }
 
 #[unsafe(no_mangle)]
@@ -457,7 +457,7 @@ pub extern "C" fn roivecbt_cancel(
     wait: bool,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.cancel(asset_no, order_id, wait))
+    handle_result(hbt.cancel(asset_no, OrderId::new(order_id), wait))
 }
 
 #[unsafe(no_mangle)]
@@ -490,7 +490,7 @@ pub extern "C" fn roivecbt_clear_inactive_orders(
 pub extern "C" fn roivecbt_orders(
     hbt_ptr: *const ROIVectorMarketDepthBacktest,
     asset_no: usize,
-) -> *const HashMap<u64, Order> {
+) -> *const HashMap<OrderId, Order> {
     let hbt = unsafe { &*hbt_ptr };
     hbt.orders(asset_no) as *const _
 }

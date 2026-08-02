@@ -930,7 +930,7 @@ where
     }
 
     #[inline]
-    fn orders(&self, asset_no: usize) -> &HashMap<u64, Order> {
+    fn orders(&self, asset_no: usize) -> &HashMap<OrderId, Order> {
         self.local.get(asset_no).unwrap().orders()
     }
 
@@ -1292,7 +1292,7 @@ mod test {
     /// The quantity resting ahead of the order in the queue.
     const QUEUE_AHEAD_QTY: f64 = 5.0;
     const ORDER_QTY: f64 = 10.0;
-    const ORDER_ID: OrderId = 1;
+    const ORDER_ID: OrderId = OrderId::new(1);
     const LATENCY: i64 = 10_000_000;
     const SEC: i64 = 1_000_000_000;
     const MAKER_FEE: f64 = 0.0002;
@@ -1366,7 +1366,7 @@ mod test {
             local_ts: ts,
             px,
             qty,
-            order_id,
+            order_id: order_id.get(),
             ival: 0,
             fval: 0.0,
         }
@@ -1571,7 +1571,7 @@ mod test {
         let book = [l3_event(
             LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
             0,
-            1000,
+            OrderId::new(1000),
             BID_PRICE,
             10.0,
         )];
@@ -1648,7 +1648,7 @@ mod test {
             l3_event(
                 LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
                 0,
-                1000,
+                OrderId::new(1000),
                 BID_PRICE,
                 10.0,
             ),
@@ -1656,7 +1656,7 @@ mod test {
             l3_event(
                 LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
                 SEC,
-                1001,
+                OrderId::new(1001),
                 ASK_PRICE,
                 10.0,
             ),
