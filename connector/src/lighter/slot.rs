@@ -154,9 +154,12 @@ mod tests {
         nonce_action,
         placement_after_deadline,
     };
-    use crate::lighter::{
-        private_msg::AccountOrder,
-        rest::{SendOutcome, SendTxAck, TxVerdict},
+    use crate::{
+        lighter::{
+            private_msg::AccountOrder,
+            rest::{SendOutcome, SendTxAck, TxVerdict},
+        },
+        utils::Micros,
     };
 
     fn ack() -> SendTxAck {
@@ -259,7 +262,7 @@ mod tests {
             initial_base_amount: 0.001,
             remaining_base_amount: 0.001,
             filled_base_amount: 0.0,
-            transaction_time_us: 1785431774184833,
+            transaction_time_us: Micros::new(1785431774184833),
         }
     }
 

@@ -35,7 +35,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::lighter::LighterError;
+use crate::{lighter::LighterError, utils::Micros};
 
 /// One order as `account_all_orders` states it — only the fields the order path keys on.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,8 +54,10 @@ pub struct AccountOrder {
     pub initial_base_amount: f64,
     pub remaining_base_amount: f64,
     pub filled_base_amount: f64,
-    /// **The only monotone ordering key** (§4.12), microseconds. Never order by `updated_at`.
-    pub transaction_time_us: i64,
+    /// **The only monotone ordering key** (§4.12). Never order by `updated_at`. Typed
+    /// [`Micros`] so it reaches the nanosecond `exch_timestamp` only through the checked
+    /// [`crate::utils::Nanos::from_micros`] — a raw assignment does not compile (T1).
+    pub transaction_time_us: Micros,
 }
 
 /// One account position as `account_all_positions` states it.
@@ -251,7 +253,7 @@ fn account_orders_from(
             initial_base_amount: parse_number(&order.initial_base_amount)?,
             remaining_base_amount: parse_number(&order.remaining_base_amount)?,
             filled_base_amount: parse_number(&order.filled_base_amount)?,
-            transaction_time_us: order.transaction_time,
+            transaction_time_us: Micros::new(order.transaction_time),
         });
     }
     Ok(orders)
@@ -322,16 +324,19 @@ fn parse_number(text: &str) -> Result<f64, LighterError> {
 #[cfg(test)]
 mod tests {
     use super::{PrivateFrame, parse_private_frame};
-    use crate::lighter::fixtures::{
-        CONNECTED,
-        PRIVATE_ERROR_AUTH_REQUIRED,
-        PRIVATE_ORDERS_SNAPSHOT,
-        PRIVATE_ORDERS_UPDATE_CANCELED,
-        PRIVATE_POSITIONS_UPDATE_FLAT,
-        PRIVATE_TRADES_SNAPSHOT_EMPTY,
-        REST_ACTIVE_ORDERS_AUTH_REQUIRED,
-        REST_ACTIVE_ORDERS_EMPTY,
-        REST_ACTIVE_ORDERS_ONE,
+    use crate::{
+        lighter::fixtures::{
+            CONNECTED,
+            PRIVATE_ERROR_AUTH_REQUIRED,
+            PRIVATE_ORDERS_SNAPSHOT,
+            PRIVATE_ORDERS_UPDATE_CANCELED,
+            PRIVATE_POSITIONS_UPDATE_FLAT,
+            PRIVATE_TRADES_SNAPSHOT_EMPTY,
+            REST_ACTIVE_ORDERS_AUTH_REQUIRED,
+            REST_ACTIVE_ORDERS_EMPTY,
+            REST_ACTIVE_ORDERS_ONE,
+        },
+        utils::Micros,
     };
 
     fn orders(text: &str) -> (bool, Vec<super::AccountOrder>) {
@@ -374,8 +379,8 @@ mod tests {
     fn transaction_time_is_monotone_where_updated_at_is_not() {
         let (_, snap) = orders(PRIVATE_ORDERS_SNAPSHOT);
         let (_, delta) = orders(PRIVATE_ORDERS_UPDATE_CANCELED);
-        assert_eq!(snap[0].transaction_time_us, 1785431774184833);
-        assert_eq!(delta[0].transaction_time_us, 1785431906364320);
+        assert_eq!(snap[0].transaction_time_us, Micros::new(1785431774184833));
+        assert_eq!(delta[0].transaction_time_us, Micros::new(1785431906364320));
         assert!(
             delta[0].transaction_time_us > snap[0].transaction_time_us,
             "the cancel must sort after the open, and only transaction_time does that"
@@ -449,7 +454,7 @@ mod tests {
         assert_eq!(orders[0].price, 56608.2);
         assert_eq!(orders[0].remaining_base_amount, 0.001);
         // `transaction_time` is microseconds, like the WS channel (§4.12) — confirmed live.
-        assert_eq!(orders[0].transaction_time_us, 1785542568396486);
+        assert_eq!(orders[0].transaction_time_us, Micros::new(1785542568396486));
     }
 
     /// A flat account's `accountActiveOrders` is `code 200` with an empty array — the venue

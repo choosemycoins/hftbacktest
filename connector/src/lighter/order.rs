@@ -43,6 +43,7 @@ use crate::{
         rest::MarketInfo,
         signer::CreateOrder,
     },
+    utils::{Micros, Nanos},
 };
 
 /// 0 is `NilClientOrderIndex` and reserved; the allocator never hands it out (§3.5).
@@ -93,9 +94,10 @@ struct Tracked {
     market_index: i64,
     order: Order,
     order_index: Option<i64>,
-    /// The last `transaction_time` applied, microseconds — the §4.12 watermark. A frame with
-    /// a smaller one is stale and must not rewind the order.
-    update_ts_us: i64,
+    /// The last `transaction_time` applied — the §4.12 watermark. A frame with a smaller one is
+    /// stale and must not rewind the order. Typed [`Micros`] (like the frame it is compared to)
+    /// so it can never be confused with the nanosecond `exch_timestamp` (T1).
+    update_ts_us: Micros,
     /// Cumulative filled base amount seen, so a fill's `exec_qty` is reported as the delta of
     /// *this* execution, not the running total (`AGENTS.md` §4.6, `Order::exec_qty`).
     filled: f64,
@@ -275,7 +277,7 @@ impl OrderManager {
                 market_index: market.market_id,
                 order: accepted,
                 order_index: None,
-                update_ts_us: 0,
+                update_ts_us: Micros::new(0),
                 filled: 0.0,
                 confirmed: false,
             },
@@ -333,7 +335,7 @@ impl OrderManager {
             if update.transaction_time_us < tracked.update_ts_us {
                 debug!(
                     coi,
-                    stale_by_us = tracked.update_ts_us - update.transaction_time_us,
+                    stale_by_us = tracked.update_ts_us.get() - update.transaction_time_us.get(),
                     "Ignoring an out-of-order Lighter order update (§4.12)."
                 );
                 return None;
@@ -343,8 +345,23 @@ impl OrderManager {
             tracked.confirmed = true;
             tracked.order.req = Status::None;
             tracked.order.status = map_status(&update.status);
-            tracked.order.exch_timestamp =
-                tracked.order.exch_timestamp.max(update.transaction_time_us);
+            // §4.4/T1: the venue states `transaction_time` in microseconds; the money-path
+            // `exch_timestamp` is nanoseconds. Convert through the one checked bridge. On the
+            // (year-2262) overflow, fail closed by leaving the timestamp unadvanced rather than
+            // landing a wrapped value — the order-state update below still applies.
+            match Nanos::from_micros(update.transaction_time_us) {
+                Ok(ns) => {
+                    tracked.order.exch_timestamp = tracked.order.exch_timestamp.max(ns.get());
+                }
+                Err(overflow) => {
+                    warn!(
+                        coi,
+                        %overflow,
+                        "A Lighter transaction_time does not fit in nanoseconds; leaving \
+                         exch_timestamp unadvanced (§1.1)."
+                    );
+                }
+            }
             tracked.order.leaves_qty = update.remaining_base_amount;
             // §4.6: `exec_qty` is the amount executed by THIS update, the delta of the
             // cumulative `filled_base_amount`, not the running total.
@@ -393,15 +410,33 @@ impl OrderManager {
     }
 
     /// Maps a position frame onto the registered symbol and returns `(symbol, qty, exch_ts)`
-    /// to publish. The position is the venue's stated signed size (§3.4), never inferred; a
-    /// market this connector never registered is ignored (it is some other bot's).
+    /// to publish, `exch_ts` in **nanoseconds**. The position is the venue's stated signed size
+    /// (§3.4), never inferred; a market this connector never registered is ignored (it is some
+    /// other bot's).
+    ///
+    /// `exch_ts_us` is microseconds (the caller passes `Utc::now().timestamp_micros()`) and
+    /// reaches the nanosecond wire field only through the checked bridge (T1). On the
+    /// (year-2262) overflow it fails closed — the position is dropped rather than published with
+    /// a wrapped timestamp (§1.1).
     pub fn apply_position(
         &self,
         position: &AccountPosition,
-        exch_ts_us: i64,
+        exch_ts_us: Micros,
     ) -> Option<(String, f64, i64)> {
         let symbol = self.symbol_by_market.get(&position.market_index)?.clone();
-        Some((symbol, position.position, exch_ts_us))
+        let exch_ts = match Nanos::from_micros(exch_ts_us) {
+            Ok(ns) => ns.get(),
+            Err(overflow) => {
+                warn!(
+                    %overflow,
+                    market_index = position.market_index,
+                    "A Lighter position timestamp does not fit in nanoseconds; dropping the \
+                     position publish (§1.1)."
+                );
+                return None;
+            }
+        };
+        Some((symbol, position.position, exch_ts))
     }
 
     /// Reconciles against the venue's open-order snapshot on (re)connect.
@@ -483,6 +518,7 @@ mod tests {
             private_msg::{AccountOrder, AccountPosition},
             rest::MarketInfo,
         },
+        utils::Micros,
     };
 
     fn btc() -> MarketInfo {
@@ -520,7 +556,7 @@ mod tests {
             initial_base_amount: 0.001,
             remaining_base_amount: if status == "open" { 0.001 } else { 0.0 },
             filled_base_amount: 0.0,
-            transaction_time_us: txn_us,
+            transaction_time_us: Micros::new(txn_us),
         }
     }
 
@@ -756,10 +792,12 @@ mod tests {
             position: -1.5,
             open_order_count: 0,
         };
-        let (symbol, qty, exch_ts) = m.apply_position(&short, 4_242).expect("ours");
+        let (symbol, qty, exch_ts) = m.apply_position(&short, Micros::new(4_242)).expect("ours");
         assert_eq!(symbol, "BTC");
         assert_eq!(qty, -1.5);
-        assert_eq!(exch_ts, 4_242);
+        // The µs `now` is converted to nanoseconds (T1): 4_242 µs → 4_242_000 ns. Before the
+        // fix this returned the raw 4_242.
+        assert_eq!(exch_ts, 4_242_000);
 
         // An unregistered market is some other bot's; ignored.
         let foreign = AccountPosition {
@@ -768,7 +806,7 @@ mod tests {
             position: 10.0,
             open_order_count: 0,
         };
-        assert!(m.apply_position(&foreign, 1).is_none());
+        assert!(m.apply_position(&foreign, Micros::new(1)).is_none());
     }
 
     /// **Reconciliation expires an order the venue no longer lists** (§3.4, §5.10) — the
@@ -815,6 +853,21 @@ mod tests {
         assert_eq!(m.orders(Some("BTC".to_string())).len(), 1);
         assert_eq!(m.orders(Some("ETH".to_string())).len(), 0);
         assert_eq!(m.orders(None).len(), 1);
+    }
+
+    /// **An order update's `exch_timestamp` is the venue microsecond `transaction_time`
+    /// converted to nanoseconds** — the money-path unit (§4.4, T1). Before the fix it stored the
+    /// raw microseconds, 1000× too small; the `Micros`-typed field now makes the raw assignment
+    /// a compile error and the checked [`crate::utils::Nanos::from_micros`] the only bridge.
+    #[test]
+    fn an_order_updates_exch_timestamp_is_the_transaction_time_in_nanoseconds() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        let txn_us = 1_785_431_774_184_833;
+        let (_, order) = m
+            .apply_order_update(&account_order(coi, 5, "open", txn_us))
+            .expect("our order, opened");
+        assert_eq!(order.exch_timestamp, txn_us * 1_000);
     }
 
     #[test]

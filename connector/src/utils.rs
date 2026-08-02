@@ -152,6 +152,117 @@ pub fn get_timestamp() -> u64 {
     Utc::now().timestamp_millis() as u64
 }
 
+/// Nanoseconds since the Unix epoch — the unit every timestamp the connector writes onto the
+/// money path is in (`Order.exch_timestamp`, `Event.exch_ts`, `LiveEvent::Position.exch_ts`).
+///
+/// A venue reporting microseconds or milliseconds reaches this `i64` **only** through the
+/// checked constructors [`Nanos::from_micros`] / [`Nanos::from_millis`]: there is no
+/// `From<i64>` and no `Nanos::new`, and the field is private, so a raw microsecond value cannot
+/// be assigned where nanoseconds are expected — that assignment does not compile. This
+/// forecloses the microsecond/nanosecond/millisecond mix class at the connector boundary where
+/// it occurs (`AGENTS.md` §4, correctness-by-construction §1.6); the seed was the Lighter order
+/// path writing a raw-microsecond `transaction_time` into a nanosecond `exch_timestamp`.
+///
+/// The conversion is *checked* because the release profile compiles with overflow checks off
+/// (`panic = "abort"`, root `Cargo.toml`): an unchecked `micros * 1_000` on a far-future time
+/// would silently wrap to a garbage — possibly negative — nanosecond value and land it on the
+/// money path. A value that does not fit is an [`Overflow`], to be handled fail-closed, never
+/// wrapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Nanos(i64);
+
+/// A venue time in microseconds. Type a venue message field as this when the venue documents
+/// its time in µs (e.g. Lighter `transaction_time`), so the value can reach nanoseconds only
+/// through [`Nanos::from_micros`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Micros(i64);
+
+/// A venue time in milliseconds. Same discipline as [`Micros`], bridged by
+/// [`Nanos::from_millis`].
+///
+/// The millisecond arm of the set is exercised by the unit tests but has **no production caller
+/// yet**: the Lighter order path this change fixes is microsecond-only. The connector's ms→ns
+/// conversions still live as ad-hoc `checked_mul(1_000_000)` in the Hyperliquid feed path
+/// (`hyperliquid/{trades,depth,private_stream}.rs`), which are the intended first callers when
+/// that path is folded onto this bridge — hence the `allow(dead_code)` here and on
+/// [`Nanos::from_millis`], scoped to the ms arm only.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Millis(i64);
+
+/// A venue time in its source unit does not fit in nanoseconds as an `i64` (roughly, a
+/// microsecond time past the year 2262). Returned by the [`Nanos`] constructors instead of a
+/// silent wrap; the caller fails closed — it drops the update or leaves the timestamp
+/// unadvanced — and never lands a wrapped value on the money path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    /// The source value that overflowed, in its own unit.
+    pub value: i64,
+}
+
+impl fmt::Display for Overflow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "venue time {} does not fit in nanoseconds as an i64",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for Overflow {}
+
+impl Micros {
+    #[inline]
+    pub const fn new(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    #[inline]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+#[allow(dead_code)] // ms arm: see the note on `Millis`.
+impl Millis {
+    #[inline]
+    pub const fn new(millis: i64) -> Self {
+        Self(millis)
+    }
+
+    #[inline]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl Nanos {
+    #[inline]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+
+    /// Converts microseconds to nanoseconds, or [`Overflow`] if the product does not fit `i64`.
+    pub fn from_micros(micros: Micros) -> Result<Self, Overflow> {
+        micros
+            .0
+            .checked_mul(1_000)
+            .map(Self)
+            .ok_or(Overflow { value: micros.0 })
+    }
+
+    /// Converts milliseconds to nanoseconds, or [`Overflow`] if the product does not fit `i64`.
+    #[allow(dead_code)] // ms arm: see the note on `Millis`.
+    pub fn from_millis(millis: Millis) -> Result<Self, Overflow> {
+        millis
+            .0
+            .checked_mul(1_000_000)
+            .map(Self)
+            .ok_or(Overflow { value: millis.0 })
+    }
+}
+
 pub type PxQty = (f64, f64);
 
 pub fn parse_depth(
@@ -488,7 +599,16 @@ mod tests {
 
     use hashbrown::HashMap;
 
-    use crate::utils::{BackoffStrategy, ExponentialBackoff, RefSymbolOrderId, SymbolOrderId};
+    use crate::utils::{
+        BackoffStrategy,
+        ExponentialBackoff,
+        Micros,
+        Millis,
+        Nanos,
+        Overflow,
+        RefSymbolOrderId,
+        SymbolOrderId,
+    };
 
     #[test]
     fn equivalent_symbol_order_id() {
@@ -568,6 +688,45 @@ mod tests {
             backoff.backoff();
         }
         assert_eq!(backoff.backoff(), Duration::from_secs(30));
+    }
+
+    /// A known microsecond venue time converts to the nanoseconds the money path expects, and a
+    /// value that would overflow `i64` fails closed with [`Overflow`] rather than wrapping.
+    #[test]
+    fn nanos_from_micros_converts_a_known_time_and_fails_closed_on_overflow() {
+        // A real Lighter `transaction_time` (µs) → nanoseconds.
+        let us = 1_785_431_774_184_833i64;
+        assert_eq!(
+            Nanos::from_micros(Micros::new(us)).unwrap().get(),
+            us * 1_000
+        );
+
+        // The largest microsecond value that still fits, and the first that does not.
+        assert!(Nanos::from_micros(Micros::new(i64::MAX / 1_000)).is_ok());
+        assert_eq!(
+            Nanos::from_micros(Micros::new(i64::MAX / 999)),
+            Err(Overflow {
+                value: i64::MAX / 999
+            })
+        );
+    }
+
+    /// The millisecond bridge behaves the same: a known time converts, an overflow is `Err`.
+    #[test]
+    fn nanos_from_millis_converts_a_known_time_and_fails_closed_on_overflow() {
+        let ms = 1_785_358_835_916i64;
+        assert_eq!(
+            Nanos::from_millis(Millis::new(ms)).unwrap().get(),
+            ms * 1_000_000
+        );
+
+        assert!(Nanos::from_millis(Millis::new(i64::MAX / 1_000_000)).is_ok());
+        assert_eq!(
+            Nanos::from_millis(Millis::new(i64::MAX / 999_999)),
+            Err(Overflow {
+                value: i64::MAX / 999_999
+            })
+        );
     }
 
     #[test]

@@ -77,7 +77,7 @@ use crate::{
             placement_after_deadline,
         },
     },
-    utils::{BackoffStrategy, ExponentialBackoff},
+    utils::{BackoffStrategy, ExponentialBackoff, Micros},
 };
 
 /// The 8 h server ceiling on an auth token (§3.4). Minting longer succeeds on the client and
@@ -1133,7 +1133,7 @@ impl PrivateStreamTask {
                 }
             }
             PrivateFrame::Positions { positions, .. } => {
-                let now = Utc::now().timestamp_micros();
+                let now = Micros::new(Utc::now().timestamp_micros());
                 for position in &positions {
                     let mapped = self
                         .order_manager
@@ -1225,6 +1225,7 @@ mod tests {
             private_msg::AccountOrder,
             rest::MarketInfo,
         },
+        utils::Micros,
     };
 
     /// **The 8 h auth ceiling is server-only (§3.4): a 9 h token mints without error and is
@@ -1283,7 +1284,7 @@ mod tests {
             initial_base_amount: 0.001,
             remaining_base_amount: 0.001,
             filled_base_amount: 0.0,
-            transaction_time_us: 1785431774184833,
+            transaction_time_us: Micros::new(1785431774184833),
         }
     }
 
