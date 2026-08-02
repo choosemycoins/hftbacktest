@@ -104,6 +104,18 @@ impl RotatingFile {
         })
     }
 
+    /// Closes the stream and reports whether the close worked.
+    ///
+    /// Idempotent, and that is what keeps [`Drop`] usable as a backstop: the
+    /// sink is taken, so the drop that follows finds nothing left to do and
+    /// cannot write a second trailer onto a member that already has one.
+    pub fn finish(&mut self) -> Result<(), io::Error> {
+        match self.file.take() {
+            Some(file) => file.finish(),
+            None => Ok(()),
+        }
+    }
+
     pub fn write(&mut self, datetime: DateTime<Utc>, data: String) -> Result<(), io::Error> {
         let date = datetime.date_naive();
         if date != self.date {
@@ -112,6 +124,16 @@ impl RotatingFile {
             // still installed, so this object stays in a valid state and the
             // error propagates without stranding `self.file` as `None`.
             let next = Self::create(datetime, &self.path, self.encoding)?;
+            // Logged, not propagated, and the asymmetry with `Writer::finish`
+            // is deliberate. Yesterday's member is unreadable either way, and
+            // the new day's file is already open and healthy: returning here
+            // would lose *this* record — one that would have been written
+            // perfectly — and end a recording over a file that cannot be
+            // repaired by ending it. The process also keeps running, so the
+            // journal has a reader and the minutely disk gauge reaches the
+            // sidecar within a minute if the cause was the disk. On shutdown
+            // there is no "a minute later", which is why that path returns a
+            // `Result` and this one does not.
             if let Some(file) = self.file.replace(next)
                 && let Err(error) = file.finish()
             {
@@ -293,6 +315,122 @@ mod rotating_file_tests {
         assert!(read_all(&format!("{dir}/btc_20260725.gz")).contains("px"));
     }
 
+    /// Points an already-written stream's descriptor at a device that refuses
+    /// every byte, so the records landed and only the close cannot.
+    ///
+    /// `dup2` rather than closing the descriptor: it replaces what the number
+    /// refers to while leaving the `File` owning a valid one, so nothing is
+    /// closed out from under anyone and no other test's file can inherit a
+    /// recycled descriptor. Linux only, which is where the collector records.
+    #[cfg(target_os = "linux")]
+    fn refuse_further_writes(writer: &mut Writer, stream: &str) {
+        use std::os::fd::AsRawFd;
+
+        let file = writer
+            .file
+            .get_mut(stream)
+            .expect("the stream must be open before its device can stop answering");
+        let Some(Sink::Gz(encoder)) = &file.file else {
+            panic!("expected an open gzip stream for {stream}");
+        };
+        let full = File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is what makes this an ENOSPC and not a fake");
+        // SAFETY: both descriptors are open and owned for the duration of the
+        // call; `dup2` replaces the target atomically and the `File` continues
+        // to own a valid descriptor afterwards.
+        assert!(unsafe { libc::dup2(full.as_raw_fd(), encoder.get_ref().as_raw_fd()) } >= 0);
+    }
+
+    /// A gzip member without its trailer is not a shorter recording, it is an
+    /// unreadable one — and the failure that leaves it that way arrives at the
+    /// very end, when the day's records have all been written and accepted.
+    /// `Drop` cannot report it: it has nowhere to return to, so the process
+    /// exits 0, systemd logs `Deactivated successfully`, and the corrupt day is
+    /// found weeks later by whoever tries to read it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_finalise_is_reported_rather_than_swallowed() {
+        let dir = scratch("nospace");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
+        let mut w = Writer::new(&dir, "bybit");
+
+        // A day of records, every one of them accepted.
+        w.write(t, "BTC".to_string(), r#"{"px":"1"}"#.to_string())
+            .unwrap();
+        refuse_further_writes(&mut w, "btc");
+
+        let error = w
+            .finish()
+            .expect_err("a gzip member that could not be closed must not report a clean stop");
+        assert!(
+            error.to_string().contains("btc"),
+            "the report must name the stream whose file is now unreadable: {error}"
+        );
+    }
+
+    /// One file's failure must not abandon the rest, for the reason the append
+    /// mode exists: an unfinished member is undecodable, so a `finish` that
+    /// stopped at the first error would turn one bad device into a directory of
+    /// unreadable days.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stream_that_cannot_be_closed_does_not_strand_the_others() {
+        let dir = scratch("nospace-others");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
+        let mut w = Writer::new(&dir, "bybit");
+
+        w.write(t, "BTC".to_string(), r#"{"px":"1"}"#.to_string())
+            .unwrap();
+        w.write(t, "ETH".to_string(), r#"{"px":"2"}"#.to_string())
+            .unwrap();
+        refuse_further_writes(&mut w, "btc");
+
+        assert!(w.finish().is_err());
+        assert!(
+            read_all(&format!("{dir}/eth_20260725.gz")).contains("px"),
+            "the healthy stream was left unterminated by the failure of another"
+        );
+    }
+
+    /// The ordinary path: everything closes, nothing is reported, and the files
+    /// are readable without waiting for `Drop`.
+    #[test]
+    fn finishing_closes_the_files_without_waiting_for_drop() {
+        let dir = scratch("finish");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
+        let mut w = Writer::new(&dir, "bybit");
+        w.write(t, "BTC".to_string(), r#"{"px":"1"}"#.to_string())
+            .unwrap();
+
+        w.finish().unwrap();
+
+        // Deliberately not dropped: `finish` is the primary path and has to
+        // stand on its own.
+        assert!(read_all(&format!("{dir}/btc_20260725.gz")).contains("px"));
+    }
+
+    /// `Drop` stays as the backstop for the paths that never reach `finish` — a
+    /// panic, an early return — but it must not finish a stream twice: the
+    /// second call would write a second trailer onto a member that already has
+    /// one, and there is nothing left to write it to anyway.
+    #[test]
+    fn finishing_twice_over_is_not_an_error() {
+        let dir = scratch("finish-twice");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).unwrap();
+        let mut w = Writer::new(&dir, "bybit");
+        w.write(t, "BTC".to_string(), r#"{"px":"1"}"#.to_string())
+            .unwrap();
+
+        w.finish().unwrap();
+        w.finish().unwrap();
+        drop(w);
+
+        let content = read_all(&format!("{dir}/btc_20260725.gz"));
+        assert_eq!(content.lines().count(), 1, "{content:?}");
+    }
+
     /// Each line is `{recv_timestamp_nanos} {raw_payload}`. The data pipeline
     /// (`py-hftbacktest/hftbacktest/data/utils/*`) splits on the first space,
     /// so the prefix format is a contract, not an implementation detail.
@@ -350,6 +488,50 @@ impl Writer {
             path: path.to_string(),
             meta_stream: format!("{META_STREAM}_{instance}"),
             file: Default::default(),
+        }
+    }
+
+    /// Closes every open file and reports whether that worked.
+    ///
+    /// The primary path, called on the way out of `main`, because [`Drop`] is
+    /// where this failure used to go to die. A gzip member whose trailer was
+    /// never written is not a shorter recording but an unreadable one, and the
+    /// device that refuses those last bytes — a disk that filled between the
+    /// last record and the close — refuses them at the one moment nothing else
+    /// is watching. Swallowed in `Drop`, the process still exits 0 and systemd
+    /// still reports `Deactivated successfully`; the corrupt day is found weeks
+    /// later by whoever tries to read it.
+    ///
+    /// `Drop` stays as the backstop for the paths that never reach here — a
+    /// panic, an early return — and [`RotatingFile::finish`] is idempotent so
+    /// the two cannot both close the same member.
+    ///
+    /// Every stream is closed even after one fails, for the reason the append
+    /// mode exists: stopping at the first error would turn one bad device into
+    /// a directory of undecodable days. The first failure is what is returned,
+    /// and the count says how much of the day is suspect.
+    ///
+    /// The map is emptied rather than left holding closed files. A `Writer` is
+    /// usable afterwards — a later `write` reopens the stream in append mode,
+    /// which starts a fresh gzip member exactly as a restart does — where a
+    /// retained, already-closed entry would be written to and panic.
+    pub fn finish(&mut self) -> Result<(), anyhow::Error> {
+        let mut failed: Vec<String> = Vec::new();
+        let mut first: Option<io::Error> = None;
+        for (stream, mut file) in self.file.drain() {
+            if let Err(error) = file.finish() {
+                error!(?error, %stream, "couldn't finish the stream; the file may be truncated");
+                failed.push(stream);
+                first.get_or_insert(error);
+            }
+        }
+        match first {
+            None => Ok(()),
+            Some(error) => Err(anyhow::anyhow!(
+                "couldn't close {} of the day's files ({}); the first failure was: {error}",
+                failed.len(),
+                failed.join(", "),
+            )),
         }
     }
 

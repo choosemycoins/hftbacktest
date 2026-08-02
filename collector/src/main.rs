@@ -1017,11 +1017,23 @@ async fn main() -> Result<(), anyhow::Error> {
         fatal = Some(error);
     }
 
-    // Drop the writer explicitly rather than letting it fall off the end of
-    // `main`: `RotatingFile::drop` is what calls `GzEncoder::finish`. Doing it
-    // here means the "stopped" log line is emitted after the flush has been
-    // attempted. A failed flush is logged by `Drop` itself and cannot be
-    // reported through this return value.
+    // Close the files here, explicitly, and let the failure through. A gzip
+    // member whose trailer was never written is not a shorter recording but an
+    // unreadable one, and the device that refuses those last bytes refuses them
+    // at the one moment nothing else is watching. Left to `Drop` — which has
+    // nowhere to return to — the process exited 0 over a corrupt day and
+    // systemd reported `Deactivated successfully`.
+    //
+    // Second to whatever stopped the recording, which is the more useful
+    // diagnosis of the two; both reach the journal either way.
+    if let Err(error) = writer.finish() {
+        error!(%error, "the recording may be truncated");
+        fatal.get_or_insert(error);
+    }
+
+    // `Drop` stays as the backstop for the paths that never reach here — a
+    // panic, an early return. `finish` emptied the writer, so this closes
+    // nothing twice.
     drop(writer);
 
     match fatal {
