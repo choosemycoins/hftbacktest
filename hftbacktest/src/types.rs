@@ -787,6 +787,43 @@ impl Status {
             | Status::Unsupported => false,
         }
     }
+
+    /// Whether a cancel is a **meaningful request** for an order in this status.
+    ///
+    /// The predicate behind [`Order::cancellable`], which adds the orthogonal condition that
+    /// no request is already in flight.
+    ///
+    /// **Wildcard-free, and this one is why the rule exists.** `cancellable()` was the last
+    /// hand-written `status == New || status == PartiallyFilled` chain after
+    /// [`Status::is_terminal`] and [`Status::may_rest_at_venue`] were unified, and appending
+    /// [`Status::Uncertain`] compiled against it without a word — answering `false` for the
+    /// one status that most needs a cancel.
+    ///
+    /// `Uncertain` answers **true**, and it is the fail-closed answer. The three other paths a
+    /// bot has are all closed for it: it is not terminal, so `clear_inactive_orders` keeps it
+    /// and its id stays burned against `submit_order`; `modify` is
+    /// [`BotError::Unsupported`] in live (`AGENTS.md` §4.3). Refusing the cancel too leaves
+    /// the strategy holding an order it is told may be resting and can do nothing about until
+    /// the process restarts — the unattended order S3 exists to prevent, reached from the
+    /// other side. A cancel that finds nothing at the venue is a no-op; not cancelling one
+    /// that is still resting is a live position nobody is managing.
+    ///
+    /// `None` — submitted, not yet acknowledged — stays **false**, unchanged: the venue has
+    /// not given the connector an id to cancel by, and the in-flight submit is what resolves
+    /// it. `Replaced` stays false for the same reason it did before, and ruling it otherwise
+    /// is a separate question with its own measurement.
+    pub fn may_be_canceled(&self) -> bool {
+        match self {
+            Status::New | Status::PartiallyFilled | Status::Uncertain => true,
+            Status::None
+            | Status::Expired
+            | Status::Filled
+            | Status::Canceled
+            | Status::Rejected
+            | Status::Replaced
+            | Status::Unsupported => false,
+        }
+    }
 }
 
 /// Time In Force
@@ -1002,9 +1039,20 @@ impl Order {
     }
 
     /// Returns whether this order is cancelable.
+    ///
+    /// Two independent conditions: the status must be one a cancel is meaningful for
+    /// ([`Status::may_be_canceled`], the single wildcard-free ruling), and no request may
+    /// already be in flight — a second cancel on top of a pending one is a duplicate, not a
+    /// retry.
+    ///
+    /// The status half used to be written out here as `status == New || status ==
+    /// PartiallyFilled`, and it was the **last** such chain in the file after
+    /// [`Status::is_terminal`] and [`Status::may_rest_at_venue`] were unified. Appending
+    /// [`Status::Uncertain`] compiled against it silently and answered `false`, so an order
+    /// the bot was told to keep because the venue might still be holding it was the one order
+    /// it could not cancel (`AGENTS.md` §4.8, invariant S3).
     pub fn cancellable(&self) -> bool {
-        (self.status == Status::New || self.status == Status::PartiallyFilled)
-            && self.req == Status::None
+        self.status.may_be_canceled() && self.req == Status::None
     }
 
     /// Returns whether this order is active in the market.
@@ -2007,6 +2055,75 @@ mod tests {
             order.active(),
             "an uncertain order may still be resting at the venue, so every removal path \
              that filters on active() must keep it"
+        );
+    }
+
+    /// An uncertain order must still be **cancellable**, or S3 trades one silent failure for
+    /// another.
+    ///
+    /// Keeping the order (not terminal) and reporting it as possibly resting (`active()`)
+    /// only pays off if the bot can act on it. Cancel is the *only* action left: `modify` is
+    /// [`crate::types::BotError::Unsupported`] in live (§4.3), the id cannot be re-submitted
+    /// while the order is tracked (`OrderIdExist`), and `clear_inactive_orders` will not
+    /// release it because it is not terminal. Answering `false` here therefore freezes the
+    /// rung until the process restarts — the strategy is told the order may be live and
+    /// denied the one thing that would resolve it.
+    ///
+    /// Cancelling is also the **fail-closed** direction: the venue may be holding the order,
+    /// and a cancel that finds nothing is a no-op, while leaving it alone is an unattended
+    /// order — the hazard S3 exists to prevent, reached by a different door.
+    ///
+    /// The three assertions are separable on purpose: the first is the new ruling, the second
+    /// keeps the pre-existing set intact (this must not become "anything is cancellable"),
+    /// and the third pins that a request already in flight still blocks a second one.
+    #[test]
+    fn an_uncertain_order_is_still_cancellable() {
+        use crate::types::{OrdType, Order, PriceTick, Qty, Side, Status, TickSize, TimeInForce};
+
+        let uncertain = |req: Status| {
+            let mut order = Order::new(
+                OrderId::new(1),
+                PriceTick::new(100),
+                TickSize::new(0.01),
+                Qty::new(1.0),
+                Side::Buy,
+                OrdType::Limit,
+                TimeInForce::GTC,
+            );
+            order.status = Status::Uncertain;
+            order.req = req;
+            order
+        };
+
+        assert!(
+            uncertain(Status::None).cancellable(),
+            "an order whose state the venue left unreadable must still be cancellable: cancel \
+             is the only action the library leaves, and it is the fail-closed one"
+        );
+
+        for status in [
+            Status::None,
+            Status::Expired,
+            Status::Filled,
+            Status::Canceled,
+            Status::Rejected,
+            Status::Replaced,
+            Status::Unsupported,
+        ] {
+            assert!(
+                !status.may_be_canceled(),
+                "{status:?} must not become cancellable: this ruling admits Uncertain, it does \
+                 not open the set"
+            );
+        }
+        for status in [Status::New, Status::PartiallyFilled, Status::Uncertain] {
+            assert!(status.may_be_canceled(), "{status:?} must be cancellable");
+        }
+
+        assert!(
+            !uncertain(Status::Canceled).cancellable(),
+            "a cancel already in flight still blocks a second one; the status ruling does not \
+             touch the pending-request half"
         );
     }
 

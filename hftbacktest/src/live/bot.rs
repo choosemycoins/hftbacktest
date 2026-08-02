@@ -1261,6 +1261,110 @@ mod tests {
         );
     }
 
+    /// An uncertain order can still be **cancelled**, and cancelling is the only move left.
+    ///
+    /// S3 keeps the order and reports it as possibly resting. On its own that turns "the
+    /// connector silently dropped it" into "the bot silently freezes the rung": the order is
+    /// not terminal so `clear_inactive_orders` never releases it, its id is burned so
+    /// `submit_order` answers `OrderIdExist`, and `modify` is [`BotError::Unsupported`]
+    /// (§4.3). If cancel refuses it too, the strategy has been told the order may be live and
+    /// denied every action — and in `myhft` the refusal is *silent*, because cancel
+    /// candidates are filtered on `cancellable()` before the call, so the rung is skipped by
+    /// the re-quote path and by the flatten path alike, with no error and no log line.
+    ///
+    /// This drives the whole `Bot` path, not `Order::cancellable()` in isolation: the request
+    /// has to reach the channel.
+    #[test]
+    fn an_uncertain_order_can_still_be_cancelled() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, order_event("BTCUSDT", 1, 100.0)),
+                (
+                    0,
+                    uncertain_order_event("BTCUSDT", OrderId::new(1), 1_700_000_000_000_000_000),
+                ),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        bot.cancel(0, OrderId::new(1), false).expect(
+            "an order the bot is told to keep because the venue may be holding it must still \
+             be cancellable: cancel is the only action left and it is the fail-closed one",
+        );
+
+        let canceled = bot
+            .channel
+            .sent
+            .iter()
+            .filter_map(|(_, _, request)| match request {
+                LiveRequest::Order { order, .. } if order.req == Status::Canceled => Some(order),
+                _ => None,
+            })
+            .count();
+        assert_eq!(
+            canceled, 1,
+            "the cancel must reach the connector, not merely be permitted by the predicate"
+        );
+    }
+
+    /// The `status` the bot puts on the wire is one a **connector minted**, never one the bot
+    /// invented.
+    ///
+    /// This is what keeps the §4.8 upgrade ordering true now that an uncertain order is
+    /// cancellable. `LiveBot::cancel` clones the *tracked* order — `status` included — into
+    /// `LiveRequest::Order`, so the bot does emit wire ordinal 9 for `Status::Uncertain`. That
+    /// is safe for one reason only: `Uncertain` is minted **exclusively** by a connector
+    /// (`StatusVerdict::Unrecognised` on Hyperliquid and Lighter), so a peer that can send it
+    /// to the bot is by construction a peer that can decode it coming back. A bot talking to
+    /// an un-upgraded connector never holds the variant, so it never emits it.
+    ///
+    /// The assertion compares against the status **the event carried**, not against a
+    /// literal: what is being pinned is the echo, not the particular variant. If the bot ever
+    /// starts originating a status of its own — say by stamping a request "uncertain" after a
+    /// send failure — this fails, and it must, because that status would reach a connector
+    /// that never taught the bot the ordinal.
+    #[test]
+    fn the_status_the_bot_sends_is_the_one_the_connector_sent_it() {
+        let event = uncertain_order_event("BTCUSDT", OrderId::new(1), 1_700_000_000_000_000_000);
+        let LiveEvent::Order {
+            order: published, ..
+        } = event.clone()
+        else {
+            unreachable!("uncertain_order_event builds an order event")
+        };
+
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![(0, order_event("BTCUSDT", 1, 100.0)), (0, event)],
+        );
+        bot.elapse(1_000_000).unwrap();
+        bot.cancel(0, OrderId::new(1), false).unwrap();
+
+        let (_, _, request) = bot
+            .channel
+            .sent
+            .iter()
+            .rev()
+            .find(|(_, _, request)| matches!(request, LiveRequest::Order { .. }))
+            .expect("the cancel request must have been sent");
+        let LiveRequest::Order { order: sent, .. } = request else {
+            unreachable!("filtered above")
+        };
+
+        assert_eq!(
+            sent.status, published.status,
+            "the bot echoes the status the connector published; it must not originate one, or \
+             it could put an ordinal on the wire that its peer never taught it"
+        );
+        assert_eq!(
+            sent.req,
+            Status::Canceled,
+            "the connector routes on `req`, which the bot does originate — and `Canceled` is a \
+             variant every connector generation knows"
+        );
+    }
+
     /// The two [`Bot`] implementations must clear the **same** orders.
     ///
     /// `Local::clear_inactive_orders` (backtest) clears on `is_terminal()`, and this one used
