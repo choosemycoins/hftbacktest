@@ -49,6 +49,14 @@ pub enum BotError {
     Timeout,
     #[error("Interrupted")]
     Interrupted,
+    /// The requested operation is not supported by this [`Bot`] implementation.
+    ///
+    /// Returned by [`LiveBot::modify`]: live trading offers cancel + submit only. A strategy
+    /// that is green in backtesting — where `modify` is implemented — degrades to this
+    /// recoverable error instead of aborting the live process, and the caller's
+    /// `error_handler` decides fatal-vs-recoverable (`AGENTS.md` §1.1, §4.3).
+    #[error("Unsupported")]
+    Unsupported,
     #[error("Custom: {0}")]
     Custom(String),
 }
@@ -683,16 +691,24 @@ where
         )
     }
 
+    /// `modify` is not supported in live trading — only cancel + submit are — so this always
+    /// returns [`BotError::Unsupported`].
+    ///
+    /// Backtesting *does* implement `modify`, so a strategy green in replay can call it here.
+    /// This used to be a `todo!()`, which under `panic = "abort"` (release profile) would kill
+    /// the live process mid-session. Returning a recoverable error instead lets the caller's
+    /// `error_handler` rule on it (fail-closed by policy, `AGENTS.md` §1.1, §4.3). Parameters
+    /// are unused by design.
     #[inline]
     fn modify(
         &mut self,
-        asset_no: usize,
-        order_id: OrderId,
-        price: f64,
-        qty: f64,
-        wait: bool,
+        _asset_no: usize,
+        _order_id: OrderId,
+        _price: f64,
+        _qty: f64,
+        _wait: bool,
     ) -> Result<ElapseResult, Self::Error> {
-        todo!();
+        Err(BotError::Unsupported)
     }
 
     #[inline]
@@ -1276,6 +1292,24 @@ mod tests {
             bot.channel.waits,
             vec![Duration::from_millis(30)],
             "with no heartbeat there is nothing to wake up for"
+        );
+    }
+
+    /// `modify` is not supported in live trading (only cancel + submit are), but a strategy
+    /// green in backtest — where `modify` *is* implemented — can call it. It must degrade to a
+    /// recoverable `Err`, never panic: this was a `todo!()`, and `panic = "abort"` in the
+    /// release profile turns that panic into a process kill mid-session. AGENTS.md §4.3.
+    #[test]
+    fn live_modify_returns_unsupported_error_instead_of_panicking() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+
+        // Reaching this assertion at all proves it did not panic; the harness would report a
+        // panic as a failure otherwise.
+        let result = bot.modify(0, 1, 100.0, 1.0, false);
+
+        assert!(
+            matches!(result, Err(BotError::Unsupported)),
+            "live modify must return Err(Unsupported), got {result:?}"
         );
     }
 }
