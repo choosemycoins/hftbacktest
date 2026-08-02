@@ -96,7 +96,13 @@ where
         Handler: FnMut(&Order),
     {
         let mut wait_resp_order_received = false;
-        while let Some(order) = self.order_l2e.receive(timestamp) {
+        // Only a **response** can be received here — `LocalToExch::receive` yields an
+        // `ExchResponse`, and an `ExchRequest` cannot be turned into one except through
+        // `ExchResponse::rejected`, which consumes a request whose execution fields the
+        // request constructor already cleared. So "a request handed back cannot be mistaken
+        // for a fill" is a property of the types now, not of a function call (E4).
+        while let Some(response) = self.order_l2e.receive(timestamp) {
+            let order = response.into_order();
             // Updates the order latency only if it has a valid exchange timestamp. When the
             // order is rejected before it reaches the matching engine, it has no exchange
             // timestamp. This situation occurs in crypto exchanges.
