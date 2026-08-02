@@ -2,7 +2,12 @@ use hftbacktest::types::{OrdType, Side, Status, TimeInForce};
 use serde::{Deserialize, Serialize};
 
 use super::{from_str_to_side, from_str_to_status, from_str_to_tif, from_str_to_type};
-use crate::utils::{from_str_to_f64, to_lowercase};
+use crate::utils::{
+    CumulativeFilled,
+    from_str_to_cumulative_filled,
+    from_str_to_f64,
+    to_lowercase,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "e")]
@@ -299,9 +304,13 @@ pub struct ExecutionReport {
     #[serde(rename = "l")]
     #[serde(deserialize_with = "from_str_to_f64")]
     pub order_last_filled_quantity: f64,
+    /// The order's **running total** filled, not this execution's quantity — `l`
+    /// (`order_last_filled_quantity`) two fields above is that. Typed [`CumulativeFilled`] so
+    /// it cannot reach `Order::exec_qty`, which is a per-execution delta (`AGENTS.md` §4.6,
+    /// §4.11).
     #[serde(rename = "z")]
-    #[serde(deserialize_with = "from_str_to_f64")]
-    pub order_filled_accumulated_quantity: f64,
+    #[serde(deserialize_with = "from_str_to_cumulative_filled")]
+    pub order_filled_accumulated_quantity: CumulativeFilled,
     #[serde(rename = "L")]
     #[serde(deserialize_with = "from_str_to_f64")]
     pub last_filled_price: f64,

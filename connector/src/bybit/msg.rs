@@ -9,7 +9,13 @@ use serde::{
     de::{Error, Unexpected, Visitor},
 };
 
-use crate::utils::{from_str_to_f64, from_str_to_f64_opt, from_str_to_i64};
+use crate::utils::{
+    CumulativeFilled,
+    from_str_to_cumulative_filled,
+    from_str_to_f64,
+    from_str_to_f64_opt,
+    from_str_to_i64,
+};
 
 struct SideVisitor;
 
@@ -458,9 +464,14 @@ pub struct PrivateOrder {
     pub leaves_qty: f64,
     #[serde(rename = "leavesValue")]
     pub leaves_value: String,
+    /// The order's **running total** filled. Nothing reads it today; it is typed
+    /// [`CumulativeFilled`] so that the first thing that does cannot assign it into
+    /// `Order::exec_qty`, which is a per-execution delta (`AGENTS.md` §4.6, §4.11). This
+    /// backend's per-fill quantity arrives on the execution stream instead
+    /// (`Execution::exec_qty`).
     #[serde(rename = "cumExecQty")]
-    #[serde(deserialize_with = "from_str_to_f64")]
-    pub cum_exec_qty: f64,
+    #[serde(deserialize_with = "from_str_to_cumulative_filled")]
+    pub cum_exec_qty: CumulativeFilled,
     #[serde(rename = "cumExecValue")]
     #[serde(deserialize_with = "from_str_to_f64")]
     pub cum_exec_value: f64,

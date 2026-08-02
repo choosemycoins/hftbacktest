@@ -72,7 +72,7 @@ impl OrderManager {
         if resp.transaction_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = Qty::new(resp.order.original_qty);
             order_ext.order.leaves_qty =
-                Qty::new(resp.order.original_qty - resp.order.order_filled_accumulated_qty);
+                Qty::new(resp.order.original_qty - resp.order.order_filled_accumulated_qty.get());
             order_ext.order.side = resp.order.side;
             order_ext.order.time_in_force = resp.order.time_in_force;
             order_ext.order.exch_timestamp = resp.transaction_time * 1_000_000;
@@ -472,5 +472,71 @@ mod tests {
         // The cumulative figure is still used where it genuinely is a cumulative question.
         assert_eq!(published.leaves_qty, Qty::new(0.0));
         assert_eq!(published.status, Status::Filled);
+    }
+
+    /// The **WebSocket** path reports the per-fill delta, and this is the path that actually
+    /// reports fills.
+    ///
+    /// E5 typed the REST running totals, but the stream frame carries both figures two fields
+    /// apart — `l` (this fill) beside `z` (everything so far) — and the second is the one a
+    /// slip reaches for. Measured before this pin existed: swapping the identifier at the
+    /// single call site compiled clean and left all 356 connector tests passing, so the exact
+    /// bug E5 was written to close was fully rewritable here with zero signal.
+    ///
+    /// `CumulativeFilled` on the `z` field is the primary guard — the swap no longer
+    /// type-checks. This is the second layer, for the escape the type cannot close: `.get()`
+    /// hands back a bare `f64` that `ExecDelta::of_execution` accepts (`AGENTS.md` §1.6 —
+    /// type where it reaches, test where it does not).
+    ///
+    /// The numbers are the ones that make the bug visible: only a **second** partial fill
+    /// distinguishes a delta from a total, which is why this survived as long as it did.
+    #[test]
+    fn a_stream_execution_reports_what_that_fill_executed_not_the_running_total() {
+        let mut manager = OrderManager::new("test");
+        tracked(&mut manager, "test_abc", 0.003);
+        manager.order_id_map.insert(
+            SymbolOrderId::new("btcusdt".to_string(), OrderId::new(1)),
+            "test_abc".to_string(),
+        );
+
+        // Second partial fill: this frame filled 0.002, and 0.005 has filled in total.
+        let update: OrderTradeUpdate = serde_json::from_str(
+            r#"{
+                "E": 1700000000000,
+                "T": 1700000000000,
+                "o": {
+                    "s": "BTCUSDT",
+                    "c": "test_abc",
+                    "S": "BUY",
+                    "o": "LIMIT",
+                    "f": "GTC",
+                    "q": "0.005",
+                    "p": "30000.0",
+                    "ap": "30000.0",
+                    "sp": "0.0",
+                    "x": "TRADE",
+                    "X": "FILLED",
+                    "i": 1,
+                    "l": "0.002",
+                    "z": "0.005",
+                    "L": "30000.0",
+                    "T": 1700000000000,
+                    "t": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let published = manager.update_from_ws(&update).unwrap().unwrap();
+
+        assert_eq!(
+            published.exec_qty,
+            ExecDelta::of_execution(0.002),
+            "the stream reports the quantity *this* execution filled; publishing the running \
+             total re-reports every fill before it and walks the bot's position away from the \
+             venue's"
+        );
+        // `z` is still read where the question genuinely is cumulative.
+        assert_eq!(published.leaves_qty, Qty::new(0.0));
     }
 }

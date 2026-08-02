@@ -58,7 +58,7 @@ impl OrderManager {
         if resp.event_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = Qty::new(resp.quantity);
             order_ext.order.leaves_qty =
-                Qty::new(resp.quantity - resp.order_filled_accumulated_quantity);
+                Qty::new(resp.quantity - resp.order_filled_accumulated_quantity.get());
             order_ext.order.side = resp.side;
             order_ext.order.time_in_force = resp.time_in_force;
             order_ext.order.exch_timestamp = resp.event_time * 1_000_000;
