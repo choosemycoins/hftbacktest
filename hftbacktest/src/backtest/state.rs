@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::types::OrderId;
 use crate::{
     backtest::{assettype::AssetType, models::FeeModel},
-    types::{Order, StateValues},
+    types::{Order, ResolvedSide, StateValues},
 };
 
 /// Quantities are sums and differences of the same lot-scaled numbers, so the delta identity is
@@ -104,8 +104,14 @@ where
     /// a delta from a cumulative quantity takes the order's history and its amendments — neither of
     /// which this state sees. The identity over a whole sequence,
     /// `position == Σ(exec_qty × side)`, is a property test: `fill_accounting_property`.
+    ///
+    /// The direction comes in as a [`ResolvedSide`] rather than being read off `order.side`,
+    /// which is a [`Side`](`crate::types::Side`) and may be one of the two values that have no
+    /// sign. Those are ruled out where the order is submitted, and this signature is what makes
+    /// that the only place they can be ruled out: an unresolved side cannot reach this
+    /// arithmetic, so the panic that used to sit inside it is gone (invariant E2).
     #[inline]
-    pub fn apply_fill(&mut self, order: &Order) {
+    pub fn apply_fill(&mut self, order: &Order, side: ResolvedSide) {
         debug_assert!(
             order.exec_qty > 0.0
                 && order.leaves_qty >= 0.0
@@ -114,8 +120,8 @@ where
         );
 
         let amount = self.asset_type.amount(order.exec_price(), order.exec_qty);
-        self.state_values.position += order.exec_qty * AsRef::<f64>::as_ref(&order.side);
-        self.state_values.balance -= amount * AsRef::<f64>::as_ref(&order.side);
+        self.state_values.position += order.exec_qty * side.sign();
+        self.state_values.balance -= amount * side.sign();
         self.state_values.fee += self.fee_model.amount(order, amount);
         self.state_values.num_trades += 1;
         self.state_values.trading_volume += order.exec_qty;
@@ -135,5 +141,56 @@ where
     #[inline]
     pub fn values(&self) -> &StateValues {
         &self.state_values
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{CommonFees, TradingValueFeeModel},
+            state::State,
+        },
+        types::{OrdType, Order, ResolvedSide, Side, Status, TimeInForce},
+    };
+
+    fn executed(side: Side, qty: f64) -> Order {
+        let mut order = Order::new(1, 10_000, 0.01, qty, side, OrdType::Limit, TimeInForce::GTC);
+        order.exec_qty = qty;
+        order.exec_price_tick = 10_000;
+        order.leaves_qty = 0.0;
+        order.status = Status::Filled;
+        order
+    }
+
+    /// **Position math takes a direction, and it is the one it was handed** (invariant E2).
+    ///
+    /// The signature is the guarantee: [`State::apply_fill`] cannot be called with a
+    /// [`Side`](`crate::types::Side`) at all, so `Side::None` — which used to reach this
+    /// arithmetic and abort the process from inside it — has nowhere to enter. Judging the side
+    /// is the submit boundary's job, once, and this only spends the verdict.
+    ///
+    /// The order here carries a side that disagrees with the one supplied, which is not a case
+    /// the engine produces; it is here because it is the only way to show the arithmetic reads
+    /// the argument. A version that quietly went back to `order.side` would pass every other
+    /// test in this crate.
+    #[test]
+    fn a_fill_moves_the_position_by_the_direction_it_is_given() {
+        let fees = || TradingValueFeeModel::new(CommonFees::new(0.0, 0.0));
+
+        let mut state = State::new(LinearAsset::new(1.0), fees());
+        state.apply_fill(&executed(Side::Buy, 3.0), ResolvedSide::Buy);
+        assert_eq!(state.values().position, 3.0);
+        assert_eq!(state.values().balance, -300.0, "a buy pays");
+
+        let mut state = State::new(LinearAsset::new(1.0), fees());
+        state.apply_fill(&executed(Side::Buy, 3.0), ResolvedSide::Sell);
+        assert_eq!(
+            state.values().position,
+            -3.0,
+            "the direction supplied, not the one the order carries"
+        );
+        assert_eq!(state.values().balance, 300.0, "a sell is paid");
     }
 }

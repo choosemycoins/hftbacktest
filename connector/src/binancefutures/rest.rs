@@ -175,7 +175,13 @@ impl BinanceFuturesClient {
         body.push_str("&symbol=");
         body.push_str(symbol);
         body.push_str("&side=");
-        body.push_str(side.as_ref());
+        // The venue boundary: a side that is not a direction is refused here rather than
+        // written into a payload — where it used to panic the process (invariant E2).
+        body.push_str(
+            side.try_resolve()
+                .ok_or(BinanceFuturesError::InvalidRequest)?
+                .as_str(),
+        );
         body.push_str("&price=");
         body.push_str(&format!("{price:.price_prec$}"));
         body.push_str("&quantity=");
@@ -213,7 +219,14 @@ impl BinanceFuturesClient {
             body.push_str("\",\"symbol\":\"");
             body.push_str(&order.1);
             body.push_str("\",\"side\":\"");
-            body.push_str(order.2.as_ref());
+            // As above: no order in the batch reaches the wire with a sideless side.
+            body.push_str(
+                order
+                    .2
+                    .try_resolve()
+                    .ok_or(BinanceFuturesError::InvalidRequest)?
+                    .as_str(),
+            );
             body.push_str("\",\"price\":\"");
             body.push_str(&format!("{:.prec$}", order.3, prec = order.4));
             body.push_str("\",\"quantity\":\"");
@@ -254,7 +267,13 @@ impl BinanceFuturesClient {
         body.push_str("&origClientOrderId=");
         body.push_str(client_order_id);
         body.push_str("&side=");
-        body.push_str(side.as_ref());
+        // The venue boundary: a side that is not a direction is refused here rather than
+        // written into a payload — where it used to panic the process (invariant E2).
+        body.push_str(
+            side.try_resolve()
+                .ok_or(BinanceFuturesError::InvalidRequest)?
+                .as_str(),
+        );
         body.push_str("&price=");
         body.push_str(&format!("{price:.price_prec$}"));
         body.push_str("&quantity=");
@@ -345,5 +364,71 @@ impl BinanceFuturesClient {
             .get_noauth("/fapi/v1/depth", format!("symbol={symbol}&limit=1000"))
             .await?;
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hftbacktest::types::{OrdType, Side, TimeInForce};
+
+    use crate::binancefutures::{BinanceFuturesError, rest::BinanceFuturesClient};
+
+    /// The client points at a port nothing listens on: if a request were ever built, the test
+    /// would fail with a transport error instead of the refusal it asserts.
+    fn offline_client() -> BinanceFuturesClient {
+        BinanceFuturesClient::new("http://127.0.0.1:1", "key", "secret")
+    }
+
+    /// **A side that is not a direction never reaches the venue payload** (invariant E2).
+    ///
+    /// `Side` carries `None` and `Unsupported`, and the order body used to be built by
+    /// `side.as_ref()`, which panicked on both — in a connector where a panic is process death
+    /// (`AGENTS.md` §4.7). It is now refused where the payload is built, which is what the
+    /// caller already treats as a rejected submit: the bot is told, the process lives.
+    #[tokio::test]
+    async fn an_order_whose_side_has_no_sign_is_refused_before_it_reaches_the_venue() {
+        for side in [Side::None, Side::Unsupported] {
+            let refused = offline_client()
+                .submit_order(
+                    "cid",
+                    "BTCUSDT",
+                    side,
+                    30_000.0,
+                    1,
+                    0.001,
+                    OrdType::Limit,
+                    TimeInForce::GTX,
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(BinanceFuturesError::InvalidRequest)),
+                "submit {side:?}: {refused:?}"
+            );
+
+            let refused = offline_client()
+                .modify_order("cid", "BTCUSDT", side, 30_000.0, 1, 0.001)
+                .await;
+            assert!(
+                matches!(refused, Err(BinanceFuturesError::InvalidRequest)),
+                "modify {side:?}: {refused:?}"
+            );
+
+            let refused = offline_client()
+                .submit_orders(vec![(
+                    "cid".to_string(),
+                    "BTCUSDT".to_string(),
+                    side,
+                    30_000.0,
+                    1,
+                    0.001,
+                    OrdType::Limit,
+                    TimeInForce::GTX,
+                )])
+                .await;
+            assert!(
+                matches!(refused, Err(BinanceFuturesError::InvalidRequest)),
+                "batch {side:?}: {refused:?}"
+            );
+        }
     }
 }

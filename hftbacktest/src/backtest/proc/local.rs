@@ -126,7 +126,15 @@ where
                     "`exec_qty` must be the quantity executed by this execution alone, not the \
                      order's cumulative executed quantity: {order:?}"
                 );
-                self.state.apply_fill(&order);
+                // The side was resolved when the order was submitted, so a response that
+                // reports an execution carries one — but the local is fed by a channel, not by
+                // an invariant it owns, so it says so with an error rather than an assumption
+                // (E2). Nothing is applied to the state without a direction.
+                let side = order
+                    .side
+                    .try_resolve()
+                    .ok_or(BacktestError::InvalidOrderRequest)?;
+                self.state.apply_fill(&order, side);
             }
             // The ledger tracks live orders only, so it does not grow with the backtest.
             #[cfg(debug_assertions)]
@@ -186,6 +194,12 @@ where
     ) -> Result<(), BacktestError> {
         if self.orders.contains_key(&order_id) {
             return Err(BacktestError::OrderIdExist);
+        }
+        // The submit boundary: an order whose side is not a direction is refused here, before
+        // anything rests, so it cannot reach the position math that needs one. Past this point a
+        // resting order's side resolves, by construction (invariant E2).
+        if side.try_resolve().is_none() {
+            return Err(BacktestError::InvalidOrderRequest);
         }
 
         let price_tick = (price / self.depth.tick_size()).round() as i64;

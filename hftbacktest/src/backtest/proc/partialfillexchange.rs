@@ -257,7 +257,14 @@ where
         }
         order.exch_timestamp = timestamp;
 
-        self.state.apply_fill(order);
+        // Only an order that passed the submit boundary can be resting here, so this is the
+        // boundary check restated where the money moves: the state takes a direction, never a
+        // `Side` that might not be one (E2).
+        let side = order
+            .side
+            .try_resolve()
+            .ok_or(BacktestError::InvalidOrderRequest)?;
+        self.state.apply_fill(order, side);
 
         if MAKE_RESPONSE {
             self.order_e2l.respond(order.clone());

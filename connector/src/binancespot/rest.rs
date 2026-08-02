@@ -207,7 +207,13 @@ impl BinanceSpotClient {
         body.push_str("&symbol=");
         body.push_str(symbol);
         body.push_str("&side=");
-        body.push_str(side.as_ref());
+        // The venue boundary: a side that is not a direction is refused here rather than
+        // written into a payload — where it used to panic the process (invariant E2).
+        body.push_str(
+            side.try_resolve()
+                .ok_or(BinanceSpotError::InvalidRequest)?
+                .as_str(),
+        );
         body.push_str("&price=");
         body.push_str(&format!("{price:.price_prec$}"));
         body.push_str("&quantity=");
@@ -224,6 +230,39 @@ impl BinanceSpotClient {
                 code: resp.code,
                 msg: resp.msg,
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hftbacktest::types::{OrdType, Side, TimeInForce};
+
+    use crate::binancespot::{BinanceSpotError, rest::BinanceSpotClient};
+
+    /// **A side that is not a direction never reaches the venue payload** (invariant E2) — the
+    /// same refusal as on the futures client, for the same reason: building the body used to
+    /// panic, and a panic in the connector is process death (`AGENTS.md` §4.7). The client
+    /// points at a port nothing listens on, so a request that got built would fail loudly.
+    #[tokio::test]
+    async fn an_order_whose_side_has_no_sign_is_refused_before_it_reaches_the_venue() {
+        for side in [Side::None, Side::Unsupported] {
+            let refused = BinanceSpotClient::new("http://127.0.0.1:1", "key", "secret")
+                .submit_order(
+                    "cid",
+                    "BTCUSDT",
+                    side,
+                    30_000.0,
+                    1,
+                    0.001,
+                    OrdType::Limit,
+                    TimeInForce::GTX,
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(BinanceSpotError::InvalidRequest)),
+                "submit {side:?}: {refused:?}"
+            );
         }
     }
 }

@@ -393,24 +393,63 @@ pub enum Side {
     Unsupported = 127,
 }
 
-impl AsRef<f64> for Side {
-    fn as_ref(&self) -> &f64 {
+impl Side {
+    /// The side as a direction, or `None` when it is not one.
+    ///
+    /// The only way to obtain a [`ResolvedSide`], and therefore the one place where the two
+    /// non-directions — [`Side::None`] and [`Side::Unsupported`] — have to be dealt with. Call
+    /// it at the boundary where an order is submitted or a venue message is turned into one:
+    /// refusing there costs a recoverable error, whereas the same value reaching position math
+    /// used to cost the process (invariant E2).
+    pub fn try_resolve(&self) -> Option<ResolvedSide> {
         match self {
-            Side::Buy => &1.0f64,
-            Side::Sell => &-1.0f64,
-            Side::None => panic!("Side::None"),
-            Side::Unsupported => panic!("Side::Unsupported"),
+            Side::Buy => Some(ResolvedSide::Buy),
+            Side::Sell => Some(ResolvedSide::Sell),
+            // Neither is a direction: `None` is "no side given", `Unsupported` is "the venue
+            // said something this connector does not recognise". Guessing one would guess the
+            // sign of a position (`AGENTS.md` §1.1).
+            Side::None | Side::Unsupported => None,
         }
     }
 }
 
-impl AsRef<str> for Side {
-    fn as_ref(&self) -> &'static str {
+/// A side that is a direction: exactly the two [`Side`] values that have a sign.
+///
+/// **Not a wire type on purpose.** [`Side`] stays exactly as it is on the wire, carrying the two
+/// values a venue can force on us; this is what the money path takes once they have been ruled
+/// out. Everything it offers is total — [`ResolvedSide::sign`] cannot fail — so position math
+/// that takes one cannot be reached with a side that has no sign, and the panic that used to
+/// guard it is not merely unlikely but unwritable (correctness-by-construction §1.6, invariant
+/// E2).
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum ResolvedSide {
+    Buy,
+    Sell,
+}
+
+impl ResolvedSide {
+    /// `+1` for a buy, `-1` for a sell: the factor position and balance move by.
+    pub const fn sign(&self) -> f64 {
         match self {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
-            Side::None => panic!("Side::None"),
-            Side::Unsupported => panic!("Side::Unsupported"),
+            ResolvedSide::Buy => 1.0,
+            ResolvedSide::Sell => -1.0,
+        }
+    }
+
+    /// The venue-facing spelling, for exchanges whose order payload carries the side as text.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ResolvedSide::Buy => "BUY",
+            ResolvedSide::Sell => "SELL",
+        }
+    }
+}
+
+impl From<ResolvedSide> for Side {
+    fn from(side: ResolvedSide) -> Self {
+        match side {
+            ResolvedSide::Buy => Side::Buy,
+            ResolvedSide::Sell => Side::Sell,
         }
     }
 }
@@ -1186,6 +1225,43 @@ mod tests {
         assert!(!event.is(LOCAL_BID_DEPTH_SNAPSHOT_EVENT));
         assert!(event.is(LOCAL_EVENT));
         assert!(event.is(BUY_EVENT));
+    }
+
+    /// **A side resolves to a direction or to nothing** (invariant E2).
+    ///
+    /// [`Side::try_resolve`] is total and is the only producer of a [`ResolvedSide`], so it is
+    /// the single place the two sideless values are dealt with. The signs are the pin that
+    /// matters downstream: they are what position and balance move by, and a swapped pair would
+    /// invert every position in a backtest while every other test still passed.
+    ///
+    /// `Side::Sell`'s `#[repr(i8)]` is `-1` and `Side::None`'s is `0`, which makes "just cast
+    /// the repr" look like a working shortcut — it is exactly the shortcut that puts a zero
+    /// sign, and a position that never moves, into the money path.
+    #[test]
+    fn a_side_resolves_to_a_direction_or_to_nothing() {
+        use crate::types::{ResolvedSide, Side};
+
+        assert_eq!(Side::Buy.try_resolve(), Some(ResolvedSide::Buy));
+        assert_eq!(Side::Sell.try_resolve(), Some(ResolvedSide::Sell));
+        assert_eq!(
+            Side::None.try_resolve(),
+            None,
+            "no side given is not a direction"
+        );
+        assert_eq!(
+            Side::Unsupported.try_resolve(),
+            None,
+            "a side the venue named and we do not know is not a direction"
+        );
+
+        assert_eq!(ResolvedSide::Buy.sign(), 1.0);
+        assert_eq!(ResolvedSide::Sell.sign(), -1.0);
+        assert_eq!(ResolvedSide::Buy.as_str(), "BUY");
+        assert_eq!(ResolvedSide::Sell.as_str(), "SELL");
+
+        // Round trip: resolving loses nothing that was there.
+        assert_eq!(Side::from(ResolvedSide::Buy), Side::Buy);
+        assert_eq!(Side::from(ResolvedSide::Sell), Side::Sell);
     }
 
     /// **Only a reported [`Liquidity::Maker`] claims maker liquidity** (invariant C2).

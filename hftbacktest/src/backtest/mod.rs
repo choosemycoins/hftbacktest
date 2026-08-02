@@ -1163,6 +1163,7 @@ mod test {
     use crate::{
         backtest::{
             Backtest,
+            BacktestError,
             DataSource,
             ExchangeKind,
             ExchangeKind::NoPartialFillExchange,
@@ -1195,6 +1196,8 @@ mod test {
             LOCAL_EVENT,
             OrdType,
             OrderId,
+            OrderRequest,
+            Side,
             Status,
             TimeInForce,
         },
@@ -1483,6 +1486,43 @@ mod test {
         assert_eq!(order.leaves_qty, 5.0);
         assert_sold(&bt, 3.0, 1);
 
+        Ok(())
+    }
+
+    /// **An order whose side is not a side is refused where it is submitted** (invariant E2).
+    ///
+    /// [`Side`] carries `None` and `Unsupported` — a connector's word for "the venue said
+    /// something I do not recognise" — and neither has a sign. Position math needs one, so an
+    /// order carrying one used to rest, execute, and take the whole process down inside
+    /// `State::apply_fill`. The check now lives at the submit boundary, where the caller gets a
+    /// recoverable error and nothing has been placed; past it, the sign exists by construction
+    /// ([`ResolvedSide`]) and the panic sites are gone.
+    #[test]
+    fn an_order_whose_side_has_no_sign_is_refused_at_the_boundary() -> Result<(), Box<dyn Error>> {
+        for side in [Side::None, Side::Unsupported] {
+            let mut bt = backtest(ExchangeKind::NoPartialFillExchange, &feed(&[]))?;
+            bt.elapse(0)?;
+            let refused = bt.submit_order(
+                0,
+                OrderRequest {
+                    order_id: ORDER_ID,
+                    price: ASK_PRICE,
+                    qty: ORDER_QTY,
+                    side,
+                    time_in_force: TimeInForce::GTX,
+                    order_type: OrdType::Limit,
+                },
+                false,
+            );
+            assert!(
+                matches!(refused, Err(BacktestError::InvalidOrderRequest)),
+                "{side:?} must be refused, got {refused:?}"
+            );
+            assert!(
+                bt.orders(0).is_empty(),
+                "a refused order rests nowhere: {side:?}"
+            );
+        }
         Ok(())
     }
 

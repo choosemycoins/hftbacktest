@@ -45,8 +45,12 @@ const EPS: f64 = 1e-9;
 type TestLocal =
     Local<LinearAsset, ConstantLatency, HashMapMarketDepth, TradingValueFeeModel<CommonFees>>;
 
+/// The script only ever rests directions, so a side that does not resolve is the harness being
+/// wrong about itself, not a case to model.
 fn sign(side: Side) -> f64 {
-    *AsRef::<f64>::as_ref(&side)
+    side.try_resolve()
+        .expect("the script rests only buys and sells")
+        .sign()
 }
 
 fn approx_eq(a: f64, b: f64) -> bool {
