@@ -32,6 +32,11 @@
 //! discarded exactly those records, silently, on the ordinary `systemctl stop`
 //! path.
 //!
+//! Which is also the one exception to the policy above, and the only one:
+//! during that wind-down a refusal is the mechanism working rather than a
+//! recording breaking, so it is counted instead of raised. See [`Stopping`] for
+//! how narrow that window is and why it cannot hide a fault.
+//!
 //! Awaiting the send instead — real backpressure, propagated through the socket
 //! to the venue — was rejected. A market-data recording that has fallen behind
 //! is not repaired by slowing down, and a growing backlog is precisely the
@@ -57,11 +62,16 @@
 //! `WatchdogSec`, or a supervisor timeout. It cannot be solved from inside the
 //! loop that is stuck.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
-use tracing::error;
+use tracing::{debug, error};
 
 /// Capacity of the socket reader → parser hand-off, **in messages**.
 ///
@@ -418,9 +428,68 @@ pub struct Fatal {
     pub reason: String,
 }
 
+/// Whether the collector has begun stopping, shared by every sender.
+///
+/// A refused hand-off is fatal because it means data is being lost while the
+/// collector believes it is recording. During the wind-down neither half of
+/// that is true: `main` has already decided to stop, and closing the hands-off
+/// is how the shutdown keeps its promise — everything already accepted is
+/// written, and what arrives afterwards is **refused** so its producer is told
+/// rather than left to hand records into a channel about to be destroyed. The
+/// refusal is the mechanism working, not a fault.
+///
+/// Reporting it as one is not harmless. The producers `wind_down` cannot reach
+/// are the ordinary case, not the exception — `pump` spawns the socket reader
+/// as a task of its own, and the REST snapshot fetchers hold a sender each — so
+/// every `systemctl stop` with a backlog to drain logged `a data hand-off
+/// failed; the collector will stop` at `error!`. An operator who sees that on
+/// clean stops learns to ignore the one that means it.
+///
+/// **Scoped, which is what keeps it fail-closed.** The latch is set by
+/// `wind_down`, after the loop has already broken and chosen the exit code, and
+/// `main` never reads the fatal signal again — so the report suppressed here is
+/// one that could no longer change anything. Before it is set, a refusal is as
+/// fatal as it ever was. It is never cleared: nothing resumes recording.
+#[derive(Clone, Default)]
+pub struct Stopping(Arc<StoppingState>);
+
+#[derive(Default)]
+struct StoppingState {
+    begun: AtomicBool,
+    refused: AtomicUsize,
+}
+
+impl Stopping {
+    /// Called once, by `wind_down`, before anything is cancelled or closed.
+    pub fn begin(&self) {
+        self.0.begun.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts a refusal if the wind-down is what caused it, and says whether it
+    /// did.
+    fn refuse(&self) -> bool {
+        if self.0.begun.load(Ordering::SeqCst) {
+            self.0.refused.fetch_add(1, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// How many hand-offs were refused since [`Stopping::begin`].
+    ///
+    /// Records that never reached disk, so the shutdown reports the number
+    /// rather than leaving it to be inferred from the absence of a log line.
+    pub fn refusals(&self) -> usize {
+        self.0.refused.load(Ordering::SeqCst)
+    }
+}
+
 /// The producer's end of the fatal signal. Cloned into every sender.
 #[derive(Clone)]
-pub struct FatalTx(mpsc::Sender<Fatal>);
+pub struct FatalTx {
+    tx: mpsc::Sender<Fatal>,
+    stopping: Stopping,
+}
 
 impl FatalTx {
     /// Reports a condition that must stop the process.
@@ -434,13 +503,25 @@ impl FatalTx {
     /// first one is the one that describes the original fault. Blocking here to
     /// deliver a duplicate would deadlock the producer in exactly the situation
     /// the report exists for.
+    ///
+    /// Once the collector is [`Stopping`] the same refusal is expected rather
+    /// than broken, and is counted instead of raised — see that type for why
+    /// the distinction is not a way of hiding a fault.
     pub fn raise(&self, fatal: Fatal) {
+        if self.stopping.refuse() {
+            debug!(
+                event = fatal.event,
+                reason = fatal.reason,
+                "a hand-off was refused during the wind-down; that record is not on disk"
+            );
+            return;
+        }
         error!(
             event = fatal.event,
             reason = fatal.reason,
             "a data hand-off failed; the collector will stop"
         );
-        let _ = self.0.try_send(fatal);
+        let _ = self.tx.try_send(fatal);
     }
 }
 
@@ -454,6 +535,15 @@ pub struct FatalRx {
 }
 
 impl FatalRx {
+    /// The wind-down latch every sender on this signal shares.
+    ///
+    /// Handed to `wind_down`, which is the only thing that sets it. It lives
+    /// with the fatal channel because that is what it scopes: the two are the
+    /// same decision seen from either end.
+    pub fn stopping(&self) -> Stopping {
+        self._keepalive.stopping.clone()
+    }
+
     /// Resolves when a producer reports that a hand-off failed.
     pub async fn recv(&mut self) -> Fatal {
         match self.rx.recv().await {
@@ -470,7 +560,10 @@ pub fn fatal_channel() -> (FatalTx, FatalRx) {
     // One slot: `main` acts on the first report and exits, so a second would
     // never be read.
     let (tx, rx) = mpsc::channel(1);
-    let tx = FatalTx(tx);
+    let tx = FatalTx {
+        tx,
+        stopping: Stopping::default(),
+    };
     (tx.clone(), FatalRx { rx, _keepalive: tx })
 }
 
@@ -745,6 +838,57 @@ mod tests {
         // Nothing above depends on the queue being drained; keep the receiver
         // alive so the first hop reported `Full` rather than `Closed`.
         drop(rx.try_recv());
+    }
+
+    /// The wind-down is the one time a refused hand-off is not a broken
+    /// recording, and the latch has to be scoped tightly enough to say so
+    /// without saying anything else.
+    ///
+    /// Both halves are the pin. **Before** it is set a refusal is as fatal as
+    /// it ever was — a latch that suppressed unconditionally would silence the
+    /// `full => fatal` policy this whole module exists for, and it would do it
+    /// invisibly. **After** it is set the same refusal is expected: closing the
+    /// hands-off is how the shutdown keeps its promise, and the producers it
+    /// cannot reach — `pump`'s socket reader, the REST snapshot fetchers — are
+    /// the ordinary case rather than the exception, so reporting them turned
+    /// every clean `systemctl stop` with a backlog into `error!: a data hand-off
+    /// failed`.
+    ///
+    /// Counted rather than merely dropped, because those records are not on
+    /// disk and the number is the only place that is stated.
+    #[tokio::test]
+    async fn a_refusal_is_fatal_until_the_wind_down_makes_it_expected() {
+        let (fatal_tx, mut fatal_rx) = fatal_channel();
+        let stopping = fatal_rx.stopping();
+        let (tx, rx) = bounded::<Record>(WS_HOP, 1, fatal_tx);
+        drop(rx);
+
+        assert!(tx.send(record("nowhere to go")).is_err());
+        assert!(
+            timeout(Duration::from_secs(1), fatal_rx.recv())
+                .await
+                .is_ok(),
+            "a refusal before the shutdown is the fault this module exists to report"
+        );
+        assert_eq!(stopping.refusals(), 0);
+
+        stopping.begin();
+        assert!(
+            tx.send(record("after the stop")).is_err(),
+            "the hand-off must still refuse it: suppressing the report cannot become \
+             accepting the record"
+        );
+        assert!(
+            timeout(Duration::ZERO, fatal_rx.recv()).await.is_err(),
+            "a refusal caused by the wind-down was reported as a broken recording; every \
+             clean stop would log one and an operator would learn to ignore the one that \
+             matters"
+        );
+        assert_eq!(
+            stopping.refusals(),
+            1,
+            "the record is not on disk, and the count is where the shutdown says so"
+        );
     }
 
     /// Reporting must never be what blocks a producer. The first report is the

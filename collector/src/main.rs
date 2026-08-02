@@ -172,7 +172,29 @@ const PRODUCER_STOP_GRACE: Duration = Duration::from_secs(5);
 /// (`binancefutures*`, `bybit`) hold a `writer_tx` clone of their own, and
 /// `pump`'s producer task holds the socket hop. Those are why the drain closes
 /// the hand-off rather than trusting this to have emptied the field — see
-/// [`drain_to_completion`].
+/// [`drain_to_completion`] — and why `wind_down` declares the collector stopping
+/// before calling this: cancelling `pump` is itself what orphans its reader.
+///
+/// # Known limit: the socket hop is cut, not drained
+///
+/// The collection task **is** `pump`, which owns the socket hop's receiver, so
+/// cancelling it destroys whatever that hop still held — frames the reader had
+/// already been told were accepted and the parser had not reached yet. Measured
+/// on this wiring: of 500 frames accepted into the socket hop, 244 went with the
+/// cancellation. Silently — a dropped receiver refuses nothing, so no producer
+/// was told and nothing counted them.
+///
+/// It is the promise `drain_to_completion` keeps for the writer hop, broken one
+/// hop upstream, and it predates the wind-down: before it, `main` returned and
+/// destroyed both hops' backlogs together. Normally the loss is nil — the parser
+/// is a string copy and a route, so the hop is empty unless the tape is
+/// out-running it — but that is exactly the state a stop can land in, and the
+/// 2026-07-29 excursion filled this hop to 16 384 (`queue::burst`).
+///
+/// Closing it is a cascade, not a patch: the **reader** would have to be what
+/// stops, so that `pump` sees its sender dropped, drains what is left into the
+/// writer hop and returns on its own. That means a cancellation path through
+/// five backends' `keep_connection` loops — its own change, with its own tests.
 ///
 /// Returns the error the task returned, when it had already finished on its own.
 /// A cancelled task has none, and neither has one that outlived the grace: both
@@ -225,10 +247,16 @@ async fn stop_collecting(
 /// no handle on.
 ///
 /// `Receiver::close` closes it from this end: further hand-offs are **refused**
-/// — `Tx::send` returns `Closed`, raises the fatal signal and logs, so the
-/// producer knows — while everything already accepted stays readable. That
-/// turns the invariant into one with two outcomes and no third: a record is
-/// written, or its hand-off is refused. It is also what bounds the drain.
+/// — `Tx::send` returns `Closed`, so the producer is told rather than left
+/// believing the record was taken — while everything already accepted stays
+/// readable. That turns the invariant into one with two outcomes and no third:
+/// a record is written, or its hand-off is refused.
+///
+/// A refusal here is counted, not raised: `wind_down` has already set
+/// [`queue::Stopping`], and the refusals it causes are the mechanism working.
+/// Reported as faults they were an `error!` on every clean stop with a backlog
+/// to drain — see that type for why the distinction is scoped rather than a way
+/// of hiding one. It is also the close that bounds the drain.
 /// `recv()` yields `None` once the channel is closed and every record sent
 /// before it was closed has been handed over, so the loop terminates by
 /// construction rather than by a cap — at most this hop's capacity of records,
@@ -258,11 +286,16 @@ async fn drain_to_completion(
 
 /// The wind-down, in the one order that keeps the hand-off's promise.
 ///
-/// 1. **Stop the producers.** Nothing can be handed over by a task that is no
-///    longer running, and a producer left alive is one whose next record the
-///    close below would refuse for no reason — an `error!` on every clean
-///    `systemctl stop`, which is how an operator learns to ignore them.
-/// 2. **Close both hands-off and drain them to completion.** Anything the
+/// 1. **Say that the collector is stopping**, so that a hand-off refused from
+///    here on is read as the shutdown working rather than as a broken
+///    recording. First, because step 2 is itself a cause of refusals: the abort
+///    drops the socket hop's receiver while `pump`'s reader — a task of its own,
+///    which nothing here has a handle on — is still holding the sender.
+/// 2. **Stop the producers.** Nothing can be handed over by a task that is no
+///    longer running. What that reaches is one task per backend; what it does
+///    not reach is every child they spawned, which is why step 1 comes before it
+///    and not after step 3.
+/// 3. **Close both hands-off and drain them to completion.** Anything the
 ///    detached children still hand over is refused rather than accepted and
 ///    destroyed, and the drain ends because the channel is closed rather than
 ///    because it was briefly empty.
@@ -271,14 +304,25 @@ async fn drain_to_completion(
 /// of the two; the poller hop carries the collector's own periodic output.
 ///
 /// One function so the order is testable at all: everything around it in `main`
-/// dials a socket.
+/// dials a socket. The latch is set here rather than at the `break` for the same
+/// reason — a step of the wind-down belongs where the wind-down is tested, not
+/// in the loop that cannot be.
+///
+/// Where exactly it is set *within* this function is not pinned, and the window
+/// it covers is why: between the abort landing and the join returning there is
+/// an instant in which a child on another worker thread can be refused. A test
+/// cannot schedule inside it — the abort and the join resolve together — so the
+/// placement is an argument, and `stopping.begin()` being the first statement is
+/// what makes the argument hold.
 async fn wind_down(
+    stopping: &queue::Stopping,
     collection_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     grace: Duration,
     writer_rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
     poller_rx: &mut tokio::sync::mpsc::Receiver<queue::Record>,
     mut write: impl FnMut(queue::Record) -> Result<(), anyhow::Error>,
 ) -> (Option<anyhow::Error>, usize) {
+    stopping.begin();
     let task_error = stop_collecting(collection_task, grace).await;
     let recovered = drain_to_completion(writer_rx, &mut write).await
         + drain_to_completion(poller_rx, &mut write).await;
@@ -512,6 +556,9 @@ async fn main() -> Result<(), anyhow::Error> {
     // channel is how a producer that has no error path of its own (the
     // detached REST snapshot tasks) reaches this loop.
     let (fatal_tx, mut fatal_rx) = queue::fatal_channel();
+    // Handed to `wind_down`, which sets it. Until then every hand-off reports a
+    // refusal exactly as it always has.
+    let stopping = fatal_rx.stopping();
     let (writer_tx, mut writer_rx) =
         queue::bounded(WRITER_HOP, WRITER_QUEUE_CAPACITY, fatal_tx.clone());
 
@@ -991,6 +1038,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // `drain_to_completion` for why closing the channel is what makes the
     // promise `queue.rs` makes survive the shutdown.
     let (task_error, recovered) = wind_down(
+        &stopping,
         collection_task,
         PRODUCER_STOP_GRACE,
         &mut writer_rx,
@@ -1002,6 +1050,19 @@ async fn main() -> Result<(), anyhow::Error> {
         info!(
             records = recovered,
             "wrote the queued backlog before closing"
+        );
+    }
+
+    // What the close refused: records the venue sent after the decision to
+    // stop, which is the definition of stopping rather than a broken promise —
+    // none of them was ever reported to its producer as accepted. Stated as a
+    // number because nothing else states it: the reports themselves are
+    // suppressed for the duration, or every clean stop would log a fault.
+    let refused = stopping.refusals();
+    if refused > 0 {
+        info!(
+            records = refused,
+            "hand-offs refused after the wind-down began; those records are not on disk"
         );
     }
 
@@ -1052,14 +1113,148 @@ async fn main() -> Result<(), anyhow::Error> {
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    use tokio::sync::Notify;
+    use tokio_tungstenite::tungstenite::Utf8Bytes;
+
     use super::*;
-    use crate::queue::Record;
+    use crate::{
+        error::ConnectorError,
+        queue::{Frame, Record, Tx},
+    };
 
     fn record(payload: &str) -> Record {
         (Utc::now(), "BTC".to_string(), payload.to_string())
+    }
+
+    const FRAME: &str = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
+
+    /// The producers the wind-down cannot reach are the ordinary case, and a
+    /// clean stop must not report them as a broken recording.
+    ///
+    /// Wired the way `main` wires every backend: the collection task **is**
+    /// [`pump::pump`], which owns the socket hop's receiver and spawns the
+    /// socket reader as a task of its own, holding only a join handle. So
+    /// `stop_collecting`'s cancellation lands on `pump` — dropping that
+    /// receiver — while the reader is still there with the sender, and the
+    /// reader's next hand-off meets a channel with no receiver left. The REST
+    /// snapshot fetchers (`binancefutures*`, `bybit`) are the same shape one hop
+    /// further down: a detached task holding a `writer_tx` clone.
+    ///
+    /// Reported as a fault, that is `error!: a data hand-off failed; the
+    /// collector will stop` on the ordinary `systemctl stop` — measured on this
+    /// wiring at a few hundred queued records, which is any stop that has a
+    /// backlog to drain. The exit code stays 0 and no `_meta` record is written,
+    /// so it is the journal that is wrong and not the data; an operator who sees
+    /// it on every clean stop stops reading it.
+    ///
+    /// Both halves are the pin, because suppressing the report must not become
+    /// accepting the record. The reader's hand-off is still **refused** — it
+    /// gets an error back and knows the record did not land — and the refusal is
+    /// counted, so the shutdown can say how many there were.
+    #[tokio::test]
+    async fn a_hand_off_the_wind_down_cannot_reach_is_refused_without_reporting_a_fault() {
+        let (writer_tx, mut writer_rx, mut fatal) = queue::test_bounded::<Record>(WRITER_HOP, 128);
+        let (_poller_tx, mut poller_rx, _poller_fatal) =
+            queue::test_bounded::<Record>(POLLER_HOP, 8);
+        // The socket hop inherits this one — `pump` builds it from
+        // `writer_tx.fatal()` — so one latch covers both hops, exactly as the
+        // single fatal channel in `main` does.
+        let stopping = fatal.stopping();
+
+        let released = Arc::new(Notify::new());
+        let reader_done = Arc::new(Notify::new());
+        let refused = Arc::new(AtomicBool::new(false));
+        let forwarded = Arc::new(AtomicUsize::new(0));
+
+        let collection = tokio::spawn(pump::pump(
+            writer_tx,
+            {
+                let released = released.clone();
+                let reader_done = reader_done.clone();
+                let refused = refused.clone();
+                // The socket reader. It hands one frame over, then waits —
+                // standing in for a read that has not returned when the signal
+                // arrives — and hands over the frame that was in flight after
+                // the wind-down has run. Sequenced rather than raced, because
+                // the outcome must not depend on which instant it wakes in.
+                move |ws_tx: Tx<Frame>| async move {
+                    ws_tx.send((Utc::now(), Utf8Bytes::from(FRAME))).unwrap();
+                    released.notified().await;
+                    refused.store(
+                        ws_tx.send((Utc::now(), Utf8Bytes::from(FRAME))).is_err(),
+                        Ordering::SeqCst,
+                    );
+                    reader_done.notify_one();
+                }
+            },
+            {
+                let forwarded = forwarded.clone();
+                move |writer_tx: &Tx<Record>, recv_time, data: Utf8Bytes| {
+                    writer_tx.send((recv_time, "BTC".to_string(), data.to_string()))?;
+                    forwarded.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), ConnectorError>(())
+                }
+            },
+        ));
+
+        // So this is a wind-down of a pipeline that is running, not of one that
+        // never started.
+        while forwarded.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut written = 0;
+        let (_task_error, recovered) = wind_down(
+            &stopping,
+            collection,
+            PRODUCER_STOP_GRACE,
+            &mut writer_rx,
+            &mut poller_rx,
+            |_| {
+                written += 1;
+                Ok(())
+            },
+        )
+        .await;
+
+        released.notify_one();
+        reader_done.notified().await;
+
+        assert_eq!(
+            recovered, 1,
+            "the frame the reader handed over before the stop is owed to the recording"
+        );
+        assert!(
+            refused.load(Ordering::SeqCst),
+            "the reader outlived the cancellation — that is the point — and its hand-off \
+             was accepted into a channel with no receiver left, which is the silent loss \
+             the close exists to prevent"
+        );
+        assert_eq!(
+            stopping.refusals(),
+            1,
+            "the refusal must be counted; it is a record that never reached disk and \
+             nothing else reports it"
+        );
+        // The direct observable, and the one that survives into production: on
+        // the signal path `main` discards the task's result, so a refusal shows
+        // up only as `Tx::send` raising the fatal signal and logging `a data
+        // hand-off failed`. A clean stop must raise none.
+        //
+        // A deadline of zero is a single poll of an empty channel: it cannot
+        // wait, so it cannot flake, and the keepalive in `FatalRx` means the
+        // alternative — `recv()` on a channel with no sender left — would hang
+        // rather than answer.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, fatal.recv())
+                .await
+                .is_err(),
+            "a clean shutdown reported a broken hand-off; every `systemctl stop` with a \
+             backlog would log one and an operator would learn to ignore the one that matters"
+        );
     }
 
     /// Everything still in the queue when the loop stops was already reported
@@ -1192,19 +1387,25 @@ mod tests {
     /// [`wind_down`] is what it is.
     ///
     /// Closing the hand-off keeps an accepted record from being destroyed, but
-    /// on its own it would turn every clean `systemctl stop` into a refusal
-    /// storm: the tape is still arriving when the loop breaks, so the next
-    /// frame would meet a closed channel, log `a data hand-off failed` and
-    /// raise the fatal signal — on the ordinary shutdown path, where nothing is
-    /// wrong. Stopping the producers first is what makes the refusal the rare
-    /// case it is meant to be, and it is why a record handed over while the
-    /// collector is winding down still reaches the disk rather than being
-    /// refused at the door.
+    /// closing it *under a live producer* would refuse the tape still arriving.
+    /// Stopping the producers first is what makes the record handed over while
+    /// the collector is winding down reach the disk rather than be refused at
+    /// the door — the two outcomes are not equivalent, and this is the one the
+    /// order exists to choose.
+    ///
+    /// **What this pin does not see**, and the reason
+    /// `a_hand_off_the_wind_down_cannot_reach_is_refused_without_reporting_a_
+    /// fault` exists: the producer here is the collection task itself, so the
+    /// cancellation reaches it. Every real one spawns children the cancellation
+    /// cannot reach, and for a long time this pin was cited as proof that a
+    /// clean stop raises no fatal signal. It proves that only of a producer with
+    /// no children at all.
     #[tokio::test]
     async fn a_producer_still_delivering_when_the_loop_stops_is_written_not_refused() {
         let (tx, mut writer_rx, mut fatal) = queue::test_bounded::<Record>(WRITER_HOP, 128);
         let (_poller_tx, mut poller_rx, _poller_fatal) =
             queue::test_bounded::<Record>(POLLER_HOP, 8);
+        let stopping = fatal.stopping();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counted = accepted.clone();
 
@@ -1225,6 +1426,7 @@ mod tests {
 
         let mut written = 0;
         let (task_error, recovered) = wind_down(
+            &stopping,
             collection,
             PRODUCER_STOP_GRACE,
             &mut writer_rx,
@@ -1248,11 +1450,16 @@ mod tests {
             "a cancelled producer has no error of its own, and reporting a refusal here \
              would make every clean stop look like a broken recording: {task_error:?}"
         );
-        // The direct observable, and the one that survives into production: on
-        // the signal path `main` discards the task's result, so a refusal shows
-        // up only as `Tx::send` raising the fatal signal and logging `a data
-        // hand-off failed`. A clean stop must raise none.
-        //
+        // Nothing was refused at all, which is the stronger statement and the
+        // one the order buys: a producer the cancellation reaches stops handing
+        // records over before the close can turn any of them away. The latch
+        // would have suppressed the report either way, so the count is what
+        // distinguishes "no refusal" from "a refusal nobody heard".
+        assert_eq!(
+            stopping.refusals(),
+            0,
+            "a record was refused although the producer had been stopped first"
+        );
         // A deadline of zero is a single poll of an empty channel: it cannot
         // wait, so it cannot flake, and the keepalive in `FatalRx` means the
         // alternative — `recv()` on a channel with no sender left — would hang
@@ -1261,8 +1468,7 @@ mod tests {
             tokio::time::timeout(Duration::ZERO, fatal.recv())
                 .await
                 .is_err(),
-            "a clean shutdown raised the fatal signal; every `systemctl stop` would log a \
-             broken hand-off and an operator would learn to ignore the one that matters"
+            "a clean shutdown raised the fatal signal"
         );
     }
 
@@ -1271,9 +1477,10 @@ mod tests {
     /// returned.
     #[tokio::test]
     async fn the_collection_tasks_own_error_survives_the_wind_down() {
-        let (tx, mut writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
+        let (tx, mut writer_rx, fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
         let (_poller_tx, mut poller_rx, _poller_fatal) =
             queue::test_bounded::<Record>(POLLER_HOP, 8);
+        let stopping = fatal.stopping();
 
         let collection = tokio::spawn(async move {
             tx.send(record("the last frame before it broke")).unwrap();
@@ -1289,6 +1496,7 @@ mod tests {
 
         let mut written = 0;
         let (task_error, _) = wind_down(
+            &stopping,
             collection,
             PRODUCER_STOP_GRACE,
             &mut writer_rx,
@@ -1324,9 +1532,10 @@ mod tests {
     /// Virtual time, so it costs nothing and cannot flake on a busy machine.
     #[tokio::test(start_paused = true)]
     async fn a_producer_that_has_not_stopped_yet_does_not_hold_the_shutdown_open() {
-        let (tx, mut writer_rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
+        let (tx, mut writer_rx, fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
         let (_poller_tx, mut poller_rx, _poller_fatal) =
             queue::test_bounded::<Record>(POLLER_HOP, 8);
+        let stopping = fatal.stopping();
 
         tx.send(record("accepted before it stalled")).unwrap();
         let stalled = tokio::spawn(async move {
@@ -1337,6 +1546,7 @@ mod tests {
 
         let mut written = 0;
         let (task_error, recovered) = wind_down(
+            &stopping,
             stalled,
             Duration::ZERO,
             &mut writer_rx,
