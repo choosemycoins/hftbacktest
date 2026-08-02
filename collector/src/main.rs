@@ -1066,17 +1066,36 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
 
+    conclude(writer, fatal, task_error)
+}
+
+/// Closes the day's files and decides what the process exits with.
+///
+/// The last lines of `main`, and every one of them load-bearing: which of two
+/// errors an operator is shown, whether a recording that could not be closed
+/// reaches the exit code at all, and that the files are closed before the line
+/// claiming the collector stopped is written. `main` itself cannot be tested —
+/// it parses arguments and dials sockets — so the wiring lived where deleting
+/// it left the suite green. Measured: removing the `finish` propagation, which
+/// is the entire point of closing the files explicitly, passed 180 tests.
+///
+/// The writer arrives by value so that closing it is not something a caller can
+/// forget to do afterwards.
+fn conclude(
+    mut writer: Writer,
+    fatal: Option<anyhow::Error>,
+    task_error: Option<anyhow::Error>,
+) -> Result<(), anyhow::Error> {
     // Prefer the collection task's own error. It knows the real cause — an
     // unknown symbol, an unrecoverable stream failure — where the main loop
     // only ever sees the channel close. Without this the process exits with a
     // message that describes the symptom and not the fault. Only on a path that
     // was already failing: a task cancelled by the wind-down has no error of its
     // own, and a signal that raced a dying task is still a signal.
-    if fatal.is_some()
-        && let Some(error) = task_error
-    {
-        fatal = Some(error);
-    }
+    let mut fatal = match (fatal, task_error) {
+        (Some(symptom), task_error) => Some(task_error.unwrap_or(symptom)),
+        (None, _) => None,
+    };
 
     // Close the files here, explicitly, and let the failure through. A gzip
     // member whose trailer was never written is not a shorter recording but an
@@ -1094,7 +1113,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // `Drop` stays as the backstop for the paths that never reach here — a
     // panic, an early return. `finish` emptied the writer, so this closes
-    // nothing twice.
+    // nothing twice. Explicit, so that the line below is written after the
+    // files it describes are closed and not before.
     drop(writer);
 
     match fatal {
@@ -1130,6 +1150,95 @@ mod tests {
     }
 
     const FRAME: &str = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[],[]]}}"#;
+
+    /// A writer with one stream open, so that closing it is something that can
+    /// succeed or fail rather than a no-op.
+    fn recording(name: &str) -> Writer {
+        let mut writer = Writer::new(&crate::file::testing::scratch(name), "test");
+        writer
+            .write(Utc::now(), "BTC".to_string(), "a record".to_string())
+            .unwrap();
+        writer
+    }
+
+    /// The failure `Writer::finish` was made to return, followed all the way to
+    /// what the process exits with — which is the only part of it an operator or
+    /// a supervisor can act on.
+    ///
+    /// A gzip member without its trailer is unreadable, not merely short, and
+    /// the device that refuses those last bytes refuses them when nothing else
+    /// is watching. Exiting 0 over it means systemd logs `Deactivated
+    /// successfully` and the corrupt day is found weeks later.
+    ///
+    /// This is the wiring that a mutation deleted with the whole suite staying
+    /// green: `main` cannot be called from a test, so the six lines that turn a
+    /// failed close into a non-zero exit were reachable by nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recording_that_could_not_be_closed_is_not_a_clean_stop() {
+        let mut writer = recording("conclude-enospc");
+        crate::file::testing::refuse_further_writes(&mut writer, "btc");
+
+        let error = conclude(writer, None, None)
+            .expect_err("a day whose gzip trailer was never written must not exit 0");
+        assert!(
+            error.to_string().contains("btc"),
+            "the report must name the stream that is suspect: {error}"
+        );
+    }
+
+    /// Which of the two an operator is shown when both went wrong. Whatever
+    /// stopped the recording is the more useful diagnosis — the failed close is
+    /// usually its consequence, a disk that filled while the loop was already
+    /// leaving — and both reach the journal either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_stopped_the_recording_outranks_the_close_that_then_failed() {
+        let mut writer = recording("conclude-both");
+        crate::file::testing::refuse_further_writes(&mut writer, "btc");
+
+        let error = conclude(writer, Some(anyhow!("the disk is full")), None).unwrap_err();
+        assert_eq!(error.to_string(), "the disk is full");
+    }
+
+    /// The collection task knows the real cause — an unlisted symbol, a stream
+    /// that cannot be recovered — where the loop only ever saw its channel
+    /// close. Reporting the symptom sends whoever reads the journal after the
+    /// wrong thing.
+    #[test]
+    fn the_collection_tasks_own_error_is_what_the_process_reports() {
+        let error = conclude(
+            recording("conclude-cause"),
+            Some(anyhow!("the collection task ended")),
+            Some(anyhow!("BTCUSDT is not listed on this venue")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "BTCUSDT is not listed on this venue");
+    }
+
+    /// The other side of that preference, and the reason it is conditional: a
+    /// task that was cancelled by the wind-down has no error of its own, but one
+    /// that was already dying when the signal arrived does — and a `systemctl
+    /// stop` that raced it is still a `systemctl stop`. Exiting non-zero there
+    /// would mark the unit failed on an ordinary restart.
+    #[test]
+    fn a_signal_that_raced_a_dying_task_is_still_a_clean_stop() {
+        assert!(
+            conclude(
+                recording("conclude-signal"),
+                None,
+                Some(anyhow!("BTCUSDT is not listed on this venue")),
+            )
+            .is_ok()
+        );
+    }
+
+    /// And the ordinary stop, so that none of the above is satisfied by a
+    /// function that always fails.
+    #[test]
+    fn a_stop_with_nothing_wrong_exits_cleanly() {
+        assert!(conclude(recording("conclude-clean"), None, None).is_ok());
+    }
 
     /// The producers the wind-down cannot reach are the ordinary case, and a
     /// clean stop must not report them as a broken recording.

@@ -175,23 +175,22 @@ impl Drop for RotatingFile {
     }
 }
 
+/// Helpers shared with the tests in other modules, so that a recording which
+/// cannot be closed can be built anywhere it needs to be reasoned about — the
+/// wiring that turns that failure into an exit code lives in `main`.
 #[cfg(test)]
-mod rotating_file_tests {
+pub(crate) mod testing {
     use std::{
         fs,
-        io::Read,
         sync::atomic::{AtomicU32, Ordering},
     };
-
-    use chrono::TimeZone;
-    use flate2::read::MultiGzDecoder;
 
     use super::*;
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     /// Unique scratch directory per test, no external crate needed.
-    fn scratch(name: &str) -> String {
+    pub(crate) fn scratch(name: &str) -> String {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "collector-file-test-{}-{}-{}",
@@ -202,6 +201,44 @@ mod rotating_file_tests {
         fs::create_dir_all(&dir).unwrap();
         dir.to_str().unwrap().to_string()
     }
+
+    /// Points an already-written stream's descriptor at a device that refuses
+    /// every byte, so the records landed and only the close cannot.
+    ///
+    /// `dup2` rather than closing the descriptor: it replaces what the number
+    /// refers to while leaving the `File` owning a valid one, so nothing is
+    /// closed out from under anyone and no other test's file can inherit a
+    /// recycled descriptor. Linux only, which is where the collector records.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refuse_further_writes(writer: &mut Writer, stream: &str) {
+        use std::os::fd::AsRawFd;
+
+        let file = writer
+            .file
+            .get_mut(stream)
+            .expect("the stream must be open before its device can stop answering");
+        let Some(Sink::Gz(encoder)) = &file.file else {
+            panic!("expected an open gzip stream for {stream}");
+        };
+        let full = File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is what makes this an ENOSPC and not a fake");
+        // SAFETY: both descriptors are open and owned for the duration of the
+        // call; `dup2` replaces the target atomically and the `File` continues
+        // to own a valid descriptor afterwards.
+        assert!(unsafe { libc::dup2(full.as_raw_fd(), encoder.get_ref().as_raw_fd()) } >= 0);
+    }
+}
+
+#[cfg(test)]
+mod rotating_file_tests {
+    use std::{fs, io::Read};
+
+    use chrono::TimeZone;
+    use flate2::read::MultiGzDecoder;
+
+    use super::{testing::*, *};
 
     fn read_all(path: &str) -> String {
         let bytes = fs::read(path).unwrap();
@@ -313,34 +350,6 @@ mod rotating_file_tests {
                 .unwrap();
         }
         assert!(read_all(&format!("{dir}/btc_20260725.gz")).contains("px"));
-    }
-
-    /// Points an already-written stream's descriptor at a device that refuses
-    /// every byte, so the records landed and only the close cannot.
-    ///
-    /// `dup2` rather than closing the descriptor: it replaces what the number
-    /// refers to while leaving the `File` owning a valid one, so nothing is
-    /// closed out from under anyone and no other test's file can inherit a
-    /// recycled descriptor. Linux only, which is where the collector records.
-    #[cfg(target_os = "linux")]
-    fn refuse_further_writes(writer: &mut Writer, stream: &str) {
-        use std::os::fd::AsRawFd;
-
-        let file = writer
-            .file
-            .get_mut(stream)
-            .expect("the stream must be open before its device can stop answering");
-        let Some(Sink::Gz(encoder)) = &file.file else {
-            panic!("expected an open gzip stream for {stream}");
-        };
-        let full = File::options()
-            .write(true)
-            .open("/dev/full")
-            .expect("/dev/full is what makes this an ENOSPC and not a fake");
-        // SAFETY: both descriptors are open and owned for the duration of the
-        // call; `dup2` replaces the target atomically and the `File` continues
-        // to own a valid descriptor afterwards.
-        assert!(unsafe { libc::dup2(full.as_raw_fd(), encoder.get_ref().as_raw_fd()) } >= 0);
     }
 
     /// A gzip member without its trailer is not a shorter recording, it is an
