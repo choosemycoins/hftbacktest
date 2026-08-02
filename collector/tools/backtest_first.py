@@ -193,6 +193,41 @@ FEE_ASSUMPTION = (
     'the results file records the value and where it came from.'
 )
 
+# Hyperliquid's order-request budget. Not a rate limit — a CUMULATIVE allowance:
+#
+#     budget = BUDGET_INITIAL_BUFFER_USD + cumulative FILLED notional (usd)
+#
+# and every order request spends one unit of it. A New is one, a Cancel is one,
+# and because the venue has no native modify, moving a resting order one tick is
+# a cancel plus a new: two. So a geometry can keep running only while
+#
+#     requests_per_dollar_filled = (submits + cancels) / filled_notional <= 1
+#
+# The engine below models fills, fees, latency and queue position and has no
+# notion of any of this, so an over-churning grid reads BETTER here than a calm
+# one: it captures more spread and is charged nothing for the requests it burned
+# to get there. Counted at the strategy's own emit sites (`si[IST_SUBMITS]` /
+# `si[IST_CANCELS]` in the grid loop) so the count is the request stream the live
+# bot would put on the wire from the same decisions.
+#
+# This tool measures sensitivity and does not pick a winner, so the number is
+# REPORTED here rather than used to exclude anything; the selection gate that
+# acts on it lives where a winner is picked (myhft
+# `scripts/summarize_guard_run.py`, `_gate_blockers`). Same constants, same
+# semantics, deliberately duplicated — the two repositories cannot share a
+# module, and a gate that disagreed with its own metric would be worse.
+#
+#: The sustainable ceiling: one request per dollar filled is exactly what the
+#: venue grants, so `<=` passes and `>` does not. Measured live at ~2.07 before
+#: the churn-down.
+BUDGET_REQUESTS_PER_DOLLAR_MAX = 1.0
+#: A one-time starting buffer, never refilled — which is why the ABSOLUTE form
+#: of the check is reported as context and is not the verdict.
+BUDGET_INITIAL_BUFFER_USD = 10_000.0
+#: Safety margin. Between this and the ceiling a run is still feasible, but the
+#: verdict says the margin is thin.
+BUDGET_WARN_RATIO = 0.8
+
 #: The queue model this harness actually builds. A manifest that declares
 #: something else is refused rather than silently overridden — the whole point
 #: of Phase 4 is that no model is picked up quietly.
@@ -1106,9 +1141,93 @@ def _jsonable(obj):
     return obj
 
 
+def request_budget_block(n_new, n_cancel, filled_notional_usd):
+    """Turn a run's request counts into the Hyperliquid budget verdict.
+
+    The PRIMARY number is ``requests_per_dollar_filled``, and its denominator is
+    FILLED notional — ``trading_value``, the engine's running sum of
+    ``exec_price * exec_qty``. Quoted or ordered notional would flatter exactly
+    the geometries this exists to catch: the ones that post a fortune, requote it
+    constantly and fill very little of it.
+
+    The SECONDARY number is the absolute window check,
+    ``total <= BUDGET_INITIAL_BUFFER_USD + filled``. Reported, never the verdict:
+    the buffer is a one-time grant, so a short or quiet window passes it while
+    being wildly unsustainable, and reading that as a pass is the whole mistake.
+
+    An undefined ratio is INFEASIBLE, never a skip and never a division by zero.
+    A run that spends requests and fills nothing is the worst case, not an
+    exempt one; a run that did nothing at all cannot be promoted either.
+    """
+    n_new = int(n_new)
+    n_cancel = int(n_cancel)
+    total = n_new + n_cancel
+    filled = float(filled_notional_usd)
+
+    block = {
+        'n_new': n_new,
+        'n_cancel': n_cancel,
+        'total_requests': total,
+        'filled_notional_usd': filled if math.isfinite(filled) else None,
+        'requests_per_dollar_filled': None,
+        'window_budget': None,
+        'window_ok': None,
+        'ceiling': BUDGET_REQUESTS_PER_DOLLAR_MAX,
+        'warn_ratio': BUDGET_WARN_RATIO,
+        'initial_buffer_usd': BUDGET_INITIAL_BUFFER_USD,
+        'verdict': 'infeasible',
+        'feasible': False,
+        'reason': '',
+        'note': (
+            'Hyperliquid grants one order request per dollar of FILLED notional, '
+            'on top of a one-time %.0f buffer; a New is one request, a Cancel is '
+            'one, and a requote is two because the venue has no modify. The '
+            'backtest does not model this, so the ratio is the constraint the '
+            'engine cannot see.' % BUDGET_INITIAL_BUFFER_USD),
+    }
+
+    if not math.isfinite(filled) or filled <= 0.0:
+        block['reason'] = (
+            '%d request(s) and no fills — requests per dollar filled is undefined, '
+            'which is the worst case, not an exempt one' % total
+            if total > 0 else
+            'no requests and no fills: this run never traded, so there is nothing '
+            'to read a budget off')
+        return block
+
+    block['window_budget'] = BUDGET_INITIAL_BUFFER_USD + filled
+    block['window_ok'] = total <= block['window_budget']
+
+    ratio = total / filled
+    block['requests_per_dollar_filled'] = ratio
+    if ratio > BUDGET_REQUESTS_PER_DOLLAR_MAX:
+        block['reason'] = (
+            '%.4g requests per dollar filled exceeds the sustainable ceiling of '
+            '%g: %d request(s) against $%.2f filled'
+            % (ratio, BUDGET_REQUESTS_PER_DOLLAR_MAX, total, filled))
+    elif ratio > BUDGET_WARN_RATIO:
+        block['verdict'] = 'warn'
+        block['feasible'] = True
+        block['reason'] = (
+            '%.4g requests per dollar filled is inside the ceiling but past the '
+            '%g safety margin — a live window churnier than this one exhausts '
+            'the budget' % (ratio, BUDGET_WARN_RATIO))
+    else:
+        block['verdict'] = 'sustainable'
+        block['feasible'] = True
+        block['reason'] = (
+            '%.4g requests per dollar filled, within the %g ceiling'
+            % (ratio, BUDGET_REQUESTS_PER_DOLLAR_MAX))
+    return block
+
+
 def build_results(config, manifest, stats, sweep=None):
     """The reproducibility record: every model, every parameter, every count."""
     blocked = dict(stats.guard_blocked)
+    # Derived from the counts above, never restated: `submits`/`cancels` are
+    # counted at the strategy's emit sites and `trading_value` is the engine's
+    # filled notional, so the block cannot drift from the run it describes.
+    budget = request_budget_block(stats.submits, stats.cancels, stats.trading_value)
     results = {
         'tool': TOOL_NAME,
         'phase': PHASE,
@@ -1208,6 +1327,13 @@ def build_results(config, manifest, stats, sweep=None):
             'book_changes': stats.book_changes,
             'submits': stats.submits,
             'cancels': stats.cancels,
+            # The venue-budget reading of the two counts above. The full block
+            # carries the verdict and its reasoning; the two scalars beside it
+            # are the same numbers flattened so `SWEEP_METRICS` can compare them
+            # across the runs of a sweep (`summarize_sweep` reads `run` by key).
+            'request_budget': budget,
+            'total_requests': budget['total_requests'],
+            'requests_per_dollar_filled': budget['requests_per_dollar_filled'],
             'grid_level_collisions': stats.grid_level_collisions,
             'fills': stats.fills,
             'final_position': stats.final_position,
@@ -1261,6 +1387,10 @@ _SWEEP_TYPES = {
 SWEEP_METRICS = (
     'steps', 'guard_passed', 'guard_blocked_total', 'signal_absent',
     'submits', 'cancels', 'fills', 'final_position', 'equity',
+    # A knob that moves the geometry moves the churn with it. Without these two
+    # the table can print "NO DIFFERENCE" while the one number that decides
+    # whether the geometry can run live at all has doubled.
+    'total_requests', 'requests_per_dollar_filled',
 )
 
 

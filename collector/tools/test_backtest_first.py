@@ -1611,3 +1611,113 @@ def test_comparing_two_manifests_of_the_same_book_mode_is_refused(tmp_path):
         bf.run_compare(str(a), str(b), ['--out', str(tmp_path / 'c.json')],
                        runner=lambda cfg, m, s: fake_stats())
     assert 'book_mode' in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# Hyperliquid order-request budget
+#
+# The engine models fills, fees and queue position but has no notion of the
+# venue's CUMULATIVE order-request budget: `10000 + filled notional`, one unit
+# per request, and a requote costs two because Hyperliquid has no modify. So a
+# geometry that requotes on every flicker and fills rarely reads BETTER here
+# than a calm one — it captures more spread and is charged nothing for the
+# requests. These numbers make that cost visible; the selection gate that acts
+# on them lives where a winner is actually picked (myhft
+# scripts/summarize_guard_run.py).
+# ---------------------------------------------------------------------------
+
+def test_requests_per_dollar_is_requests_over_filled_notional():
+    b = bf.request_budget_block(n_new=600, n_cancel=400, filled_notional_usd=2000.0)
+    assert b['total_requests'] == 1000
+    assert b['requests_per_dollar_filled'] == pytest.approx(0.5)
+    assert b['verdict'] == 'sustainable'
+
+
+def test_the_denominator_is_filled_notional_not_quoted_notional():
+    # Identical churn, different FILLED notional. The venue pays budget on
+    # fills, so this is the only denominator that separates the two.
+    thin = bf.request_budget_block(n_new=600, n_cancel=400, filled_notional_usd=100.0)
+    fat = bf.request_budget_block(n_new=600, n_cancel=400, filled_notional_usd=100_000.0)
+    assert thin['requests_per_dollar_filled'] == pytest.approx(10.0)
+    assert fat['requests_per_dollar_filled'] == pytest.approx(0.01)
+    assert thin['verdict'] == 'infeasible'
+    assert fat['verdict'] == 'sustainable'
+
+
+def test_over_churn_is_infeasible():
+    b = bf.request_budget_block(n_new=12_000, n_cancel=8_700, filled_notional_usd=10_000.0)
+    assert b['requests_per_dollar_filled'] == pytest.approx(2.07)
+    assert b['verdict'] == 'infeasible'
+    assert b['feasible'] is False
+
+
+def test_the_ceiling_is_feasible_and_a_hair_over_it_is_not():
+    at = bf.request_budget_block(n_new=500, n_cancel=500, filled_notional_usd=1000.0)
+    over = bf.request_budget_block(n_new=500, n_cancel=501, filled_notional_usd=1000.0)
+    assert at['feasible'] is True
+    assert over['feasible'] is False
+
+
+def test_a_run_that_churns_without_filling_is_infeasible_not_a_zero_division():
+    b = bf.request_budget_block(n_new=5000, n_cancel=5000, filled_notional_usd=0.0)
+    assert b['verdict'] == 'infeasible'
+    assert b['requests_per_dollar_filled'] is None
+    assert 'no fills' in b['reason'].lower()
+
+
+def test_a_run_that_did_nothing_is_infeasible_too():
+    b = bf.request_budget_block(n_new=0, n_cancel=0, filled_notional_usd=0.0)
+    assert b['verdict'] == 'infeasible'
+    assert b['requests_per_dollar_filled'] is None
+
+
+def test_the_window_check_is_reported_but_is_not_the_verdict():
+    # 600 requests fit inside the one-time 10000 buffer, so the ABSOLUTE form
+    # passes — while the ratio says the geometry is six times unsustainable.
+    # Reading the absolute form as a pass is the whole mistake.
+    b = bf.request_budget_block(n_new=300, n_cancel=300, filled_notional_usd=100.0)
+    assert b['window_ok'] is True
+    assert b['window_budget'] == pytest.approx(10_100.0)
+    assert b['requests_per_dollar_filled'] == pytest.approx(6.0)
+    assert b['verdict'] == 'infeasible'
+
+
+def test_the_ceiling_is_a_named_constant():
+    assert bf.BUDGET_REQUESTS_PER_DOLLAR_MAX == 1.0
+    assert bf.BUDGET_INITIAL_BUFFER_USD == 10_000.0
+    assert bf.BUDGET_WARN_RATIO < bf.BUDGET_REQUESTS_PER_DOLLAR_MAX
+
+
+def _budget_results(manifest_path, stats):
+    m = bf.load_manifest(str(manifest_path))
+    cfg = bf.resolve_config(
+        bf.build_parser().parse_args(['--manifest', str(manifest_path)]), m)
+    return bf.build_results(cfg, m, stats)
+
+
+def test_results_carry_the_budget_built_from_the_run_counts(manifest_path):
+    # submits/cancels are counted at the strategy's own emit sites in the grid
+    # loop, and trading_value is the engine's filled notional. The block must be
+    # derived from those, never restated by hand.
+    stats = fake_stats(submits=12_000, cancels=8_700, trading_value=10_000.0)
+    budget = _budget_results(manifest_path, stats)['run']['request_budget']
+    assert budget['n_new'] == 12_000
+    assert budget['n_cancel'] == 8_700
+    assert budget['total_requests'] == 20_700
+    assert budget['filled_notional_usd'] == pytest.approx(10_000.0)
+    assert budget['requests_per_dollar_filled'] == pytest.approx(2.07)
+    assert budget['verdict'] == 'infeasible'
+
+
+def test_a_sustainable_run_reports_sustainable(manifest_path):
+    stats = fake_stats(submits=300, cancels=200, trading_value=10_000.0)
+    results = _budget_results(manifest_path, stats)
+    assert results['run']['request_budget']['verdict'] == 'sustainable'
+
+
+def test_the_budget_metrics_are_compared_across_a_sweep():
+    # A sweep that moves a geometry knob moves the churn with it; if the metric
+    # is not in the compared set the tool prints "no difference" about the one
+    # number that decides whether the geometry can run at all.
+    assert 'total_requests' in bf.SWEEP_METRICS
+    assert 'requests_per_dollar_filled' in bf.SWEEP_METRICS
