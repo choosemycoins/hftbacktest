@@ -1358,6 +1358,37 @@ mod test {
             .build()?)
     }
 
+    fn l3_event(ev: u64, ts: i64, order_id: OrderId, px: f64, qty: f64) -> Event {
+        Event {
+            ev,
+            exch_ts: ts,
+            local_ts: ts,
+            px,
+            qty,
+            order_id,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    /// The L3 counterpart of [`backtest`]. [`L3AssetBuilder`] supports
+    /// [`NoPartialFillExchange`] only, so the exchange kind is not a parameter.
+    fn l3_backtest(events: &[Event]) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
+        Ok(Backtest::builder()
+            .add_asset(
+                L3AssetBuilder::default()
+                    .data(vec![DataSource::Data(Data::from_data(events))])
+                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
+                    .queue_model(L3FIFOQueueModel::new())
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT_SIZE))
+                    .build()?,
+            )
+            .build()?)
+    }
+
     /// Rests the sell order behind [`QUEUE_AHEAD_QTY`] and waits for the exchange acknowledgement.
     fn submit_resting_sell(bt: &mut Backtest<HashMapMarketDepth>) -> Result<(), Box<dyn Error>> {
         bt.elapse(0)?;
@@ -1526,6 +1557,50 @@ mod test {
         Ok(())
     }
 
+    /// The L3 twin of [`an_order_whose_side_has_no_sign_is_refused_at_the_boundary`].
+    ///
+    /// `L3Local::submit_order` carries its **own** copy of the boundary check — it does not call
+    /// `Local::submit_order` — so the L2 pin says nothing about it. Measured before this test
+    /// existed: deleting the check from `l3_local.rs` left the whole lib suite green (69 tests
+    /// then), which is to say the invariant on the L3 path was asserted by nobody.
+    /// `L3AssetBuilder` accepts [`NoPartialFillExchange`] only, hence no exchange-kind loop.
+    #[test]
+    fn an_order_whose_side_has_no_sign_is_refused_at_the_l3_boundary() -> Result<(), Box<dyn Error>>
+    {
+        let book = [l3_event(
+            LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
+            0,
+            1000,
+            BID_PRICE,
+            10.0,
+        )];
+        for side in [Side::None, Side::Unsupported] {
+            let mut bt = l3_backtest(&book)?;
+            bt.elapse(0)?;
+            let refused = bt.submit_order(
+                0,
+                OrderRequest {
+                    order_id: ORDER_ID,
+                    price: ASK_PRICE,
+                    qty: ORDER_QTY,
+                    side,
+                    time_in_force: TimeInForce::GTX,
+                    order_type: OrdType::Limit,
+                },
+                false,
+            );
+            assert!(
+                matches!(refused, Err(BacktestError::InvalidOrderRequest)),
+                "{side:?} must be refused at the L3 boundary, got {refused:?}"
+            );
+            assert!(
+                bt.orders(0).is_empty(),
+                "a refused order rests nowhere: {side:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// [`NoPartialFillExchange`] executes the whole remaining quantity regardless of the traded
     /// quantity; only the single `Filled` response exists, and it must be applied once.
     #[test]
@@ -1568,16 +1643,6 @@ mod test {
     /// partial execution cannot reach it; the rejected echo can.
     #[test]
     fn l3_rejected_cancel_does_not_reapply_the_fill() -> Result<(), Box<dyn Error>> {
-        let l3_event = |ev: u64, ts: i64, order_id: u64, px: f64, qty: f64| Event {
-            ev,
-            exch_ts: ts,
-            local_ts: ts,
-            px,
-            qty,
-            order_id,
-            ival: 0,
-            fval: 0.0,
-        };
         let events = [
             l3_event(
                 LOCAL_BID_ADD_ORDER_EVENT | EXCH_BID_ADD_ORDER_EVENT,
@@ -1595,19 +1660,7 @@ mod test {
                 10.0,
             ),
         ];
-        let mut bt = Backtest::builder()
-            .add_asset(
-                L3AssetBuilder::default()
-                    .data(vec![DataSource::Data(Data::from_data(&events))])
-                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
-                    .asset_type(LinearAsset::new(1.0))
-                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
-                    .queue_model(L3FIFOQueueModel::new())
-                    .exchange(NoPartialFillExchange)
-                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT_SIZE))
-                    .build()?,
-            )
-            .build()?;
+        let mut bt = l3_backtest(&events)?;
 
         submit_resting_sell(&mut bt)?;
 
