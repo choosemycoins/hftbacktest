@@ -1596,6 +1596,148 @@ mod tests {
         assert_eq!(ord(&Value::Empty), 6, "Empty must stay variant 6");
     }
 
+    /// The exact bytes an [`Order`] rides on the wire as, pinned as a literal.
+    ///
+    /// **Why a golden literal and not a round-trip.** The next several invariants
+    /// (`ExecDelta`, `Price`/`PriceTick`/`TickSize`/`Qty`, `OrderId`) retype `Order`'s fields
+    /// as `#[repr(transparent)]` newtypes and claim to be byte-identical. A round-trip test
+    /// cannot see a break in that claim — it would encode and decode through the *same* new
+    /// code and agree with itself. Only a literal recorded before the change can fail, and a
+    /// failure here means an older connector would misread every order this bot sends
+    /// (`AGENTS.md` §2: the payload has no version field).
+    ///
+    /// **The fixture is deliberately not all-zeros.** `bincode`'s `standard()` config is
+    /// varint + zigzag for integers and fixed-8 little-endian for floats, so a zeroed order
+    /// encodes to a short run of `0x00`s that would survive almost any field retyping. The
+    /// values below are chosen to discriminate: a **negative** `price_tick` (zigzag, so a
+    /// sign flip changes the bytes), an `order_id` past the one-byte varint boundary, non-zero
+    /// execution fields, and the enum variants whose positional ordinal differs from their
+    /// `#[repr(..)]` literal (`Side::Sell` is repr `-1` but rides as `1`).
+    #[test]
+    fn an_order_encodes_to_the_bytes_it_has_always_encoded_to() {
+        use crate::types::{OrdType, Order, Side, Status, TimeInForce};
+
+        let mut order = Order::new(
+            300,
+            -5,
+            0.01,
+            1.5,
+            Side::Sell,
+            OrdType::Limit,
+            TimeInForce::IOC,
+        );
+        order.leaves_qty = 0.5;
+        order.exec_qty = 1.0;
+        order.exec_price_tick = -4;
+        order.exch_timestamp = 1_700_000_000_000_000_000;
+        order.local_timestamp = 1_700_000_000_000_000_001;
+        order.maker = true;
+        order.req = Status::New;
+        order.status = Status::PartiallyFilled;
+
+        let bytes = bincode::encode_to_vec(&order, bincode::config::standard()).unwrap();
+
+        assert_eq!(
+            bytes,
+            vec![
+                // qty: f64 1.5, fixed 8 bytes little-endian
+                0, 0, 0, 0, 0, 0, 248, 63, //
+                // leaves_qty: f64 0.5
+                0, 0, 0, 0, 0, 0, 224, 63, //
+                // exec_qty: f64 1.0
+                0, 0, 0, 0, 0, 0, 240, 63, //
+                // exec_price_tick: i64 -4, zigzag varint
+                7, //
+                // price_tick: i64 -5, zigzag varint
+                9, //
+                // tick_size: f64 0.01
+                123, 20, 174, 71, 225, 122, 132, 63, //
+                // exch_timestamp: i64 1_700_000_000_000_000_000, zigzag varint
+                // (zigzag doubles it to 0x2F2F_39FC_6C54_0000, then 8 bytes little-endian)
+                253, 0, 0, 84, 108, 252, 57, 47, 47, //
+                // local_timestamp: i64 1_700_000_000_000_000_001, zigzag varint
+                253, 2, 0, 84, 108, 252, 57, 47, 47, //
+                // order_id: u64 300, varint (past the one-byte boundary)
+                251, 44, 1, //
+                // maker: bool true
+                1, //
+                // order_type: OrdType::Limit, positional 0
+                0, //
+                // req: Status::New, positional 1
+                1, //
+                // status: Status::PartiallyFilled, positional 5
+                5, //
+                // side: Side::Sell, positional 1 — NOT its repr -1
+                1, //
+                // time_in_force: TimeInForce::IOC, positional 3
+                3,
+            ],
+            "the on-wire form of an Order changed; an older connector would misread every \
+             order this bot sends (AGENTS.md §2 — no version field)"
+        );
+
+        // And it still decodes back to itself on this side.
+        let (decoded, _): (Order, usize) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(
+            bincode::encode_to_vec(&decoded, bincode::config::standard()).unwrap(),
+            bytes
+        );
+    }
+
+    /// The **second** wire: the in-memory layout `py-hftbacktest`'s numpy `order_dtype`
+    /// mirrors, pinned field by field.
+    ///
+    /// [`Order`] rides on two wires at once and they read different things. `bincode` reads
+    /// the *positional* variant index and ignores `#[repr(..)]` entirely (that is what
+    /// [`status_variants_are_append_only_on_the_wire`] and its siblings pin). numpy reads the
+    /// **`#[repr(C)]` byte at a hard-coded offset**, so for `order_dtype` the repr is not a
+    /// decoy at all — it is the whole contract, and `Status::Unsupported = 255` is the byte
+    /// Python actually sees.
+    ///
+    /// Nothing connects the two definitions but this test: `order_dtype` is a Python literal
+    /// that cannot know a Rust field was retyped or reordered. numpy does not validate, it
+    /// just reads the offset — so a break here is silent and produces plausible-looking wrong
+    /// numbers in every recorded `.npz`, not an error.
+    #[test]
+    fn the_order_layout_the_python_dtype_mirrors_is_unchanged() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        use crate::types::Order;
+
+        // `py-hftbacktest/hftbacktest/types.py::order_dtype`, `align=True`: itemsize 96,
+        // alignment 8.
+        assert_eq!(size_of::<Order>(), 96, "order_dtype itemsize is 96");
+        assert_eq!(align_of::<Order>(), 8, "order_dtype alignment is 8");
+
+        for (field, offset, dtype_name) in [
+            (offset_of!(Order, qty), 0, "qty"),
+            (offset_of!(Order, leaves_qty), 8, "leaves_qty"),
+            (offset_of!(Order, exec_qty), 16, "exec_qty"),
+            (offset_of!(Order, exec_price_tick), 24, "exec_price_tick"),
+            (offset_of!(Order, price_tick), 32, "price_tick"),
+            (offset_of!(Order, tick_size), 40, "tick_size"),
+            (offset_of!(Order, exch_timestamp), 48, "exch_timestamp"),
+            (offset_of!(Order, local_timestamp), 56, "local_timestamp"),
+            (offset_of!(Order, order_id), 64, "order_id"),
+            // `q` is a `Box<dyn AnyClone + Send>` — a 16-byte fat pointer, which the dtype
+            // spells as the two opaque `u8` fields `_q1`/`_q2`.
+            (offset_of!(Order, q), 72, "_q1/_q2"),
+            (offset_of!(Order, maker), 88, "maker"),
+            (offset_of!(Order, order_type), 89, "order_type"),
+            (offset_of!(Order, req), 90, "req"),
+            (offset_of!(Order, status), 91, "status"),
+            (offset_of!(Order, side), 92, "side"),
+            (offset_of!(Order, time_in_force), 93, "time_in_force"),
+        ] {
+            assert_eq!(
+                field, offset,
+                "Order::{dtype_name} moved; py-hftbacktest's order_dtype reads offset \
+                 {offset} and would silently return a different field"
+            );
+        }
+    }
+
     /// The single definition of "terminal" ([`Status::is_terminal`]), pinned. A terminal
     /// status is final: no later update may resurrect the order, and the order id it held is
     /// freed. Before this method the set `{Canceled, Expired, Filled}` was duplicated at the
