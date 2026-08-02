@@ -28,6 +28,7 @@ use crate::{
         EXCH_EVENT,
         EXCH_SELL_TRADE_EVENT,
         Event,
+        Liquidity,
         Order,
         OrderId,
         Side,
@@ -139,7 +140,7 @@ where
                 return self.fill::<true>(
                     order,
                     timestamp,
-                    true,
+                    Liquidity::Maker,
                     order.price_tick,
                     order.leaves_qty,
                 );
@@ -162,7 +163,13 @@ where
                     } else {
                         filled_qty
                     };
-                    return self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty);
+                    return self.fill::<true>(
+                        order,
+                        timestamp,
+                        Liquidity::Maker,
+                        order.price_tick,
+                        exec_qty,
+                    );
                 }
             }
         }
@@ -182,7 +189,7 @@ where
                 return self.fill::<true>(
                     order,
                     timestamp,
-                    true,
+                    Liquidity::Maker,
                     order.price_tick,
                     order.leaves_qty,
                 );
@@ -206,7 +213,13 @@ where
                     } else {
                         filled_qty
                     };
-                    return self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty);
+                    return self.fill::<true>(
+                        order,
+                        timestamp,
+                        Liquidity::Maker,
+                        order.price_tick,
+                        exec_qty,
+                    );
                 }
             }
         }
@@ -217,7 +230,7 @@ where
         &mut self,
         order: &mut Order,
         timestamp: i64,
-        maker: bool,
+        liquidity: Liquidity,
         exec_price_tick: i64,
         exec_qty: f64,
     ) -> Result<(), BacktestError> {
@@ -228,8 +241,8 @@ where
             return Err(BacktestError::InvalidOrderStatus);
         }
 
-        order.maker = maker;
-        if maker {
+        order.set_liquidity(Some(liquidity));
+        if liquidity == Liquidity::Maker {
             order.exec_price_tick = order.price_tick;
         } else {
             order.exec_price_tick = exec_price_tick;
@@ -316,7 +329,7 @@ where
                         self.fill::<true>(
                             order,
                             timestamp,
-                            true,
+                            Liquidity::Maker,
                             order.price_tick,
                             order.leaves_qty,
                         )?;
@@ -331,7 +344,7 @@ where
                             self.fill::<true>(
                                 order,
                                 timestamp,
-                                true,
+                                Liquidity::Maker,
                                 order.price_tick,
                                 order.leaves_qty,
                             )?;
@@ -364,7 +377,7 @@ where
                         self.fill::<true>(
                             order,
                             timestamp,
-                            true,
+                            Liquidity::Maker,
                             order.price_tick,
                             order.leaves_qty,
                         )?;
@@ -379,7 +392,7 @@ where
                             self.fill::<true>(
                                 order,
                                 timestamp,
-                                true,
+                                Liquidity::Maker,
                                 order.price_tick,
                                 order.leaves_qty,
                             )?;
@@ -428,7 +441,11 @@ where
                                         if qty > 0.0 {
                                             let exec_qty = qty.min(order.leaves_qty);
                                             self.fill::<false>(
-                                                order, timestamp, false, t, exec_qty,
+                                                order,
+                                                timestamp,
+                                                Liquidity::Taker,
+                                                t,
+                                                exec_qty,
                                             )?;
                                             if order.status == Status::Filled {
                                                 return Ok(());
@@ -448,7 +465,13 @@ where
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<false>(
+                                            order,
+                                            timestamp,
+                                            Liquidity::Taker,
+                                            t,
+                                            exec_qty,
+                                        )?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -464,7 +487,13 @@ where
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<false>(
+                                            order,
+                                            timestamp,
+                                            Liquidity::Taker,
+                                            t,
+                                            exec_qty,
+                                        )?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -476,7 +505,13 @@ where
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
                                 let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
-                                self.fill::<false>(order, timestamp, false, price_tick, leaves_qty)
+                                self.fill::<false>(
+                                    order,
+                                    timestamp,
+                                    Liquidity::Taker,
+                                    price_tick,
+                                    leaves_qty,
+                                )
                             }
                             TimeInForce::Unsupported => Err(BacktestError::InvalidOrderRequest),
                         }
@@ -513,7 +548,7 @@ where
                         let qty = self.depth.ask_qty_at_tick(t);
                         if qty > 0.0 {
                             let exec_qty = qty.min(order.leaves_qty);
-                            self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                            self.fill::<false>(order, timestamp, Liquidity::Taker, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
                             return Ok(());
@@ -556,7 +591,11 @@ where
                                         if qty > 0.0 {
                                             let exec_qty = qty.min(order.leaves_qty);
                                             self.fill::<false>(
-                                                order, timestamp, false, t, exec_qty,
+                                                order,
+                                                timestamp,
+                                                Liquidity::Taker,
+                                                t,
+                                                exec_qty,
                                             )?;
                                             if order.status == Status::Filled {
                                                 return Ok(());
@@ -576,7 +615,13 @@ where
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<false>(
+                                            order,
+                                            timestamp,
+                                            Liquidity::Taker,
+                                            t,
+                                            exec_qty,
+                                        )?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -592,7 +637,13 @@ where
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<false>(
+                                            order,
+                                            timestamp,
+                                            Liquidity::Taker,
+                                            t,
+                                            exec_qty,
+                                        )?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -604,7 +655,13 @@ where
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
                                 let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
-                                self.fill::<false>(order, timestamp, false, price_tick, leaves_qty)
+                                self.fill::<false>(
+                                    order,
+                                    timestamp,
+                                    Liquidity::Taker,
+                                    price_tick,
+                                    leaves_qty,
+                                )
                             }
                             _ => {
                                 unreachable!();
@@ -644,7 +701,7 @@ where
                         let qty = self.depth.bid_qty_at_tick(t);
                         if qty > 0.0 {
                             let exec_qty = qty.min(order.leaves_qty);
-                            self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                            self.fill::<false>(order, timestamp, Liquidity::Taker, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
                             return Ok(());

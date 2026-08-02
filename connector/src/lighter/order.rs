@@ -387,7 +387,17 @@ impl OrderManager {
                 tracked.order.exec_qty = update.filled_base_amount - tracked.filled;
                 tracked.order.exec_price_tick =
                     (update.price / tracked.order.tick_size).round() as i64;
-                tracked.order.maker = true;
+                // C2: `account_all_orders` states how much of the order is filled and nothing
+                // about which side of the book provided it — the frame carries no per-execution
+                // maker field. `None` is therefore the measurement, and it claims nothing; the
+                // previous unconditional `maker = true` made the flag a constant that fee and
+                // fill-quality attribution read as the venue's word (`AGENTS.md` §1.1).
+                //
+                // The public `trade` channel does carry `is_maker_ask`, but it says which side
+                // of *that* trade rested, not which account did — it cannot attribute our own
+                // execution. Reading a real per-fill flag needs an account trade feed this
+                // backend does not subscribe to.
+                tracked.order.set_liquidity(None);
                 tracked.filled = update.filled_base_amount;
             } else {
                 tracked.order.exec_qty = 0.0;
@@ -717,6 +727,34 @@ mod tests {
         assert_eq!(m.tracked(), 0);
         // The order_id can now be reused for a fresh order.
         assert!(m.new_order("BTC", &btc(), &bid(1, 58200.0, 0.001)).is_ok());
+    }
+
+    /// **An execution claims maker liquidity only if the venue reported it** (C2). Lighter's
+    /// `account_all_orders` frame states how much of the order is filled, and nothing at all
+    /// about which side of the book provided the liquidity — there is no per-execution maker
+    /// field on it. An unmeasured source must therefore claim nothing: the flag the bot reads
+    /// stays unset, which under-claims rather than over-claims (`AGENTS.md` §1.1).
+    ///
+    /// This replaces an unconditional `maker = true` on every execution, which made the flag a
+    /// constant that fee and fill-quality attribution read as a measurement.
+    #[test]
+    fn an_execution_claims_no_liquidity_the_channel_does_not_report() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        m.apply_order_update(&account_order(coi, 5, "open", 1_000));
+
+        let mut filled = account_order(coi, 5, "filled", 2_000);
+        filled.filled_base_amount = 0.001;
+        filled.remaining_base_amount = 0.0;
+        let (_, order) = m
+            .apply_order_update(&filled)
+            .expect("our order, fully executed");
+
+        assert_eq!(order.exec_qty, 0.001, "the execution itself is reported");
+        assert!(
+            !order.maker,
+            "Lighter reports no per-execution liquidity, so the flag must claim none"
+        );
     }
 
     /// **An unrecognised status must not drop the order** (S1). A venue status this connector

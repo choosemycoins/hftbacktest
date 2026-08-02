@@ -509,6 +509,11 @@ impl OrderManager {
                 tracked.order.exec_qty = fill.sz;
                 tracked.order.exec_price_tick = (fill.px / tracked.order.tick_size).round() as i64;
                 tracked.order.exch_timestamp = tracked.order.exch_timestamp.max(exch_ts);
+                // The venue's own word on the liquidity, carried no further than this fill: a
+                // fill that states none leaves the flag unset rather than claiming the maker
+                // side (C2). Passed at the moment the fill is applied, which is the only
+                // moment it is known.
+                tracked.order.set_liquidity(fill.liquidity());
                 tracked.order.clone()
             });
 
@@ -1154,6 +1159,70 @@ mod tests {
         assert!(manager.apply_fill(&fill).is_replay());
         assert_eq!(manager.replayed_fills(), 1);
         assert_eq!(manager.orders(None)[0].exec_qty, 0.00016, "not doubled");
+    }
+
+    /// **The liquidity a fill reports is the venue's word, and the only thing that may set the
+    /// maker flag** (C2). `crossed` says our order crossed the spread to make the fill happen;
+    /// a fill that did not cross was resting and was hit. Before this the flag was never
+    /// written on Hyperliquid at all — the venue said so on every fill and the connector
+    /// dropped it, so a maker grid's fills reached the bot indistinguishable from taker fills.
+    #[test]
+    fn a_fill_reports_the_liquidity_the_venue_stated() {
+        let mut manager = manager();
+        manager
+            .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
+            .unwrap();
+        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+
+        let mut fill = fills(USER_FILLS_INCREMENT).remove(0);
+        fill.cloid = Some(cloid.clone());
+        assert_eq!(
+            fill.crossed,
+            Some(false),
+            "the recorded fill is a resting one"
+        );
+        let FillDisposition::Applied { order, .. } = manager.apply_fill(&fill) else {
+            panic!("the first delivery of a fill is not a replay");
+        };
+        assert!(
+            order.expect("ours").maker,
+            "the venue said this fill did not cross"
+        );
+
+        // The same order, taking this time: the flag follows the venue rather than sticking.
+        fill.tid += 1;
+        fill.crossed = Some(true);
+        let FillDisposition::Applied { order, .. } = manager.apply_fill(&fill) else {
+            panic!("a new tid is not a replay");
+        };
+        assert!(
+            !order.expect("ours").maker,
+            "a crossed fill took liquidity, whatever the last one did"
+        );
+    }
+
+    /// A fill that states no liquidity claims none — the flag stays unset rather than reading
+    /// the absent field as `false`/"rested", which would claim the maker side nobody reported
+    /// (`AGENTS.md` §1.1). The venue sends `crossed` today; this is what happens the day it
+    /// renames it.
+    #[test]
+    fn a_fill_that_states_no_liquidity_claims_none() {
+        let mut manager = manager();
+        manager
+            .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
+            .unwrap();
+        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+
+        let mut fill = fills(USER_FILLS_INCREMENT).remove(0);
+        fill.cloid = Some(cloid);
+        fill.crossed = None;
+        let FillDisposition::Applied { order, .. } = manager.apply_fill(&fill) else {
+            panic!("the first delivery of a fill is not a replay");
+        };
+        assert!(
+            !order.expect("ours").maker,
+            "an unreported liquidity claims nothing"
+        );
     }
 
     /// The position the venue states is **absolute**, so a fill this connector never saw

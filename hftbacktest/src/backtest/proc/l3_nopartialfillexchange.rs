@@ -21,6 +21,7 @@ use crate::{
         EXCH_FILL_EVENT,
         EXCH_MODIFY_ORDER_EVENT,
         Event,
+        Liquidity,
         Order,
         OrderId,
         SELL_EVENT,
@@ -107,7 +108,7 @@ where
         &mut self,
         order: &mut Order,
         timestamp: i64,
-        maker: bool,
+        liquidity: Liquidity,
         exec_price_tick: i64,
     ) -> Result<(), BacktestError> {
         if order.status == Status::Expired
@@ -117,8 +118,8 @@ where
             return Err(BacktestError::InvalidOrderStatus);
         }
 
-        order.maker = maker;
-        if maker {
+        order.set_liquidity(Some(liquidity));
+        if liquidity == Liquidity::Maker {
             order.exec_price_tick = order.price_tick;
         } else {
             order.exec_price_tick = exec_price_tick;
@@ -148,7 +149,7 @@ where
             .on_best_bid_update(prev_best_tick, new_best_tick)?;
         for mut order in filled {
             let price_tick = order.price_tick;
-            self.fill::<true>(&mut order, timestamp, true, price_tick)?;
+            self.fill::<true>(&mut order, timestamp, Liquidity::Maker, price_tick)?;
         }
         Ok(())
     }
@@ -164,7 +165,7 @@ where
             .on_best_ask_update(prev_best_tick, new_best_tick)?;
         for mut order in filled {
             let price_tick = order.price_tick;
-            self.fill::<true>(&mut order, timestamp, true, price_tick)?;
+            self.fill::<true>(&mut order, timestamp, Liquidity::Maker, price_tick)?;
         }
         Ok(())
     }
@@ -192,7 +193,7 @@ where
                                 self.fill::<false>(
                                     order,
                                     timestamp,
-                                    false,
+                                    Liquidity::Taker,
                                     self.depth.best_ask_tick(),
                                 )
                             }
@@ -220,7 +221,12 @@ where
                 }
                 OrdType::Market => {
                     // Takes the market.
-                    self.fill::<false>(order, timestamp, false, self.depth.best_ask_tick())
+                    self.fill::<false>(
+                        order,
+                        timestamp,
+                        Liquidity::Taker,
+                        self.depth.best_ask_tick(),
+                    )
                 }
                 OrdType::Unsupported => Err(BacktestError::InvalidOrderRequest),
             }
@@ -242,7 +248,7 @@ where
                                 self.fill::<false>(
                                     order,
                                     timestamp,
-                                    false,
+                                    Liquidity::Taker,
                                     self.depth.best_bid_tick(),
                                 )
                             }
@@ -270,7 +276,12 @@ where
                 }
                 OrdType::Market => {
                     // Takes the market.
-                    self.fill::<false>(order, timestamp, false, self.depth.best_bid_tick())
+                    self.fill::<false>(
+                        order,
+                        timestamp,
+                        Liquidity::Taker,
+                        self.depth.best_bid_tick(),
+                    )
                 }
                 OrdType::Unsupported => Err(BacktestError::InvalidOrderRequest),
             }
@@ -401,7 +412,7 @@ where
                 let timestamp = event.exch_ts;
                 for mut order in filled {
                     let price_tick = order.price_tick;
-                    self.fill::<true>(&mut order, timestamp, true, price_tick)?;
+                    self.fill::<true>(&mut order, timestamp, Liquidity::Maker, price_tick)?;
                 }
             }
         }

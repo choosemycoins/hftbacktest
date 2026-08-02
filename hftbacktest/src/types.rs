@@ -415,6 +415,23 @@ impl AsRef<str> for Side {
     }
 }
 
+/// Which side of an execution our order was on: it rested and was hit ([`Liquidity::Maker`]),
+/// or it crossed the spread and took ([`Liquidity::Taker`]).
+///
+/// **Not a wire type on purpose.** It is how a fill's liquidity is *supplied* — by the backtest
+/// exchange, which knows it by construction, or by a venue that reports it — and it reaches the
+/// wire only as [`Order::maker`], the `bool` that was already there. Callers pass
+/// `Option<Liquidity>`: `None` is the honest answer for a venue that does not report the
+/// liquidity of a fill, and it claims nothing rather than claiming the cheaper side
+/// (`AGENTS.md` §1.1, correctness-by-construction §1.6 invariant C2).
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Liquidity {
+    /// The order was resting and provided the liquidity.
+    Maker,
+    /// The order crossed the spread and took the liquidity.
+    Taker,
+}
+
 /// Order status
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(u8)]
@@ -578,7 +595,16 @@ pub struct Order {
     /// Additional data used for [`QueueModel`](`crate::backtest::models::QueueModel`).
     /// This is only available in backtesting, and the type `Q` is set to `()` in a live bot.
     pub q: Box<dyn AnyClone + Send>,
-    /// Whether the order is executed as a maker, only available when this order is executed.
+    /// Whether the execution this order reports was a maker execution.
+    ///
+    /// **True means a [`Liquidity::Maker`] was reported for that execution — nothing else sets
+    /// it.** Write it through [`Order::set_liquidity`], which takes the liquidity as it is
+    /// supplied at the moment a fill is applied. `false` therefore reads as "took liquidity, or
+    /// nobody said": a venue that reports no per-fill liquidity leaves the flag unset rather
+    /// than claiming the maker side it did not measure (`AGENTS.md` §1.1, invariant C2). The
+    /// two are not distinguishable here, and deliberately so — the wire field is the `bool` it
+    /// has always been, and under-claiming is the safe direction for fee and fill-quality
+    /// attribution.
     pub maker: bool,
     pub order_type: OrdType,
     /// Request status:
@@ -629,6 +655,17 @@ impl Order {
     /// Returns the executed price, only available when this order is executed.
     pub fn exec_price(&self) -> f64 {
         self.exec_price_tick as f64 * self.tick_size
+    }
+
+    /// Records the liquidity of the execution being applied to this order.
+    ///
+    /// The one writer of [`Order::maker`]. `Some(Liquidity::Maker)` is the only input that sets
+    /// the flag; `Some(Liquidity::Taker)` and `None` — the venue reported no liquidity for this
+    /// execution — both clear it, so a claim never outlives the execution that earned it. That
+    /// is what keeps the flag a measurement instead of a constant (invariant C2): the callers
+    /// that have no measurement have nothing to pass but `None`.
+    pub fn set_liquidity(&mut self, liquidity: Option<Liquidity>) {
+        self.maker = liquidity == Some(Liquidity::Maker);
     }
 
     /// Returns whether this order is cancelable.
@@ -1149,6 +1186,48 @@ mod tests {
         assert!(!event.is(LOCAL_BID_DEPTH_SNAPSHOT_EVENT));
         assert!(event.is(LOCAL_EVENT));
         assert!(event.is(BUY_EVENT));
+    }
+
+    /// **Only a reported [`Liquidity::Maker`] claims maker liquidity** (invariant C2).
+    ///
+    /// The flag is a measurement, so the three inputs a caller can have — "the venue said
+    /// maker", "the venue said taker", "the venue said nothing" — must give true, false,
+    /// false. The last is the one that matters: a source that does not report the liquidity of
+    /// a fill has nothing to pass but `None`, and `None` must not read as the cheaper side.
+    ///
+    /// A claim also does not outlive the execution that earned it: applying an unreported
+    /// execution to an order that last filled as a maker clears the flag rather than leaving
+    /// the previous fill's word standing for this one.
+    #[test]
+    fn only_a_reported_maker_execution_claims_maker_liquidity() {
+        use crate::types::{Liquidity, OrdType, Order, Side, TimeInForce};
+
+        let mut order = Order::new(
+            1,
+            100,
+            0.01,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        assert!(
+            !order.maker,
+            "an order that has not executed claims nothing"
+        );
+
+        order.set_liquidity(Some(Liquidity::Maker));
+        assert!(order.maker, "the venue reported a maker execution");
+
+        order.set_liquidity(Some(Liquidity::Taker));
+        assert!(!order.maker, "the venue reported a taker execution");
+
+        order.set_liquidity(Some(Liquidity::Maker));
+        order.set_liquidity(None);
+        assert!(
+            !order.maker,
+            "an unreported execution claims nothing, whatever the last one was"
+        );
     }
 
     /// **`LiveRequest` is bincode-encoded with no version field, so a variant may only ever

@@ -10,7 +10,7 @@
 //! they are pinned by fixtures — a field the venue renames shows up downstream as an
 //! account that simply never seems to trade.
 
-use hftbacktest::types::Status;
+use hftbacktest::types::{Liquidity, Status};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -147,6 +147,14 @@ pub struct UserFill {
     /// anchor for the position the account actually holds.
     #[serde(default, deserialize_with = "from_str_to_f64")]
     pub start_position: f64,
+    /// Whether **our** order crossed the spread to make this fill happen — the venue's own
+    /// word on the liquidity, and the only per-fill statement of it (C2).
+    ///
+    /// `Option` on purpose: a fill that does not carry the field states nothing, and a
+    /// `bool` defaulting to `false` would state "rested", claiming maker liquidity nobody
+    /// reported. Absent means unknown, and unknown claims nothing (`AGENTS.md` §1.1).
+    #[serde(default)]
+    pub crossed: Option<bool>,
 }
 
 impl UserFill {
@@ -157,6 +165,20 @@ impl UserFill {
     /// The signed size this fill moved the position by.
     pub fn signed_size(&self) -> f64 {
         if self.is_buy() { self.sz } else { -self.sz }
+    }
+
+    /// The liquidity the venue reported for this fill, or `None` when it reported none.
+    ///
+    /// `crossed` is stated from our order's point of view: it crossed the spread, so it took
+    /// liquidity. Not crossing means it was resting and was hit.
+    pub fn liquidity(&self) -> Option<Liquidity> {
+        self.crossed.map(|crossed| {
+            if crossed {
+                Liquidity::Taker
+            } else {
+                Liquidity::Maker
+            }
+        })
     }
 }
 
