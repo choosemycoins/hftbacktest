@@ -284,6 +284,27 @@ where
             }
             LiveEvent::Order { order, .. } => {
                 debug!(%inst_no, ?order, "Event::Order");
+                if order.status == Status::Uncertain {
+                    // Surfaced, never dropped (invariant S3). The connector could not read
+                    // what the venue said about this order, so it may still be resting; the
+                    // order stays in `orders(asset_no)` carrying `Status::Uncertain` for the
+                    // strategy to reconcile, and this is the operator's grep target.
+                    //
+                    // Deliberately **not** a new `ErrorKind`: that would be policy in the
+                    // library, and `LiveBot` hands policy to the consumer's `error_handler`
+                    // (`AGENTS.md` §1.1). The first-class status in `orders()` is the signal.
+                    error!(
+                        %inst_no,
+                        order_id = %order.order_id,
+                        symbol = %self
+                            .instruments
+                            .get(inst_no)
+                            .map(|i| i.symbol.as_str())
+                            .unwrap_or("?"),
+                        "An order this connector could not read the venue's status for; it is \
+                         kept as Status::Uncertain and must be reconciled, not assumed gone."
+                    );
+                }
                 let received_order_resp = match wait_order_response {
                     WaitOrderResponse::Any => true,
                     WaitOrderResponse::Specified {
@@ -746,17 +767,29 @@ where
         Ok(ElapseResult::Ok)
     }
 
+    /// Clears the orders this bot no longer needs to track.
+    ///
+    /// Reads the same single ruling as `Local::clear_inactive_orders` in the backtest
+    /// ([`Status::is_terminal`]) — it used to read `active()` instead, which is a *different*
+    /// set. The two disagree on `Status::None` (submitted, not yet acked) and
+    /// `Status::Replaced`: calling this in production dropped both, while the replay that was
+    /// supposed to validate the strategy kept them. Losing a submitted-not-yet-acked order
+    /// frees its id while the venue may be about to rest it (`AGENTS.md` §4.3).
     #[inline]
     fn clear_inactive_orders(&mut self, asset_no: Option<usize>) {
         match asset_no {
             Some(inst_no) => {
                 if let Some(instrument) = self.instruments.get_mut(inst_no) {
-                    instrument.orders.retain(|_, order| order.active());
+                    instrument
+                        .orders
+                        .retain(|_, order| !order.status.is_terminal());
                 }
             }
             None => {
                 for instrument in self.instruments.iter_mut() {
-                    instrument.orders.retain(|_, order| order.active());
+                    instrument
+                        .orders
+                        .retain(|_, order| !order.status.is_terminal());
                 }
             }
         }
@@ -1110,6 +1143,151 @@ mod tests {
         let mut bot = make_bot(&["BTCUSDT"], vec![]);
         bot.elapse(1_000).unwrap();
         assert!(!bot.snapshot_ready(0));
+    }
+
+    /// An order the venue said something unreadable about, at a given exchange clock.
+    fn uncertain_order_event(symbol: &str, order_id: OrderId, exch_ts: i64) -> LiveEvent {
+        let mut order = Order::new(
+            order_id,
+            10_000,
+            0.01,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::Uncertain;
+        order.req = Status::None;
+        order.exch_timestamp = exch_ts;
+        LiveEvent::Order {
+            symbol: symbol.into(),
+            order,
+        }
+    }
+
+    /// An uncertain order **survives `clear_inactive_orders`** and **reads as still resting**.
+    ///
+    /// Appending `Status::Uncertain` is the easy half of S3; on its own it inverts the
+    /// invariant. The two assertions cover the two ways it inverts, and they fail against
+    /// different code:
+    ///
+    /// * surviving `clear_inactive_orders` fails if that path treats the new variant as
+    ///   clearable. The call is what makes this non-vacuous — without it the test passes on
+    ///   the `Entry::Vacant` insert alone and never touches a removal path.
+    /// * `active()` is the **strategy-facing** question, and the one that is load-bearing
+    ///   here: a strategy asking "is this order still live?" about an uncertain order must
+    ///   not be told "no". That is the fail-open answer — it re-quotes and stands a duplicate
+    ///   at a venue that may still be holding the original (`AGENTS.md` §1.1, §4.8).
+    #[test]
+    fn an_uncertain_order_is_kept_and_surfaced() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, order_event("BTCUSDT", 1, 100.0)),
+                (
+                    0,
+                    uncertain_order_event("BTCUSDT", 1, 1_700_000_000_000_000_000),
+                ),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        bot.clear_inactive_orders(None);
+
+        let order = bot
+            .orders(0)
+            .get(&1)
+            .expect("an uncertain order must not be dropped: the venue may still be holding it");
+        assert_eq!(
+            order.status,
+            Status::Uncertain,
+            "the uncertainty must reach the strategy as a first-class status it can reconcile"
+        );
+        assert!(
+            order.active(),
+            "a strategy asking whether this order is still live must not be told 'no': that \
+             is the fail-open answer that stands a duplicate"
+        );
+    }
+
+    /// An uncertain update whose exchange clock has **not advanced** still applies.
+    ///
+    /// The connector deliberately does not advance its stale-frame watermark when it cannot
+    /// read a status — an unreadable frame carries no ordering authority — so the copy it
+    /// publishes carries the *tracked* `exch_timestamp`, equal to the one the bot already
+    /// holds. `process_event` accepts it only because its guard is `>=`.
+    ///
+    /// This pin exists because tightening that guard to `>` looks like a reasonable
+    /// "fix out-of-order updates" edit, and would silently swallow **every** uncertain event
+    /// while leaving the rest of the suite green.
+    #[test]
+    fn an_uncertain_update_that_does_not_advance_the_exchange_clock_is_still_applied() {
+        let clock = 1_700_000_000_000_000_000;
+        let mut first = order_event("BTCUSDT", 1, 100.0);
+        if let LiveEvent::Order { order, .. } = &mut first {
+            order.exch_timestamp = clock;
+        }
+
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, first),
+                // Same clock, not a later one.
+                (0, uncertain_order_event("BTCUSDT", 1, clock)),
+            ],
+        );
+        bot.elapse(1_000_000).unwrap();
+
+        assert_eq!(
+            bot.orders(0).get(&1).unwrap().status,
+            Status::Uncertain,
+            "an uncertain update at an equal exchange timestamp must apply; the connector \
+             cannot advance the clock on a frame it could not read"
+        );
+    }
+
+    /// The two [`Bot`] implementations must clear the **same** orders.
+    ///
+    /// `Local::clear_inactive_orders` (backtest) clears on `is_terminal()`, and this one used
+    /// to clear on `!active()`. The sets differ on `Status::None` (submitted, not yet acked)
+    /// and `Status::Replaced` — so a strategy that calls `clear_inactive_orders` lost a live
+    /// order in production and kept it in the replay that was supposed to validate it. That
+    /// is the "green in backtest, wrong in prod" class of `AGENTS.md` §4.3, and it is what
+    /// left the S2 unification incomplete.
+    #[test]
+    fn the_two_bot_implementations_clear_the_same_orders() {
+        let kept = [
+            Status::None,
+            Status::New,
+            Status::PartiallyFilled,
+            Status::Replaced,
+            Status::Unsupported,
+            Status::Uncertain,
+        ];
+        let cleared = [
+            Status::Filled,
+            Status::Canceled,
+            Status::Expired,
+            Status::Rejected,
+        ];
+
+        for status in kept.into_iter().chain(cleared) {
+            let mut event = order_event("BTCUSDT", 1, 100.0);
+            if let LiveEvent::Order { order, .. } = &mut event {
+                order.status = status;
+            }
+            let mut bot = make_bot(&["BTCUSDT"], vec![(0, event)]);
+            bot.elapse(1_000_000).unwrap();
+            bot.clear_inactive_orders(None);
+
+            let survived = bot.orders(0).contains_key(&1);
+            assert_eq!(
+                survived,
+                !status.is_terminal(),
+                "{status:?}: the live bot must clear exactly what Local::clear_inactive_orders \
+                 clears — the single is_terminal() ruling"
+            );
+        }
     }
 
     fn heartbeats(bot: &LiveBot<MockChannel, HashMapMarketDepth>) -> Vec<(u64, usize)> {

@@ -425,21 +425,43 @@ impl OrderManager {
 
         // Classify before touching the order. An unrecognised status is kept, never dropped:
         // folding it into a terminal `Status` would free the id and let the strategy stand a
-        // duplicate at the venue (S1, `AGENTS.md` §1.1). The order is left exactly as last
-        // known — watermark not advanced, status unchanged, not dropped — so a later
-        // recognised update applies normally; reconnect reconciliation expires it if it is
-        // truly gone.
+        // duplicate at the venue (S1, `AGENTS.md` §1.1).
         let status = match map_order_status(&update.status) {
             StatusVerdict::Known(status) => status,
             StatusVerdict::Unrecognised(raw) => {
                 error!(
                     %cloid,
                     status = %raw,
-                    "An unrecognised Hyperliquid order status; keeping the order tracked so it \
-                     is not dropped and re-submitted as a duplicate. Reconnect reconciliation \
-                     expires it if it is truly gone."
+                    "An unrecognised Hyperliquid order status; publishing it as \
+                     Status::Uncertain so the bot reconciles it rather than assuming it gone, \
+                     and keeping it tracked so it is not re-submitted as a duplicate."
                 );
-                return None;
+                // S3: the uncertainty is carried **to the bot** as a first-class status, not
+                // just logged here. Publishing nothing left the bot re-asserting its last
+                // known claim (`New`), and the bot is the half that decides whether to
+                // re-quote.
+                //
+                // Three deliberate choices in this copy:
+                //
+                // * `exec_qty`/`exec_price_tick` are zeroed — this update says nothing about
+                //   a fill, and the tracked order still carries the last execution's delta.
+                //   Re-publishing it would report that fill a second time (the connector-side
+                //   statement of E5's per-execution-delta rule).
+                // * `exch_timestamp` is the **tracked** one, unchanged: a frame we could not
+                //   read carries no ordering authority, so it must not become a watermark a
+                //   later readable frame has to beat. `LiveBot::process_event` accepts the
+                //   equal-clock copy because its guard is `>=`.
+                // * `tracked` itself is **not** mutated — neither `update_ts` nor `status`.
+                //   The connector's own book keeps the last thing it actually understood, so
+                //   `orders()` on registration answers with a real status.
+                let mut uncertain = tracked.order.clone();
+                uncertain.status = Status::Uncertain;
+                uncertain.req = Status::None;
+                uncertain.exec_qty = 0.0;
+                uncertain.exec_price_tick = 0;
+                let mut published = tracked.clone();
+                published.order = uncertain;
+                return Some(published);
             }
         };
 
@@ -980,10 +1002,9 @@ mod tests {
         weird[0].order.cloid = Some(cloid);
         weird[0].status = "someBrandNewLifecycleState".to_string();
         weird[0].status_timestamp = open[0].status_timestamp + 1;
-        assert!(
-            manager.apply_order_update(&weird[0]).is_none(),
-            "an unrecognised status publishes nothing"
-        );
+        manager
+            .apply_order_update(&weird[0])
+            .expect("an unrecognised status is published as uncertain, not swallowed (S3)");
         assert_eq!(
             manager.tracked(),
             1,
@@ -994,6 +1015,72 @@ mod tests {
             1,
             "the order is still resting from the bot's view"
         );
+    }
+
+    /// **The uncertainty reaches the bot** (S3), rather than staying a connector-side log line.
+    ///
+    /// Keeping the order tracked (S1, above) fixed the connector's own book but left the bot
+    /// with a stale claim: nothing was published, so it went on believing the order was
+    /// `New`. The bot is the half that decides whether to re-quote, so it is the half that has
+    /// to know the state is unknown.
+    ///
+    /// Three properties, each separately breakable:
+    ///
+    /// * the published copy carries `Status::Uncertain` — not the last known status, which
+    ///   would re-assert a claim the venue has just undermined;
+    /// * it reports **no execution** (`exec_qty == 0`), because an update that says nothing
+    ///   about a fill must not re-report the previous one's delta;
+    /// * the stale-frame watermark is **not advanced**, so a later readable frame at an
+    ///   earlier venue clock still applies. A frame this connector could not read carries no
+    ///   ordering authority. `LiveBot::process_event` accepts the equal-clock copy for the
+    ///   same reason (its guard is `>=`).
+    #[test]
+    fn an_unrecognised_status_is_published_as_uncertain() {
+        let mut manager = manager();
+        manager
+            .new_order("BTC", &btc(), 3, bot_order(7, 31700.0, 0.00032, Side::Buy))
+            .unwrap();
+        let cloid = manager.cancel_order("BTC", 7, 3).unwrap().0;
+
+        let mut open = updates(ORDER_UPDATE_OPEN);
+        open[0].order.cloid = Some(cloid.clone());
+        let applied = manager.apply_order_update(&open[0]).unwrap();
+        let known_ts = applied.order.exch_timestamp;
+        assert_eq!(applied.order.status, Status::New);
+
+        let mut weird = updates(ORDER_UPDATE_OPEN);
+        weird[0].order.cloid = Some(cloid.clone());
+        weird[0].status = "someBrandNewLifecycleState".to_string();
+        weird[0].status_timestamp = open[0].status_timestamp + 5;
+
+        let published = manager
+            .apply_order_update(&weird[0])
+            .expect("the bot must be told the state is unknown");
+        assert_eq!(
+            published.order.status,
+            Status::Uncertain,
+            "publishing the last known status would re-assert a claim the venue undermined"
+        );
+        assert_eq!(
+            published.order.exec_qty, 0.0,
+            "an update that reports no execution must not re-report the previous delta"
+        );
+        assert_eq!(
+            published.order.exch_timestamp, known_ts,
+            "an unreadable frame carries no venue clock to advance to"
+        );
+
+        // The watermark was not advanced, so a readable frame stamped *before* the unreadable
+        // one still applies. Had the unreadable frame moved the watermark, this would be
+        // dropped as stale and the order would sit uncertain until reconnect.
+        let mut later = updates(ORDER_UPDATE_OPEN);
+        later[0].order.cloid = Some(cloid);
+        later[0].status = "canceled".to_string();
+        later[0].status_timestamp = open[0].status_timestamp + 1;
+        let resolved = manager
+            .apply_order_update(&later[0])
+            .expect("a readable frame after an unreadable one must still apply");
+        assert_eq!(resolved.order.status, Status::Canceled);
     }
 
     /// **A market order is refused, never silently placed as a resting limit** (C1).

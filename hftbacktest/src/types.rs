@@ -486,6 +486,35 @@ pub enum Status {
     /// This occurs when the [`Connector`](`crate::connector::Connector`) receives an order status
     /// value that does not have a corresponding enum value.
     Unsupported = 255,
+    /// The venue said something about this order that the connector could not read, so its
+    /// state is **unknown** — and unknown is not a resolution.
+    ///
+    /// Minted only by a connector, at the one place a venue status string fails to classify
+    /// (`StatusVerdict::Unrecognised`). Before this variant existed the connector logged the
+    /// unreadable status and published nothing, so the bot's copy silently kept whatever
+    /// status it last held — an order the venue had just said something unexpected about
+    /// looked, to the strategy, exactly like one it had confirmed as resting.
+    ///
+    /// The two properties that make it safe are enforced elsewhere and are easy to break
+    /// independently: it is **not terminal** ([`Status::is_terminal`]), so no removal path
+    /// frees the order id; and it **may still rest at the venue**
+    /// ([`Status::may_rest_at_venue`], and therefore [`Order::active`]), so no path that
+    /// filters on `active()` drops it. An uncertain order that gets dropped is the exact
+    /// fail-open this variant exists to prevent: the id is freed, the strategy re-submits,
+    /// and a duplicate stands at a venue that may still be holding the original
+    /// (`AGENTS.md` §1.1, correctness-by-construction §1.6, invariant S3).
+    ///
+    /// It **overwrites** the last known status, and that is the intended reading: we no
+    /// longer hold the claim that the order was `New` or `PartiallyFilled`, we hold only the
+    /// quantities. Reconnect reconciliation is what resolves it — which today exists on
+    /// Hyperliquid and Lighter only.
+    ///
+    /// The `= 9` is **mandatory, not cosmetic**: `Unsupported = 255` makes an implicit
+    /// discriminant here `E0370 enum discriminant overflowed`. It is also read by
+    /// `py-hftbacktest`'s numpy `order_dtype`, which reads this repr byte rather than the
+    /// bincode ordinal. That the two happen to both be 9 is a coincidence of appending after
+    /// exactly nine variants — the wire number is positional and is pinned separately.
+    Uncertain = 9,
 }
 
 impl Status {
@@ -501,22 +530,63 @@ impl Status {
     ///
     /// The match is **exhaustive with no wildcard on purpose**: a new [`Status`] variant does
     /// not compile until it is ruled terminal-or-not here, so it cannot silently fall through
-    /// to "drop the order" at a removal site — the structural half of invariants S1/S2. A
-    /// future non-terminal `Status::Uncertain` (deferred design item S3) would be forced to
-    /// declare itself here, keeping an uncertain order tracked rather than dropped and
-    /// re-submitted as a duplicate.
+    /// to "drop the order" at a removal site — the structural half of invariants S1/S2. That
+    /// is how [`Status::Uncertain`] (invariant S3) was forced to declare itself when it was
+    /// appended, rather than defaulting into a set it does not belong in.
     ///
     /// Ruling on the two the previous hand-written set silently omitted: `Rejected` **is**
     /// terminal (a refused order never rested and takes no later update); `Replaced` is
     /// **not** (a replaced order keeps its id and continues resting — `Local::modify`).
-    /// `None`/`Unsupported` are not terminal either — neither is a resolution that frees an
-    /// order id.
+    /// `None`/`Unsupported`/`Uncertain` are not terminal either — none of them is a
+    /// resolution that frees an order id.
     pub fn is_terminal(&self) -> bool {
         match self {
             Status::Filled | Status::Canceled | Status::Expired | Status::Rejected => true,
             Status::None
             | Status::New
             | Status::PartiallyFilled
+            | Status::Replaced
+            | Status::Unsupported
+            | Status::Uncertain => false,
+        }
+    }
+
+    /// Whether an order in this status **may still be resting at the venue**, and so must not
+    /// be treated as gone.
+    ///
+    /// This is the predicate behind [`Order::active`], and it is a different question from
+    /// [`Status::is_terminal`]. "Terminal" asks whether the order is *resolved*; this asks
+    /// whether it might *still be working*. The gap between them is where orders get lost.
+    ///
+    /// **Where this actually bites, stated precisely** — it is easy to overstate, and the
+    /// overstatement would make a reviewer trust a pin that is not there. `active()` is
+    /// **strategy-facing**: it is what a bot asks about the orders in `Bot::orders(asset_no)`,
+    /// and those do carry [`Status::Uncertain`]. Answering `false` there is the fail-open
+    /// direction — the strategy concludes the order is gone, re-quotes, and stands a duplicate
+    /// at a venue that may still be holding the original (`AGENTS.md` §1.1).
+    ///
+    /// It is **not** what the removal paths in this tree key on. `LiveBot::clear_inactive_orders`
+    /// and its backtest twin both read `is_terminal()`; the five connector `orders()` filters
+    /// do read `active()`, but never see an uncertain order, because the connectors publish
+    /// the uncertainty *without* writing it into their own tracked copy. So this ruling is
+    /// load-bearing for the strategy and merely defensive for those filters.
+    ///
+    /// **Wildcard-free on purpose.** The hand-written `status == New || status ==
+    /// PartiallyFilled` this replaces would have compiled unchanged when `Uncertain` was
+    /// appended and quietly answered `false` — no test failure, no log line. A future variant
+    /// has to rule on itself here.
+    ///
+    /// `Uncertain` answers **true**: we do not know that it is gone. `None` — submitted, not
+    /// yet acked — answers false, preserving the existing meaning of `active()`; an order the
+    /// venue has not acknowledged is not yet resting.
+    pub fn may_rest_at_venue(&self) -> bool {
+        match self {
+            Status::New | Status::PartiallyFilled | Status::Uncertain => true,
+            Status::None
+            | Status::Expired
+            | Status::Filled
+            | Status::Canceled
+            | Status::Rejected
             | Status::Replaced
             | Status::Unsupported => false,
         }
@@ -714,8 +784,20 @@ impl Order {
     }
 
     /// Returns whether this order is active in the market.
+    ///
+    /// Delegates to [`Status::may_rest_at_venue`], the single wildcard-free ruling. It used to
+    /// be the hand-written `status == New || status == PartiallyFilled` here — the same set
+    /// for every status that existed then, but a hand-written set answers `false` for a *new*
+    /// variant without anyone noticing, which is how appending [`Status::Uncertain`] would
+    /// have quietly made every uncertain order look gone.
+    ///
+    /// **This predicate now also answers `true` for `Uncertain`**, which widens it: a strategy
+    /// counting `orders().filter(active)` as "orders I am confident are resting" now also
+    /// counts orders whose state is unknown. That is the fail-closed direction —
+    /// over-counting resting orders suppresses a re-quote rather than standing a duplicate —
+    /// but it is a strategy-visible change (`AGENTS.md` §4.8, invariant S3).
     pub fn active(&self) -> bool {
-        self.status == Status::New || self.status == Status::PartiallyFilled
+        self.status.may_rest_at_venue()
     }
 
     /// Returns whether this order has an ongoing request.
@@ -1477,12 +1559,63 @@ mod tests {
         assert_eq!(ord(&Status::Rejected), 6, "Rejected must stay variant 6");
         assert_eq!(ord(&Status::Replaced), 7, "Replaced must stay variant 7");
         // Decoy: `#[repr(u8)] Unsupported = 255` is not what rides on the wire. bincode writes
-        // the positional index, so this is 8. A future `Uncertain` (design item S3) appended
-        // after it would be 9 — not 8 — whatever literal is written next to it.
+        // the positional index, so this is 8.
         assert_eq!(
             ord(&Status::Unsupported),
             8,
             "Unsupported rides as positional 8, never its repr 255"
+        );
+        // `Uncertain` (invariant S3) was **appended**, so it is 9 — the position after
+        // `Unsupported`, not its `#[repr(u8)]` literal, which happens to also be 9 for an
+        // unrelated reason (255 is taken, so an implicit discriminant would overflow). The
+        // two nines are a coincidence; only this one is the wire.
+        assert_eq!(
+            ord(&Status::Uncertain),
+            9,
+            "Uncertain must stay appended at positional 9; inserting it anywhere earlier \
+             renumbers every later variant and makes an older bot decode one status as another"
+        );
+    }
+
+    /// An uncertain order is **kept**: neither terminal nor droppable.
+    ///
+    /// [`Status::Uncertain`] means "the venue said something about this order that this
+    /// connector could not read" — the order may well still be resting. Both halves matter and
+    /// they are enforced at different sites:
+    ///
+    /// * not **terminal**, so the live final-status guard does not freeze it and
+    ///   `Local::clear_inactive_orders` does not clear it;
+    /// * still **resting** ([`Order::active`]), so none of the removal paths that filter on
+    ///   `active()` drop it — five connector `orders()` filters and
+    ///   `LiveBot::clear_inactive_orders`.
+    ///
+    /// The second half is the one that is easy to miss, and getting it wrong inverts the
+    /// invariant silently: an uncertain order that is dropped frees its id, the strategy
+    /// re-submits, and a duplicate stands at the venue — exactly the fail-open S3 exists to
+    /// prevent (`AGENTS.md` §1.1).
+    #[test]
+    fn an_uncertain_order_is_neither_terminal_nor_droppable() {
+        use crate::types::{OrdType, Order, Side, Status, TimeInForce};
+
+        assert!(
+            !Status::Uncertain.is_terminal(),
+            "an unreadable status is not a resolution: it frees no order id"
+        );
+
+        let mut order = Order::new(
+            1,
+            100,
+            0.01,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::Uncertain;
+        assert!(
+            order.active(),
+            "an uncertain order may still be resting at the venue, so every removal path \
+             that filters on active() must keep it"
         );
     }
 

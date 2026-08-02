@@ -41,6 +41,20 @@ PARTIALLY_FILLED = 5
 #: REJECTED
 REJECTED = 6
 
+#: REPLACED. A replaced order keeps its ``order_id`` and goes on resting, so this is not a
+#: terminal status. Rust has had this variant for some time; Python was missing it.
+REPLACED = 7
+
+#: UNCERTAIN. The venue said something about this order that the connector could not read, so
+#: its state is unknown — which is not the same as gone. The order may still be resting, so it
+#: is neither terminal nor droppable, and it must be reconciled rather than assumed away.
+#:
+#: These status constants are the ``#[repr(u8)]`` byte, which is what :obj:`order_dtype` reads
+#: out of memory — **not** the positional index bincode writes on the wire. The two agree for
+#: most statuses and deliberately do not for :const:`UNSUPPORTED`, whose repr is 255 while its
+#: wire ordinal is 8.
+UNCERTAIN = 9
+
 #: Good 'till cancel
 GTC = 0
 
