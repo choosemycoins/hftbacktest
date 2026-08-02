@@ -207,8 +207,17 @@ FEE_ASSUMPTION = (
 # notion of any of this, so an over-churning grid reads BETTER here than a calm
 # one: it captures more spread and is charged nothing for the requests it burned
 # to get there. Counted at the strategy's own emit sites (`si[IST_SUBMITS]` /
-# `si[IST_CANCELS]` in the grid loop) so the count is the request stream the live
-# bot would put on the wire from the same decisions.
+# `si[IST_CANCELS]` in the grid loop), so it is the request stream those decisions
+# produce.
+#
+# It is an UPPER BOUND on live churn, not live churn. The live bot runs behind
+# requote-suppression guards (myhft `src/hysteresis.rs` §§1-3:
+# `min_requote_interval_ms`, `min_order_lifetime_ms`, `min_price_move_ticks`)
+# that drop cancels and their paired submits before the wire; this grid loop has
+# no such guards, so it counts the unsuppressed stream — the live shakeout
+# settings alone are worth roughly a factor of two. The direction is safe for a
+# tool that only reports, and it is a real caveat for anyone comparing the number
+# against the ~2.07 measured live, which WAS measured with the guards engaged.
 #
 # This tool measures sensitivity and does not pick a winner, so the number is
 # REPORTED here rather than used to exclude anything; the selection gate that
