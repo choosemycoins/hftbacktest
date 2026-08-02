@@ -471,6 +471,113 @@ pub enum Liquidity {
     Taker,
 }
 
+/// A price, in the instrument's quote currency.
+///
+/// One half of invariant C5. Prices, prices-in-ticks and quantities are all `f64`/`i64` and so
+/// were freely interchangeable; the measured cost was `bybit/ordermanager.rs` dividing an
+/// execution price by `order.price_tick` — a price already in ticks — instead of by the tick
+/// size, which reported every bybit fill as having executed at tick 0.
+///
+/// The **only** crossing to ticks is [`Price::to_ticks`], which takes a [`TickSize`]. A
+/// [`PriceTick`] passed there does not compile.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default, Decode, Encode)]
+#[repr(transparent)]
+pub struct Price(f64);
+
+impl Price {
+    pub const fn new(price: f64) -> Self {
+        Self(price)
+    }
+
+    pub const fn get(&self) -> f64 {
+        self.0
+    }
+
+    /// This price in ticks — the one bridge, and it needs a [`TickSize`] to cross.
+    ///
+    /// `.round()` rather than a bare `as i64` cast: a cast truncates toward zero, so a price
+    /// landing on a half-tick lands on a different tick above and below zero. The scattered
+    /// hand-written copies of this idiom mostly used `.round()`, which is what makes them
+    /// *mostly* equivalent — centralising it removes the "mostly".
+    pub fn to_ticks(self, tick_size: TickSize) -> PriceTick {
+        PriceTick((self.0 / tick_size.0).round() as i64)
+    }
+}
+
+/// A price expressed in ticks — `price / tick_size`, as an integer.
+///
+/// The counterpart to [`Price`]. Crossing back needs the same [`TickSize`]
+/// ([`PriceTick::to_price`]).
+///
+/// **Residual, stated rather than hidden:** `Order::price_tick` and `Order::exec_price_tick`
+/// are both `PriceTick`, so swapping *those two* is still writable. Distinguishing them would
+/// take two more types for no measured bug, and the confusion this closes is the
+/// price-versus-tick one.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Decode, Encode)]
+#[repr(transparent)]
+pub struct PriceTick(i64);
+
+impl PriceTick {
+    pub const fn new(ticks: i64) -> Self {
+        Self(ticks)
+    }
+
+    /// The raw tick count, for the depth and queue interfaces that still speak `i64`.
+    ///
+    /// [`MarketDepth`](crate::depth::MarketDepth) and the queue models are deliberately left
+    /// on raw `i64` — they are strategy-facing and are read by the numba bindings, and no bug
+    /// has been measured there. This is the named adapter at that boundary; a `get()` or a
+    /// `PriceTick::new` far away from a depth call is worth a second look.
+    pub const fn get(&self) -> i64 {
+        self.0
+    }
+
+    /// This tick back as a price — the one bridge, and it needs the same [`TickSize`].
+    pub fn to_price(self, tick_size: TickSize) -> Price {
+        Price(self.0 as f64 * tick_size.0)
+    }
+}
+
+/// The tick size of an instrument: the price increment its venue quotes on.
+///
+/// Exists so that [`Price::to_ticks`] and [`PriceTick::to_price`] can demand one, which is
+/// what makes a price-in-ticks unusable as a divisor (invariant C5).
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default, Decode, Encode)]
+#[repr(transparent)]
+pub struct TickSize(f64);
+
+impl TickSize {
+    pub const fn new(tick_size: f64) -> Self {
+        Self(tick_size)
+    }
+
+    pub const fn get(&self) -> f64 {
+        self.0
+    }
+}
+
+/// A quantity of the instrument — an order's size or what is left of it.
+///
+/// The other half of invariant C5: a quantity and a price are both `f64`, so nothing stopped
+/// one being used where the other belonged. There is no arithmetic between [`Qty`] and
+/// [`Price`], so `qty * price` — a notional, which is a third thing — must be spelled out
+/// through `get()` rather than falling out of a typo.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default, Decode, Encode)]
+#[repr(transparent)]
+pub struct Qty(f64);
+
+impl Qty {
+    pub const ZERO: Self = Self(0.0);
+
+    pub const fn new(qty: f64) -> Self {
+        Self(qty)
+    }
+
+    pub const fn get(&self) -> f64 {
+        self.0
+    }
+}
+
 /// The quantity executed by **one** execution — a delta, never a running total.
 ///
 /// [`Order::exec_qty`] has always meant "how much this particular execution filled", so that
@@ -729,10 +836,10 @@ impl AnyClone for () {
 #[repr(C)]
 pub struct Order {
     /// Order quantity
-    pub qty: f64,
+    pub qty: Qty,
     /// The quantity of this order that has not yet been executed. It represents the remaining
     /// quantity that is still open or active in the market after any partial fills.
-    pub leaves_qty: f64,
+    pub leaves_qty: Qty,
     /// Executed quantity, only available when this order is executed.
     ///
     /// This is the quantity executed by the single execution the order reports, not the
@@ -746,11 +853,11 @@ pub struct Order {
     pub exec_qty: ExecDelta,
     /// Executed price in ticks (`executed_price / tick_size`), only available when this order is
     /// executed. It is the price of the execution [`Order::exec_qty`] reports.
-    pub exec_price_tick: i64,
+    pub exec_price_tick: PriceTick,
     /// Order price in ticks (`price / tick_size`).
-    pub price_tick: i64,
+    pub price_tick: PriceTick,
     /// The tick size of the asset associated with this order.
-    pub tick_size: f64,
+    pub tick_size: TickSize,
     /// The time at which the exchange processes this order, ideally when the matching engine
     /// processes the order, will be set if the value is available.
     pub exch_timestamp: i64,
@@ -785,9 +892,9 @@ impl Order {
     /// Constructs an instance of `Order`.
     pub fn new(
         order_id: u64,
-        price_tick: i64,
-        tick_size: f64,
-        qty: f64,
+        price_tick: PriceTick,
+        tick_size: TickSize,
+        qty: Qty,
         side: Side,
         order_type: OrdType,
         time_in_force: TimeInForce,
@@ -803,7 +910,7 @@ impl Order {
             status: Status::None,
             local_timestamp: 0,
             req: Status::None,
-            exec_price_tick: 0,
+            exec_price_tick: PriceTick::new(0),
             exec_qty: ExecDelta::ZERO,
             order_id,
             q: Box::new(()),
@@ -813,13 +920,13 @@ impl Order {
     }
 
     /// Returns the order price.
-    pub fn price(&self) -> f64 {
-        self.price_tick as f64 * self.tick_size
+    pub fn price(&self) -> Price {
+        self.price_tick.to_price(self.tick_size)
     }
 
     /// Returns the executed price, only available when this order is executed.
-    pub fn exec_price(&self) -> f64 {
-        self.exec_price_tick as f64 * self.tick_size
+    pub fn exec_price(&self) -> Price {
+        self.exec_price_tick.to_price(self.tick_size)
     }
 
     /// Records one execution against this order: the delta it filled, the price it filled at,
@@ -837,12 +944,12 @@ impl Order {
     pub fn record_execution(
         &mut self,
         delta: ExecDelta,
-        exec_price_tick: i64,
+        exec_price_tick: PriceTick,
         liquidity: Option<Liquidity>,
     ) {
         self.exec_qty = delta;
         self.exec_price_tick = exec_price_tick;
-        self.leaves_qty -= delta.get();
+        self.leaves_qty = Qty::new(self.leaves_qty.get() - delta.get());
         self.set_liquidity(liquidity);
     }
 
@@ -1438,13 +1545,22 @@ mod tests {
     /// the previous fill's word standing for this one.
     #[test]
     fn only_a_reported_maker_execution_claims_maker_liquidity() {
-        use crate::types::{Liquidity, OrdType, Order, Side, TimeInForce};
+        use crate::types::{
+            Liquidity,
+            OrdType,
+            Order,
+            PriceTick,
+            Qty,
+            Side,
+            TickSize,
+            TimeInForce,
+        };
 
         let mut order = Order::new(
             1,
-            100,
-            0.01,
-            1.0,
+            PriceTick::new(100),
+            TickSize::new(0.01),
+            Qty::new(1.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,
@@ -1478,7 +1594,16 @@ mod tests {
     /// happily with the variants reordered — only the first byte tells the truth.
     #[test]
     fn live_request_variants_are_append_only_on_the_wire() {
-        use crate::types::{LiveRequest, OrdType, Order, Side, TimeInForce};
+        use crate::types::{
+            LiveRequest,
+            OrdType,
+            Order,
+            PriceTick,
+            Qty,
+            Side,
+            TickSize,
+            TimeInForce,
+        };
 
         let encode = |request: &LiveRequest| {
             bincode::encode_to_vec(request, bincode::config::standard()).unwrap()
@@ -1488,9 +1613,9 @@ mod tests {
             symbol: "BTC".to_string(),
             order: Order::new(
                 1,
-                100,
-                0.01,
-                1.0,
+                PriceTick::new(100),
+                TickSize::new(0.01),
+                Qty::new(1.0),
                 Side::Buy,
                 OrdType::Limit,
                 TimeInForce::GTC,
@@ -1545,7 +1670,10 @@ mod tests {
             LiveEvent,
             OrdType,
             Order,
+            PriceTick,
+            Qty,
             Side,
+            TickSize,
             TimeInForce,
         };
 
@@ -1564,9 +1692,9 @@ mod tests {
         };
         let an_order = Order::new(
             1,
-            100,
-            0.01,
-            1.0,
+            PriceTick::new(100),
+            TickSize::new(0.01),
+            Qty::new(1.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,
@@ -1657,6 +1785,45 @@ mod tests {
         );
     }
 
+    /// A price becomes ticks **only** by being divided by a tick size (invariant C5).
+    ///
+    /// The idiom `(price / tick).round() as i64` is written out at roughly ten call sites, and
+    /// at two of them the divisor is not a tick size at all: `bybit/ordermanager.rs` divides an
+    /// execution price by `order.price_tick` — a price already *in* ticks. Every other backend
+    /// divides by `tick_size`. The result is silently wrong rather than absurd, which is why it
+    /// survived: it produces a small integer that still looks like a tick.
+    ///
+    /// [`Price::to_ticks`] and [`PriceTick::to_price`] are the only crossings, and each takes a
+    /// [`TickSize`]. Passing a `PriceTick` where a `TickSize` belongs no longer type-checks, so
+    /// the bybit bug is not merely fixed — it is unwritable.
+    #[test]
+    fn the_only_bridge_between_a_price_and_a_tick_is_the_tick_size() {
+        use crate::types::{Price, PriceTick, TickSize};
+
+        let tick = TickSize::new(0.1);
+        assert_eq!(Price::new(100.5).to_ticks(tick), PriceTick::new(1005));
+        assert_eq!(PriceTick::new(1005).to_price(tick), Price::new(100.5));
+
+        // Negatives round symmetrically: an instrument may quote below zero (a spread, a
+        // basis), and `.round()` goes away from zero where a bare `as i64` would truncate
+        // toward it.
+        assert_eq!(Price::new(-100.5).to_ticks(tick), PriceTick::new(-1005));
+
+        // **Not exact on a half-tick, and pinned as it is rather than as it ought to be.**
+        // `0.15 / 0.1` is `1.4999999999999998` in binary floating point, not `1.5`, so it
+        // rounds *down* to 1: a price sitting exactly on a half-tick boundary can land on
+        // either neighbour depending on how the two decimals happen to be represented.
+        //
+        // This is the behaviour of the `(price / tick).round()` idiom that was already
+        // written out at every call site. Centralising it neither introduced the wart nor
+        // removed it, and asserting the idealised answer here would make this test a wish
+        // instead of a description — the first thing a future reader would trust and the
+        // first thing to mislead them. Removing it for real means decimal or scaled-integer
+        // arithmetic throughout, which is a separate change with its own wire consequences.
+        assert_eq!(Price::new(0.15).to_ticks(tick), PriceTick::new(1));
+        assert_eq!(Price::new(-0.15).to_ticks(tick), PriceTick::new(-1));
+    }
+
     /// An execution and the remainder it leaves **move together**, by construction.
     ///
     /// [`Order::exec_qty`] is a *per-execution delta*, never a running total — an order that
@@ -1671,33 +1838,47 @@ mod tests {
     /// it, rather than a reviewer having to.
     #[test]
     fn an_execution_and_the_remainder_move_together() {
-        use crate::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+        use crate::types::{
+            ExecDelta,
+            OrdType,
+            Order,
+            PriceTick,
+            Qty,
+            Side,
+            Status,
+            TickSize,
+            TimeInForce,
+        };
 
         let mut order = Order::new(
             1,
-            100,
-            0.01,
-            10.0,
+            PriceTick::new(100),
+            TickSize::new(0.01),
+            Qty::new(10.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,
         );
         order.status = Status::New;
-        assert_eq!(order.leaves_qty, 10.0);
+        assert_eq!(order.leaves_qty, Qty::new(10.0));
         assert_eq!(order.exec_qty, ExecDelta::ZERO);
 
-        order.record_execution(ExecDelta::of_execution(3.0), 100, None);
+        order.record_execution(ExecDelta::of_execution(3.0), PriceTick::new(100), None);
         assert_eq!(order.exec_qty, ExecDelta::of_execution(3.0));
-        assert_eq!(order.leaves_qty, 7.0, "the remainder moved by the delta");
+        assert_eq!(
+            order.leaves_qty,
+            Qty::new(7.0),
+            "the remainder moved by the delta"
+        );
 
         // A second execution reports its **own** size, not the 5.0 cumulative.
-        order.record_execution(ExecDelta::of_execution(2.0), 100, None);
+        order.record_execution(ExecDelta::of_execution(2.0), PriceTick::new(100), None);
         assert_eq!(
             order.exec_qty,
             ExecDelta::of_execution(2.0),
             "each execution reports itself; the parts sum to the order's filled quantity"
         );
-        assert_eq!(order.leaves_qty, 5.0);
+        assert_eq!(order.leaves_qty, Qty::new(5.0));
     }
 
     /// An uncertain order is **kept**: neither terminal nor droppable.
@@ -1718,7 +1899,7 @@ mod tests {
     /// prevent (`AGENTS.md` §1.1).
     #[test]
     fn an_uncertain_order_is_neither_terminal_nor_droppable() {
-        use crate::types::{OrdType, Order, Side, Status, TimeInForce};
+        use crate::types::{OrdType, Order, PriceTick, Qty, Side, Status, TickSize, TimeInForce};
 
         assert!(
             !Status::Uncertain.is_terminal(),
@@ -1727,9 +1908,9 @@ mod tests {
 
         let mut order = Order::new(
             1,
-            100,
-            0.01,
-            1.0,
+            PriceTick::new(100),
+            TickSize::new(0.01),
+            Qty::new(1.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,
@@ -1871,20 +2052,30 @@ mod tests {
     /// `#[repr(..)]` literal (`Side::Sell` is repr `-1` but rides as `1`).
     #[test]
     fn an_order_encodes_to_the_bytes_it_has_always_encoded_to() {
-        use crate::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+        use crate::types::{
+            ExecDelta,
+            OrdType,
+            Order,
+            PriceTick,
+            Qty,
+            Side,
+            Status,
+            TickSize,
+            TimeInForce,
+        };
 
         let mut order = Order::new(
             300,
-            -5,
-            0.01,
-            1.5,
+            PriceTick::new(-5),
+            TickSize::new(0.01),
+            Qty::new(1.5),
             Side::Sell,
             OrdType::Limit,
             TimeInForce::IOC,
         );
-        order.leaves_qty = 0.5;
+        order.leaves_qty = Qty::new(0.5);
         order.exec_qty = ExecDelta::of_execution(1.0);
-        order.exec_price_tick = -4;
+        order.exec_price_tick = PriceTick::new(-4);
         order.exch_timestamp = 1_700_000_000_000_000_000;
         order.local_timestamp = 1_700_000_000_000_000_001;
         order.maker = true;

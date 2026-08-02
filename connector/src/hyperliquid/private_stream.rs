@@ -1003,7 +1003,18 @@ fn report_rejection(
 
 #[cfg(test)]
 mod tests {
-    use hftbacktest::types::{ErrorKind, LiveEvent, OrdType, Order, Side, Status, TimeInForce};
+    use hftbacktest::types::{
+        ErrorKind,
+        LiveEvent,
+        OrdType,
+        Order,
+        PriceTick,
+        Qty,
+        Side,
+        Status,
+        TickSize,
+        TimeInForce,
+    };
     use tokio::sync::mpsc::unbounded_channel;
 
     use crate::{
@@ -1173,9 +1184,9 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let order = Order::new(
             7,
-            100,
-            0.1,
-            1.0,
+            PriceTick::new(100),
+            TickSize::new(0.1),
+            Qty::new(1.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,
@@ -1210,9 +1221,9 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let order = Order::new(
             7,
-            100,
-            0.1,
-            1.0,
+            PriceTick::new(100),
+            TickSize::new(0.1),
+            Qty::new(1.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,

@@ -26,9 +26,13 @@ use crate::{
         OrdType,
         Order,
         OrderId,
+        Price,
+        PriceTick,
+        Qty,
         Side,
         StateValues,
         Status,
+        TickSize,
         TimeInForce,
     },
 };
@@ -111,12 +115,14 @@ where
             return Err(BacktestError::InvalidOrderRequest);
         }
 
-        let price_tick = (price / self.depth.tick_size()).round() as i64;
+        // The one bridge (C5): a price becomes ticks only by being divided by a tick size.
+        let tick_size = TickSize::new(self.depth.tick_size());
+        let price_tick = Price::new(price).to_ticks(tick_size);
         let mut order = Order::new(
             order_id,
             price_tick,
-            self.depth.tick_size(),
-            qty,
+            tick_size,
+            Qty::new(qty),
             side,
             order_type,
             time_in_force,
@@ -151,26 +157,26 @@ where
             return Err(BacktestError::OrderRequestInProcess);
         }
 
-        let orig_price_tick = order.price_tick;
-        let orig_qty = order.qty;
-        let orig_leaves_qty = order.leaves_qty;
+        let orig_price_tick = order.price_tick.get();
+        let orig_qty = order.qty.get();
+        let orig_leaves_qty = order.leaves_qty.get();
 
         let price_tick = (price / self.depth.tick_size()).round() as i64;
-        order.price_tick = price_tick;
-        order.qty = qty;
+        order.price_tick = PriceTick::new(price_tick);
+        order.qty = Qty::new(qty);
         // The amended quantity is the quantity the order rests for. The exchange re-rests the
         // order when the amendment changes its price, and it rests whatever `leaves_qty` the
         // request carries.
-        order.leaves_qty = qty;
+        order.leaves_qty = Qty::new(qty);
 
         order.req = Status::Replaced;
         order.local_timestamp = current_timestamp;
 
         self.order_l2e.request(order.clone(), |order| {
             order.req = Status::Rejected;
-            order.price_tick = orig_price_tick;
-            order.qty = orig_qty;
-            order.leaves_qty = orig_leaves_qty;
+            order.price_tick = PriceTick::new(orig_price_tick);
+            order.qty = Qty::new(orig_qty);
+            order.leaves_qty = Qty::new(orig_leaves_qty);
         });
         // The amendment re-rests the order, so what it had left before says nothing about what it
         // has left now.

@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
+use hftbacktest::types::{OrdType, Order, Price, Qty, Side, Status, TickSize, TimeInForce};
 use tokio::time::{Duration, Instant, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -139,9 +139,9 @@ async fn a_post_only_bid_round_trips_on_testnet() {
     let mut manager = OrderManager::new("a1f0").unwrap();
     let mut order = Order::new(
         7,
-        (price / info.tick_size()).round() as i64,
-        info.tick_size(),
-        size,
+        Price::new(price).to_ticks(TickSize::new(info.tick_size())),
+        TickSize::new(info.tick_size()),
+        Qty::new(size),
         Side::Buy,
         OrdType::Limit,
         TimeInForce::GTX,

@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+use hftbacktest::types::{ExecDelta, OrdType, Order, PriceTick, Qty, Side, Status, TimeInForce};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
@@ -210,20 +210,20 @@ impl OrderManager {
 
         // Quantise onto the venue's integer grid from the CATALOG decimals (§3.5), not from
         // the tick and lot the bot happens to have registered.
-        let price_scaled = (order.price() * 10f64.powi(market.price_decimals as i32)).round();
+        let price_scaled = (order.price().get() * 10f64.powi(market.price_decimals as i32)).round();
         if !(0.0..=f64::from(u32::MAX)).contains(&price_scaled) {
             return Err(OrderError::OutOfRange(format!(
                 "price {} scales to {price_scaled}, outside u32",
-                order.price()
+                order.price().get()
             )));
         }
         let price = price_scaled as u32;
 
-        let base_scaled = (order.qty * 10f64.powi(market.size_decimals as i32)).round();
+        let base_scaled = (order.qty.get() * 10f64.powi(market.size_decimals as i32)).round();
         if !(1.0..=(MAX_COI as f64)).contains(&base_scaled) {
             return Err(OrderError::OutOfRange(format!(
                 "size {} scales to {base_scaled}, not a positive base amount",
-                order.qty
+                order.qty.get()
             )));
         }
         let base_amount = base_scaled as i64;
@@ -265,7 +265,7 @@ impl OrderManager {
         // Keep the accepted (quantised) size, so the copy published back is the truth about
         // what rests on the venue (HL §5.3).
         let mut accepted = order.clone();
-        accepted.qty = base_amount as f64 * market.lot_size();
+        accepted.qty = Qty::new(base_amount as f64 * market.lot_size());
         accepted.leaves_qty = accepted.qty;
         accepted.req = Status::New;
         accepted.status = Status::New;
@@ -375,7 +375,7 @@ impl OrderManager {
                     uncertain.status = Status::Uncertain;
                     uncertain.req = Status::None;
                     uncertain.exec_qty = ExecDelta::ZERO;
-                    uncertain.exec_price_tick = 0;
+                    uncertain.exec_price_tick = PriceTick::new(0);
                     return Some((tracked.symbol.clone(), uncertain));
                 }
             };
@@ -401,7 +401,7 @@ impl OrderManager {
                     );
                 }
             }
-            tracked.order.leaves_qty = update.remaining_base_amount;
+            tracked.order.leaves_qty = Qty::new(update.remaining_base_amount);
             // §4.6: `exec_qty` is the amount executed by THIS update, the delta of the
             // cumulative `filled_base_amount`, not the running total. The subtraction used to
             // be written out here by hand; `CumulativeFilled::advance` is the same arithmetic
@@ -410,8 +410,9 @@ impl OrderManager {
             match update.filled_base_amount.advance(&mut tracked.filled) {
                 Some(delta) => {
                     tracked.order.exec_qty = delta;
-                    tracked.order.exec_price_tick =
-                        (update.price / tracked.order.tick_size).round() as i64;
+                    tracked.order.exec_price_tick = PriceTick::new(
+                        (update.price / tracked.order.tick_size.get()).round() as i64,
+                    );
                     // C2: `account_all_orders` states how much of the order is filled and
                     // nothing about which side of the book provided it — the frame carries no
                     // per-execution maker field. `None` is therefore the measurement, and it
@@ -573,7 +574,17 @@ impl GetOrders for OrderManager {
 
 #[cfg(test)]
 mod tests {
-    use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+    use hftbacktest::types::{
+        ExecDelta,
+        OrdType,
+        Order,
+        Price,
+        Qty,
+        Side,
+        Status,
+        TickSize,
+        TimeInForce,
+    };
 
     use super::{MAX_COI, OrderError, OrderManager, map_status};
     use crate::{
@@ -599,9 +610,9 @@ mod tests {
         // tick_size and lot_size are the venue's own here, as the bot is told to register.
         Order::new(
             order_id,
-            (price / 0.1).round() as i64,
-            0.1,
-            qty,
+            Price::new(price).to_ticks(TickSize::new(0.1)),
+            TickSize::new(0.1),
+            Qty::new(qty),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTX,

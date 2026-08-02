@@ -103,7 +103,7 @@ impl ScriptedExchange {
         if !order.active() {
             return None;
         }
-        let exec_qty = qty.min(order.leaves_qty);
+        let exec_qty = qty.min(order.leaves_qty.get());
         if exec_qty <= 0.0 {
             return None;
         }
@@ -115,7 +115,7 @@ impl ScriptedExchange {
             order.price_tick,
             Some(Liquidity::Maker),
         );
-        order.status = if order.leaves_qty > 0.0 {
+        order.status = if order.leaves_qty.get() > 0.0 {
             Status::PartiallyFilled
         } else {
             Status::Filled
@@ -355,20 +355,20 @@ impl Harness {
 
         for (order_id, order) in self.local.orders() {
             prop_assert!(
-                order.leaves_qty >= 0.0,
+                order.leaves_qty.get() >= 0.0,
                 "leaves_qty went negative: {order:?}"
             );
             prop_assert!(
-                order.leaves_qty <= order.qty + EPS,
+                order.leaves_qty.get() <= order.qty.get() + EPS,
                 "leaves_qty exceeds the order: {order:?}"
             );
             if let Some(&before) = self.left.get(order_id) {
                 prop_assert!(
-                    order.leaves_qty <= before + EPS,
+                    order.leaves_qty.get() <= before + EPS,
                     "leaves_qty rose from {before} without an amendment: {order:?}"
                 );
             }
-            self.left.insert(*order_id, order.leaves_qty);
+            self.left.insert(*order_id, order.leaves_qty.get());
         }
         Ok(())
     }

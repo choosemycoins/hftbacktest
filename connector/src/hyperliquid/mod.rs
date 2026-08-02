@@ -786,8 +786,11 @@ mod tests {
         LiveEvent,
         OrdType,
         Order,
+        PriceTick,
+        Qty,
         Side,
         Status,
+        TickSize,
         TimeInForce,
         Value,
     };
@@ -1129,9 +1132,9 @@ mod tests {
     fn an_order() -> Order {
         Order::new(
             7,
-            100,
-            0.1,
-            1.0,
+            PriceTick::new(100),
+            TickSize::new(0.1),
+            Qty::new(1.0),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,

@@ -464,6 +464,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use hftbacktest::types::{PriceTick, Qty, TickSize};
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -865,9 +866,9 @@ mod tests {
             "BTC",
             Order::new(
                 1,
-                100,
-                0.1,
-                1.0,
+                PriceTick::new(100),
+                TickSize::new(0.1),
+                Qty::new(1.0),
                 Side::Buy,
                 OrdType::Limit,
                 TimeInForce::GTC,

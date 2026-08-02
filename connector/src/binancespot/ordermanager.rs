@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use hashbrown::HashMap;
-use hftbacktest::types::{ExecDelta, Order, OrderId, Status};
+use hftbacktest::types::{ExecDelta, Order, OrderId, PriceTick, Qty, Status};
 use tracing::error;
 
 use crate::{
@@ -56,14 +56,16 @@ impl OrderManager {
 
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
         if resp.event_time * 1_000_000 >= order_ext.order.exch_timestamp {
-            order_ext.order.qty = resp.quantity;
-            order_ext.order.leaves_qty = resp.quantity - resp.order_filled_accumulated_quantity;
+            order_ext.order.qty = Qty::new(resp.quantity);
+            order_ext.order.leaves_qty =
+                Qty::new(resp.quantity - resp.order_filled_accumulated_quantity);
             order_ext.order.side = resp.side;
             order_ext.order.time_in_force = resp.time_in_force;
             order_ext.order.exch_timestamp = resp.event_time * 1_000_000;
             order_ext.order.status = resp.order_status;
-            order_ext.order.exec_price_tick =
-                (resp.last_filled_price / order_ext.order.tick_size).round() as i64;
+            order_ext.order.exec_price_tick = PriceTick::new(
+                (resp.last_filled_price / order_ext.order.tick_size.get()).round() as i64,
+            );
             // `order_last_filled_quantity` is Binance's per-fill quantity — already a delta.
             order_ext.order.exec_qty = ExecDelta::of_execution(resp.order_last_filled_quantity);
             order_ext.order.order_type = resp.order_type;
@@ -192,8 +194,8 @@ impl OrderManager {
 
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
         if resp.transact_time * 1_000_000 >= order_ext.order.exch_timestamp {
-            order_ext.order.qty = resp.orig_qty;
-            order_ext.order.leaves_qty = resp.orig_qty - resp.executed_qty.get();
+            order_ext.order.qty = Qty::new(resp.orig_qty);
+            order_ext.order.leaves_qty = Qty::new(resp.orig_qty - resp.executed_qty.get());
             order_ext.order.side = resp.side;
             order_ext.order.time_in_force = resp.time_in_force;
             order_ext.order.exch_timestamp = resp.transact_time * 1_000_000;
@@ -350,7 +352,17 @@ impl GetOrders for OrderManager {
 
 #[cfg(test)]
 mod tests {
-    use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+    use hftbacktest::types::{
+        ExecDelta,
+        OrdType,
+        Order,
+        PriceTick,
+        Qty,
+        Side,
+        Status,
+        TickSize,
+        TimeInForce,
+    };
 
     use super::*;
 
@@ -370,15 +382,15 @@ mod tests {
         let mut manager = OrderManager::new("test");
         let mut order = Order::new(
             1,
-            30_000_00,
-            0.01,
-            0.005,
+            PriceTick::new(30_000_00),
+            TickSize::new(0.01),
+            Qty::new(0.005),
             Side::Buy,
             OrdType::Limit,
             TimeInForce::GTC,
         );
         order.status = Status::PartiallyFilled;
-        order.leaves_qty = 0.002;
+        order.leaves_qty = Qty::new(0.002);
         // The last execution the WebSocket stream reported, already applied by the bot.
         order.exec_qty = ExecDelta::of_execution(0.003);
         manager.orders.insert(
@@ -424,7 +436,7 @@ mod tests {
             "a REST response carries no per-execution quantity; publishing its cumulative \
              executedQty re-reports fills the bot has already accounted for"
         );
-        assert_eq!(published.leaves_qty, 0.0);
+        assert_eq!(published.leaves_qty, Qty::new(0.0));
         assert_eq!(published.status, Status::Filled);
     }
 }

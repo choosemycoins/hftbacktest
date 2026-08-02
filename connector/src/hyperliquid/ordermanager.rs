@@ -32,7 +32,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use hftbacktest::types::{ExecDelta, OrdType, Order, OrderId, Side, Status};
+use hftbacktest::types::{ExecDelta, OrdType, Order, OrderId, Price, PriceTick, Qty, Side, Status};
 use rand::Rng;
 use tracing::{debug, error, warn};
 
@@ -325,18 +325,18 @@ impl OrderManager {
         // the order wire without this having succeeded.
         let venue_kind = VenueOrderKind::resolve(order.order_type, tif)?;
 
-        let requested_price = order.price_tick as f64 * order.tick_size;
+        let requested_price = order.price().get();
         let price = normalize_price(requested_price, info, order.side)?;
-        let size = normalize_size(order.qty, info)?;
+        let size = normalize_size(order.qty.get(), info)?;
         let (p, s) = wire_numbers(price, size)?;
 
-        if price != requested_price || size != order.qty {
+        if price != requested_price || size != order.qty.get() {
             debug!(
                 %symbol,
                 order_id = order.order_id,
                 requested_price,
                 price,
-                requested_size = order.qty,
+                requested_size = order.qty.get(),
                 size,
                 "Adjusted a Hyperliquid order onto the venue's grid; the bot is told the \
                  accepted values."
@@ -363,9 +363,9 @@ impl OrderManager {
         };
 
         let mut accepted = order;
-        accepted.price_tick = (price / accepted.tick_size).round() as i64;
-        accepted.qty = size;
-        accepted.leaves_qty = size;
+        accepted.price_tick = Price::new(price).to_ticks(accepted.tick_size);
+        accepted.qty = Qty::new(size);
+        accepted.leaves_qty = Qty::new(size);
 
         self.order_id_map.insert(symbol_order_id, cloid.clone());
         self.orders.insert(
@@ -458,7 +458,7 @@ impl OrderManager {
                 uncertain.status = Status::Uncertain;
                 uncertain.req = Status::None;
                 uncertain.exec_qty = ExecDelta::ZERO;
-                uncertain.exec_price_tick = 0;
+                uncertain.exec_price_tick = PriceTick::new(0);
                 let mut published = tracked.clone();
                 published.order = uncertain;
                 return Some(published);
@@ -493,7 +493,7 @@ impl OrderManager {
         // copy, and a fill may already have carried this order past this stamp.
         tracked.order.exch_timestamp = tracked.order.exch_timestamp.max(exch_ts);
         if update.order.orig_sz > 0.0 {
-            tracked.order.leaves_qty = update.order.sz;
+            tracked.order.leaves_qty = Qty::new(update.order.sz);
         }
 
         // Drop (free the id) iff the status is terminal. One definition of "terminal"
@@ -538,7 +538,8 @@ impl OrderManager {
                 // stream (`update.order.sz`), a different venue channel; moving it from both
                 // would double-count the remainder.
                 tracked.order.exec_qty = ExecDelta::of_execution(fill.sz);
-                tracked.order.exec_price_tick = (fill.px / tracked.order.tick_size).round() as i64;
+                tracked.order.exec_price_tick =
+                    PriceTick::new((fill.px / tracked.order.tick_size.get()).round() as i64);
                 tracked.order.exch_timestamp = tracked.order.exch_timestamp.max(exch_ts);
                 tracked.order.set_liquidity(fill.liquidity());
                 tracked.order.clone()
@@ -731,7 +732,17 @@ impl GetOrders for OrderManager {
 mod tests {
     use std::time::Instant;
 
-    use hftbacktest::types::{ExecDelta, OrdType, Order, Side, Status, TimeInForce};
+    use hftbacktest::types::{
+        ExecDelta,
+        OrdType,
+        Order,
+        Price,
+        Qty,
+        Side,
+        Status,
+        TickSize,
+        TimeInForce,
+    };
 
     use crate::{
         connector::GetOrders,
@@ -764,9 +775,9 @@ mod tests {
     fn bot_order(order_id: u64, price: f64, qty: f64, side: Side) -> Order {
         let mut order = Order::new(
             order_id,
-            (price / 0.1).round() as i64,
-            0.1,
-            qty,
+            Price::new(price).to_ticks(TickSize::new(0.1)),
+            TickSize::new(0.1),
+            Qty::new(qty),
             side,
             OrdType::Limit,
             TimeInForce::GTX,
@@ -892,12 +903,9 @@ mod tests {
 
         let recorded = manager.orders(Some("BTC".into()));
         assert_eq!(recorded.len(), 1);
-        assert_eq!(
-            recorded[0].price_tick as f64 * recorded[0].tick_size,
-            31700.0
-        );
-        assert_eq!(recorded[0].qty, 0.00123);
-        assert_eq!(recorded[0].leaves_qty, 0.00123);
+        assert_eq!(recorded[0].price().get(), 31700.0);
+        assert_eq!(recorded[0].qty, Qty::new(0.00123));
+        assert_eq!(recorded[0].leaves_qty, Qty::new(0.00123));
 
         // A sell at the same price rounds the other way.
         let (_, wire) = manager

@@ -44,10 +44,11 @@ impl ExecutionLedger {
     /// `leaves_qty` that every level lowered (§4.6, a known and separate shortfall), and that
     /// response is always the order's first.
     pub(crate) fn record(&mut self, order: &Order) -> bool {
-        match self.left.insert(order.order_id, order.leaves_qty) {
+        match self.left.insert(order.order_id, order.leaves_qty.get()) {
             Some(before) => {
-                let executed = before - order.leaves_qty;
-                (executed - order.exec_qty.get()).abs() <= QTY_TOLERANCE * order.qty.abs().max(1.0)
+                let executed = before - order.leaves_qty.get();
+                (executed - order.exec_qty.get()).abs()
+                    <= QTY_TOLERANCE * order.qty.get().abs().max(1.0)
             }
             None => true,
         }
@@ -114,14 +115,14 @@ where
     pub fn apply_fill(&mut self, order: &Order, side: ResolvedSide) {
         debug_assert!(
             order.exec_qty.get() > 0.0
-                && order.leaves_qty >= 0.0
-                && order.exec_qty.get() <= order.qty * (1.0 + QTY_TOLERANCE),
+                && order.leaves_qty.get() >= 0.0
+                && order.exec_qty.get() <= order.qty.get() * (1.0 + QTY_TOLERANCE),
             "an execution reports a positive quantity that fits within the order: {order:?}"
         );
 
         let amount = self
             .asset_type
-            .amount(order.exec_price(), order.exec_qty.get());
+            .amount(order.exec_price().get(), order.exec_qty.get());
         self.state_values.position += order.exec_qty.get() * side.sign();
         self.state_values.balance -= amount * side.sign();
         self.state_values.fee += self.fee_model.amount(order, amount);
@@ -154,13 +155,32 @@ mod tests {
             models::{CommonFees, TradingValueFeeModel},
             state::State,
         },
-        types::{ExecDelta, OrdType, Order, ResolvedSide, Side, Status, TimeInForce},
+        types::{
+            ExecDelta,
+            OrdType,
+            Order,
+            PriceTick,
+            Qty,
+            ResolvedSide,
+            Side,
+            Status,
+            TickSize,
+            TimeInForce,
+        },
     };
 
     fn executed(side: Side, qty: f64) -> Order {
-        let mut order = Order::new(1, 10_000, 0.01, qty, side, OrdType::Limit, TimeInForce::GTC);
-        order.record_execution(ExecDelta::of_execution(qty), 10_000, None);
-        order.leaves_qty = 0.0;
+        let mut order = Order::new(
+            1,
+            PriceTick::new(10_000),
+            TickSize::new(0.01),
+            Qty::new(qty),
+            side,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.record_execution(ExecDelta::of_execution(qty), PriceTick::new(10_000), None);
+        order.leaves_qty = Qty::new(0.0);
         order.status = Status::Filled;
         order
     }

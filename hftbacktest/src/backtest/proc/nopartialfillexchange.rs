@@ -32,6 +32,7 @@ use crate::{
         Liquidity,
         Order,
         OrderId,
+        PriceTick,
         Side,
         Status,
         TimeInForce,
@@ -120,18 +121,28 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        match order.price_tick.cmp(&price_tick) {
+        match order.price_tick.get().cmp(&price_tick) {
             Ordering::Greater => {}
             Ordering::Less => {
                 self.filled_orders.push(order.order_id);
-                return self.fill::<true>(order, timestamp, Liquidity::Maker, order.price_tick);
+                return self.fill::<true>(
+                    order,
+                    timestamp,
+                    Liquidity::Maker,
+                    order.price_tick.get(),
+                );
             }
             Ordering::Equal => {
                 // Updates the order's queue position.
                 self.queue_model.trade(order, qty, &self.depth);
                 if self.queue_model.is_filled(order, &self.depth) > 0.0 {
                     self.filled_orders.push(order.order_id);
-                    return self.fill::<true>(order, timestamp, Liquidity::Maker, order.price_tick);
+                    return self.fill::<true>(
+                        order,
+                        timestamp,
+                        Liquidity::Maker,
+                        order.price_tick.get(),
+                    );
                 }
             }
         }
@@ -145,10 +156,15 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        match order.price_tick.cmp(&price_tick) {
+        match order.price_tick.get().cmp(&price_tick) {
             Ordering::Greater => {
                 self.filled_orders.push(order.order_id);
-                return self.fill::<true>(order, timestamp, Liquidity::Maker, order.price_tick);
+                return self.fill::<true>(
+                    order,
+                    timestamp,
+                    Liquidity::Maker,
+                    order.price_tick.get(),
+                );
             }
             Ordering::Less => {}
             Ordering::Equal => {
@@ -156,7 +172,12 @@ where
                 self.queue_model.trade(order, qty, &self.depth);
                 if self.queue_model.is_filled(order, &self.depth) > 0.0 {
                     self.filled_orders.push(order.order_id);
-                    return self.fill::<true>(order, timestamp, Liquidity::Maker, order.price_tick);
+                    return self.fill::<true>(
+                        order,
+                        timestamp,
+                        Liquidity::Maker,
+                        order.price_tick.get(),
+                    );
                 }
             }
         }
@@ -180,13 +201,13 @@ where
         // The single writer (E5). This exchange fills the whole remainder in one go, so the
         // delta *is* `leaves_qty` — and recording it drives `leaves_qty` to exactly zero.
         let filled_at = if liquidity == Liquidity::Maker {
-            order.price_tick
+            order.price_tick.get()
         } else {
             exec_price_tick
         };
         order.record_execution(
-            ExecDelta::of_execution(order.leaves_qty),
-            filled_at,
+            ExecDelta::of_execution(order.leaves_qty.get()),
+            PriceTick::new(filled_at),
             Some(liquidity),
         );
         order.status = Status::Filled;
@@ -214,12 +235,12 @@ where
                 let order = orders.remove(&order_id).unwrap();
                 if order.side == Side::Buy {
                     self.buy_orders
-                        .get_mut(&order.price_tick)
+                        .get_mut(&order.price_tick.get())
                         .unwrap()
                         .remove(&order_id);
                 } else {
                     self.sell_orders
-                        .get_mut(&order.price_tick)
+                        .get_mut(&order.price_tick.get())
                         .unwrap()
                         .remove(&order_id);
                 }
@@ -266,9 +287,14 @@ where
                 || (orders_borrowed.len() as i64) < new_best_tick - prev_best_tick
             {
                 for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Sell && order.price_tick <= new_best_tick {
+                    if order.side == Side::Sell && order.price_tick.get() <= new_best_tick {
                         self.filled_orders.push(order.order_id);
-                        self.fill::<true>(order, timestamp, Liquidity::Maker, order.price_tick)?;
+                        self.fill::<true>(
+                            order,
+                            timestamp,
+                            Liquidity::Maker,
+                            order.price_tick.get(),
+                        )?;
                     }
                 }
             } else {
@@ -281,7 +307,7 @@ where
                                 order,
                                 timestamp,
                                 Liquidity::Maker,
-                                order.price_tick,
+                                order.price_tick.get(),
                             )?;
                         }
                     }
@@ -307,9 +333,14 @@ where
                 || (orders_borrowed.len() as i64) < prev_best_tick - new_best_tick
             {
                 for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Buy && order.price_tick >= new_best_tick {
+                    if order.side == Side::Buy && order.price_tick.get() >= new_best_tick {
                         self.filled_orders.push(order.order_id);
-                        self.fill::<true>(order, timestamp, Liquidity::Maker, order.price_tick)?;
+                        self.fill::<true>(
+                            order,
+                            timestamp,
+                            Liquidity::Maker,
+                            order.price_tick.get(),
+                        )?;
                     }
                 }
             } else {
@@ -322,7 +353,7 @@ where
                                 order,
                                 timestamp,
                                 Liquidity::Maker,
-                                order.price_tick,
+                                order.price_tick.get(),
                             )?;
                         }
                     }
@@ -342,7 +373,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the buy order price is greater than or equal to the current best ask.
-                    if order.price_tick >= self.depth.best_ask_tick() {
+                    if order.price_tick.get() >= self.depth.best_ask_tick() {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -370,7 +401,7 @@ where
                                 order.status = Status::New;
                                 // The exchange accepts this order.
                                 self.buy_orders
-                                    .entry(order.price_tick)
+                                    .entry(order.price_tick.get())
                                     .or_default()
                                     .insert(order.order_id);
 
@@ -404,7 +435,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the sell order price is less than or equal to the current best bid.
-                    if order.price_tick <= self.depth.best_bid_tick() {
+                    if order.price_tick.get() <= self.depth.best_bid_tick() {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -432,7 +463,7 @@ where
                                 order.status = Status::New;
                                 // The exchange accepts this order.
                                 self.sell_orders
-                                    .entry(order.price_tick)
+                                    .entry(order.price_tick.get())
                                     .or_default()
                                     .insert(order.order_id);
 
@@ -483,12 +514,12 @@ where
         // Deletes the order.
         if order.side == Side::Buy {
             self.buy_orders
-                .get_mut(&order.price_tick)
+                .get_mut(&order.price_tick.get())
                 .unwrap()
                 .remove(&order.order_id);
         } else {
             self.sell_orders
-                .get_mut(&order.price_tick)
+                .get_mut(&order.price_tick.get())
                 .unwrap()
                 .remove(&order.order_id);
         }

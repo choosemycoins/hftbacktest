@@ -15,9 +15,12 @@ use crate::{
         OrdType,
         Order,
         OrderId,
+        PriceTick,
+        Qty,
         SELL_EVENT,
         Side,
         Status,
+        TickSize,
         TimeInForce,
     },
 };
@@ -67,9 +70,9 @@ where
 {
     fn new_order(&self, order: &mut Order, depth: &MD) {
         let front_q_qty = if order.side == Side::Buy {
-            depth.bid_qty_at_tick(order.price_tick)
+            depth.bid_qty_at_tick(order.price_tick.get())
         } else {
-            depth.ask_qty_at_tick(order.price_tick)
+            depth.ask_qty_at_tick(order.price_tick.get())
         };
         order.q = Box::new(front_q_qty);
     }
@@ -166,9 +169,9 @@ where
     fn new_order(&self, order: &mut Order, depth: &MD) {
         let mut q = QueuePos::default();
         if order.side == Side::Buy {
-            q.front_q_qty = depth.bid_qty_at_tick(order.price_tick);
+            q.front_q_qty = depth.bid_qty_at_tick(order.price_tick.get());
         } else {
-            q.front_q_qty = depth.ask_qty_at_tick(order.price_tick);
+            q.front_q_qty = depth.ask_qty_at_tick(order.price_tick.get());
         }
         order.q = Box::new(q);
     }
@@ -623,7 +626,7 @@ where
     }
 
     fn add_backtest_order(&mut self, mut order: Order, _depth: &MD) -> Result<(), BacktestError> {
-        let order_price_tick = order.price_tick;
+        let order_price_tick = order.price_tick.get();
         let side = order.side;
         let order_id = order.order_id;
 
@@ -663,17 +666,17 @@ where
         };
 
         queue.push_back(Order {
-            qty: order.qty,
-            leaves_qty: order.qty,
-            price_tick: order_price_tick,
+            qty: Qty::new(order.qty),
+            leaves_qty: Qty::new(order.qty),
+            price_tick: PriceTick::new(order_price_tick),
             exch_timestamp: order.exch_ts,
             q: Box::new(L3OrderSource::MarketFeed),
-            tick_size,
+            tick_size: TickSize::new(tick_size),
             order_id,
             side,
             // The information below is invalid.
             exec_qty: ExecDelta::ZERO,
-            exec_price_tick: 0,
+            exec_price_tick: PriceTick::new(0),
             local_timestamp: 0,
             maker: false,
             order_type: OrdType::Limit,
@@ -806,9 +809,11 @@ where
                             //     self.bid_queue.remove(&order_price_tick);
                             // }
                             if prev_order_price_tick != order.price_tick {
-                                *order_price_tick = order.price_tick;
-                                let queue_ =
-                                    self.bid_queue.entry(prev_order.price_tick).or_default();
+                                *order_price_tick = order.price_tick.get();
+                                let queue_ = self
+                                    .bid_queue
+                                    .entry(prev_order.price_tick.get())
+                                    .or_default();
                                 queue_.push_back(prev_order);
                             } else {
                                 queue.push_back(prev_order);
@@ -847,9 +852,11 @@ where
                             //     self.bid_queue.remove(&order_price_tick);
                             // }
                             if prev_order_price_tick != order.price_tick {
-                                *order_price_tick = order.price_tick;
-                                let queue_ =
-                                    self.ask_queue.entry(prev_order.price_tick).or_default();
+                                *order_price_tick = order.price_tick.get();
+                                let queue_ = self
+                                    .ask_queue
+                                    .entry(prev_order.price_tick.get())
+                                    .or_default();
                                 queue_.push_back(prev_order);
                             } else {
                                 queue.push_back(prev_order);
@@ -894,19 +901,19 @@ where
                 for i in 0..queue.len() {
                     let order_in_q = queue.get_mut(i).unwrap();
                     if order_in_q.is_market_feed_order() && order_in_q.order_id == order_id {
-                        if (order_in_q.price_tick != new_price_tick)
-                            || (order_in_q.leaves_qty < order.qty)
+                        if (order_in_q.price_tick != PriceTick::new(new_price_tick))
+                            || (order_in_q.leaves_qty < Qty::new(order.qty))
                         {
                             let mut prev_order = queue.remove(i).unwrap();
                             let prev_order_price_tick = prev_order.price_tick;
-                            prev_order.price_tick = new_price_tick;
-                            prev_order.leaves_qty = order.qty;
-                            prev_order.qty = order.qty;
+                            prev_order.price_tick = PriceTick::new(new_price_tick);
+                            prev_order.leaves_qty = Qty::new(order.qty);
+                            prev_order.qty = Qty::new(order.qty);
                             prev_order.exch_timestamp = order.exch_ts;
                             // if queue.len() == 0 {
                             //     self.bid_queue.remove(&order_price_tick);
                             // }
-                            if prev_order_price_tick != new_price_tick {
+                            if prev_order_price_tick != PriceTick::new(new_price_tick) {
                                 *order_price_tick = new_price_tick;
 
                                 let queue_ = self.bid_queue.entry(*order_price_tick).or_default();
@@ -915,8 +922,8 @@ where
                                 queue.push_back(prev_order);
                             }
                         } else {
-                            order_in_q.leaves_qty = order.qty;
-                            order_in_q.qty = order.qty;
+                            order_in_q.leaves_qty = Qty::new(order.qty);
+                            order_in_q.qty = Qty::new(order.qty);
                             order_in_q.exch_timestamp = order.exch_ts;
                         }
                         processed = true;
@@ -933,19 +940,19 @@ where
                 for i in 0..queue.len() {
                     let order_in_q = queue.get_mut(i).unwrap();
                     if order_in_q.is_market_feed_order() && order_in_q.order_id == order_id {
-                        if (order_in_q.price_tick != new_price_tick)
-                            || (order_in_q.leaves_qty < order.qty)
+                        if (order_in_q.price_tick != PriceTick::new(new_price_tick))
+                            || (order_in_q.leaves_qty < Qty::new(order.qty))
                         {
                             let mut prev_order = queue.remove(i).unwrap();
                             let prev_order_price_tick = prev_order.price_tick;
-                            prev_order.price_tick = new_price_tick;
-                            prev_order.leaves_qty = order.qty;
-                            prev_order.qty = order.qty;
+                            prev_order.price_tick = PriceTick::new(new_price_tick);
+                            prev_order.leaves_qty = Qty::new(order.qty);
+                            prev_order.qty = Qty::new(order.qty);
                             prev_order.exch_timestamp = order.exch_ts;
                             // if queue.len() == 0 {
                             //     self.bid_queue.remove(&order_price_tick);
                             // }
-                            if prev_order_price_tick != new_price_tick {
+                            if prev_order_price_tick != PriceTick::new(new_price_tick) {
                                 *order_price_tick = new_price_tick;
 
                                 let queue_ = self.ask_queue.entry(*order_price_tick).or_default();
@@ -954,8 +961,8 @@ where
                                 queue.push_back(prev_order);
                             }
                         } else {
-                            order_in_q.leaves_qty = order.qty;
-                            order_in_q.qty = order.qty;
+                            order_in_q.leaves_qty = Qty::new(order.qty);
+                            order_in_q.qty = Qty::new(order.qty);
                             order_in_q.exch_timestamp = order.exch_ts;
                         }
                         processed = true;
@@ -1143,7 +1150,16 @@ mod l3_tests {
             Status,
             TimeInForce,
         },
-        types::{ADD_ORDER_EVENT, BUY_EVENT, EXCH_EVENT, FILL_EVENT, SELL_EVENT},
+        types::{
+            ADD_ORDER_EVENT,
+            BUY_EVENT,
+            EXCH_EVENT,
+            FILL_EVENT,
+            PriceTick,
+            Qty,
+            SELL_EVENT,
+            TickSize,
+        },
     };
 
     #[test]
@@ -1185,12 +1201,12 @@ mod l3_tests {
 
         qm.add_backtest_order(
             Order {
-                qty: 1.0,
-                leaves_qty: 0.0,
+                qty: Qty::new(1.0),
+                leaves_qty: Qty::new(0.0),
                 exec_qty: ExecDelta::ZERO,
-                exec_price_tick: 0,
-                price_tick: 100,
-                tick_size: 1.0,
+                exec_price_tick: PriceTick::new(0),
+                price_tick: PriceTick::new(100),
+                tick_size: TickSize::new(1.0),
                 exch_timestamp: 0,
                 local_timestamp: 0,
                 order_id: 1,
@@ -1219,12 +1235,12 @@ mod l3_tests {
 
         qm.add_backtest_order(
             Order {
-                qty: 1.0,
-                leaves_qty: 0.0,
+                qty: Qty::new(1.0),
+                leaves_qty: Qty::new(0.0),
                 exec_qty: ExecDelta::ZERO,
-                exec_price_tick: 0,
-                price_tick: 101,
-                tick_size: 1.0,
+                exec_price_tick: PriceTick::new(0),
+                price_tick: PriceTick::new(101),
+                tick_size: TickSize::new(1.0),
                 exch_timestamp: 0,
                 local_timestamp: 0,
                 order_id: 1,
@@ -1275,12 +1291,12 @@ mod l3_tests {
 
         qm.add_backtest_order(
             Order {
-                qty: 1.0,
-                leaves_qty: 0.0,
+                qty: Qty::new(1.0),
+                leaves_qty: Qty::new(0.0),
                 exec_qty: ExecDelta::ZERO,
-                exec_price_tick: 0,
-                price_tick: 100,
-                tick_size: 1.0,
+                exec_price_tick: PriceTick::new(0),
+                price_tick: PriceTick::new(100),
+                tick_size: TickSize::new(1.0),
                 exch_timestamp: 0,
                 local_timestamp: 0,
                 order_id: 1,

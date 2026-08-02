@@ -1455,21 +1455,21 @@ mod test {
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::PartiallyFilled);
-        assert_eq!(order.leaves_qty, 7.0);
+        assert_eq!(order.leaves_qty.get(), 7.0);
         assert_eq!(order.exec_qty, ExecDelta::of_execution(3.0));
         assert_sold(&bt, 3.0, 1);
 
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::PartiallyFilled);
-        assert_eq!(order.leaves_qty, 3.0);
+        assert_eq!(order.leaves_qty.get(), 3.0);
         assert_eq!(order.exec_qty, ExecDelta::of_execution(4.0));
         assert_sold(&bt, 7.0, 2);
 
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::Filled);
-        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.leaves_qty.get(), 0.0);
         assert_eq!(order.exec_qty, ExecDelta::of_execution(3.0));
         assert_sold(&bt, ORDER_QTY, 3);
 
@@ -1490,7 +1490,7 @@ mod test {
         bt.cancel(0, ORDER_ID, true)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::Canceled);
-        assert_eq!(order.leaves_qty, 7.0);
+        assert_eq!(order.leaves_qty.get(), 7.0);
         assert_sold(&bt, 3.0, 1);
 
         // The canceled remainder must not execute against the later trade either.
@@ -1515,7 +1515,7 @@ mod test {
         // order in place instead of replacing it.
         bt.modify(0, ORDER_ID, ASK_PRICE, 5.0, true)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
-        assert_eq!(order.leaves_qty, 5.0);
+        assert_eq!(order.leaves_qty.get(), 5.0);
         assert_sold(&bt, 3.0, 1);
 
         Ok(())
@@ -1613,7 +1613,7 @@ mod test {
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::Filled);
-        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.leaves_qty.get(), 0.0);
         // Only 3 of the traded 8 was executable by queue position, yet the whole order fills.
         assert_eq!(order.exec_qty, ExecDelta::of_execution(ORDER_QTY));
         assert_sold(&bt, ORDER_QTY, 1);
@@ -1694,7 +1694,7 @@ mod test {
         bt.elapse(SEC)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::Filled);
-        assert_eq!(order.leaves_qty, 0.0);
+        assert_eq!(order.leaves_qty.get(), 0.0);
         assert_eq!(order.exec_qty, ExecDelta::of_execution(7.0));
         assert_sold(&bt, ORDER_QTY, 2);
 
@@ -1725,8 +1725,8 @@ mod test {
 
         bt.modify(0, ORDER_ID, amended_price, amended_qty, true)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
-        assert_eq!(order.qty, amended_qty);
-        assert_eq!(order.leaves_qty, amended_qty);
+        assert_eq!(order.qty.get(), amended_qty);
+        assert_eq!(order.leaves_qty.get(), amended_qty);
 
         // Nothing rests ahead at the amended price and the trade is larger than the whole
         // order, so whatever rests is what fills.
@@ -1759,7 +1759,7 @@ mod test {
         bt.modify(0, ORDER_ID, ASK_PRICE + TICK_SIZE, 5.0, true)?;
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::New);
-        assert_eq!(order.leaves_qty, 5.0);
+        assert_eq!(order.leaves_qty.get(), 5.0);
         assert_eq!(order.exec_qty, ExecDelta::of_execution(0.0));
         assert_sold(&bt, 3.0, 1);
 

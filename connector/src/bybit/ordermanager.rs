@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use hashbrown::HashMap;
 use hftbacktest::{
     prelude::get_precision,
-    types::{ExecDelta, OrdType, Order, OrderId, Side, Status, TimeInForce},
+    types::{ExecDelta, OrdType, Order, OrderId, Price, Side, Status, TimeInForce},
 };
 
 use crate::{
@@ -70,7 +70,7 @@ impl OrderManager {
             .get_mut(&data.order_link_id)
             .ok_or(BybitError::OrderNotFound)?;
         order_info.order.exec_price_tick =
-            (data.exec_price / order_info.order.price_tick as f64).round() as i64;
+            Price::new(data.exec_price).to_ticks(order_info.order.tick_size);
         order_info.order.exec_qty = ExecDelta::of_execution(data.exec_qty);
         order_info.order.exch_timestamp = data.exec_time * 1_000_000;
         Ok(order_info.clone())
@@ -86,7 +86,7 @@ impl OrderManager {
             .get_mut(&data.order_link_id)
             .ok_or(BybitError::OrderNotFound)?;
         order_info.order.exec_price_tick =
-            (data.exec_price / order_info.order.price_tick as f64).round() as i64;
+            Price::new(data.exec_price).to_ticks(order_info.order.tick_size);
         order_info.order.exec_qty = ExecDelta::of_execution(data.exec_qty);
         order_info.order.exch_timestamp = data.exec_time * 1_000_000;
         Ok(order_info.clone())
@@ -98,7 +98,7 @@ impl OrderManager {
         category: &str,
         order: Order,
     ) -> Result<BybitOrder, BybitError> {
-        let price_prec = get_precision(order.tick_size);
+        let price_prec = get_precision(order.tick_size.get());
         let order_link_id = format!("{}{}", self.prefix, generate_rand_string(16));
         let bybit_order = BybitOrder {
             symbol: symbol.to_string(),
@@ -116,12 +116,8 @@ impl OrderManager {
                     OrdType::Unsupported => return Err(BybitError::InvalidArg("order_type")),
                 }
             }),
-            qty: Some(format!("{:.5}", order.qty)),
-            price: Some(format!(
-                "{:.prec$}",
-                order.price_tick as f64 * order.tick_size,
-                prec = price_prec
-            )),
+            qty: Some(format!("{:.5}", order.qty.get())),
+            price: Some(format!("{:.prec$}", order.price().get(), prec = price_prec)),
             category: category.to_string(),
             time_in_force: Some({
                 match order.time_in_force {
@@ -234,5 +230,92 @@ impl GetOrders for OrderManager {
             .map(|(_, order)| &order.order)
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hftbacktest::types::{ExecDelta, Price, PriceTick, Qty, TickSize};
+
+    use super::*;
+
+    fn execution(order_link_id: &str, exec_price: f64, exec_qty: f64) -> Execution {
+        Execution {
+            category: "linear".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            exec_fee: "0".to_string(),
+            exec_id: "e1".to_string(),
+            exec_price,
+            exec_qty,
+            exec_type: "Trade".to_string(),
+            exec_value: "0".to_string(),
+            is_maker: true,
+            fee_rate: "0".to_string(),
+            trade_iv: String::new(),
+            mark_iv: String::new(),
+            block_trade_id: String::new(),
+            mark_price: "0".to_string(),
+            index_price: "0".to_string(),
+            underlying_price: "0".to_string(),
+            leaves_qty: 0.0,
+            order_id: "o1".to_string(),
+            order_link_id: order_link_id.to_string(),
+            order_price: exec_price,
+            order_qty: exec_qty,
+            order_type: "Limit".to_string(),
+            stop_order_type: String::new(),
+            side: "Buy".to_string(),
+            exec_time: 1_700_000_000_000,
+            is_leverage: "0".to_string(),
+            closed_size: "0".to_string(),
+            seq: 1,
+        }
+    }
+
+    /// **An execution price is converted by the tick size, never by the price** (invariant C5).
+    ///
+    /// This backend divided `exec_price` by `order.price_tick.get()` — the order's price *already in
+    /// ticks* — where every other backend divides by `tick_size`. Both operands are numbers
+    /// about price, so the expression reads plausibly and the result is a small integer that
+    /// still looks like a tick; nothing about it is absurd enough to notice.
+    ///
+    /// With the order resting at 1000 ticks of 0.1 and executing at 100.5, the answer is 1005.
+    /// The old expression computed `round(100.5 / 1000) == 0`, i.e. it reported every
+    /// execution as having happened at tick 0 — a price of zero. `Order::exec_price()`
+    /// multiplies that back by the tick size, so anything reading the execution price of a
+    /// bybit fill read 0.0.
+    #[test]
+    fn an_execution_price_is_converted_by_the_tick_size_not_by_the_price() {
+        let mut manager = OrderManager::new("test");
+        let mut order = Order::new(
+            1,
+            PriceTick::new(1000),
+            TickSize::new(0.1),
+            Qty::new(1.0),
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        order.status = Status::New;
+        manager.orders.insert(
+            "test_abc".to_string(),
+            OrderExt {
+                symbol: "BTCUSDT".to_string(),
+                order,
+            },
+        );
+
+        let updated = manager
+            .update_execution(&execution("test_abc", 100.5, 1.0))
+            .unwrap();
+
+        assert_eq!(
+            updated.order.exec_price_tick,
+            PriceTick::new(1005),
+            "an execution at 100.5 with a 0.1 tick is tick 1005; dividing by price_tick \
+             (1000) yields 0 and reports every fill as having happened at a price of zero"
+        );
+        assert_eq!(updated.order.exec_price(), Price::new(100.5));
+        assert_eq!(updated.order.exec_qty, ExecDelta::of_execution(1.0));
     }
 }

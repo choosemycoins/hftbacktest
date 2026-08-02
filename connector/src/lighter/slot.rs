@@ -144,6 +144,7 @@ pub fn deadline_action(confirmed: Option<bool>, has_tx_hash: bool) -> DeadlineAc
 
 #[cfg(test)]
 mod tests {
+
     use super::{
         AmbiguousFate,
         DeadlineAction,

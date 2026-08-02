@@ -32,6 +32,7 @@ use crate::{
         Liquidity,
         Order,
         OrderId,
+        PriceTick,
         Side,
         Status,
         TimeInForce,
@@ -134,7 +135,7 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        match order.price_tick.cmp(&price_tick) {
+        match order.price_tick.get().cmp(&price_tick) {
             Ordering::Greater => {}
             Ordering::Less => {
                 self.filled_orders.push(order.order_id);
@@ -142,8 +143,8 @@ where
                     order,
                     timestamp,
                     Liquidity::Maker,
-                    order.price_tick,
-                    order.leaves_qty,
+                    order.price_tick.get(),
+                    order.leaves_qty.get(),
                 );
             }
             Ordering::Equal => {
@@ -158,9 +159,9 @@ where
                     // including when it takes exactly that quantity: the order must be retired
                     // here, or it rests on already filled and the next trade at its price
                     // reaches it.
-                    let exec_qty = if filled_qty >= order.leaves_qty {
+                    let exec_qty = if filled_qty >= order.leaves_qty.get() {
                         self.filled_orders.push(order.order_id);
-                        order.leaves_qty
+                        order.leaves_qty.get()
                     } else {
                         filled_qty
                     };
@@ -168,7 +169,7 @@ where
                         order,
                         timestamp,
                         Liquidity::Maker,
-                        order.price_tick,
+                        order.price_tick.get(),
                         exec_qty,
                     );
                 }
@@ -184,15 +185,15 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        match order.price_tick.cmp(&price_tick) {
+        match order.price_tick.get().cmp(&price_tick) {
             Ordering::Greater => {
                 self.filled_orders.push(order.order_id);
                 return self.fill::<true>(
                     order,
                     timestamp,
                     Liquidity::Maker,
-                    order.price_tick,
-                    order.leaves_qty,
+                    order.price_tick.get(),
+                    order.leaves_qty.get(),
                 );
             }
             Ordering::Less => {}
@@ -208,9 +209,9 @@ where
                     // including when it takes exactly that quantity: the order must be retired
                     // here, or it rests on already filled and the next trade at its price
                     // reaches it.
-                    let exec_qty = if filled_qty >= order.leaves_qty {
+                    let exec_qty = if filled_qty >= order.leaves_qty.get() {
                         self.filled_orders.push(order.order_id);
-                        order.leaves_qty
+                        order.leaves_qty.get()
                     } else {
                         filled_qty
                     };
@@ -218,7 +219,7 @@ where
                         order,
                         timestamp,
                         Liquidity::Maker,
-                        order.price_tick,
+                        order.price_tick.get(),
                         exec_qty,
                     );
                 }
@@ -245,16 +246,16 @@ where
         // The single writer: the delta and the remainder move together, so a cumulative
         // quantity cannot be recorded here without driving `leaves_qty` negative (E5).
         let filled_at = if liquidity == Liquidity::Maker {
-            order.price_tick
+            order.price_tick.get()
         } else {
             exec_price_tick
         };
         order.record_execution(
             ExecDelta::of_execution(exec_qty),
-            filled_at,
+            PriceTick::new(filled_at),
             Some(liquidity),
         );
-        if (order.leaves_qty / self.depth.lot_size()).round() > 0f64 {
+        if (order.leaves_qty.get() / self.depth.lot_size()).round() > 0f64 {
             order.status = Status::PartiallyFilled;
         } else {
             order.status = Status::Filled;
@@ -283,12 +284,12 @@ where
                 let order = orders.remove(&order_id).unwrap();
                 if order.side == Side::Buy {
                     self.buy_orders
-                        .get_mut(&order.price_tick)
+                        .get_mut(&order.price_tick.get())
                         .unwrap()
                         .remove(&order_id);
                 } else {
                     self.sell_orders
-                        .get_mut(&order.price_tick)
+                        .get_mut(&order.price_tick.get())
                         .unwrap()
                         .remove(&order_id);
                 }
@@ -335,14 +336,14 @@ where
                 || (orders_borrowed.len() as i64) < new_best_tick - prev_best_tick
             {
                 for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Sell && order.price_tick <= new_best_tick {
+                    if order.side == Side::Sell && order.price_tick.get() <= new_best_tick {
                         self.filled_orders.push(order.order_id);
                         self.fill::<true>(
                             order,
                             timestamp,
                             Liquidity::Maker,
-                            order.price_tick,
-                            order.leaves_qty,
+                            order.price_tick.get(),
+                            order.leaves_qty.get(),
                         )?;
                     }
                 }
@@ -356,8 +357,8 @@ where
                                 order,
                                 timestamp,
                                 Liquidity::Maker,
-                                order.price_tick,
-                                order.leaves_qty,
+                                order.price_tick.get(),
+                                order.leaves_qty.get(),
                             )?;
                         }
                     }
@@ -383,14 +384,14 @@ where
                 || (orders_borrowed.len() as i64) < prev_best_tick - new_best_tick
             {
                 for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Buy && order.price_tick >= new_best_tick {
+                    if order.side == Side::Buy && order.price_tick.get() >= new_best_tick {
                         self.filled_orders.push(order.order_id);
                         self.fill::<true>(
                             order,
                             timestamp,
                             Liquidity::Maker,
-                            order.price_tick,
-                            order.leaves_qty,
+                            order.price_tick.get(),
+                            order.leaves_qty.get(),
                         )?;
                     }
                 }
@@ -404,8 +405,8 @@ where
                                 order,
                                 timestamp,
                                 Liquidity::Maker,
-                                order.price_tick,
-                                order.leaves_qty,
+                                order.price_tick.get(),
+                                order.leaves_qty.get(),
                             )?;
                         }
                     }
@@ -425,7 +426,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the buy order price is greater than or equal to the current best ask.
-                    if order.price_tick >= self.depth.best_ask_tick() {
+                    if order.price_tick.get() >= self.depth.best_ask_tick() {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -437,20 +438,20 @@ where
                                 // entire order will be cancelled.
                                 let mut execute = false;
                                 let mut cum_qty = 0f64;
-                                for t in self.depth.best_ask_tick()..=order.price_tick {
+                                for t in self.depth.best_ask_tick()..=order.price_tick.get() {
                                     cum_qty += self.depth.ask_qty_at_tick(t);
                                     if (cum_qty / self.depth.lot_size()).round()
-                                        >= (order.qty / self.depth.lot_size()).round()
+                                        >= (order.qty.get() / self.depth.lot_size()).round()
                                     {
                                         execute = true;
                                         break;
                                     }
                                 }
                                 if execute {
-                                    for t in self.depth.best_ask_tick()..=order.price_tick {
+                                    for t in self.depth.best_ask_tick()..=order.price_tick.get() {
                                         let qty = self.depth.ask_qty_at_tick(t);
                                         if qty > 0.0 {
-                                            let exec_qty = qty.min(order.leaves_qty);
+                                            let exec_qty = qty.min(order.leaves_qty.get());
                                             self.fill::<false>(
                                                 order,
                                                 timestamp,
@@ -472,10 +473,10 @@ where
                             }
                             TimeInForce::IOC => {
                                 // The order must be executed immediately.
-                                for t in self.depth.best_ask_tick()..=order.price_tick {
+                                for t in self.depth.best_ask_tick()..=order.price_tick.get() {
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
-                                        let exec_qty = qty.min(order.leaves_qty);
+                                        let exec_qty = qty.min(order.leaves_qty.get());
                                         self.fill::<false>(
                                             order,
                                             timestamp,
@@ -494,10 +495,10 @@ where
                             }
                             TimeInForce::GTC => {
                                 // Takes the market.
-                                for t in self.depth.best_ask_tick()..order.price_tick {
+                                for t in self.depth.best_ask_tick()..order.price_tick.get() {
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
-                                        let exec_qty = qty.min(order.leaves_qty);
+                                        let exec_qty = qty.min(order.leaves_qty.get());
                                         self.fill::<false>(
                                             order,
                                             timestamp,
@@ -515,7 +516,8 @@ where
                                 // market depth during backtesting based on market-data replay. So, even
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
-                                let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
+                                let (price_tick, leaves_qty) =
+                                    (order.price_tick.get(), order.leaves_qty.get());
                                 self.fill::<false>(
                                     order,
                                     timestamp,
@@ -534,7 +536,7 @@ where
                                 order.status = Status::New;
                                 // The exchange accepts this order.
                                 self.buy_orders
-                                    .entry(order.price_tick)
+                                    .entry(order.price_tick.get())
                                     .or_default()
                                     .insert(order.order_id);
 
@@ -558,7 +560,7 @@ where
                     for t in self.depth.best_ask_tick()..(self.depth.best_ask_tick() + 100) {
                         let qty = self.depth.ask_qty_at_tick(t);
                         if qty > 0.0 {
-                            let exec_qty = qty.min(order.leaves_qty);
+                            let exec_qty = qty.min(order.leaves_qty.get());
                             self.fill::<false>(order, timestamp, Liquidity::Taker, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
@@ -575,7 +577,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the sell order price is less than or equal to the current best bid.
-                    if order.price_tick <= self.depth.best_bid_tick() {
+                    if order.price_tick.get() <= self.depth.best_bid_tick() {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -587,20 +589,23 @@ where
                                 // entire order will be cancelled.
                                 let mut execute = false;
                                 let mut cum_qty = 0f64;
-                                for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
+                                for t in (order.price_tick.get()..=self.depth.best_bid_tick()).rev()
+                                {
                                     cum_qty += self.depth.bid_qty_at_tick(t);
                                     if (cum_qty / self.depth.lot_size()).round()
-                                        >= (order.qty / self.depth.lot_size()).round()
+                                        >= (order.qty.get() / self.depth.lot_size()).round()
                                     {
                                         execute = true;
                                         break;
                                     }
                                 }
                                 if execute {
-                                    for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
+                                    for t in
+                                        (order.price_tick.get()..=self.depth.best_bid_tick()).rev()
+                                    {
                                         let qty = self.depth.bid_qty_at_tick(t);
                                         if qty > 0.0 {
-                                            let exec_qty = qty.min(order.leaves_qty);
+                                            let exec_qty = qty.min(order.leaves_qty.get());
                                             self.fill::<false>(
                                                 order,
                                                 timestamp,
@@ -622,10 +627,11 @@ where
                             }
                             TimeInForce::IOC => {
                                 // The order must be executed immediately.
-                                for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
+                                for t in (order.price_tick.get()..=self.depth.best_bid_tick()).rev()
+                                {
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
-                                        let exec_qty = qty.min(order.leaves_qty);
+                                        let exec_qty = qty.min(order.leaves_qty.get());
                                         self.fill::<false>(
                                             order,
                                             timestamp,
@@ -644,10 +650,11 @@ where
                             }
                             TimeInForce::GTC => {
                                 // Takes the market.
-                                for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
+                                for t in (order.price_tick.get()..=self.depth.best_bid_tick()).rev()
+                                {
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
-                                        let exec_qty = qty.min(order.leaves_qty);
+                                        let exec_qty = qty.min(order.leaves_qty.get());
                                         self.fill::<false>(
                                             order,
                                             timestamp,
@@ -665,7 +672,8 @@ where
                                 // market depth during backtesting based on market-data replay. So, even
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
-                                let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
+                                let (price_tick, leaves_qty) =
+                                    (order.price_tick.get(), order.leaves_qty.get());
                                 self.fill::<false>(
                                     order,
                                     timestamp,
@@ -686,7 +694,7 @@ where
                                 order.status = Status::New;
                                 // The exchange accepts this order.
                                 self.sell_orders
-                                    .entry(order.price_tick)
+                                    .entry(order.price_tick.get())
                                     .or_default()
                                     .insert(order.order_id);
 
@@ -711,7 +719,7 @@ where
                     {
                         let qty = self.depth.bid_qty_at_tick(t);
                         if qty > 0.0 {
-                            let exec_qty = qty.min(order.leaves_qty);
+                            let exec_qty = qty.min(order.leaves_qty.get());
                             self.fill::<false>(order, timestamp, Liquidity::Taker, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
@@ -745,12 +753,12 @@ where
         // Deletes the order.
         if order.side == Side::Buy {
             self.buy_orders
-                .get_mut(&order.price_tick)
+                .get_mut(&order.price_tick.get())
                 .unwrap()
                 .remove(&order.order_id);
         } else {
             self.sell_orders
-                .get_mut(&order.price_tick)
+                .get_mut(&order.price_tick.get())
                 .unwrap()
                 .remove(&order.order_id);
         }

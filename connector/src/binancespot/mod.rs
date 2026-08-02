@@ -266,9 +266,9 @@ impl Connector for BinanceSpot {
                             &client_order_id,
                             &symbol,
                             order.side,
-                            order.price_tick as f64 * order.tick_size,
-                            get_precision(order.tick_size),
-                            order.qty,
+                            order.price().get(),
+                            get_precision(order.tick_size.get()),
+                            order.qty.get(),
                             order.order_type,
                             order.time_in_force,
                         )

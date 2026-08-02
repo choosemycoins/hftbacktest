@@ -25,6 +25,8 @@ use crate::{
         Liquidity,
         Order,
         OrderId,
+        PriceTick,
+        Qty,
         SELL_EVENT,
         Side,
         Status,
@@ -97,7 +99,7 @@ where
 
     fn expired(&mut self, mut order: Order, timestamp: i64) -> Result<(), BacktestError> {
         order.exec_qty = ExecDelta::ZERO;
-        order.leaves_qty = 0.0;
+        order.leaves_qty = Qty::new(0.0);
         order.status = Status::Expired;
         order.exch_timestamp = timestamp;
 
@@ -122,13 +124,13 @@ where
         // The single writer (E5), as in the L2 twin: this exchange fills the whole
         // remainder, so the delta *is* `leaves_qty` and recording it zeroes the remainder.
         let filled_at = if liquidity == Liquidity::Maker {
-            order.price_tick
+            order.price_tick.get()
         } else {
             exec_price_tick
         };
         order.record_execution(
-            ExecDelta::of_execution(order.leaves_qty),
-            filled_at,
+            ExecDelta::of_execution(order.leaves_qty.get()),
+            PriceTick::new(filled_at),
             Some(liquidity),
         );
         order.status = Status::Filled;
@@ -159,7 +161,7 @@ where
             .queue_model
             .on_best_bid_update(prev_best_tick, new_best_tick)?;
         for mut order in filled {
-            let price_tick = order.price_tick;
+            let price_tick = order.price_tick.get();
             self.fill::<true>(&mut order, timestamp, Liquidity::Maker, price_tick)?;
         }
         Ok(())
@@ -175,7 +177,7 @@ where
             .queue_model
             .on_best_ask_update(prev_best_tick, new_best_tick)?;
         for mut order in filled {
-            let price_tick = order.price_tick;
+            let price_tick = order.price_tick.get();
             self.fill::<true>(&mut order, timestamp, Liquidity::Maker, price_tick)?;
         }
         Ok(())
@@ -190,7 +192,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the buy order price is greater than or equal to the current best ask.
-                    if order.price_tick >= self.depth.best_ask_tick() {
+                    if order.price_tick.get() >= self.depth.best_ask_tick() {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -245,7 +247,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the sell order price is less than or equal to the current best bid.
-                    if order.price_tick <= self.depth.best_bid_tick() {
+                    if order.price_tick.get() <= self.depth.best_bid_tick() {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -422,7 +424,7 @@ where
                 )?;
                 let timestamp = event.exch_ts;
                 for mut order in filled {
-                    let price_tick = order.price_tick;
+                    let price_tick = order.price_tick.get();
                     self.fill::<true>(&mut order, timestamp, Liquidity::Maker, price_tick)?;
                 }
             }
