@@ -130,7 +130,7 @@ pub extern "C" fn hashmaplive_wait_order_response(
     timeout: i64,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.wait_order_response(asset_no, order_id, timeout))
+    handle_result(hbt.wait_order_response(asset_no, OrderId::new(order_id), timeout))
 }
 
 #[unsafe(no_mangle)]
@@ -158,7 +158,7 @@ pub extern "C" fn hashmaplive_submit_buy_order(
     let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
     handle_result(hbt.submit_buy_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         tif,
@@ -181,7 +181,7 @@ pub extern "C" fn hashmaplive_submit_sell_order(
     let hbt = unsafe { &mut *hbt_ptr };
     handle_result(hbt.submit_sell_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) },
@@ -198,7 +198,7 @@ pub extern "C" fn hashmaplive_cancel(
     wait: bool,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.cancel(asset_no, order_id, wait))
+    handle_result(hbt.cancel(asset_no, OrderId::new(order_id), wait))
 }
 
 #[unsafe(no_mangle)]
@@ -377,7 +377,7 @@ pub extern "C" fn roiveclive_wait_order_response(
     timeout: i64,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.wait_order_response(asset_no, order_id, timeout))
+    handle_result(hbt.wait_order_response(asset_no, OrderId::new(order_id), timeout))
 }
 
 #[unsafe(no_mangle)]
@@ -405,7 +405,7 @@ pub extern "C" fn roiveclive_submit_buy_order(
     let tif = unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) };
     handle_result(hbt.submit_buy_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         tif,
@@ -428,7 +428,7 @@ pub extern "C" fn roiveclive_submit_sell_order(
     let hbt = unsafe { &mut *hbt_ptr };
     handle_result(hbt.submit_sell_order(
         asset_no,
-        order_id,
+        OrderId::new(order_id),
         price,
         qty,
         unsafe { mem::transmute::<u8, TimeInForce>(time_in_force) },
@@ -445,7 +445,7 @@ pub extern "C" fn roiveclive_cancel(
     wait: bool,
 ) -> i64 {
     let hbt = unsafe { &mut *hbt_ptr };
-    handle_result(hbt.cancel(asset_no, order_id, wait))
+    handle_result(hbt.cancel(asset_no, OrderId::new(order_id), wait))
 }
 
 #[unsafe(no_mangle)]

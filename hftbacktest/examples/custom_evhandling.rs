@@ -96,7 +96,7 @@ where
         self.local.depth()
     }
 
-    fn orders(&self) -> &HashMap<u64, Order> {
+    fn orders(&self) -> &HashMap<OrderId, Order> {
         self.local.orders()
     }
 
