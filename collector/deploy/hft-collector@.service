@@ -95,10 +95,18 @@ Restart=always
 RestartSec=5s
 
 # SIGTERM is what makes the gzip stream valid. The collector handles it
-# explicitly (see shutdown_signal in collector/src/main.rs), flushes every
-# open RotatingFile through GzEncoder::finish, and exits 0. TimeoutStopSec
-# must stay generous enough for that flush; a SIGKILL here truncates the
-# current gzip member.
+# explicitly (`Shutdown` in collector/src/main.rs) and then winds down in a
+# fixed order (`wind_down`): stop the producers under a 5s grace, close and
+# drain both hand-offs so nothing already accepted is destroyed, then
+# `Writer::finish` every open member through GzEncoder::finish. Exits 0 only
+# if all of that worked — a finalise that fails is now a non-zero exit rather
+# than a clean-looking stop over a corrupt day.
+#
+# TimeoutStopSec must stay generous enough for the whole sequence: the 5s
+# grace plus gzipping whatever was queued (a full writer hop is ~13 MB, a
+# sub-second job at this compression level). A SIGKILL here truncates the
+# current gzip member, which is the one outcome all of the above exists to
+# avoid.
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30s
