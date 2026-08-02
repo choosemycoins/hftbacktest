@@ -305,10 +305,7 @@ where
                             hook(ex_order, &order)?;
                         }
                         if order.exch_timestamp >= ex_order.exch_timestamp {
-                            if ex_order.status == Status::Canceled
-                                || ex_order.status == Status::Expired
-                                || ex_order.status == Status::Filled
-                            {
+                            if ex_order.status.is_terminal() {
                                 // Ignores the update since the current status is the final status.
                             } else {
                                 ex_order.update(&order);

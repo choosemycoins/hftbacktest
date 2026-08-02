@@ -179,11 +179,9 @@ where
     }
 
     fn clear_inactive_orders(&mut self) {
-        self.orders.retain(|_, order| {
-            order.status != Status::Expired
-                && order.status != Status::Filled
-                && order.status != Status::Canceled
-        })
+        // Kept textually identical to the L2 `Local::clear_inactive_orders` on purpose: one
+        // definition of "terminal" ([`Status::is_terminal`]) for both.
+        self.orders.retain(|_, order| !order.status.is_terminal())
     }
 
     fn position(&self) -> f64 {

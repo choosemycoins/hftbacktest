@@ -251,11 +251,9 @@ where
     }
 
     fn clear_inactive_orders(&mut self) {
-        self.orders.retain(|_, order| {
-            order.status != Status::Expired
-                && order.status != Status::Filled
-                && order.status != Status::Canceled
-        })
+        // One definition of "terminal" ([`Status::is_terminal`]); this and the live guard no
+        // longer hand-maintain the set independently, and it now also clears `Rejected`.
+        self.orders.retain(|_, order| !order.status.is_terminal())
     }
 
     fn position(&self) -> f64 {

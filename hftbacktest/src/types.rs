@@ -432,6 +432,41 @@ pub enum Status {
     Unsupported = 255,
 }
 
+impl Status {
+    /// Whether this is a **terminal** status: the order is final, no later update may
+    /// resurrect it, and the `order_id` it held is freed.
+    ///
+    /// This is the single definition of "terminal". The live final-status guard
+    /// ([`Bot`] impl in `live/bot.rs`), `Local::clear_inactive_orders`
+    /// (`backtest/proc/local.rs` and its L3 mirror), and the connector order managers'
+    /// removal paths all read it, so "terminal" cannot drift between sites the way the
+    /// hand-written `status == A || status == B` chains it replaces did (`AGENTS.md` §1.5,
+    /// correctness-by-construction §1.6).
+    ///
+    /// The match is **exhaustive with no wildcard on purpose**: a new [`Status`] variant does
+    /// not compile until it is ruled terminal-or-not here, so it cannot silently fall through
+    /// to "drop the order" at a removal site — the structural half of invariants S1/S2. A
+    /// future non-terminal `Status::Uncertain` (deferred design item S3) would be forced to
+    /// declare itself here, keeping an uncertain order tracked rather than dropped and
+    /// re-submitted as a duplicate.
+    ///
+    /// Ruling on the two the previous hand-written set silently omitted: `Rejected` **is**
+    /// terminal (a refused order never rested and takes no later update); `Replaced` is
+    /// **not** (a replaced order keeps its id and continues resting — `Local::modify`).
+    /// `None`/`Unsupported` are not terminal either — neither is a resolution that frees an
+    /// order id.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Status::Filled | Status::Canceled | Status::Expired | Status::Rejected => true,
+            Status::None
+            | Status::New
+            | Status::PartiallyFilled
+            | Status::Replaced
+            | Status::Unsupported => false,
+        }
+    }
+}
+
 /// Time In Force
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(u8)]
@@ -1404,5 +1439,42 @@ mod tests {
             "Map must stay variant 5"
         );
         assert_eq!(ord(&Value::Empty), 6, "Empty must stay variant 6");
+    }
+
+    /// The single definition of "terminal" ([`Status::is_terminal`]), pinned. A terminal
+    /// status is final: no later update may resurrect the order, and the order id it held is
+    /// freed. Before this method the set `{Canceled, Expired, Filled}` was duplicated at the
+    /// live final-status guard (`live/bot.rs`) and `Local::clear_inactive_orders`
+    /// (`backtest/proc/local.rs` and its L3 mirror), and **both omitted `Rejected`** — a
+    /// rejected order was neither frozen against resurrection nor cleared from the book. The
+    /// ruling this pins, forced by the method's wildcard-free match:
+    ///
+    /// * `Rejected` **is** terminal — a refused order never rested and takes no later update.
+    /// * `Replaced` is **not** terminal — in this codebase a replaced order keeps its
+    ///   `order_id` and continues resting (`Local::modify` sets `req = Replaced`), so it must
+    ///   stay mutable and tracked.
+    /// * `None`/`Unsupported` are **not** terminal — neither frees an order id, and the
+    ///   connector removal path must not drop on them (invariants S1/S2).
+    #[test]
+    fn is_terminal_is_the_single_ruling_and_rejected_is_terminal() {
+        use crate::types::Status;
+
+        for terminal in [
+            Status::Filled,
+            Status::Canceled,
+            Status::Expired,
+            Status::Rejected,
+        ] {
+            assert!(terminal.is_terminal(), "{terminal:?} must be terminal");
+        }
+        for live in [
+            Status::None,
+            Status::New,
+            Status::PartiallyFilled,
+            Status::Replaced,
+            Status::Unsupported,
+        ] {
+            assert!(!live.is_terminal(), "{live:?} must not be terminal");
+        }
     }
 }
