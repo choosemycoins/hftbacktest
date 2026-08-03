@@ -1318,8 +1318,13 @@ where
     ///
     /// In backtest mode this always returns `true` (snapshot is trivial).
     ///
+    /// The default is `false` — fail-closed: a `Bot` impl that does not override this is
+    /// treated as never-ready, never as ready. Both in-crate impls override it.
+    ///
     /// * `asset_no` - Asset number to query.
-    fn snapshot_ready(&self, asset_no: usize) -> bool;
+    fn snapshot_ready(&self, _asset_no: usize) -> bool {
+        false
+    }
 
     /// Returns whether at least one position update has been received for this asset.
     ///
@@ -1340,8 +1345,13 @@ where
     /// In backtest mode this always returns `true` — the position is authoritative from the
     /// first tick and there is no round trip to wait for.
     ///
+    /// The default is `false` — fail-closed, for the same reason as
+    /// [`snapshot_ready`](Self::snapshot_ready). Both in-crate impls override it.
+    ///
     /// * `asset_no` - Asset number to query.
-    fn position_observed(&self, asset_no: usize) -> bool;
+    fn position_observed(&self, _asset_no: usize) -> bool {
+        false
+    }
 
     /// Returns the state's values such as balance, fee, and so on.
     fn state_values(&self, asset_no: usize) -> &StateValues;
@@ -2410,21 +2420,219 @@ mod tests {
 
         // `py-hftbacktest/hftbacktest/types.py::state_values_dtype`, `align=True`: itemsize
         // 48, alignment 8. Every field is 8 bytes, so the offsets are dense.
-        assert_eq!(size_of::<StateValues>(), 48, "state_values_dtype itemsize is 48");
-        assert_eq!(align_of::<StateValues>(), 8, "state_values_dtype alignment is 8");
+        assert_eq!(
+            size_of::<StateValues>(),
+            48,
+            "state_values_dtype itemsize is 48"
+        );
+        assert_eq!(
+            align_of::<StateValues>(),
+            8,
+            "state_values_dtype alignment is 8"
+        );
 
         for (field, offset, dtype_name) in [
             (offset_of!(StateValues, position), 0, "position"),
             (offset_of!(StateValues, balance), 8, "balance"),
             (offset_of!(StateValues, fee), 16, "fee"),
             (offset_of!(StateValues, num_trades), 24, "num_trades"),
-            (offset_of!(StateValues, trading_volume), 32, "trading_volume"),
+            (
+                offset_of!(StateValues, trading_volume),
+                32,
+                "trading_volume",
+            ),
             (offset_of!(StateValues, trading_value), 40, "trading_value"),
         ] {
             assert_eq!(
                 field, offset,
                 "StateValues::{dtype_name} moved; py-hftbacktest's state_values_dtype reads \
                  offset {offset} and would silently return a different field"
+            );
+        }
+    }
+
+    /// Pins the *required* surface of [`Bot`] — the methods with no default body. Adding a new
+    /// required (defaultless) method to `Bot` breaks every external implementor at compile time
+    /// (AGENTS.md §2); today that first surfaces as a *downstream* build failure (e.g. myhft).
+    /// This stand-in for an external impl makes it surface here, in `cargo test`, one commit
+    /// earlier. It deliberately does not override `snapshot_ready`/`position_observed`, which
+    /// both proves their defaults exist (else this would not compile) and lets the test pin the
+    /// fail-closed value. Note: `cargo check` does not build `cfg(test)`, so only `cargo test`
+    /// hits this pin.
+    mod upstream_surface_pin {
+        use std::collections::HashMap;
+
+        use crate::{
+            depth::HashMapMarketDepth,
+            types::{
+                Bot,
+                ElapseResult,
+                Event,
+                OrdType,
+                Order,
+                OrderId,
+                OrderRequest,
+                StateValues,
+                TimeInForce,
+            },
+        };
+
+        struct UpstreamSurfaceBot {
+            depth: HashMapMarketDepth,
+            state: StateValues,
+            orders: HashMap<OrderId, Order>,
+            trades: Vec<Event>,
+        }
+
+        impl Bot<HashMapMarketDepth> for UpstreamSurfaceBot {
+            type Error = ();
+
+            fn current_timestamp(&self) -> i64 {
+                0
+            }
+
+            fn num_assets(&self) -> usize {
+                1
+            }
+
+            fn position(&self, _asset_no: usize) -> f64 {
+                0.0
+            }
+
+            fn state_values(&self, _asset_no: usize) -> &StateValues {
+                &self.state
+            }
+
+            fn depth(&self, _asset_no: usize) -> &HashMapMarketDepth {
+                &self.depth
+            }
+
+            fn last_trades(&self, _asset_no: usize) -> &[Event] {
+                &self.trades
+            }
+
+            fn clear_last_trades(&mut self, _asset_no: Option<usize>) {}
+
+            fn orders(&self, _asset_no: usize) -> &HashMap<OrderId, Order> {
+                &self.orders
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn submit_buy_order(
+                &mut self,
+                _asset_no: usize,
+                _order_id: OrderId,
+                _price: f64,
+                _qty: f64,
+                _time_in_force: TimeInForce,
+                _order_type: OrdType,
+                _wait: bool,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn submit_sell_order(
+                &mut self,
+                _asset_no: usize,
+                _order_id: OrderId,
+                _price: f64,
+                _qty: f64,
+                _time_in_force: TimeInForce,
+                _order_type: OrdType,
+                _wait: bool,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn submit_order(
+                &mut self,
+                _asset_no: usize,
+                _order: OrderRequest,
+                _wait: bool,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn modify(
+                &mut self,
+                _asset_no: usize,
+                _order_id: OrderId,
+                _price: f64,
+                _qty: f64,
+                _wait: bool,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn cancel(
+                &mut self,
+                _asset_no: usize,
+                _order_id: OrderId,
+                _wait: bool,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn clear_inactive_orders(&mut self, _asset_no: Option<usize>) {}
+
+            fn wait_order_response(
+                &mut self,
+                _asset_no: usize,
+                _order_id: OrderId,
+                _timeout: i64,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn wait_next_feed(
+                &mut self,
+                _include_order_resp: bool,
+                _timeout: i64,
+            ) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn elapse(&mut self, _duration: i64) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn elapse_bt(&mut self, _duration: i64) -> Result<ElapseResult, Self::Error> {
+                Ok(ElapseResult::Ok)
+            }
+
+            fn close(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn feed_latency(&self, _asset_no: usize) -> Option<(i64, i64)> {
+                None
+            }
+
+            fn order_latency(&self, _asset_no: usize) -> Option<(i64, i64, i64)> {
+                None
+            }
+        }
+
+        /// The two fork-added methods default to `false` (fail-closed). This also exercises the
+        /// pin: `UpstreamSurfaceBot` implements exactly `Bot`'s required surface, so a new
+        /// defaultless method would fail the `impl` above with E0046.
+        #[test]
+        fn fork_added_bot_methods_default_fail_closed() {
+            let bot = UpstreamSurfaceBot {
+                depth: HashMapMarketDepth::new(0.1, 1.0),
+                state: StateValues::default(),
+                orders: HashMap::new(),
+                trades: Vec::new(),
+            };
+            // Calls the trait defaults — UpstreamSurfaceBot does not override them.
+            assert!(
+                !bot.snapshot_ready(0),
+                "snapshot_ready must default to false (fail-closed)"
+            );
+            assert!(
+                !bot.position_observed(0),
+                "position_observed must default to false (fail-closed)"
             );
         }
     }
