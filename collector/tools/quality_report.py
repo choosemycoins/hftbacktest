@@ -623,6 +623,7 @@ HYPERLIQUID = "hyperliquid"
 BINANCE = "binance"
 BYBIT = "bybit"
 LIGHTER = "lighter"
+EXTENDED = "extended"
 
 _FAMILY = {
     "lighter": LIGHTER,
@@ -633,6 +634,7 @@ _FAMILY = {
     "binance": BINANCE,
     "binancespot": BINANCE,
     "bybit": BYBIT,
+    "extended": EXTENDED,
 }
 
 #: `collector/src/main.rs` matches `"binancefutures" | "binancefuturesum"` onto
@@ -719,6 +721,28 @@ MAX_GAP_NS = {
     (LIGHTER, "ticker"): 20 * SEC_NS,
     (LIGHTER, "trade"): 120 * SEC_NS,
     (LIGHTER, "market_stats"): 30 * SEC_NS,
+    # Extended cadences have never been measured over a full day in this repo, so
+    # like Binance's and Bybit's these are deliberately loose flat limits in the
+    # spirit "name reconnect-sized holes, not grade liquidity".
+    #
+    # `orderbook` is the subtle one. A book delta only arrives when *that* market's
+    # book changes, so a thin market goes quiet like an event-driven feed — a 25s
+    # smoke on 2026-08-03 measured CHZ-USD and TURBO-USD going ~37s between book
+    # frames while BTC-USD ran gaplessly. The floor under that quiet is the venue's
+    # full-book **re-snapshot every ~60 s** (README, and the same fact the
+    # reconnect loop relies on), so the limit is 90s = 1.5x that floor: it tolerates
+    # a quiet market (which still re-snapshots inside a minute) yet a firehose that
+    # actually died shows >90s gaps on *every* market including the majors, which
+    # then flag. A tighter limit painted the first healthy recording yellow.
+    #
+    # `trades` droughts are legal; `mark` runs ~0.7 frames/s (measured gapless at
+    # ~1.5s); `funding` is roughly one frame a minute (perpetual-only, so a short
+    # run may record none). Tighten once a full day of a thin market has been
+    # recorded and looked at.
+    (EXTENDED, "orderbook"): 90 * SEC_NS,
+    (EXTENDED, "trades"): 120 * SEC_NS,
+    (EXTENDED, "mark"): 30 * SEC_NS,
+    (EXTENDED, "funding"): 300 * SEC_NS,
 }
 
 #: Lighter's four limits above are round numbers far above a measurement, and
@@ -944,6 +968,34 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
         # with no flag behind it, so there is no legal recording that asked for
         # fewer.
         return Expected((), ("order_book", "ticker", "trade", "market_stats"))
+
+    if exchange == "extended":
+        # Same standing as Bybit and Lighter: no mode-A dataset reads Extended,
+        # so nothing it does can make one red. The stream classes are chosen to
+        # be checked while low-noise, because Extended's sockets are not uniform
+        # across markets or files:
+        #
+        #   * `orderbook` is optional (absent → yellow). Every Extended symbol
+        #     file carries a book — the plain `{market}` file the indicative
+        #     one, the `{market}-rfq` sibling the executable one — so a file
+        #     with no book at all is a real, actionable warning.
+        #   * `trades`, `funding`, `mark` are informational (absent → silent,
+        #     checked while present). Each is legitimately absent from some
+        #     file: the `{market}-rfq` sibling carries only the book; `funding`
+        #     is perpetual-only and roughly one frame a minute, so a spot market
+        #     or a short run has none; `mark` is per-market but not on the RFQ
+        #     file. Making them optional would paint every RFQ file and every
+        #     spot market yellow for streams they never had — the noise a gate
+        #     dies of. The per-socket liveness warn
+        #     (`extended::SocketLiveness`) is the runtime guard for a feed that
+        #     was expected and went silent; this offline check verifies what was
+        #     recorded rather than asserting what a market must carry.
+        #
+        # `orderbook` covers the RFQ book too: the executable and indicative
+        # books are the same shape and are separated by file, so both classify
+        # as `orderbook` and an RFQ sibling with a book satisfies the optional
+        # set on its own.
+        return Expected((), ("orderbook",), None, ("trades", "funding", "mark"))
 
     raise ValueError(
         f"profile {profile!r} defines no expected stream set for exchange "
@@ -1199,6 +1251,30 @@ def classify(family: str, obj: dict) -> Optional[str]:
         channel = obj.get("channel")
         if isinstance(channel, str):
             return channel.split(":", 1)[0]
+        return None
+
+    if family == EXTENDED:
+        # The envelope is `{type, data, error, ts, seq}`
+        # (`collector/src/extended`). The four streams are told apart
+        # structurally, in the order that keeps each unambiguous:
+        #   * book — `type` is SNAPSHOT or DELTA, `data` a single object. The
+        #     RFQ executable book is byte-identical in shape and kept apart by
+        #     *file* (`{market}-rfq`), not by any field, so it classifies as
+        #     `orderbook` too — correctly, since the file is what separates them.
+        #   * mark — `type` is `MP`.
+        #   * trades — no `type`; `data` is an *array* of prints.
+        #   * funding — no `type`; `data` is an object carrying the funding
+        #     rate `f` (mark's object carries `p`, so `f` is the discriminator).
+        typ = obj.get("type")
+        if typ in ("SNAPSHOT", "DELTA"):
+            return "orderbook"
+        if typ == "MP":
+            return "mark"
+        data = obj.get("data")
+        if isinstance(data, list):
+            return "trades"
+        if isinstance(data, dict) and "f" in data:
+            return "funding"
         return None
 
     return None
@@ -2165,8 +2241,27 @@ def check_day(
         present[path.name[:-3].rsplit("_", 1)[0]] = path
 
     wanted = [s.lower() for s in (config or {}).get("symbols", [])]
+
+    def is_expected_file(name: str) -> bool:
+        """Whether a recorded file's symbol was asked for.
+
+        Extended records an RFQ market's executable book beside the plain book
+        as a sibling `{market}-rfq` file (`collector/src/extended`). It is
+        expected output for a requested RFQ market, not a leftover, so it must
+        not read as `unexpected_symbol`.
+        """
+        if name in wanted:
+            return True
+        if (
+            config is not None
+            and family_of(exchange) == EXTENDED
+            and name.endswith("-rfq")
+        ):
+            return name[: -len("-rfq")] in wanted
+        return False
+
     for name in sorted(present):
-        if config is not None and name not in wanted:
+        if config is not None and not is_expected_file(name):
             issues.append(
                 issue(
                     YELLOW,

@@ -22,6 +22,7 @@ mod clock;
 mod cpu;
 mod disk;
 mod error;
+mod extended;
 mod file;
 mod hyperliquid;
 mod lighter;
@@ -625,6 +626,17 @@ async fn main() -> Result<(), anyhow::Error> {
             );
 
             tokio::spawn(paradex::run_collection(
+                args.symbols,
+                writer_tx,
+                !args.no_symbol_check,
+            ))
+        }
+        "extended" => {
+            // URL-based public feed: no subscribe frames, one socket per
+            // channel. `--no-symbol-check` skips the catalog lookup that
+            // resolves market type and the RFQ flag; leave it on so an unknown
+            // symbol refuses to start and RFQ markets get their executable book.
+            tokio::spawn(extended::run_collection(
                 args.symbols,
                 writer_tx,
                 !args.no_symbol_check,
