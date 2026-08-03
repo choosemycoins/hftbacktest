@@ -297,6 +297,11 @@ impl Connector for Lighter {
                 self.config.rest_url.clone(),
                 self.config.public_url.clone(),
                 self.symbols.clone(),
+                // The registration wake-up: the private stream re-resolves a symbol registered
+                // after it connected, so orders for it reach the venue (§4.2). Without it a
+                // symbol seeded before connect works and one registered after silently never
+                // places an order.
+                self.symbol_tx.subscribe(),
                 ev_tx,
             ));
         }
@@ -341,18 +346,34 @@ impl Connector for Lighter {
         };
         // One `CancelAllOrders` per resolved market (§3.4) — scoped to the swept symbols rather
         // than the whole account, so a dead bot's sweep cannot flatten a live bot's markets.
+        let mut unresolved: Vec<String> = Vec::new();
         let market_indices: Vec<i32> = {
             let manager = order_path.order_manager();
             let manager = manager.lock().unwrap();
             symbols
                 .iter()
-                .filter_map(|symbol| {
-                    manager
-                        .market_info(symbol)
-                        .map(|info| info.market_id as i32)
+                .filter_map(|symbol| match manager.market_info(symbol) {
+                    Some(info) => Some(info.market_id as i32),
+                    None => {
+                        unresolved.push(symbol.clone());
+                        None
+                    }
                 })
                 .collect()
         };
+        if !unresolved.is_empty() {
+            // A symbol whose market never resolved is silently skipped by the filter above, so a
+            // dead-bot or shutdown sweep does NOT cancel its resting orders — and on this venue
+            // orders outlive the process (§2.7), so they keep trading unattended. Name them, so
+            // the operator can see what the sweep could not cover.
+            warn!(
+                ?reason,
+                ?unresolved,
+                "Some Lighter symbols have no resolved market, so this sweep cannot cancel their \
+                 orders; any resting orders on them keep trading until the market resolves or the \
+                 connector stops."
+            );
+        }
         info!(
             ?reason,
             ?symbols,

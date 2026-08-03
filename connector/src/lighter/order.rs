@@ -72,6 +72,17 @@ pub enum OrderError {
     OrderIdLive { symbol: String, order_id: u64 },
     #[error("no live order {order_id} on {symbol}")]
     OrderNotFound { symbol: String, order_id: u64 },
+    /// The symbol has no resolved catalog row yet, so no order can be addressed on it. This is
+    /// the zero-fills bug's true cause (a symbol registered after the private stream connected
+    /// was never resolved for orders), and it is **deliberately distinct** from
+    /// [`OrderError::OrderNotFound`]: the old code reused the "no live order" message here, and
+    /// that string is exactly what a downstream classifier downgrades to a benign
+    /// cancel-raced-a-fill (`myhft/src/classifiers/lighter.rs`), so every submit silently
+    /// failing read as harmless. The message must never contain "no live order".
+    #[error(
+        "no resolved Lighter market for {symbol}; the catalog has not mapped it to a market_id yet"
+    )]
+    MarketUnresolved { symbol: String },
     #[error("order {order_id} on {symbol} is not confirmed yet; the venue order_index is unknown")]
     NotConfirmed { symbol: String, order_id: u64 },
     #[error("the client-order-index allocator is exhausted (reached 2^48-1)")]
@@ -815,6 +826,39 @@ mod tests {
         assert_eq!(m.orders(Some("BTC".to_string())).len(), 1);
         assert_eq!(m.orders(Some("ETH".to_string())).len(), 0);
         assert_eq!(m.orders(None).len(), 1);
+    }
+
+    /// **`MarketUnresolved` must not wear the `OrderNotFound` message** — the coupling that
+    /// misdiagnosed the zero-fills bug as an order-id issue. `OrderNotFound`'s Display carries
+    /// "no live order", which `myhft/src/classifiers/lighter.rs` treats as a benign cancel that
+    /// raced a fill and downgrades to `None` (no rate-limit-storm signal). If the
+    /// market-unresolved failure reused that string, every submit failing for an unresolved
+    /// market would be classified benign and the operator would get no signal at all. The two
+    /// Displays must stay distinct, and `MarketUnresolved` must never contain "no live order".
+    #[test]
+    fn market_unresolved_is_distinct_from_order_not_found() {
+        let unresolved = OrderError::MarketUnresolved {
+            symbol: "ETH".to_string(),
+        }
+        .to_string();
+        let not_found = OrderError::OrderNotFound {
+            symbol: "ETH".to_string(),
+            order_id: 7,
+        }
+        .to_string();
+        assert!(
+            !unresolved.contains("no live order"),
+            "MarketUnresolved must not carry the OrderNotFound message the classifier downgrades \
+             to None: {unresolved}"
+        );
+        assert!(
+            unresolved.contains("ETH"),
+            "the operator must be able to grep the symbol: {unresolved}"
+        );
+        assert_ne!(
+            unresolved, not_found,
+            "the two failures are not the same failure"
+        );
     }
 
     #[test]

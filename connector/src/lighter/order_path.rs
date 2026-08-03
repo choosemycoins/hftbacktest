@@ -43,6 +43,7 @@ use serde::Deserialize;
 use tokio::{
     select,
     sync::{
+        broadcast::{self, error::RecvError},
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
     },
@@ -51,7 +52,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{Error as WsError, Message, client::IntoClientRequest},
 };
 use tracing::{error, info, warn};
 
@@ -64,7 +65,8 @@ use crate::{
         order::{CancelPlan, OrderManager},
         private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
         public_stream::{BACKOFF_MAX, BACKOFF_MIN, CONNECT_TIMEOUT, PING_FRAME, PING_INTERVAL},
-        rest::{self, SendOutcome},
+        publish_error,
+        rest::{self, MarketInfo, SendOutcome},
         signer::{CreateOrder, SignerClient, python_sidecar_command},
         slot::{
             AmbiguousFate,
@@ -258,11 +260,19 @@ impl OrderPath {
     }
 
     /// Spawns the slot task and the private stream.
+    ///
+    /// `symbol_rx` is the registration wake-up (`Connector::register` broadcasts on it). The
+    /// private stream re-resolves any newly registered symbol off it, so a symbol registered
+    /// **after** the private stream connected is tracked for orders — without it, `market_info`
+    /// stays `None` and every submit is expired before signing (the zero-fills bug). The shared
+    /// symbol set stays authoritative for *what* is registered; the broadcast is only the
+    /// impulse to re-read it, exactly as `public_stream` uses it (`AGENTS.md` §4.2).
     pub fn spawn(
         config: OrderPathConfig,
         rest_url: String,
         public_url: String,
         symbols: SharedSymbolSet,
+        symbol_rx: broadcast::Receiver<String>,
         ev_tx: UnboundedSender<PublishEvent>,
     ) -> Self {
         // The COI allocator is seeded from a millisecond timestamp so a restart does not reuse
@@ -286,6 +296,7 @@ impl OrderPath {
             rest_url,
             public_url,
             symbols,
+            symbol_rx,
             order_manager: order_manager.clone(),
             command_tx: command_tx.clone(),
             ev_tx,
@@ -306,9 +317,14 @@ impl OrderPath {
             let mut manager = self.order_manager.lock().unwrap();
             match manager.market_info(symbol) {
                 Some(market) => manager.new_order(symbol, &market, order),
-                None => Err(crate::lighter::order::OrderError::OrderNotFound {
+                // The market has not resolved yet — the zero-fills bug's true cause. Report it
+                // as its own error, NOT the reused `OrderNotFound` ("no live order …") message
+                // that made this look like an order-id problem and that a downstream classifier
+                // downgrades to benign (`OrderError::MarketUnresolved` doc, `order.rs`). The
+                // registration wake arm resolves the symbol so this window is transient rather
+                // than permanent.
+                None => Err(crate::lighter::order::OrderError::MarketUnresolved {
                     symbol: symbol.to_string(),
-                    order_id: order.order_id,
                 }),
             }
         };
@@ -918,13 +934,19 @@ struct PrivateStreamTask {
     rest_url: String,
     public_url: String,
     symbols: SharedSymbolSet,
+    /// The registration wake-up. Re-read on every connect and on every wake so a symbol
+    /// registered after this stream connected is resolved for orders (`AGENTS.md` §4.2). The
+    /// receiver lives across reconnects: the shared set is authoritative, so a wake missed
+    /// while disconnected is recovered by the connect-time re-resolve, and a `Lagged` is a
+    /// re-resolve, not a lost symbol.
+    symbol_rx: broadcast::Receiver<String>,
     order_manager: Arc<Mutex<OrderManager>>,
     command_tx: UnboundedSender<Command>,
     ev_tx: UnboundedSender<PublishEvent>,
 }
 
 impl PrivateStreamTask {
-    async fn run(self) {
+    async fn run(mut self) {
         let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
         loop {
             match self.connect().await {
@@ -968,16 +990,14 @@ impl PrivateStreamTask {
         Some((token, lifetime))
     }
 
-    async fn connect(&self) -> Result<StreamEnd, LighterError> {
-        // The market↔symbol map the position frames need, resolved once per connect (§3.4).
-        let registered: Vec<String> = self.symbols.lock().unwrap().iter().cloned().collect();
-        let (resolved, _refused) = rest::resolve_symbols(&self.rest_url, &registered).await;
-        {
-            let mut manager = self.order_manager.lock().unwrap();
-            for info in resolved {
-                manager.track_market(info);
-            }
-        }
+    async fn connect(&mut self) -> Result<StreamEnd, LighterError> {
+        // The market↔symbol map the position frames and every submit need, resolved per connect
+        // (§3.4). Only the not-yet-tracked symbols are asked about, so a reconnect does not
+        // re-fetch a `market_id` that cannot change under a running process; a refusal is
+        // reported per symbol and re-tried on the next wake, rather than dropped (the fold-1
+        // fix — a REST blip at connect used to reject 100 % of orders for the ~7.5 h life of
+        // the connection with no error at all).
+        self.resolve_registered().await;
 
         let (token, lifetime_s) = self
             .mint_auth()
@@ -1026,12 +1046,37 @@ impl PrivateStreamTask {
             write.send(Message::Text(frame.into())).await?;
         }
 
+        self.serve(&mut write, &mut read, lifetime_s).await
+    }
+
+    /// One connection: pump the account channels, keep it alive, refresh the token before it
+    /// expires — and re-resolve any symbol registered after connect off the wake-up.
+    ///
+    /// Split from [`Self::connect`] so the registration wake arm — the fix for the zero-fills
+    /// bug — is driven by the tests below with the halves in hand, rather than only modelled.
+    /// Modelled on `public_stream::serve`. No socket drop on a wake: the account channels are
+    /// account-scoped, not per-symbol, so a newly registered symbol needs only its market
+    /// resolved, not a resubscribe.
+    pub(crate) async fn serve<S, R>(
+        &mut self,
+        write: &mut S,
+        read: &mut R,
+        lifetime_s: i64,
+    ) -> Result<StreamEnd, LighterError>
+    where
+        S: SinkExt<Message> + Unpin,
+        LighterError: From<S::Error>,
+        R: StreamExt<Item = Result<Message, WsError>> + Unpin,
+    {
         let mut ping = time::interval(PING_INTERVAL);
         // Refresh the token by cycling cleanly before it expires — a connection must never
         // outlive its token (§3.4). Fires once, ~`AUTH_REFRESH_LEAD_S` before expiry.
         let refresh_at = auth_refresh_after(lifetime_s);
         let refresh = time::sleep(refresh_at);
         tokio::pin!(refresh);
+        // A closed broadcast resolves instantly and for ever; stop polling the arm once it has,
+        // or the loop spins at full tilt for the life of the connection (public_stream §4.2).
+        let mut registrations_closed = false;
         loop {
             select! {
                 _ = ping.tick() => {
@@ -1039,6 +1084,25 @@ impl PrivateStreamTask {
                 }
                 _ = &mut refresh => {
                     return Ok(StreamEnd::TokenRefresh);
+                }
+                registered = self.symbol_rx.recv(), if !registrations_closed => {
+                    match registered {
+                        Ok(symbol) => {
+                            // A symbol registered after this stream connected: resolve its
+                            // market so submits can address it. Without this arm `market_info`
+                            // stays `None` and every submit is expired before signing — the
+                            // zero-fills bug (§4.2, mirrors `public_stream`'s wake).
+                            info!(%symbol, "A Lighter symbol was registered; resolving its market for the order path.");
+                            self.resolve_registered().await;
+                        }
+                        Err(RecvError::Lagged(missed)) => {
+                            // A missed wake never loses a symbol: the shared set is authoritative
+                            // and re-read here (§4.2).
+                            warn!(missed, "Lighter order-path registration wake-ups were dropped; re-resolving the registered set.");
+                            self.resolve_registered().await;
+                        }
+                        Err(RecvError::Closed) => registrations_closed = true,
+                    }
                 }
                 message = read.next() => {
                     match message {
@@ -1057,6 +1121,57 @@ impl PrivateStreamTask {
                     }
                 }
             }
+        }
+    }
+
+    /// Resolves every registered symbol not yet tracked and records the catalog rows, so submits
+    /// can address them and position frames map back to the registered name (§3.4). Refusals are
+    /// reported per symbol, not dropped (fold-1); a transiently unavailable catalog leaves the
+    /// symbol untracked, so the next wake re-resolves it rather than writing it off for the life
+    /// of the connection. Called at connect and on every registration wake.
+    async fn resolve_registered(&self) {
+        let unresolved: Vec<String> = {
+            let registered: Vec<String> = self.symbols.lock().unwrap().iter().cloned().collect();
+            let manager = self.order_manager.lock().unwrap();
+            registered
+                .into_iter()
+                .filter(|symbol| manager.market_info(symbol).is_none())
+                .collect()
+        };
+        if unresolved.is_empty() {
+            return;
+        }
+        let (resolved, refused) = rest::resolve_symbols(&self.rest_url, &unresolved).await;
+        self.apply_resolution(resolved, refused);
+    }
+
+    /// Tracks what resolved and reports what did not, per symbol (fold-1, modelled on
+    /// `public_stream::apply_resolution`). A refused symbol is surfaced as a
+    /// [`ErrorKind::CriticalConnectionError`] — a symbol that resolves to no market can neither
+    /// be served nor traded, the same class of failure the market-data side reports — and is
+    /// left untracked so the next wake asks again. Split from the round trip so it is testable
+    /// without a socket.
+    fn apply_resolution(&self, resolved: Vec<MarketInfo>, refused: Vec<(String, LighterError)>) {
+        {
+            let mut manager = self.order_manager.lock().unwrap();
+            for info in resolved {
+                info!(
+                    symbol = %info.symbol,
+                    market_id = info.market_id,
+                    "Tracked a Lighter market for the order path."
+                );
+                manager.track_market(info);
+            }
+        }
+        for (symbol, error) in &refused {
+            error!(
+                %symbol,
+                ?error,
+                "Refusing to track a Lighter symbol for the order path: it does not resolve to a \
+                 market. Every submit for it is expired until it resolves; the next registration \
+                 wake retries a transient catalog failure."
+            );
+            publish_error(&self.ev_tx, ErrorKind::CriticalConnectionError, error);
         }
     }
 
@@ -1167,11 +1282,18 @@ fn expire_unsent(symbol: &str, order: &Order, ev_tx: &UnboundedSender<PublishEve
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-    use hftbacktest::types::LiveEvent;
+    use hftbacktest::types::{ErrorKind, LiveEvent};
     use serde::Deserialize;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::{
+        sync::{broadcast, mpsc::unbounded_channel},
+        time,
+    };
 
     use super::{
         AUTH_MAX_LIFETIME_S,
@@ -1188,6 +1310,7 @@ mod tests {
     use crate::{
         connector::PublishEvent,
         lighter::{
+            LighterError,
             fixtures::{
                 PRIVATE_ORDERS_SNAPSHOT,
                 PRIVATE_ORDERS_SNAPSHOT_EMPTY,
@@ -1197,6 +1320,7 @@ mod tests {
             private_msg::AccountOrder,
             rest::MarketInfo,
         },
+        utils::testing::{RecordingSink, read_after_connect},
     };
 
     /// **The 8 h auth ceiling is server-only (§3.4): a 9 h token mints without error and is
@@ -1355,11 +1479,16 @@ mod tests {
             confirm_deadline_ms: 5_000,
             connect_policy: policy,
         };
+        // The wake-up receiver: the on_frame tests here never send on it, and the tx is leaked
+        // so the receiver never sees the channel close (mirrors `public_stream`'s test helper).
+        let (symbol_tx, symbol_rx) = broadcast::channel(16);
+        std::mem::forget(symbol_tx);
         let task = PrivateStreamTask {
             config,
             rest_url: String::new(),
             public_url: String::new(),
             symbols: Arc::new(Mutex::new(Default::default())),
+            symbol_rx,
             order_manager: Arc::new(Mutex::new(OrderManager::new(1))),
             command_tx,
             ev_tx,
@@ -1443,5 +1572,158 @@ mod tests {
             }
             _ => panic!("the positions snapshot must publish a LiveEvent::Position (§3.4)"),
         }
+    }
+
+    /// **fold-1, socketless: what resolves is tracked, and what does not is reported per
+    /// symbol.** The old code did `let (resolved, _refused) = …` and dropped every refusal,
+    /// so a REST blip at connect rejected 100 % of orders for the ~7.5 h life of the
+    /// connection with no error at all. Modelled on `public_stream`'s
+    /// `an_unresolvable_symbol_is_refused_by_name`. A refused symbol is left untracked (so the
+    /// next wake asks again) and surfaced as a `CriticalConnectionError`.
+    #[test]
+    fn apply_resolution_tracks_resolved_markets_and_reports_refused_ones() {
+        let (task, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+
+        task.apply_resolution(
+            vec![MarketInfo {
+                symbol: "ETH".to_string(),
+                market_id: 42,
+                price_decimals: 2,
+                size_decimals: 4,
+            }],
+            vec![(
+                "NOTACOIN".to_string(),
+                LighterError::UnknownSymbol("NOTACOIN is not listed on Lighter".into()),
+            )],
+        );
+
+        assert!(
+            task.order_manager
+                .lock()
+                .unwrap()
+                .market_info("ETH")
+                .is_some(),
+            "the resolved market must be tracked so submits can address it"
+        );
+        assert!(
+            task.order_manager
+                .lock()
+                .unwrap()
+                .market_info("NOTACOIN")
+                .is_none(),
+            "a refused symbol is left untracked, so the next wake re-resolves it"
+        );
+
+        let mut errors = Vec::new();
+        while let Ok(event) = ev_rx.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Error(error)) = event {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors.len(), 1, "the one refusal is reported, not dropped");
+        assert_eq!(
+            errors[0].kind,
+            ErrorKind::CriticalConnectionError,
+            "a symbol that resolves to no market can neither be served nor traded"
+        );
+    }
+
+    /// A local HTTP endpoint that answers `GET /api/v1/orderBooks` with `body` — the catalog
+    /// the resolve fetches — so the wake arm can be driven end to end without the internet.
+    /// Same shape the `public_stream` catalog tests use (a bound `TcpListener`), but this one
+    /// returns a body rather than holding the socket open.
+    async fn catalog_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Read the request line and headers (a GET has no body), then answer.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// **The zero-fills bug, socketless: a symbol registered AFTER the private stream connected
+    /// is resolved for orders by the wake arm.**
+    ///
+    /// The order manager starts empty (the post-connect state) and no market is tracked. The
+    /// bot then registers `ETH` — the shared set gains it and a wake-up is broadcast, exactly
+    /// as `Connector::register` does. Driving `serve` (with the halves in hand, the way
+    /// `public_stream`'s reconnect pin drives it) must resolve `ETH` off the wake and track it,
+    /// so `market_info` goes `None` → `Some` and a submit would no longer be expired before
+    /// signing. Delete the wake arm and the market is never tracked — the mutation this pins.
+    #[tokio::test]
+    async fn an_order_path_tracks_a_symbol_registered_after_connect() {
+        // `reqwest` builds its rustls backend when the client is built; a test has no `main` to
+        // install the process-level provider. Idempotent (`AGENTS.md` §4.7).
+        crate::install_crypto_provider();
+        let rest_url = catalog_server(
+            r#"{"order_books":[{"symbol":"ETH","market_id":42,"status":"active","supported_price_decimals":2,"supported_size_decimals":4}]}"#,
+        )
+        .await;
+
+        let (command_tx, _command_rx) = unbounded_channel();
+        let (ev_tx, _ev_rx) = unbounded_channel();
+        let (symbol_tx, symbol_rx) = broadcast::channel(16);
+        let symbols: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let order_manager = Arc::new(Mutex::new(OrderManager::new(1)));
+        let config = OrderPathConfig {
+            account_index: 516,
+            api_key_index: 5,
+            signer_python: String::new(),
+            signer_script: String::new(),
+            signer_config: String::new(),
+            confirm_deadline_ms: 5_000,
+            connect_policy: ConnectPolicy::Reconcile,
+        };
+        let mut task = PrivateStreamTask {
+            config,
+            rest_url,
+            public_url: String::new(),
+            symbols: symbols.clone(),
+            symbol_rx,
+            order_manager: order_manager.clone(),
+            command_tx,
+            ev_tx,
+        };
+
+        // Post-connect state: ETH is not registered yet, so nothing is tracked.
+        assert!(
+            order_manager.lock().unwrap().market_info("ETH").is_none(),
+            "precondition: ETH is not tracked before it is registered"
+        );
+
+        // The bot registers ETH after connect: the shared set gains it and the wake fires.
+        symbols.lock().unwrap().insert("ETH".to_string());
+        symbol_tx.send("ETH".to_string()).unwrap();
+
+        // Drive the connection loop. The read half never speaks and never ends, so the loop is
+        // driven only by its own arms — the wake arm resolves ETH against the local catalog.
+        // A large lifetime keeps the token refresh far out of the window. Real time, so the
+        // local round trip runs; bounded so the (otherwise endless) loop is stopped.
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_connect(|| {});
+        let _ = time::timeout(
+            Duration::from_secs(2),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        assert!(
+            order_manager.lock().unwrap().market_info("ETH").is_some(),
+            "a symbol registered after connect must be resolved and tracked by the wake arm — \
+             without it every submit for ETH is expired before signing (the zero-fills bug)"
+        );
     }
 }
