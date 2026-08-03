@@ -64,7 +64,7 @@ exactly these streams.
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
 | `hyperliquid` | `trades`, `bbo`, `activeAssetCtx`, `l2Book` × `{--hl-l2-modes}` |
 | `lighter` | `order_book`, `ticker`, `trade`, `market_stats` — all four per market |
-| `extended` | `orderbooks` + `publicTrades` (all-markets, filtered), `funding` + `prices/mark` per market, `orderbooks/rfq` per RFQ market |
+| `extended` | `orderbooks` (all-markets firehose, filtered), `publicTrades` + `funding` + `prices/mark` per market, `orderbooks/rfq` per RFQ market |
 
 USD-M is the odd row: it carries no `@markPrice@1s`, because **that class
 lives on fstream's routed `/market` path** (Binance split fstream into
@@ -456,21 +456,41 @@ Which sockets are opened, and why the split (measured on mainnet 2026-08-03):
 
 | Channel | Form | Note |
 |---|---|---|
-| `orderbooks` | all-markets, one socket | full book, 100 ms; filtered to the requested markets by `data.m` |
-| `publicTrades` | all-markets, one socket | `data` is an array of prints |
-| `funding/{market}` | per market | perpetual-only; ~hourly, so a short run may record none |
+| `orderbooks` | all-markets firehose, one socket | full book, 100 ms; filtered to the requested markets by `data.m` |
+| `publicTrades/{market}` | per market | `data` is an array of prints, all for this market |
+| `funding/{market}` | per market | perpetual-only; ~1 frame a minute, so a short run may record none |
 | `prices/mark/{market}` | per market | `type:MP`, ~0.7 frames/s |
 | `orderbooks/rfq/{market}` | per RFQ market | the **executable** quote book; written to a separate `{market}-rfq` file |
 
-Two things are worth knowing about the all-markets book/trades sockets. First,
-they are a **firehose**: `/orderbooks` ran at ~950 frames/s across 316 markets,
-so a recording of a few symbols parses the whole venue and writes under 1% of
-it — acceptable on a Tokyo-co-located host, but the per-market form
+The book and trades channels both accept the all-markets form, but only the
+book takes it — and the asymmetry is the shape of a frame. A **book** frame's
+`data` is a single object naming one market, so each all-markets frame belongs
+to exactly one market and is filed correctly by `data.m`; the firehose cannot
+misfile. A **trades** frame's `data` is an *array*, and the all-markets firehose
+**batches prints from several markets into one frame** (measured at 7.6% of
+prints), while the router can only read the first entry's market — so on the
+firehose such a frame filed every foreign print into the first market's tape, or
+dropped the whole frame if the first market was not requested. Trades are
+therefore subscribed **per market** (`/publicTrades/{market}`): one socket that
+only ever carries its own market's prints, which makes the batching hazard
+unreachable and keeps per-market trade `seq` consecutive.
+
+The book firehose is worth knowing about on two counts. First, it is a
+**firehose**: `/orderbooks` ran at ~950 frames/s across 316 markets, so a
+recording of a few symbols parses the whole venue and writes under 1% of it —
+acceptable on a Tokyo-co-located host, but the per-market form
 (`/orderbooks/{market}`) is leaner for a one- or two-symbol recording. Second,
 because the firehose's `seq` counts every market, the `seq` on one market's
-recorded book frames is **not** consecutive (the skipped numbers are other
+recorded **book** frames is **not** consecutive (the skipped numbers are other
 markets, filtered out); per-market book continuity offline comes from the
 absolute `c` sizes and the 60 s re-snapshot, not from `seq`.
+
+Because Extended is the first backend to open **several** sockets per recording,
+each socket also reports a per-socket liveness record into `_meta` once a minute
+(`socket_liveness`, with `url`, `age_s` and `served`), and warns for a socket
+that has **never** served a frame — a dead `/orderbooks` firehose is otherwise
+invisible while a per-market mark socket keeps the stall watchdog and the
+per-symbol gauge both satisfied.
 
 The RFQ executable book and the plain indicative book are **byte-identical in
 shape**, so they are kept apart by *file*, not by any field: the plain book (and
@@ -570,6 +590,7 @@ as the venues themselves:
 | `{"_collector":"poller_degraded", …}` | a REST poller has failed `consecutive_failures` times running, `interval_s` apart, with `error`. The collector is **not** stopping — see below | binancefuturesum |
 | `{"_collector":"sequence_gap", …}` | a venue sequence number skipped ahead, so frames were lost: `channel`, `market`, `symbol`, `expected_begin_nonce`, `begin_nonce`, and the market's running `count`. The collector is **not** stopping — it repairs that market's book, at most once a minute per market | lighter |
 | `{"_collector":"probe_failed", …}` | the venue refused the WebSocket upgrade from this host before anything was recorded: `url`, `error`. The collector **is** stopping, and this is not a symbol problem — see [Geoblocking is checked before recording starts](#geoblocking-is-checked-before-recording-starts) | lighter |
+| `{"_collector":"socket_liveness", …}` | per-socket, once a minute: `url`, `age_s` since its last frame, and `served` — whether it has ever served one. The collector is **not** stopping; a socket that has never served warns. Only a backend that opens several sockets per recording needs it | extended |
 | `{"channel":"subscriptionResponse", …}` | the venue's ack, echoing its normalised parameters | hyperliquid |
 | `{"channel":"error", …}` | venue rejections | hyperliquid |
 | `{"channel":"pong", …}` | liveness during a stretch with no market data | hyperliquid |

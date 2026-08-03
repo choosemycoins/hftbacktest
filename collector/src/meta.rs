@@ -134,6 +134,34 @@ pub fn stream_ended(connected_for_ms: u64) -> Value {
     )
 }
 
+/// How long one socket has gone without serving a frame, sampled once a minute.
+///
+/// The ninth record, and the fourth exception to "every backend writes these":
+/// only a backend that opens **several** sockets per recording can have one die
+/// while the others keep the recording looking healthy, and Extended is the only
+/// one that does (`extended::http::keep_connection_one`). It is spelled here for
+/// the reason the whole module exists — one vocabulary for the sidecar — rather
+/// than locally inside that backend.
+///
+/// It earns its place because neither process-level guard can see it. The stall
+/// watchdog fires only on **total** silence, and the per-symbol
+/// [`crate::liveness::LivenessGauge`] ages symbols, not sockets — so a dead
+/// `/orderbooks` firehose, while a per-market mark socket keeps resetting both
+/// clocks, is invisible to both. `served=false` is the sharp end: a socket that
+/// has **never** served a frame is one whose URL the venue may be silently
+/// refusing to feed, which no `dial_failed`/`disconnected` pair reports because
+/// the dial itself succeeded.
+pub fn socket_liveness(url: &str, age_s: u64, served: bool) -> Value {
+    record(
+        "socket_liveness",
+        serde_json::json!({
+            "url": url,
+            "age_s": age_s,
+            "served": served,
+        }),
+    )
+}
+
 /// A REST poller has been failing for long enough that its feed is missing.
 ///
 /// The five records above are written by every backend; this one is written by
@@ -303,10 +331,35 @@ mod tests {
                 probe_failed("wss://venue/stream", "the upgrade failed"),
                 "probe_failed",
             ),
+            (
+                socket_liveness("wss://venue/orderbooks", 0, true),
+                "socket_liveness",
+            ),
         ] {
             assert!(is_record(&value), "{value}");
             assert_eq!(value[TAG], event, "{value}");
         }
+    }
+
+    /// The per-socket record has to carry which socket, how long it has been
+    /// quiet, and — the sharp end — whether it has ever served a frame at all.
+    /// A socket that never served one is the fault this exists for: the dial
+    /// succeeded, so no `dial_failed` names it, and the venue is simply not
+    /// feeding that URL.
+    #[test]
+    fn a_socket_liveness_record_names_the_socket_and_whether_it_ever_served() {
+        let never = socket_liveness("wss://venue/orderbooks", 137, false);
+        assert_eq!(never[TAG], "socket_liveness");
+        assert_eq!(never["url"], "wss://venue/orderbooks");
+        assert_eq!(never["age_s"], 137);
+        assert_eq!(
+            never["served"], false,
+            "a socket that never served a frame must say so: {never}"
+        );
+
+        let alive = socket_liveness("wss://venue/prices/mark/BTC-USD", 3, true);
+        assert_eq!(alive["served"], true);
+        assert_eq!(alive["age_s"], 3);
     }
 
     /// A venue that will not talk to this host is not a bad symbol.

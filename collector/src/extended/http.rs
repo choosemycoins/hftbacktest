@@ -7,7 +7,11 @@ use std::{
 use anyhow::Error;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use tokio::{select, sync::mpsc::unbounded_channel};
+use tokio::{
+    select,
+    sync::mpsc::unbounded_channel,
+    time::{Interval, MissedTickBehavior},
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -18,6 +22,7 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
+use super::SocketLiveness;
 use crate::{
     backoff::reconnect_delay,
     meta::{self, StreamEnd},
@@ -31,10 +36,17 @@ use crate::{
 /// this only sets the required `User-Agent` and reads. `connected_at` is the
 /// out-parameter that lets the caller tell a dropped connection from one that
 /// never dialled — the dial failure leaves through `?`.
+///
+/// `liveness` and `minute` are owned by the caller so they persist across
+/// reconnects (see [`keep_connection_one`]): every text frame notes itself on
+/// the gauge, and on each minute tick the gauge's record is emitted and a socket
+/// that has never served a frame is warned about.
 pub async fn connect(
     url: &str,
     ws_tx: Tx<Frame>,
     connected_at: &mut Option<Instant>,
+    liveness: &mut SocketLiveness,
+    minute: &mut Interval,
 ) -> Result<StreamEnd, anyhow::Error> {
     let mut request = url.into_client_request()?;
     // Required by the venue; the value is otherwise unconstrained. Without it
@@ -73,34 +85,52 @@ pub async fn connect(
     });
 
     loop {
-        match read.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let recv_time = Utc::now();
-                // A refused hand-off is terminal (parser gone or not draining):
-                // `send` has already raised the fatal signal, and reading on
-                // would drop frames in silence. Returning ends the retry loop,
-                // releasing this socket's `ws_tx` clone.
-                if ws_tx.send((recv_time, text)).is_err() {
-                    return Ok(StreamEnd::HandOffRefused);
+        select! {
+            // The per-socket liveness sample, on the same one-a-minute cadence
+            // as `main`'s host gauges. `read.next()` is cancel-safe — a frame in
+            // the socket buffer is not consumed until it is returned — so losing
+            // this race to the tick drops no data.
+            _ = minute.tick() => {
+                let (record, never_served) = liveness.sample(tokio::time::Instant::now());
+                meta::emit(&ws_tx, record);
+                if never_served {
+                    warn!(
+                        %url,
+                        "extended socket has served no frame yet; the venue may be \
+                         silently not feeding this URL (the dial succeeded)"
+                    );
                 }
             }
-            Some(Ok(Message::Binary(_))) => {}
-            // The venue's own pings; tokio-tungstenite has already ponged.
-            Some(Ok(Message::Ping(_))) => {}
-            Some(Ok(Message::Pong(_))) => {}
-            Some(Ok(Message::Close(close_frame))) => {
-                warn!(?close_frame, %url, "connection closed");
-                return Err(Error::from(io::Error::new(
-                    ErrorKind::ConnectionAborted,
-                    "connection closed",
-                )));
-            }
-            Some(Ok(Message::Frame(_))) => {}
-            Some(Err(e)) => {
-                return Err(Error::from(e));
-            }
-            None => {
-                break;
+            message = read.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    liveness.saw_frame(tokio::time::Instant::now());
+                    let recv_time = Utc::now();
+                    // A refused hand-off is terminal (parser gone or not
+                    // draining): `send` has already raised the fatal signal, and
+                    // reading on would drop frames in silence. Returning ends the
+                    // retry loop, releasing this socket's `ws_tx` clone.
+                    if ws_tx.send((recv_time, text)).is_err() {
+                        return Ok(StreamEnd::HandOffRefused);
+                    }
+                }
+                Some(Ok(Message::Binary(_))) => {}
+                // The venue's own pings; tokio-tungstenite has already ponged.
+                Some(Ok(Message::Ping(_))) => {}
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Close(close_frame))) => {
+                    warn!(?close_frame, %url, "connection closed");
+                    return Err(Error::from(io::Error::new(
+                        ErrorKind::ConnectionAborted,
+                        "connection closed",
+                    )));
+                }
+                Some(Ok(Message::Frame(_))) => {}
+                Some(Err(e)) => {
+                    return Err(Error::from(e));
+                }
+                None => {
+                    break;
+                }
             }
         }
     }
@@ -127,6 +157,19 @@ pub async fn connect(
 async fn keep_connection_one(url: String, ws_tx: Tx<Frame>) {
     let mut error_count: u32 = 0;
     let mut attempt: u64 = 0;
+
+    // One gauge and one timer for the whole life of this socket, owned here so
+    // they persist across reconnects: a socket that keeps reconnecting without
+    // ever serving a frame still accumulates the "never served" verdict, and a
+    // reconnect does not restart the minute clock. The interval's first tick is
+    // immediate, so it is consumed now — the first real sample is a minute in,
+    // not at t=0 when nothing could have arrived. `Delay` keeps a long backoff
+    // from firing a burst of catch-up ticks on reconnect.
+    let mut liveness = SocketLiveness::new(url.clone(), tokio::time::Instant::now());
+    let mut minute = tokio::time::interval(Duration::from_secs(60));
+    minute.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    minute.tick().await;
+
     loop {
         // What was opened, recorded before the dial: the case it is most needed
         // for is the dial that never completes.
@@ -139,7 +182,15 @@ async fn keep_connection_one(url: String, ws_tx: Tx<Frame>) {
         let dial_time = Instant::now();
         let mut connected_at = None;
 
-        match connect(&url, ws_tx.clone(), &mut connected_at).await {
+        match connect(
+            &url,
+            ws_tx.clone(),
+            &mut connected_at,
+            &mut liveness,
+            &mut minute,
+        )
+        .await
+        {
             Ok(StreamEnd::HandOffRefused) => return,
             Ok(StreamEnd::Eof) => {
                 // A clean close. For a persistent per-channel socket this is a

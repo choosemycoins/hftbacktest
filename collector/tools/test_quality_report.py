@@ -862,6 +862,176 @@ def test_a_quiet_lighter_ticker_over_a_live_book_is_not_reported(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Extended: URL-based channels, RFQ sibling files
+# --------------------------------------------------------------------------
+
+
+def extended_book(symbol, ts, seq, kind="DELTA"):
+    return {
+        "type": kind,
+        "data": {"t": kind, "m": symbol, "b": [], "a": [], "d": "f"},
+        "ts": ms_of(ts),
+        "seq": seq,
+    }
+
+
+def extended_trade(symbol, ts, seq):
+    return {
+        "data": [{"i": seq, "m": symbol, "S": "BUY", "tT": "TRADE", "T": ms_of(ts), "p": "1", "q": "1"}],
+        "ts": ms_of(ts),
+        "seq": seq,
+    }
+
+
+def extended_mark(symbol, ts, seq):
+    return {"type": "MP", "data": {"m": symbol, "p": "1", "ts": 0}, "ts": ms_of(ts), "seq": seq}
+
+
+def extended_funding(symbol, ts, seq):
+    return {"ts": ms_of(ts), "data": {"m": symbol, "T": ms_of(ts), "f": "0.001"}, "seq": seq}
+
+
+def extended_dir(tmp_path, streams=("orderbook", "trades", "mark", "funding"), rfq=False, day=DAY):
+    """A minimal, complete Extended recording for BTC-USD.
+
+    Each stream present spans the same window (a frame at t=0 and t=5), so a
+    complete day has a non-empty coverage window — the intersection across the
+    streams — rather than four disjoint single points. `rfq=True` also writes
+    the `{market}-rfq` sibling file (executable book).
+    """
+    d = tmp_path / "extended"
+    d.mkdir()
+    recs = []
+    seq = 0
+    for t in (0, 5):
+        if "orderbook" in streams:
+            seq += 1
+            kind = "SNAPSHOT" if t == 0 else "DELTA"
+            recs.append((ns(t), extended_book("BTC-USD", ns(t), seq, kind=kind)))
+        if "trades" in streams:
+            seq += 1
+            recs.append((ns(t), extended_trade("BTC-USD", ns(t), seq)))
+        if "mark" in streams:
+            seq += 1
+            recs.append((ns(t), extended_mark("BTC-USD", ns(t), seq)))
+        if "funding" in streams:
+            seq += 1
+            recs.append((ns(t), extended_funding("BTC-USD", ns(t), seq)))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc-usd_{day}.gz", recs)
+    if rfq:
+        write_gz(
+            d / f"btc-usd-rfq_{day}.gz",
+            [
+                (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+                (ns(1), extended_book("BTC-USD", ns(1), 2)),
+            ],
+        )
+    write_meta(d, "extended", day, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    return d
+
+
+def test_family_of_and_expected_streams_know_extended():
+    """The report used to raise `ValueError` on `session_start.exchange` =
+    "extended", so a recorded day could not be gate-checked at all.
+
+    Extended is not part of a mode-A dataset, so — like Bybit and Lighter —
+    nothing it does can make one red: `required` is empty. The book is optional
+    (every file carries one), the conditional feeds are informational.
+    """
+    assert qr.family_of("extended") == qr.EXTENDED
+
+    expected = qr.expected_streams("mode-a-v1", "extended", {})
+    assert expected.required == ()
+    assert expected.optional == ("orderbook",)
+    assert set(expected.informational) == {"trades", "funding", "mark"}
+    assert expected.violation is None
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")), "orderbook"),
+        (json.dumps(extended_book("BTC-USD", ns(0), 2)), "orderbook"),
+        (json.dumps(extended_trade("BTC-USD", ns(0), 3)), "trades"),
+        (json.dumps(extended_mark("BTC-USD", ns(0), 4)), "mark"),
+        (json.dumps(extended_funding("BTC-USD", ns(0), 5)), "funding"),
+    ],
+)
+def test_extended_frames_are_classified_not_lumped_as_unknown(raw, stream):
+    """Each of the four shapes has to become a stream of its own.
+
+    `mark` and `funding` are the trap: both are `{data:{m, …}}` objects, told
+    apart only by `type:MP` versus the funding rate `f`. Getting it wrong would
+    make the whole feed `(unclassified)` and every Extended day yellow.
+    """
+    assert qr.classify(qr.EXTENDED, json.loads(raw)) == stream
+
+
+def test_a_complete_extended_day_is_checked_and_never_red(tmp_path):
+    """A day with all four feeds is green and reports a coverage window.
+
+    Nothing is required (Extended is not a mode-A venue), so with the book
+    present and the informational feeds present-and-checked there is nothing to
+    warn about.
+    """
+    d = extended_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "extended")
+    day = report["venues"]["extended"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"]["btc-usd"]
+    assert set(sym["streams"]) == {"orderbook", "trades", "mark", "funding"}
+    assert sym["unclassified_frames"] == 0
+    assert sym["missing_optional"] == []
+    cov = sym["coverage"]
+    assert cov["first_local_ts"] is not None and cov["last_local_ts"] is not None
+
+
+def test_an_extended_book_absent_is_a_warning_not_a_crash(tmp_path):
+    """The one stream every Extended file must carry is the book.
+
+    A file with no book is a real, actionable yellow (`missing_optional`); the
+    conditional feeds staying absent raise nothing, because an RFQ sibling or a
+    spot market legitimately has none. Never red — Extended blocks no dataset.
+    """
+    d = extended_dir(tmp_path, streams=("trades",))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, "a missing Extended stream must never block a build"
+    day = report["venues"]["extended"]["days"][DAY]
+    assert day["verdict"] == "yellow", day["issues"]
+    sym = day["symbols"]["btc-usd"]
+    assert sym["missing_required"] == []
+    assert "orderbook" in sym["missing_optional"]
+    # The conditional feeds are informational: absent is silent, not a warning.
+    assert set(sym["missing_informational"]) == {"trades", "funding", "mark"} - {"trades"}
+
+
+def test_extended_rfq_sibling_file_is_expected_not_a_leftover(tmp_path):
+    """`{market}-rfq` is the executable book recorded on purpose beside the
+    plain one, so it must not read as `unexpected_symbol` — the check that
+    otherwise fires for any file whose symbol was not in `session_start`.
+    """
+    d = extended_dir(tmp_path, rfq=True)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    checks = checks_of(report, "extended")
+    assert "unexpected_symbol" not in checks, issues_of(report, "extended")
+    day = report["venues"]["extended"]["days"][DAY]
+    # The sibling is still checked: it carries only the book, which satisfies
+    # its optional set, and its informational feeds stay silent when absent.
+    rfq_sym = day["symbols"]["btc-usd-rfq"]
+    assert set(rfq_sym["streams"]) == {"orderbook"}
+    assert rfq_sym["missing_optional"] == []
+
+
+# --------------------------------------------------------------------------
 # 5./8. cadence gaps and their explanation
 # --------------------------------------------------------------------------
 

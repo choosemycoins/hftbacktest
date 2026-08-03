@@ -16,6 +16,7 @@ use std::{collections::HashSet, time::Duration};
 
 use chrono::{DateTime, Utc};
 pub use http::keep_connections;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{error, info, warn};
 
@@ -81,13 +82,20 @@ impl MarketInfo {
     }
 
     /// The stand-in used with `--no-symbol-check`: without the catalog the type
-    /// and RFQ flag are unknown, so it assumes a perpetual (opening funding and
-    /// mark) and no RFQ book. The book and trades firehoses still cover it.
+    /// and RFQ flag are unknown, so it assumes **both** — a perpetual (opening
+    /// funding and mark) and an RFQ market (opening the executable-quote book),
+    /// erring toward capturing more rather than silently dropping a feed. The
+    /// executable book is the whole reason this venue is recorded (§41), so
+    /// hardcoding `rfq: false` here would quietly disable it for every
+    /// `--no-symbol-check` run — the exact silent-omission this backend is built
+    /// to avoid. A socket that then stays dead (a spot market's funding, a
+    /// non-RFQ market's `/orderbooks/rfq`) is surfaced by the per-socket
+    /// liveness warn in [`http::keep_connection_one`], not hidden.
     fn unchecked(name: &str) -> Self {
         Self {
             name: name.to_string(),
             perpetual: true,
-            rfq: false,
+            rfq: true,
             active: true,
             status: "UNKNOWN".to_string(),
             tick: None,
@@ -109,42 +117,61 @@ pub struct ChannelUrl {
 
 /// The full set of sockets to open for a collection.
 ///
-/// # Why the book and trades sockets are opened for *all* markets
+/// # Why the book is a firehose but trades are per-market
 ///
-/// Extended's book and trades channels take an optional trailing market
-/// segment; omitting it subscribes to **every** market on the venue, and the
-/// per-frame `data.m` says which market each update belongs to. This backend
-/// takes that all-markets form for `/orderbooks` and `/publicTrades` and
-/// filters to the requested set in [`route`], exactly as the wire spec
-/// prescribes ("route by data.m").
+/// Extended's book and trades channels both take an optional trailing market
+/// segment; omitting it subscribes to **every** market on the venue. The two
+/// are not symmetric in how safe that is, and the difference is the shape of a
+/// frame:
 ///
-/// The cost, and it is real, is measured: the all-markets `/orderbooks`
-/// firehose ran at **~950 frames/s across 316 markets** on mainnet 2026-08-03,
-/// so a recording of a handful of symbols parses the whole venue's book traffic
-/// and writes under 1% of it. That load lands on the one hop whose overflow the
-/// collector treats as fatal (`queue::WS_QUEUE_CAPACITY`), and it scales with
-/// the *venue*, not with the recording. It is acceptable here because the
-/// recording host is co-located in AWS Tokyo (cheap ingress) and the intended
-/// use records a modest subset; a recording of one or two symbols would be
-/// leaner on the per-market form (`/orderbooks/{market}`), which is a one-line
-/// change should the firehose ever prove too heavy.
+/// * A **book** frame's `data` is a single object carrying one `m`, so each
+///   all-markets frame belongs to exactly one market and [`route`] files it
+///   correctly by `data.m` (a frame for an unrequested market is cleanly
+///   dropped). The firehose is immune to misfiling **by construction**.
+/// * A **trades** frame's `data` is an *array* of prints, and the all-markets
+///   firehose **batches prints from several markets into one frame** — measured
+///   at 7.6% of prints on mainnet 2026-08-03. [`market_of`] can only read the
+///   first entry's `m`, so on the firehose such a frame files every foreign
+///   print into the first market's tape, or — if the first market is not
+///   requested — drops the whole frame including prints that *were* requested.
+///   Either way a requested market's tape is silently corrupted.
 ///
-/// Funding, mark price and the RFQ book stay **per-market**: funding is
-/// perpetual-only and roughly hourly, mark is ~0.7 frames/s, and the RFQ book
-/// has no all-markets form at all. Opening them per market costs a few quiet
-/// sockets and keeps the recording free of every other market's funding/mark.
+/// So `/orderbooks` stays the all-markets firehose and `/publicTrades/{market}`
+/// is opened **per requested market**: one socket that only ever carries its own
+/// market's prints, which makes the batching hazard unreachable rather than
+/// merely unlikely, keeps per-market `seq` consecutive, and drops the
+/// whole-venue trades parse.
+///
+/// The book firehose cost is real and measured: `/orderbooks` ran at **~950
+/// frames/s across 316 markets** on mainnet 2026-08-03, so a recording of a
+/// handful of symbols parses the whole venue's book traffic and writes under 1%
+/// of it. That load lands on the one hop whose overflow the collector treats as
+/// fatal (`queue::WS_QUEUE_CAPACITY`), and it scales with the *venue*, not with
+/// the recording. It is acceptable here because the recording host is co-located
+/// in AWS Tokyo (cheap ingress) and the intended use records a modest subset; a
+/// recording of one or two symbols would be leaner on the per-market form
+/// (`/orderbooks/{market}`), which is a one-line change should the firehose ever
+/// prove too heavy.
+///
+/// Funding, mark price and the RFQ book are **per-market** for the same reason
+/// trades now are (plus: the RFQ book has no all-markets form at all). Funding
+/// is perpetual-only and roughly one frame a minute; mark is ~0.7 frames/s.
+/// Opening them per market costs a few quiet sockets and keeps the recording
+/// free of every other market's funding/mark.
 fn channel_urls(base: &str, markets: &[MarketInfo]) -> Vec<ChannelUrl> {
-    let mut urls = vec![
-        ChannelUrl {
-            url: format!("{base}/orderbooks"),
-            rfq: false,
-        },
-        ChannelUrl {
-            url: format!("{base}/publicTrades"),
-            rfq: false,
-        },
-    ];
+    // The book firehose; immune to misfiling because each frame names one market.
+    let mut urls = vec![ChannelUrl {
+        url: format!("{base}/orderbooks"),
+        rfq: false,
+    }];
     for m in markets {
+        // Trades per-market: a firehose trades frame batches prints from several
+        // markets, and `market_of` sees only the first — so a per-market socket
+        // is the only form that cannot misfile a foreign print into this tape.
+        urls.push(ChannelUrl {
+            url: format!("{base}/publicTrades/{}", m.name),
+            rfq: false,
+        });
         // Funding is perpetual-only; a spot funding socket would connect and
         // never send, which reads downstream as a quiet feed.
         if m.perpetual {
@@ -172,6 +199,12 @@ fn channel_urls(base: &str, markets: &[MarketInfo]) -> Vec<ChannelUrl> {
 /// The market a data frame belongs to: `data.m` for book/funding/mark, or the
 /// first entry's `m` for a trades frame (whose `data` is an array).
 ///
+/// The trades case reads only the **first** entry, which is exactly why trades
+/// are subscribed per-market (see [`channel_urls`]): on a per-market socket
+/// every entry names the same market, so the first is the whole answer; on the
+/// old all-markets firehose a frame batching several markets' prints would be
+/// filed under whichever happened to come first.
+///
 /// Returns `None` for a frame that names no market — an ack, an error envelope,
 /// an empty trades array — which [`route`] sends to the sidecar rather than a
 /// symbol file.
@@ -193,12 +226,13 @@ enum Routed {
     /// Written to the sidecar: acks, errors, no-market frames, and the
     /// collector's own lifecycle records.
     Meta,
-    /// Dropped. A frame from the all-markets firehose for a market this
+    /// Dropped. A frame from the all-markets book firehose for a market this
     /// recording did not ask for — see [`channel_urls`]. This is the one
     /// deliberate drop, and it is *not* the silent-venue-rejection drop the
     /// collector forbids: rejections carry no market and go to [`Routed::Meta`]
     /// above; this is a book update for some other listed market that the
-    /// operator did not scope the recording to.
+    /// operator did not scope the recording to. (Trades no longer reach this
+    /// arm — their per-market sockets only ever carry a requested market.)
     Skip,
 }
 
@@ -214,6 +248,15 @@ enum Routed {
 /// Everything else within a `{market}` file — book, trades, funding, mark — is
 /// distinguishable by shape (`type`, an array `data`, an `f` field, `type:MP`),
 /// so those legitimately share the file.
+///
+/// `requested` holds the market names **lowercased** (see [`run_collection`]),
+/// and the frame's market is folded the same way before the membership test.
+/// The venue spells markets `BTC-USD`; with `--no-symbol-check` the operator's
+/// own spelling is taken on trust and can differ in case (`btc-usd`), and a
+/// case-sensitive test would then drop **every** frame silently — an empty
+/// recording that looks perfectly healthy. This is the same case-folding
+/// `Writer` applies to pick a filename and `LivenessGauge` applies to match a
+/// symbol.
 fn route(rfq: bool, requested: &HashSet<String>, j: &serde_json::Value) -> Routed {
     // The collector's own lifecycle records (see `meta.rs`) are tagged so they
     // can never be mistaken for venue output. Matched first, before any market
@@ -225,9 +268,11 @@ fn route(rfq: bool, requested: &HashSet<String>, j: &serde_json::Value) -> Route
         // Acks, error envelopes, empty trades arrays: kept, but in the sidecar.
         None => Routed::Meta,
         Some(market) => {
-            if !requested.contains(market) {
+            if !requested.contains(&market.to_ascii_lowercase()) {
                 return Routed::Skip;
             }
+            // The venue's spelling is kept in the stream name; `Writer`
+            // lowercases the filename, so `BTC-USD` and `btc-usd` are one file.
             Routed::Stream(if rfq {
                 format!("{market}-rfq")
             } else {
@@ -255,6 +300,64 @@ fn handle(
         Routed::Skip => {}
     }
     Ok(())
+}
+
+/// Ages one socket by the time since it last served a frame, sampled once a
+/// minute into `_meta`.
+///
+/// Extended is the first backend to open **several** sockets per recording, and
+/// that breaks an assumption both existing silence guards rest on. The stall
+/// watchdog fires only on **total** silence, and the per-symbol
+/// [`crate::liveness::LivenessGauge`] ages *symbols*, not sockets — so a dead
+/// `/orderbooks` firehose, while a per-market `/prices/mark/{m}` socket keeps
+/// resetting both clocks, leaves the recording looking healthy while a whole
+/// feed is gone. This ages the one socket [`http::keep_connection_one`] owns.
+///
+/// It never stops the collector — partial silence is ambiguous the same way the
+/// per-symbol gauge's is — it records and, for the sharp case, warns: a socket
+/// that has **never** served a frame is one whose URL the venue may be silently
+/// refusing to feed, which no `dial_failed`/`disconnected` pair reports because
+/// the dial succeeded.
+///
+/// Pure and time-injected (`now` is a parameter, not `Instant::now()`), so the
+/// cadence can be tested under a paused clock without a socket — the integration
+/// in `http.rs` is not otherwise unit-testable.
+pub struct SocketLiveness {
+    url: String,
+    /// When a frame last arrived, or — until the first one — when the socket was
+    /// opened, so `age_s` is "since last frame" once serving and "since open"
+    /// before it.
+    last: Instant,
+    /// Whether a frame has *ever* arrived on this socket. The warn is keyed on
+    /// this, not on `age_s`: a socket quiet for 61 s having served thousands of
+    /// frames is a thin market; one quiet for 61 s having served none is a dead
+    /// subscription.
+    served: bool,
+}
+
+impl SocketLiveness {
+    pub fn new(url: String, now: Instant) -> Self {
+        Self {
+            url,
+            last: now,
+            served: false,
+        }
+    }
+
+    /// Records that a frame arrived. Called per frame, on the hot path — one
+    /// `Instant` write and a bool set, no allocation.
+    pub fn saw_frame(&mut self, now: Instant) {
+        self.last = now;
+        self.served = true;
+    }
+
+    /// The minutely record, and whether this socket has never served a frame
+    /// (which the caller turns into a `warn!`).
+    pub fn sample(&self, now: Instant) -> (serde_json::Value, bool) {
+        let age_s = now.saturating_duration_since(self.last).as_secs();
+        let never = !self.served;
+        (meta::socket_liveness(&self.url, age_s, self.served), never)
+    }
 }
 
 /// Checks every requested market exists in the venue catalog and returns what
@@ -391,7 +494,13 @@ pub async fn run_collection(
         symbols.iter().map(|s| MarketInfo::unchecked(s)).collect()
     };
 
-    let requested: HashSet<String> = markets.iter().map(|m| m.name.clone()).collect();
+    // Lowercased, so [`route`] can fold the venue's `BTC-USD` and an operator's
+    // `btc-usd` (taken on trust under `--no-symbol-check`) to one market rather
+    // than dropping every frame of the recording in silence.
+    let requested: HashSet<String> = markets
+        .iter()
+        .map(|m| m.name.to_ascii_lowercase())
+        .collect();
 
     // The RFQ sockets go to their own pump so their frames are filed under
     // `{market}-rfq`; everything else to the main pump under `{market}`.
@@ -448,19 +557,35 @@ pub async fn run_collection(
 mod tests {
     use super::*;
 
+    // Lowercased to mirror `run_collection`: `route` folds the frame's market
+    // the same way, so a test can pass either spelling and get the real
+    // matching behaviour rather than an accident of case.
     fn set(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| s.to_string()).collect()
+        names.iter().map(|s| s.to_ascii_lowercase()).collect()
     }
 
     fn j(s: &str) -> serde_json::Value {
         serde_json::from_str(s).unwrap()
     }
 
-    // Real frames captured from mainnet on 2026-08-03. Trimmed in the arrays,
-    // untouched in shape.
+    // Frames in the exact envelope the venue sends, trimmed in the `b`/`a`/`data`
+    // arrays but untouched in shape. Provenance is mixed and labelled honestly
+    // rather than asserted uniformly: the book, trades and mark shapes match what
+    // the mainnet sockets served on 2026-08-03; `FUNDING` is taken from the
+    // venue's own stream documentation (its ~1/min cadence means a short capture
+    // may catch none); `MULTI_MARKET_TRADES` below is synthesised. What every
+    // fixture is used for is the *shape* of the frame, which is stable.
     const BOOK_SNAPSHOT: &str = r#"{"type":"SNAPSHOT","data":{"t":"SNAPSHOT","m":"BTC-USD","b":[{"q":"14.79329","p":"63720"}],"a":[{"q":"5.1","p":"63721"}]},"ts":1785778403000,"seq":1}"#;
     const BOOK_DELTA: &str = r#"{"type":"DELTA","data":{"t":"DELTA","m":"BTC-USD","b":[{"q":"-0.00005","p":"63717","c":"0.85928"}],"a":[],"d":"f"},"ts":1785778403488,"seq":2}"#;
     const TRADES: &str = r#"{"data":[{"i":2084331146732113920,"m":"ETH-USD","S":"BUY","tT":"TRADE","T":1785778245038,"p":"63709","q":"0.00481"}],"ts":1785778245045,"seq":2}"#;
+    // Synthesised (NOT captured): a firehose `/publicTrades` frame whose `data`
+    // array batches prints from ten different markets into one message — the
+    // shape measured at 7.6% of prints on the all-markets socket, mainnet
+    // 2026-08-03. It exists to prove the hazard the per-market subscription
+    // removes: `market_of` reads only the first entry, so on the firehose this
+    // whole batch filed under `AAA-USD` (or dropped if `AAA-USD` was not
+    // requested), silently corrupting nine other tapes.
+    const MULTI_MARKET_TRADES: &str = r#"{"data":[{"i":1,"m":"AAA-USD","S":"BUY","tT":"TRADE","T":1,"p":"1","q":"1"},{"i":2,"m":"BTC-USD","S":"SELL","tT":"TRADE","T":1,"p":"2","q":"1"},{"i":3,"m":"ETH-USD","S":"BUY","tT":"TRADE","T":1,"p":"3","q":"1"},{"i":4,"m":"SOL-USD","S":"SELL","tT":"TRADE","T":1,"p":"4","q":"1"},{"i":5,"m":"DOGE-USD","S":"BUY","tT":"TRADE","T":1,"p":"5","q":"1"},{"i":6,"m":"XRP-USD","S":"SELL","tT":"TRADE","T":1,"p":"6","q":"1"},{"i":7,"m":"AVAX-USD","S":"BUY","tT":"TRADE","T":1,"p":"7","q":"1"},{"i":8,"m":"LINK-USD","S":"SELL","tT":"TRADE","T":1,"p":"8","q":"1"},{"i":9,"m":"ATOM-USD","S":"BUY","tT":"TRADE","T":1,"p":"9","q":"1"},{"i":10,"m":"OP-USD","S":"SELL","tT":"TRADE","T":1,"p":"10","q":"1"}],"ts":1,"seq":9}"#;
     const MARK: &str = r#"{"type":"MP","data":{"m":"BTC-USD","p":"63807.605956624996","ts":0},"ts":1785778593418,"seq":1}"#;
     // From the venue's own documentation for the funding stream.
     const FUNDING: &str =
@@ -481,12 +606,12 @@ mod tests {
         }
     }
 
-    /// The book and trades sockets are the all-markets form — the URL ends at
-    /// the channel, with no market segment — because the wire spec routes them
-    /// by `data.m`. A market segment accidentally appended here would silently
-    /// narrow the recording to one market's book.
+    /// The book is the all-markets firehose — the URL ends at the channel, no
+    /// market segment — because each book frame names exactly one market, so the
+    /// firehose cannot misfile. A market segment accidentally appended here would
+    /// silently narrow the recording to one market's book.
     #[test]
-    fn book_and_trades_are_the_all_markets_form() {
+    fn the_book_is_the_all_markets_firehose() {
         let urls = channel_urls("wss://x/v1", &[market("BTC-USD", true, false)]);
         let plain: Vec<&str> = urls
             .iter()
@@ -494,10 +619,63 @@ mod tests {
             .map(|u| u.url.as_str())
             .collect();
         assert!(plain.contains(&"wss://x/v1/orderbooks"));
-        assert!(plain.contains(&"wss://x/v1/publicTrades"));
-        // and NOT the per-market form for either.
+        // and NOT the per-market book form.
         assert!(!plain.iter().any(|u| u.contains("/orderbooks/BTC-USD")));
-        assert!(!plain.iter().any(|u| u.contains("/publicTrades/BTC-USD")));
+    }
+
+    /// Trades are **per-market**, not the all-markets firehose, and this is the
+    /// data-corruption fix: a firehose trades frame batches prints from several
+    /// markets into one array, and `market_of` reads only the first, so on the
+    /// firehose a batch files every foreign print into one tape (or drops the
+    /// whole frame). A per-market socket only ever carries its own market's
+    /// prints, which makes that unreachable. A missing market segment here would
+    /// reopen the firehose and the corruption with it.
+    #[test]
+    fn trades_are_subscribed_per_market_not_as_a_firehose() {
+        let urls = channel_urls(
+            "wss://x/v1",
+            &[
+                market("BTC-USD", true, false),
+                market("ETH-USD", true, false),
+            ],
+        );
+        let all: Vec<&str> = urls.iter().map(|u| u.url.as_str()).collect();
+        // one socket per requested market...
+        assert!(all.contains(&"wss://x/v1/publicTrades/BTC-USD"));
+        assert!(all.contains(&"wss://x/v1/publicTrades/ETH-USD"));
+        // ...and NOT the all-markets firehose form.
+        assert!(!all.contains(&"wss://x/v1/publicTrades"));
+    }
+
+    /// The hazard the per-market subscription removes, made concrete: a firehose
+    /// trades frame carrying prints from ten markets is collapsed by `market_of`
+    /// onto its FIRST entry, so on the old all-markets socket the whole batch —
+    /// nine other markets' prints — filed under `AAA-USD` (or dropped if it was
+    /// unrequested). The fix is structural: no per-market socket can carry such a
+    /// frame, and `channel_urls` opens no firehose trades socket for it to arrive
+    /// on.
+    #[test]
+    fn a_multi_market_trades_frame_can_never_reach_a_per_market_socket() {
+        let frame = j(MULTI_MARKET_TRADES);
+        // `market_of` sees only the first of the ten markets — the misfiling
+        // hazard, stated as the property the fix depends on.
+        assert_eq!(
+            market_of(&frame),
+            Some("AAA-USD"),
+            "market_of collapses a batched frame onto its first entry"
+        );
+        // Because trades are per-market, that frame is unreachable: no
+        // `/publicTrades` firehose socket is opened for it to be delivered on.
+        let urls = channel_urls(WS_BASE, &[market("ETH-USD", true, false)]);
+        assert!(
+            !urls.iter().any(|u| u.url.ends_with("/publicTrades")),
+            "no all-markets trades firehose may be opened"
+        );
+        assert!(
+            urls.iter()
+                .any(|u| u.url.ends_with("/publicTrades/ETH-USD")),
+            "the only trades socket is the requested market's own"
+        );
     }
 
     /// Funding is per-market and perpetual-only; mark is per-market for any
@@ -688,18 +866,45 @@ mod tests {
     }
 
     /// `--no-symbol-check` builds a market with no catalog: it must assume a
-    /// perpetual (so funding and mark open) and no RFQ book, and still open the
-    /// two firehoses.
+    /// perpetual (so funding and mark open) AND an RFQ market (so the executable
+    /// book opens), erring toward capturing more rather than silently dropping a
+    /// feed. Hardcoding `rfq: false` here — as it once did — disabled the whole
+    /// point of recording this venue for every `--no-symbol-check` run.
     #[test]
-    fn unchecked_markets_still_open_the_core_sockets() {
+    fn unchecked_markets_open_every_socket_including_the_rfq_book() {
         let m = MarketInfo::unchecked("BTC-USD");
         assert!(m.perpetual);
-        assert!(!m.rfq);
+        assert!(m.rfq, "an unchecked market must not silently disable RFQ");
         let urls = channel_urls(WS_BASE, &[m]);
         assert!(urls.iter().any(|u| u.url.ends_with("/orderbooks")));
-        assert!(urls.iter().any(|u| u.url.ends_with("/publicTrades")));
+        // Trades are per-market now, so the socket carries the market segment.
+        assert!(
+            urls.iter()
+                .any(|u| u.url.ends_with("/publicTrades/BTC-USD"))
+        );
         assert!(urls.iter().any(|u| u.url.contains("/funding/BTC-USD")));
-        assert!(!urls.iter().any(|u| u.rfq));
+        // The executable book is opened, and flagged so it is filed separately.
+        assert!(
+            urls.iter()
+                .any(|u| u.rfq && u.url.ends_with("/orderbooks/rfq/BTC-USD"))
+        );
+    }
+
+    /// With `--no-symbol-check` the operator's spelling is taken on trust and can
+    /// differ in case from the venue's. Before the fold, `requested` held the
+    /// operator's `btc-usd` and the venue sent `BTC-USD`, so a case-sensitive
+    /// membership test dropped **every** frame to `Skip` — an empty recording
+    /// that looked perfectly healthy. The market is folded to lower case on both
+    /// sides, exactly as `Writer` folds a filename.
+    #[test]
+    fn a_case_mismatched_request_still_matches_the_venue_spelling() {
+        // Operator typed the lower-case form; the venue frame is `BTC-USD`.
+        let requested = set(&["btc-usd"]);
+        assert_eq!(
+            route(false, &requested, &j(BOOK_SNAPSHOT)),
+            Routed::Stream("BTC-USD".to_string()),
+            "a case-only difference must not drop the frame"
+        );
     }
 
     /// The catalog row carries the two facts the sockets are built from — the
@@ -722,5 +927,67 @@ mod tests {
         let rfq_info = MarketInfo::from_entry("ATOM-USD", &rfq_entry);
         assert!(rfq_info.rfq);
         assert!(rfq_info.tick.is_none());
+    }
+
+    // ---- SocketLiveness -----------------------------------------------------
+
+    /// The fault this exists for. A socket connected (the dial succeeded, so no
+    /// `dial_failed` names it) but the venue never fed its URL. Neither the stall
+    /// watchdog (total silence only) nor the per-symbol gauge (a mark socket on
+    /// the same symbol keeps its clock reset) would report it; the never-served
+    /// flag does.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_never_serves_a_frame_is_flagged() {
+        let gauge = SocketLiveness::new("wss://x/orderbooks".to_string(), Instant::now());
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let (record, never_served) = gauge.sample(Instant::now());
+
+        assert!(
+            never_served,
+            "a socket that served nothing must be flagged: {record}"
+        );
+        assert_eq!(record["served"], false);
+        assert_eq!(record["age_s"], 61, "age runs from when the socket opened");
+        assert_eq!(record["url"], "wss://x/orderbooks");
+    }
+
+    /// A frame clears the never-served flag and resets the age to "since the
+    /// last frame", which is the distinction the warn is keyed on.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_clears_the_never_served_flag_and_resets_the_age() {
+        let mut gauge =
+            SocketLiveness::new("wss://x/prices/mark/BTC-USD".to_string(), Instant::now());
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        gauge.saw_frame(Instant::now());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let (record, never_served) = gauge.sample(Instant::now());
+
+        assert!(
+            !never_served,
+            "a socket that has served a frame is not flagged: {record}"
+        );
+        assert_eq!(record["served"], true);
+        assert_eq!(record["age_s"], 5, "age is measured from the last frame");
+    }
+
+    /// A busy socket that later goes quiet is a thin market, not a dead
+    /// subscription: it reports a rising age but is never flagged, because the
+    /// warn is keyed on "ever served", not on the age. Conflating the two would
+    /// warn every calm minute — the noise that makes a gauge unread.
+    #[tokio::test(start_paused = true)]
+    async fn a_served_socket_that_goes_quiet_reports_age_but_is_not_flagged() {
+        let mut gauge = SocketLiveness::new("wss://x/orderbooks".to_string(), Instant::now());
+        gauge.saw_frame(Instant::now());
+
+        tokio::time::advance(Duration::from_secs(120)).await;
+        let (record, never_served) = gauge.sample(Instant::now());
+
+        assert!(
+            !never_served,
+            "a served socket must not be flagged: {record}"
+        );
+        assert_eq!(record["age_s"], 120);
     }
 }
