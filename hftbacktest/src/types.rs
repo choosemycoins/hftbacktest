@@ -2389,6 +2389,41 @@ mod tests {
         }
     }
 
+    /// `StateValues` rides the same silent numpy wire as [`Order`]: it crosses four
+    /// `#[no_mangle]` FFI entry points (`py-hftbacktest/src/{live,backtest}.rs`'s
+    /// `*_state_values`) into the hand-written `state_values_dtype`, and `numba.carray`
+    /// reads those offsets without validating them. A retyped or reordered field here is
+    /// silent — it becomes plausible-looking wrong PnL/fee numbers in recorded state, not a
+    /// build error. This pin is also what makes the rejection of a separate `LiveState` type
+    /// *enforced* rather than merely asserted: the reason that split is worse than the
+    /// documented-zeros status quo is precisely that this dtype boundary validates nothing.
+    #[test]
+    fn the_state_values_layout_the_python_dtype_mirrors_is_unchanged() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        use crate::types::StateValues;
+
+        // `py-hftbacktest/hftbacktest/types.py::state_values_dtype`, `align=True`: itemsize
+        // 48, alignment 8. Every field is 8 bytes, so the offsets are dense.
+        assert_eq!(size_of::<StateValues>(), 48, "state_values_dtype itemsize is 48");
+        assert_eq!(align_of::<StateValues>(), 8, "state_values_dtype alignment is 8");
+
+        for (field, offset, dtype_name) in [
+            (offset_of!(StateValues, position), 0, "position"),
+            (offset_of!(StateValues, balance), 8, "balance"),
+            (offset_of!(StateValues, fee), 16, "fee"),
+            (offset_of!(StateValues, num_trades), 24, "num_trades"),
+            (offset_of!(StateValues, trading_volume), 32, "trading_volume"),
+            (offset_of!(StateValues, trading_value), 40, "trading_value"),
+        ] {
+            assert_eq!(
+                field, offset,
+                "StateValues::{dtype_name} moved; py-hftbacktest's state_values_dtype reads \
+                 offset {offset} and would silently return a different field"
+            );
+        }
+    }
+
     /// The single definition of "terminal" ([`Status::is_terminal`]), pinned. A terminal
     /// status is final: no later update may resurrect the order, and the order id it held is
     /// freed. Before this method the set `{Canceled, Expired, Filled}` was duplicated at the
