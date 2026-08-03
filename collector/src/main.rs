@@ -15,6 +15,7 @@ use crate::{
 mod backoff;
 mod binance;
 mod binancefuturescm;
+mod aster;
 mod binancefuturesum;
 mod bybit;
 mod clock;
@@ -509,6 +510,19 @@ async fn main() -> Result<(), anyhow::Error> {
                 // The one backend with a producer of its own. Nothing else
                 // takes this, so for every other exchange the hop is closed
                 // before the loop starts and its arm never fires.
+                poller_tx.take().expect("the poller hop is claimed once"),
+            ))
+        }
+        "aster" => {
+            let streams = aster::STREAMS
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
+
+            tokio::spawn(aster::run_collection(
+                streams,
+                args.symbols,
+                writer_tx,
                 poller_tx.take().expect("the poller hop is claimed once"),
             ))
         }
