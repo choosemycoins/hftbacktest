@@ -8,7 +8,8 @@ use crate::{
     types::{Recorder, StateValues},
 };
 
-/// Provides logging of the live strategy's state values.
+/// Provides logging of the live strategy's position — the only [`StateValues`] field a live
+/// bot measures (the others are backtest-only; see the `record` body and AGENTS.md §4.7).
 #[derive(Default)]
 pub struct LoggingRecorder {
     state: HashMap<usize, (f64, StateValues)>,
@@ -43,12 +44,18 @@ impl Recorder for LoggingRecorder {
                 }
             };
             if updated {
+                // Live only measures `position`: `State::apply_fill` — the sole writer of
+                // balance/fee/num_trades/trading_volume/trading_value — is called only by the
+                // backtest processors, so in live those five are permanently zero (AGENTS.md
+                // §4.7). Logging the whole struct lets an operator read `fee: 0.0` beside a
+                // real position and mistake "not measured" for "flat" — a fail-open signal at
+                // the one production surface. Emit only the field that is real here.
                 info!(
                     %asset_no,
                     %mid,
                     bid = format!("{:.prec$}", depth.best_bid(), prec = price_prec),
                     ask = format!("{:.prec$}", depth.best_ask(), prec = price_prec),
-                    ?state_values,
+                    position = state_values.position,
                     "The state of asset number {asset_no} has been updated."
                 );
             }
