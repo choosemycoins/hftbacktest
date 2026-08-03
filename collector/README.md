@@ -64,6 +64,7 @@ exactly these streams.
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
 | `hyperliquid` | `trades`, `bbo`, `activeAssetCtx`, `l2Book` × `{--hl-l2-modes}` |
 | `lighter` | `order_book`, `ticker`, `trade`, `market_stats` — all four per market |
+| `extended` | `orderbooks` + `publicTrades` (all-markets, filtered), `funding` + `prices/mark` per market, `orderbooks/rfq` per RFQ market |
 
 USD-M is the odd row: it carries no `@markPrice@1s`, because **that class
 lives on fstream's routed `/market` path** (Binance split fstream into
@@ -436,6 +437,47 @@ Plan disk accordingly: a ten-market instance is roughly 5 GB/day.
 One process handles one venue. Recording two venues means two processes — see
 [Deployment](#deployment), where that maps onto one systemd instance each.
 
+### Extended: URL-based channels, no subscribe frames
+
+Extended's public feed subscribes by **opening a URL whose path names the
+channel** — there are no subscribe messages — so each channel is a separate
+socket. Reconnect is "reopen the URL". Market names are hyphenated
+(`BTC-USD`); they are validated at startup against `GET /api/v1/info/markets`
+(`--no-symbol-check` skips it), whose catalog also supplies each market's
+`type` and `isRfq`, recorded in the `universe` sidecar record with the tick.
+
+The frame envelope is `{type, data, error, ts, seq}`. Order-book deltas carry
+an **absolute** size per level (`c`) as well as the delta (`q`), and the full
+book **re-snapshots every ~60 s**, so a dropped frame self-heals within a
+minute without a reconnect. `seq` is monotonic **per socket**, and is recorded
+raw for the offline layer to check.
+
+Which sockets are opened, and why the split (measured on mainnet 2026-08-03):
+
+| Channel | Form | Note |
+|---|---|---|
+| `orderbooks` | all-markets, one socket | full book, 100 ms; filtered to the requested markets by `data.m` |
+| `publicTrades` | all-markets, one socket | `data` is an array of prints |
+| `funding/{market}` | per market | perpetual-only; ~hourly, so a short run may record none |
+| `prices/mark/{market}` | per market | `type:MP`, ~0.7 frames/s |
+| `orderbooks/rfq/{market}` | per RFQ market | the **executable** quote book; written to a separate `{market}-rfq` file |
+
+Two things are worth knowing about the all-markets book/trades sockets. First,
+they are a **firehose**: `/orderbooks` ran at ~950 frames/s across 316 markets,
+so a recording of a few symbols parses the whole venue and writes under 1% of
+it — acceptable on a Tokyo-co-located host, but the per-market form
+(`/orderbooks/{market}`) is leaner for a one- or two-symbol recording. Second,
+because the firehose's `seq` counts every market, the `seq` on one market's
+recorded book frames is **not** consecutive (the skipped numbers are other
+markets, filtered out); per-market book continuity offline comes from the
+absolute `c` sizes and the 60 s re-snapshot, not from `seq`.
+
+The RFQ executable book and the plain indicative book are **byte-identical in
+shape**, so they are kept apart by *file*, not by any field: the plain book (and
+trades/funding/mark) land in `{market}`, the RFQ book in `{market}-rfq`. On an
+RFQ market both are recorded on purpose — the gap between the indicative and the
+executable book is the retail-flow signal this venue is collected for.
+
 ---
 
 ## Output format
@@ -536,6 +578,8 @@ as the venues themselves:
 | `{"error":{"code":30005,…}}` | a subscription the venue would not serve | lighter |
 | `{"error":{"code":30003,…}}` | a subscribe for a channel this connection already holds. It names no channel, so it can only land here | lighter |
 | `{"channel":"height",…}`, `{"channel":"market_stats:all",…}` | channels that name no single market, if they ever arrive | lighter |
+| `{"_collector":"universe", …}` | the resolved markets and their metadata: `name`, `perpetual`, `rfq`, `status`, `tick`, `min_size` | extended, hyperliquid (as `symbols`) |
+| `{"type":"SNAPSHOT","error":…}` / any frame naming no market | a venue rejection or an ack; it carries no `data.m`, so it lands here rather than a symbol file | extended |
 
 A `subscribe` followed by `dial_failed` is a socket that never came up. A
 `connected` with no market data behind it is a subscription the venue accepted
