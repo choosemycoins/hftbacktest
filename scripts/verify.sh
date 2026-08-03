@@ -44,6 +44,18 @@ echo "==> cargo clippy --workspace --lib --bins"
 # the files you touched" — this prints, it does not judge (`AGENTS.md` §5).
 cargo clippy --workspace --lib --bins
 
+echo "==> py-hftbacktest source-parity gate (the blind spot A1/A3 closed)"
+# These are pure-source pytest (no wheel build): they catch a ctypes symbol that
+# no extern exports, and a StateValues<->numpy-dtype layout drift — both of which
+# every cargo command above passes green. This is the whole reason A1 exists, so
+# it has to run in the gate, not just under a manual pytest sweep.
+if [ -x .venv/bin/pytest ]; then
+    .venv/bin/pytest py-hftbacktest/tests/test_ffi_symbol_parity.py \
+                     py-hftbacktest/tests/test_state_values_parity.py -q
+else
+    echo "   SKIPPED: no .venv/bin/pytest here (e.g. a git worktree) — run it where the venv lives"
+fi
+
 echo
 echo "All green. Not covered here and still on you: cargo +nightly fmt (nightly, not"
 echo "stable — the rustfmt.toml options are nightly-only), and .venv/bin/pytest"
