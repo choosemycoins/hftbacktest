@@ -1648,7 +1648,9 @@ if LIVE_FEATURE:
                 asset_no: Asset number from which the state values will be retrieved.
 
             Returns:
-                The state’s values.
+                The state’s values. In live, only 'position' is populated; the other
+                fields (balance, fee, num_trades, trading_volume, trading_value) are always
+                0 because no live path computes them (AGENTS.md §4.7).
             """
             ptr = hashmaplive_state_values(self.ptr, asset_no)
             arr = numba.carray(
@@ -2069,7 +2071,9 @@ if LIVE_FEATURE:
                 asset_no: Asset number from which the state values will be retrieved.
 
             Returns:
-                The state’s values.
+                The state’s values. In live, only 'position' is populated; the other
+                fields (balance, fee, num_trades, trading_volume, trading_value) are always
+                0 because no live path computes them (AGENTS.md §4.7).
             """
             ptr = roiveclive_state_values(self.ptr, asset_no)
             arr = numba.carray(

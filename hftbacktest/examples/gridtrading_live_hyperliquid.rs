@@ -26,7 +26,8 @@
 //!   1 USDC traded — so a quoting bot that does not fill only ever spends. Hence a 1-second
 //!   cadence rather than the 100 ms of `gridtrading_live.rs`, and a 3-level grid.
 //!
-//! `LiveBot::modify` is `todo!()` and panics, so the loop below only ever cancels and
+//! `LiveBot::modify` returns `Err(BotError::Unsupported)` — `LiveRequest` has no `Modify`
+//! variant, so a live amend cannot be expressed — the loop below only ever cancels and
 //! submits. Do not "improve" it into an amend.
 //!
 //! Run the connector first, then this:

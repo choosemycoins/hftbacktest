@@ -24,6 +24,8 @@ class StateValues:
     def balance(self) -> float64:
         """
         Returns the cash balance.
+
+        Backtest only; in live this is always 0 (no live path computes it).
         """
         return self.arr[0].balance
 
@@ -31,6 +33,8 @@ class StateValues:
     def fee(self) -> float64:
         """
         Returns the accumulated fee.
+
+        Backtest only; in live this is always 0 (no live path computes it).
         """
         return self.arr[0].fee
 
@@ -38,6 +42,8 @@ class StateValues:
     def num_trades(self) -> int64:
         """
         Returns the total number of trades.
+
+        Backtest only; in live this is always 0 (no live path computes it).
         """
         return self.arr[0].num_trades
 
@@ -45,6 +51,8 @@ class StateValues:
     def trading_volume(self) -> float64:
         """
         Returns the total trading volume.
+
+        Backtest only; in live this is always 0 (no live path computes it).
         """
         return self.arr[0].trading_volume
 
@@ -52,6 +60,8 @@ class StateValues:
     def trading_value(self) -> float64:
         """
         Returns the total trading value.
+
+        Backtest only; in live this is always 0 (no live path computes it).
         """
         return self.arr[0].trading_value
 

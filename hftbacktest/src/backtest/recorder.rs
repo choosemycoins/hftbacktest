@@ -30,6 +30,11 @@ unsafe impl POD for Record {}
 
 /// Provides recording of the backtesting strategy's state values, which are needed to compute
 /// performance metrics.
+///
+/// Backtest only, despite the generic `I: Bot<MD>` bound: a `LiveBot` compiles here, but in
+/// live `balance`/`fee`/`num_trades`/`trading_volume`/`trading_value` are structurally zero
+/// (only `position` is ever written — AGENTS.md §4.7), so the recorded `.npz` becomes a
+/// plausible fee-free equity curve in `stats`. Use `LoggingRecorder` for live.
 pub struct BacktestRecorder {
     values: Vec<Vec<Record>>,
 }

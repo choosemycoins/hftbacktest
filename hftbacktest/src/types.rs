@@ -1429,6 +1429,11 @@ where
 
     /// Modifies an open order.
     ///
+    /// Not every implementation supports this: `Backtest` modifies in place, but the live
+    /// `LiveBot` returns `Err(BotError::Unsupported)` because `LiveRequest` has no `Modify`
+    /// variant — a live amend cannot be expressed on the wire. A strategy that must run both
+    /// in backtest and live should use cancel + submit rather than modify.
+    ///
     /// * `asset_no` - Asset number at which this command will be executed.
     /// * `order_id` - Order ID to modify.
     /// * `price` - Order price.
