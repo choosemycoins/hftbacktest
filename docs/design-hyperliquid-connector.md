@@ -67,8 +67,9 @@ volume rather than time (§5.9).
 - Spot. Spot has balances, not positions, so `LiveEvent::Position { qty }` has no honest
   meaning there. Adding it later is additive.
 - `l4Book` via a self-hosted node (§5.1) — designed for, not built.
-- Modify/amend. `Connector` has no `modify` method and `LiveBot::modify` is `todo!()`
-  (`live/bot.rs:558`); adding amend support is a separate cross-cutting change.
+- Modify/amend. `Connector` has no `modify` method and `LiveBot::modify` returns
+  `Err(BotError::Unsupported)` (`LiveRequest` has no `Modify` variant); adding amend support is a
+  separate cross-cutting change.
 - Builder codes, vaults, sub-accounts, TWAP orders.
 
 ---
