@@ -27,6 +27,7 @@ mod lighter;
 mod liveness;
 mod lock;
 mod meta;
+mod paradex;
 mod pump;
 mod queue;
 mod throttler;
@@ -597,6 +598,23 @@ async fn main() -> Result<(), anyhow::Error> {
             );
 
             tokio::spawn(lighter::run_collection(markets, writer_tx))
+        }
+        "paradex" => {
+            // Markets are addressed by symbol (BTC-USD-PERP), so no catalog
+            // pre-resolution is needed the way Lighter's integer market ids are;
+            // `run_collection` confirms each exists and records the universe.
+            info!(
+                markets = args.symbols.len(),
+                channels = ?paradex::CHANNELS,
+                subscriptions = args.symbols.len() * paradex::CHANNELS.len(),
+                "paradex markets"
+            );
+
+            tokio::spawn(paradex::run_collection(
+                args.symbols,
+                writer_tx,
+                !args.no_symbol_check,
+            ))
         }
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));
