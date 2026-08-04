@@ -366,6 +366,15 @@ impl Connector for Lighter {
             // dead-bot or shutdown sweep does NOT cancel its resting orders — and on this venue
             // orders outlive the process (§2.7), so they keep trading unattended. Name them, so
             // the operator can see what the sweep could not cover.
+            //
+            // **Reported rather than fixed, deliberately.** `CancelAllOrders` addresses a
+            // market by index and has no by-name form; the one index that needs no catalog is
+            // `255`, which means *every* market on the account and would flatten a live bot's
+            // grid — the exact harm `AGENTS.md` §4.7 says a sweep must not do. What narrows the
+            // residual is `OrderPath::submit`: it refuses any symbol with no catalog row, so an
+            // unresolved symbol cannot be holding an order **this** process placed. What it can
+            // be holding is a previous incarnation's, and the path for those is the connect-time
+            // snapshot under `connect_policy = "cancel_all"` (§3.4), not this sweep.
             warn!(
                 ?reason,
                 ?unresolved,
@@ -455,6 +464,11 @@ pub(crate) fn publish_error(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fmt,
+        sync::{Arc, Mutex},
+    };
+
     use hftbacktest::types::{
         ErrorKind,
         LiveError,
@@ -467,10 +481,25 @@ mod tests {
         Value,
     };
     use tokio::sync::mpsc::unbounded_channel;
+    use tracing::{
+        Event as LogEvent,
+        Level,
+        Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
 
     use crate::{
-        connector::{Connector, ConnectorBuilder, PublishEvent},
-        lighter::{Config, Lighter, LighterError, MAX_ERROR_BYTES, TRUNCATION_MARK, reject_order},
+        connector::{Connector, ConnectorBuilder, PublishEvent, SweepReason},
+        lighter::{
+            Config,
+            Lighter,
+            LighterError,
+            MAX_ERROR_BYTES,
+            TRUNCATION_MARK,
+            reject_order,
+            rest::MarketInfo,
+        },
     };
 
     /// The shipped example must parse with the code that reads it. `AGENTS.md` §6 requires
@@ -629,6 +658,175 @@ mod tests {
             });
             assert!(encoded <= MAX_PAYLOAD_SIZE);
         }
+    }
+
+    /// A market-data-only config, and the same one with the order path armed.
+    ///
+    /// Both point at a dead local port: `run` really does start its tasks, and no test may
+    /// reach for the venue. What they do once started is irrelevant here — the wiring under
+    /// test is done by the time `run` returns.
+    const MARKET_DATA_ONLY: &str = r#"
+        public_url = "ws://127.0.0.1:1/stream"
+        rest_url = "http://127.0.0.1:1"
+        symbols = ["BTC"]
+        "#;
+
+    const ARMED: &str = r#"
+        public_url = "ws://127.0.0.1:1/stream"
+        rest_url = "http://127.0.0.1:1"
+        symbols = ["BTC"]
+
+        [order_path]
+        account_index = 516
+        api_key_index = 5
+        signer_python = ""
+        signer_script = ""
+        signer_config = ""
+        "#;
+
+    /// **The order path is subscribed to the registration wake-up.**
+    ///
+    /// "The wake was never wired" *is* the zero-fills bug: a symbol seeded in the config
+    /// resolved and a symbol a bot registered afterwards never did, so the connector quoted
+    /// nothing and said nothing. Every other test in this backend proves what the private
+    /// stream does *given* a wake-up; not one of them proves anything feeds it. Measured:
+    /// replacing `self.symbol_tx.subscribe()` in `run` with a detached channel left the whole
+    /// lighter suite green.
+    ///
+    /// Counted rather than asserted through behaviour because the count is the wiring: two
+    /// receivers when the order path is armed (the public stream and the private one), one
+    /// when it is not.
+    #[tokio::test]
+    async fn the_order_path_subscribes_to_the_registration_wake_up() {
+        // `reqwest` builds its rustls backend when the client is built (`AGENTS.md` §4.7).
+        crate::install_crypto_provider();
+
+        let mut armed = Lighter::build_from(ARMED).unwrap();
+        let (ev_tx, _armed_events) = unbounded_channel();
+        armed.run(ev_tx);
+        let armed_receivers = armed.symbol_tx.receiver_count();
+        armed.shutdown();
+
+        let mut data_only = Lighter::build_from(MARKET_DATA_ONLY).unwrap();
+        let (ev_tx, _data_only_events) = unbounded_channel();
+        data_only.run(ev_tx);
+        let data_only_receivers = data_only.symbol_tx.receiver_count();
+        data_only.shutdown();
+
+        assert_eq!(
+            data_only_receivers, 1,
+            "market-data only: the public stream alone listens for registrations"
+        );
+        assert_eq!(
+            armed_receivers, 2,
+            "armed: the order path must listen too, or a symbol registered after it connected \
+             never resolves and every order on it is expired before signing"
+        );
+    }
+
+    /// Captures the `unresolved` field of `warn!` events on **this thread only**, for as long
+    /// as the guard lives (the shape `bybit/public_stream.rs` uses; `AGENTS.md` §4.2 documents
+    /// why a log field sometimes has to be the pin, and that the pattern can flake when other
+    /// tests race the global callsite-interest cache).
+    #[derive(Clone, Default)]
+    struct ReportedUnresolved(Arc<Mutex<Vec<String>>>);
+
+    impl ReportedUnresolved {
+        fn capturing(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn reported(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for ReportedUnresolved {
+        fn on_event(&self, event: &LogEvent<'_>, _: LayerContext<'_, S>) {
+            if *event.metadata().level() != Level::WARN {
+                return;
+            }
+            let mut field = UnresolvedField(None);
+            event.record(&mut field);
+            if let Some(value) = field.0 {
+                self.0.lock().unwrap().push(value);
+            }
+        }
+    }
+
+    /// Pulls the `unresolved = ...` field out of one event and ignores every other field. It is
+    /// recorded with `?`, so it arrives as a `Debug` rendering of the list.
+    struct UnresolvedField(Option<String>);
+
+    impl Visit for UnresolvedField {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "unresolved" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// **A sweep that cannot cover a symbol names it.**
+    ///
+    /// `sweep` addresses each market by the `market_id` this process resolved, so a symbol that
+    /// never resolved is dropped by the `filter_map` and its resting orders are **not**
+    /// cancelled — the §4.7 failure class, and on this venue orders outlive the process (§2.7),
+    /// so they keep trading unattended after a dead-bot sweep or a shutdown.
+    ///
+    /// This is a **report, not a fix**, and the report is all there is to pin: an unaddressable
+    /// market cannot be cancelled, because `CancelAllOrders` takes a market index and there is
+    /// no by-name form. The residual is narrow by construction — [`OrderPath::submit`] refuses
+    /// any symbol without a catalog row, so an unresolved symbol cannot be holding an order
+    /// **this** process placed; what it can be holding is a previous incarnation's, which the
+    /// connect-time snapshot (under `connect_policy = "cancel_all"`) is the path for. The pin
+    /// exists because a `warn!` is exactly the kind of change that reverts without a single
+    /// test noticing (`AGENTS.md` §4.2), and the operator greps the symbol.
+    #[tokio::test]
+    async fn a_sweep_names_the_symbols_it_could_not_cover() {
+        crate::install_crypto_provider();
+        let mut connector = Lighter::build_from(ARMED).unwrap();
+        let (ev_tx, _events) = unbounded_channel();
+        connector.run(ev_tx.clone());
+
+        // BTC resolved; ETH never did — the state a catalog refusal leaves behind.
+        connector
+            .order_path
+            .as_ref()
+            .unwrap()
+            .order_manager()
+            .lock()
+            .unwrap()
+            .track_market(MarketInfo {
+                symbol: "BTC".to_string(),
+                market_id: 1,
+                price_decimals: 1,
+                size_decimals: 5,
+            });
+
+        let reported = ReportedUnresolved::default();
+        let handle = {
+            let _capturing = reported.capturing();
+            connector.sweep(
+                vec!["BTC".to_string(), "ETH".to_string()],
+                SweepReason::ConnectorStopping,
+                ev_tx,
+            )
+        };
+        assert!(handle.is_some(), "the resolved market is still swept");
+        connector.shutdown();
+
+        let reported = reported.reported();
+        assert_eq!(reported.len(), 1, "one report, naming what was missed");
+        assert!(
+            reported[0].contains("ETH"),
+            "the symbol the sweep could not cover must be named: {}",
+            reported[0]
+        );
+        assert!(
+            !reported[0].contains("BTC"),
+            "and the one it did cover must not be: {}",
+            reported[0]
+        );
     }
 
     /// Truncation must not split a character: a message is a `String` on the wire, and half
