@@ -376,10 +376,12 @@ def interleave_kind(prev_stream: str, stream: str, delta_ns: int) -> str:
     it can have waited in while the other row went past:
 
     * **Both rows crossed the same hops** — every WS pair on every venue, and
-      every pair at all on Hyperliquid, Bybit and Lighter. One reader stamps at
-      receive and hands frames on in that order, and every queue after it is a
-      FIFO, so write order IS receive order. `INTERLEAVE_EXCESS`, red, at a
-      nanosecond.
+      every pair at all on the venues with no second producer: Hyperliquid,
+      Bybit, Lighter, Extended and Paradex (whose only non-WS writes — the
+      universe catalog and the refusal-to-start record — go to `_meta`, not to
+      a symbol file). One reader stamps at receive and hands frames on in that
+      order, and every queue after it is a FIFO, so write order IS receive
+      order. `INTERLEAVE_EXCESS`, red, at a nanosecond.
     * **The late row is the poll** — it crossed `queue::POLLER_HOP` and nothing
       else, so that hop plus one turn of `main`'s `select!` is the whole of what
       it can have waited in, and `queue.rs` says in as many words that this hop
@@ -624,7 +626,16 @@ BINANCE = "binance"
 BYBIT = "bybit"
 LIGHTER = "lighter"
 EXTENDED = "extended"
+PARADEX = "paradex"
 
+#: `aster` is deliberately NOT a family of its own. The venue is a literal
+#: Binance USD-M clone — combined-stream `sym@channel` envelope, the same
+#: `data.e` event names, the same `pu` chain, and the same bare elements from
+#: its own `GET /fapi/v1/premiumIndex` — verified frame by frame against a real
+#: recording (2026-08-04, `/opt/hft-collector/data/aster`: 0 unclassified frames
+#: over three symbol-days under the Binance rules). A second family would have
+#: been a copy of those rules that could drift from them silently. What Aster
+#: does NOT share is its expectations: see `expected_streams`.
 _FAMILY = {
     "lighter": LIGHTER,
     "hyperliquid": HYPERLIQUID,
@@ -633,8 +644,10 @@ _FAMILY = {
     "binancefuturescm": BINANCE,
     "binance": BINANCE,
     "binancespot": BINANCE,
+    "aster": BINANCE,
     "bybit": BYBIT,
     "extended": EXTENDED,
+    "paradex": PARADEX,
 }
 
 #: `collector/src/main.rs` matches `"binancefutures" | "binancefuturesum"` onto
@@ -743,6 +756,35 @@ MAX_GAP_NS = {
     (EXTENDED, "trades"): 120 * SEC_NS,
     (EXTENDED, "mark"): 30 * SEC_NS,
     (EXTENDED, "funding"): 300 * SEC_NS,
+    # Paradex, measured 2026-08-04 over 8.1h of a live day on four markets
+    # (BTC, SOL and the thin NEAR, ONDO), which is the first venue here whose
+    # limits were set from its own recording rather than from a smoke test:
+    #
+    #   * both books   0.20s median on BTC, 1.9s on NEAR; worst hole 173.7s
+    #     (thin markets) and 107.9s (BTC). Nominally `@100ms`, but the refresh
+    #     is a ceiling on updates, not a heartbeat: a book that does not change
+    #     sends nothing. 300s is ~1.7x the worst hole seen, and it flagged
+    #     nothing on any of the four markets.
+    #   * `funding`    5.00s exactly, worst 18.5s, identical across all four
+    #     markets. Periodic — a frame arrives whether or not anything changed —
+    #     so, like `activeAssetCtx` and `markPriceUpdate`, its silence is
+    #     evidence on its own and it takes a tight K: 60s is 12 periods and
+    #     3.2x the worst interval observed.
+    #   * `bbo`        event-driven and the noisiest thing here: 13 holes past
+    #     300s on NEAR and 20 on ONDO in those 8.1h, worst 41 minutes, every
+    #     one of them with both books running gaplessly across it. The limit is
+    #     therefore paired with a `LIVENESS_REFERENCE` rather than loosened to
+    #     the point of measuring nothing — see there.
+    #
+    # `trades` has NO entry, on purpose: NEAR printed 15 times in those 8.1h
+    # (worst hole 1h33m) and SOL 37 (worst 1h43m). A limit that does not flag
+    # those is not a limit; one that does flags a healthy thin market every day.
+    # This feed has no cadence, and saying so is more honest than a round number
+    # nobody could act on. `gap_limit` returning `None` skips the check.
+    (PARADEX, "book_snapshot"): 300 * SEC_NS,
+    (PARADEX, "book_interactive"): 300 * SEC_NS,
+    (PARADEX, "bbo"): 300 * SEC_NS,
+    (PARADEX, "funding"): 60 * SEC_NS,
 }
 
 #: Lighter's four limits above are round numbers far above a measurement, and
@@ -807,9 +849,24 @@ MAX_GAP_NS = {
 #: is here because the alternative — waiting for the noise — means shipping a
 #: gate whose first day is yellow for a reason nobody can act on. Revisit it
 #: with a day's evidence.
+#:
+#: Paradex's `bbo` is the same channel as Hyperliquid's, and it is here for the
+#: same reason Hyperliquid's is: counted false positives, not a prediction.
+#: Measured 2026-08-04 over 8.1h — 13 holes past the 300s limit on
+#: NEAR-USD-PERP and 20 on ONDO-USD-PERP, worst 41 minutes, with both books
+#: running across every one of them (their own worst hole on those two markets
+#: was 173.7s, inside their limit). Left alone that is ~33 yellows a day per
+#: thin market for a top of book that simply stopped moving.
+#:
+#: Both books are references because both are throttled `@100ms` feeds on the
+#: same socket, so their cadence measures the socket rather than the market, and
+#: either one running gaplessly settles the question. `book_snapshot` is first
+#: only because it is the plain API book: `book_interactive` carries the
+#: RPI-inclusive quotes and is the more market-dependent of the two.
 LIVENESS_REFERENCE = {
     (HYPERLIQUID, "bbo"): ("l2Book_fast", "l2Book_slow"),
     (LIGHTER, "ticker"): ("order_book", "market_stats"),
+    (PARADEX, "bbo"): ("book_snapshot", "book_interactive"),
 }
 
 
@@ -996,6 +1053,62 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
         # as `orderbook` and an RFQ sibling with a book satisfies the optional
         # set on its own.
         return Expected((), ("orderbook",), None, ("trades", "funding", "mark"))
+
+    if exchange == "aster":
+        # Same standing as Bybit, Lighter and Extended: collect-only, so nothing
+        # it does can make a mode-A dataset red. It shares Binance's FAMILY (the
+        # frame shapes are identical, see `_FAMILY`) and nothing else: the
+        # branch above requires `bookTicker` because mode A's signal is
+        # `binancefuturesum`, and this venue is not that venue.
+        #
+        #   * `bookTicker` and `depthUpdate` are optional (absent → yellow).
+        #     Both are in `aster::STREAMS` for every symbol, so a file carrying
+        #     neither is a real, actionable warning — this venue acks a stream
+        #     name it will never serve and reports no error, exactly as Binance
+        #     does, so a dropped subscription is invisible from the inside.
+        #   * `trade` is informational: a thin Aster perp legitimately prints
+        #     nothing for hours (measured 2026-08-04: 57 prints in 8.2h on
+        #     ETHFIUSDT, 77 on NEARUSDT), so a whole quiet day with none is
+        #     ordinary rather than a finding.
+        #   * `premiumIndex` is informational for the reason it is on USD-M: it
+        #     is the collector's own REST poller, not order flow, and a day
+        #     recorded before the poller existed cannot have it.
+        #
+        # Known and accepted: cadence limits are keyed by FAMILY, so Aster
+        # inherits Binance's flat 30s/30s/120s guesses. Its markets are quieter
+        # than Binance's — measured 2026-08-04, ETHFIUSDT alone produced 199
+        # `bookTicker`, 51 `depthUpdate` and 34 `trade` holes past them in 8.2h
+        # of a perfectly healthy recording. Those are yellow, so the gate still
+        # exits 0, but they are noise. Fixing it properly means limits keyed by
+        # exchange rather than by family; loosening the Binance entries instead
+        # would loosen the mode-A signal venue, which is not on the table.
+        return Expected((), ("bookTicker", "depthUpdate"), None, ("trade", "premiumIndex"))
+
+    if exchange == "paradex":
+        # Same standing again: no mode-A dataset reads Paradex, so nothing it
+        # does may be red. The gate exited 2 on this venue before this branch
+        # existed — one venue falling through to the raise below fails the whole
+        # `gate@all` service, so a venue recording perfectly well took every
+        # other venue's report down with it.
+        #
+        #   * Both books are optional (absent → yellow). Every Paradex symbol
+        #     file carries both, and the PAIR is the measurement: `snapshot` is
+        #     the plain API book, `interactive` the RPI-inclusive one, and the
+        #     gap between them is the retail-flow thesis this venue is recorded
+        #     for (`paradex::CHANNELS`). Half the pair is not the dataset.
+        #   * `bbo`, `trades` and `funding` are informational — checked while
+        #     present, silent when absent. Each is legitimately empty on a thin
+        #     market: measured 2026-08-04 over 8.1h, NEAR-USD-PERP printed 15
+        #     trades and ONDO-USD-PERP emitted no `bbo` at all for stretches of
+        #     41 minutes. Making them optional would paint every thin market
+        #     yellow for feeds that behaved exactly as that market trades.
+        #
+        # The RFQ path does not apply here: Paradex publishes its executable
+        # book as a second channel on the same market, not as a sibling file,
+        # which is why `book_interactive` is a stream and not a `-rfq` file.
+        return Expected(
+            (), ("book_snapshot", "book_interactive"), None, ("bbo", "trades", "funding")
+        )
 
     raise ValueError(
         f"profile {profile!r} defines no expected stream set for exchange "
@@ -1277,6 +1390,43 @@ def classify(family: str, obj: dict) -> Optional[str]:
             return "funding"
         return None
 
+    if family == PARADEX:
+        # JSON-RPC: `{"params": {"channel": "<type>.<MARKET>[.<suffix>]",
+        # "data": {...}}}`. The market is the SECOND dot-segment — a Paradex
+        # market is `BTC-USD-PERP`, dashes and no dots — which is what
+        # `collector/src/paradex/mod.rs::route` keys the file on, and the type
+        # is the first. Anything without a `params.channel` is an ack, a venue
+        # error or a pong, and the same call is made here as there: not a
+        # stream.
+        #
+        # The mapping is a whitelist rather than the channel name verbatim,
+        # because it is not the identity: `funding_data` is shortened, and
+        # `order_book` splits in two. Those two ARE different books — `snapshot`
+        # is the plain API book, `interactive` the RPI-inclusive one, and the
+        # difference between them is the whole reason this venue is recorded
+        # (`paradex::CHANNELS`) — so collapsing them would hide either going
+        # silent. The feed word is inside the third segment, ahead of the
+        # `@15@100ms` depth and refresh.
+        #
+        # A channel the collector starts recording and this report has not been
+        # taught (the full-depth `deltas` feed, reserved for a core set) falls
+        # through to `None` and is counted as `unclassified_frame`. That yellow
+        # is the signal to teach this function; a name derived from the channel
+        # would instead have produced a stream with no cadence limit and no
+        # expectation, which is the same absence with nothing to read.
+        params = obj.get("params")
+        channel = params.get("channel") if isinstance(params, dict) else None
+        if not isinstance(channel, str):
+            return None
+        parts = channel.split(".")
+        head = parts[0]
+        if head == "order_book":
+            feed = parts[2].split("@", 1)[0] if len(parts) > 2 else ""
+            return f"book_{feed}" if feed in ("snapshot", "interactive") else None
+        if head == "funding_data":
+            return "funding"
+        return head if head in ("bbo", "trades") else None
+
     return None
 
 
@@ -1507,7 +1657,8 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     rows, with 110 677 poll rows and 395 REST snapshots landing among them — on
     the same recording whose adjacent-pair inversions run to 1.046s. On a venue
     with no second producer at all the two cursors are the same row every time,
-    so nothing about this reaches Hyperliquid, Bybit or Lighter.
+    so nothing about this reaches Hyperliquid, Bybit, Lighter, Extended or
+    Paradex.
     """
     path = Path(path)
     family = family_of(exchange)

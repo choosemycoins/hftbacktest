@@ -1032,6 +1032,503 @@ def test_extended_rfq_sibling_file_is_expected_not_a_leftover(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Paradex: JSON-RPC channels, two books
+# --------------------------------------------------------------------------
+#
+# Every fixture below is a real frame captured from the Tokyo recorder on
+# 2026-08-04 (`/opt/hft-collector/data/paradex`), trimmed of its level arrays.
+# A synthetic shape would have pinned this report against a guess about the
+# venue rather than against the venue.
+
+
+def paradex_frame(channel, data):
+    """The JSON-RPC envelope every Paradex data update arrives in."""
+    return {"jsonrpc": "2.0", "method": "subscription", "params": {"channel": channel, "data": data}}
+
+
+def paradex_bbo(market, ts, seq):
+    return paradex_frame(
+        f"bbo.{market}",
+        {
+            "market": market,
+            "seq_no": seq,
+            "ask": "1.75",
+            "ask_size": "425.4",
+            "bid": "1.725",
+            "bid_size": "115.8",
+            "last_updated_at": ms_of(ts),
+        },
+    )
+
+
+def paradex_book(market, ts, seq, feed="snapshot"):
+    """`order_book.{market}.{feed}@15@100ms` — the depth and refresh are in the
+    channel name, so the feed word is the second `.`-segment of a three-segment
+    channel whose market itself contains dashes."""
+    return paradex_frame(
+        f"order_book.{market}.{feed}@15@100ms",
+        {
+            "seq_no": seq,
+            "market": market,
+            "last_updated_at": ms_of(ts),
+            "update_type": "s",
+            "inserts": [{"side": "BUY", "price": "1.721", "size": "288.3"}],
+            "updates": [],
+            "deletes": [],
+        },
+    )
+
+
+def paradex_trade(market, ts, seq):
+    return paradex_frame(
+        f"trades.{market}",
+        {
+            "id": f"{ms_of(ts)}2017092384900{seq:02d}",
+            "market": market,
+            "side": "BUY",
+            "size": "0.0002",
+            "price": "63502.5",
+            "created_at": ms_of(ts),
+            "trade_type": "RPI",
+        },
+    )
+
+
+def paradex_funding(market, ts):
+    return paradex_frame(
+        f"funding_data.{market}",
+        {
+            "market": market,
+            "funding_index": "0.02992082550491794701",
+            "funding_premium": "0.0001231622482595002781",
+            "funding_rate": "0.00007100916923",
+            "created_at": ms_of(ts),
+        },
+    )
+
+
+MARKET = "NEAR-USD-PERP"
+
+
+def paradex_dir(
+    tmp_path,
+    streams=("book_snapshot", "book_interactive", "bbo", "trades", "funding"),
+    day=DAY,
+    times=(0, 5),
+):
+    """A Paradex recording for one market, `streams` present at each of `times`."""
+    d = tmp_path / "paradex"
+    d.mkdir()
+    recs = []
+    seq = 0
+    for t in times:
+        for stream in streams:
+            seq += 1
+            if stream == "book_snapshot":
+                recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="snapshot")))
+            elif stream == "book_interactive":
+                recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="interactive")))
+            elif stream == "bbo":
+                recs.append((ns(t), paradex_bbo(MARKET, ns(t), seq)))
+            elif stream == "trades":
+                recs.append((ns(t), paradex_trade(MARKET, ns(t), seq)))
+            elif stream == "funding":
+                recs.append((ns(t), paradex_funding(MARKET, ns(t))))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"{MARKET.lower()}_{day}.gz", recs)
+    write_meta(d, "paradex", day, [(ns(0), session_start("paradex", [MARKET]))])
+    return d
+
+
+def test_family_of_and_expected_streams_know_paradex():
+    """The gate exited 2 on `session_start.exchange` = "paradex": no family, and
+    `expected_streams` fell through to its fail-closed raise. One venue doing
+    that fails the whole `gate@all` service, so a venue recording perfectly well
+    took the report down for every other venue with it.
+
+    Paradex is collect-only — no mode-A dataset reads it — so nothing it does
+    may be red: `required` is empty. Both books are the norm on every file and
+    are optional; the three per-market feeds are informational, because a thin
+    perp legitimately prints nothing for hours (measured: 15 trades in 8.1h on
+    NEAR-USD-PERP, 2026-08-04).
+    """
+    assert qr.family_of("paradex") == qr.PARADEX
+
+    expected = qr.expected_streams("mode-a-v1", "paradex", {})
+    assert expected.required == ()
+    assert expected.optional == ("book_snapshot", "book_interactive")
+    assert set(expected.informational) == {"bbo", "trades", "funding"}
+    assert expected.violation is None
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(paradex_bbo(MARKET, ns(0), 1)), "bbo"),
+        (json.dumps(paradex_book(MARKET, ns(0), 2, feed="snapshot")), "book_snapshot"),
+        (json.dumps(paradex_book(MARKET, ns(0), 3, feed="interactive")), "book_interactive"),
+        (json.dumps(paradex_trade(MARKET, ns(0), 4)), "trades"),
+        (json.dumps(paradex_funding(MARKET, ns(0))), "funding"),
+    ],
+)
+def test_paradex_frames_are_classified_not_lumped_as_unknown(raw, stream):
+    """The two books are the trap: same envelope, same payload shape, told apart
+    only by the `snapshot`/`interactive` word inside the third `.`-segment. They
+    are DIFFERENT books — the RPI-inclusive one against the plain one is the
+    whole reason this venue is recorded — so collapsing them into one stream
+    would hide either going silent.
+    """
+    assert qr.classify(qr.PARADEX, json.loads(raw)) == stream
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps({"jsonrpc": "2.0", "result": {"channel": f"bbo.{MARKET}"}, "id": 1}),
+        json.dumps({"jsonrpc": "2.0", "error": {"code": -32000, "message": "bad channel"}, "id": 2}),
+        json.dumps({"jsonrpc": "2.0", "result": {}, "id": 3}),
+        json.dumps({"params": {"channel": f"order_book.{MARKET}.deltas@15@100ms", "data": {}}}),
+    ],
+)
+def test_a_paradex_frame_with_no_data_channel_is_not_a_stream(raw):
+    """Acks, venue errors and pongs carry no `params.channel` and are meta, the
+    same call `collector/src/paradex/mod.rs::route` makes — classifying one as a
+    stream would give it a cadence expectation it can never meet.
+
+    A channel the collector records and this report has not been taught (the
+    full-depth `deltas` feed, reserved for a core set) deliberately falls here
+    too: an `unclassified_frame` yellow is the signal that says teach the report,
+    which a name derived from the channel would have swallowed silently.
+    """
+    assert qr.classify(qr.PARADEX, json.loads(raw)) is None
+
+
+def test_a_complete_paradex_day_is_checked_and_never_red(tmp_path):
+    """All five feeds present: green, everything classified, coverage reported."""
+    d = paradex_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "paradex")
+    day = report["venues"]["paradex"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][MARKET.lower()]
+    assert set(sym["streams"]) == {"book_snapshot", "book_interactive", "bbo", "trades", "funding"}
+    assert sym["unclassified_frames"] == 0
+    assert sym["missing_optional"] == []
+
+
+def test_a_paradex_day_of_books_alone_is_green_and_never_exit_2(tmp_path):
+    """The normal shape of a thin market: both books, and hours with no print,
+    no top-of-book change and (on a short run) no funding tick.
+
+    Books satisfy the optional set; the three informational feeds absent is
+    silent, not a warning. Nothing here may cost the gate a non-zero exit — one
+    venue's exit 2 fails `gate@all` for every venue.
+    """
+    d = paradex_dir(tmp_path, streams=("book_snapshot", "book_interactive"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "paradex")
+    day = report["venues"]["paradex"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][MARKET.lower()]
+    assert sym["missing_required"] == []
+    assert sym["missing_optional"] == []
+    assert set(sym["missing_informational"]) == {"bbo", "trades", "funding"}
+
+
+def test_a_paradex_book_absent_is_a_warning_not_a_crash(tmp_path):
+    """One book without the other is a real, actionable yellow: the pair is the
+    measurement (RPI-inclusive against plain), so half of it is not the dataset
+    this venue is recorded for. Still never red — it blocks no build.
+    """
+    d = paradex_dir(tmp_path, streams=("book_snapshot", "bbo"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, "a missing Paradex stream must never block a build"
+    day = report["venues"]["paradex"]["days"][DAY]
+    assert day["verdict"] == "yellow", day["issues"]
+    sym = day["symbols"][MARKET.lower()]
+    assert sym["missing_required"] == []
+    assert sym["missing_optional"] == ["book_interactive"]
+
+
+def test_a_paradex_trades_drought_is_not_a_cadence_gap(tmp_path):
+    """`trades` has no cadence limit at all, on purpose.
+
+    Measured 2026-08-04 over 8.1h: NEAR-USD-PERP printed 15 times (worst hole
+    1h33m), SOL-USD-PERP 37 times (worst 1h43m). Any limit that does not flag
+    those is not a limit, and one that does flags a healthy thin market every
+    day — so the honest answer is that this feed has no cadence to check.
+    """
+    d = paradex_dir(
+        tmp_path,
+        streams=("book_snapshot", "book_interactive", "trades"),
+        times=(0, 100, 200, 300, 400, 500, 600, 7_000),
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    sym = report["venues"]["paradex"]["days"][DAY]["symbols"][MARKET.lower()]
+    assert sym["streams"]["trades"]["gap_count"] == 0, "trades must carry no cadence limit"
+    gaps = [i for i in issues_of(report, "paradex") if i["check"] == "cadence_gap"]
+    assert [g for g in gaps if "trades" in g["detail"]] == []
+
+
+def test_a_quiet_paradex_bbo_hole_the_books_disprove_is_not_reported(tmp_path):
+    """`bbo` fires on a change of the touch and on nothing else, so a thin market
+    in a quiet hour emits nothing while the socket is healthy.
+
+    Measured 2026-08-04, 8.1h: 13 such holes on NEAR-USD-PERP and 20 on
+    ONDO-USD-PERP past the 300s limit (worst 41 minutes), with both books
+    running across every one of them — worst book hole on those two markets,
+    173.7s, inside their own limit. That is the same shape, and the same
+    measured count, that earned Hyperliquid's `bbo` its reference.
+    """
+    d = tmp_path / "paradex"
+    d.mkdir()
+    recs = []
+    seq = 0
+    for t in range(100, 801, 100):
+        seq += 1
+        recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="snapshot")))
+        seq += 1
+        recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="interactive")))
+    # One bbo at each end of the books' window and nothing between: a 700s hole,
+    # spanned by two books that had none. The window starts at t=100 so that the
+    # `session_start` record does not fall inside the hole — a hole the sidecar
+    # already accounts for is never suppressed, and this test is about the case
+    # where the sidecar has nothing to say.
+    recs.append((ns(100), paradex_bbo(MARKET, ns(100), 900)))
+    recs.append((ns(800), paradex_bbo(MARKET, ns(800), 901)))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"{MARKET.lower()}_{DAY}.gz", recs)
+    write_meta(d, "paradex", DAY, [(ns(0), session_start("paradex", [MARKET]))])
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    assert "cadence_gap" not in checks_of(report, "paradex"), issues_of(report, "paradex")
+    bbo = report["venues"]["paradex"]["days"][DAY]["symbols"][MARKET.lower()]["streams"]["bbo"]
+    # Measured either way: the hole is recorded, and recorded as disproved.
+    assert bbo["gap_count"] == 1
+    assert bbo["suppressed_gap_count"] == 1
+
+
+# --------------------------------------------------------------------------
+# Aster: a literal Binance USD-M clone
+# --------------------------------------------------------------------------
+#
+# Frames captured from the Tokyo recorder on 2026-08-04
+# (`/opt/hft-collector/data/aster`), verbatim but for shortened level arrays.
+
+
+def aster_book_ticker(symbol, ts, u):
+    return {
+        "stream": f"{symbol.lower()}@bookTicker",
+        "data": {
+            "e": "bookTicker",
+            "u": u,
+            "s": symbol,
+            "b": "0.4026000",
+            "B": "19318.4",
+            "a": "0.4035000",
+            "A": "2993.4",
+            "T": ms_of(ts) - 40,
+            "E": ms_of(ts),
+        },
+    }
+
+
+def aster_depth(symbol, ts, first_u, last_u, prev_u):
+    return {
+        "stream": f"{symbol.lower()}@depth@0ms",
+        "data": {
+            "e": "depthUpdate",
+            "E": ms_of(ts),
+            "T": ms_of(ts) - 50,
+            "s": symbol,
+            "U": first_u,
+            "u": last_u,
+            "pu": prev_u,
+            "b": [],
+            "a": [["0.4039000", "18568.9"]],
+        },
+    }
+
+
+def aster_trade(symbol, ts, tid):
+    return {
+        "stream": f"{symbol.lower()}@trade",
+        "data": {
+            "e": "trade",
+            "E": ms_of(ts),
+            "T": ms_of(ts) - 30,
+            "s": symbol,
+            "t": tid,
+            "p": "0.4022000",
+            "q": "20.1",
+            "X": "MARKET",
+            "m": True,
+        },
+    }
+
+
+def aster_premium_index(symbol, ts):
+    """The REST poller's element, written bare — no envelope, no `e`, and the
+    symbol under `symbol` rather than `s`. Identical to Binance USD-M's, because
+    the venue is a clone down to `GET /fapi/v1/premiumIndex`."""
+    return {
+        "symbol": symbol,
+        "markPrice": "0.40330000",
+        "indexPrice": "0.40383338",
+        "estimatedSettlePrice": "0.40091637",
+        "lastFundingRate": "-0.00004455",
+        "interestRate": "0.00010000",
+        "nextFundingTime": ms_of(ts) + 3_600_000,
+        "time": ms_of(ts),
+    }
+
+
+ASTER_SYMBOL = "ETHFIUSDT"
+
+
+def aster_dir(
+    tmp_path,
+    streams=("bookTicker", "depthUpdate", "trade", "premiumIndex"),
+    day=DAY,
+    times=(0, 5),
+):
+    d = tmp_path / "aster"
+    d.mkdir()
+    recs = []
+    u = 499_657_978_442
+    # The `pu` chain is per stream: each depth frame links to the LAST update id
+    # of the previous depth frame, not to whatever id was handed out in between.
+    # Chaining it wrong would make every fixture here report a sequence break.
+    last_depth_u = u
+    for t in times:
+        for stream in streams:
+            if stream == "bookTicker":
+                u += 1
+                recs.append((ns(t), aster_book_ticker(ASTER_SYMBOL, ns(t), u)))
+            elif stream == "depthUpdate":
+                first_u, u = u + 1, u + 2
+                recs.append((ns(t), aster_depth(ASTER_SYMBOL, ns(t), first_u, u, last_depth_u)))
+                last_depth_u = u
+            elif stream == "trade":
+                recs.append((ns(t), aster_trade(ASTER_SYMBOL, ns(t), 29_045 + int(t))))
+            elif stream == "premiumIndex":
+                recs.append((ns(t), aster_premium_index(ASTER_SYMBOL, ns(t))))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"{ASTER_SYMBOL.lower()}_{day}.gz", recs)
+    write_meta(d, "aster", day, [(ns(0), session_start("aster", [ASTER_SYMBOL]))])
+    return d
+
+
+def test_family_of_and_expected_streams_know_aster():
+    """Aster is a literal Binance USD-M clone — combined-stream `sym@channel`
+    envelope, the same `data.e` event names, the same bare `premiumIndex`
+    elements from the same REST path — so it reuses the Binance family rather
+    than growing a second copy of those rules.
+
+    Its expectations are its own, and they are permissive: Aster is collect-only,
+    so unlike `binancefuturesum` (whose `bookTicker` mode A depends on) nothing
+    it does may be red.
+    """
+    assert qr.family_of("aster") == qr.BINANCE
+
+    expected = qr.expected_streams("mode-a-v1", "aster", {})
+    assert expected.required == ()
+    assert expected.optional == ("bookTicker", "depthUpdate")
+    assert set(expected.informational) == {"trade", "premiumIndex"}
+    assert expected.violation is None
+    # The signal venue keeps its required stream: permissiveness is per exchange,
+    # not a loosening of the family they share.
+    assert qr.expected_streams("mode-a-v1", "binancefuturesum", {}).required == ("bookTicker",)
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(aster_book_ticker(ASTER_SYMBOL, ns(0), 1)), "bookTicker"),
+        (json.dumps(aster_depth(ASTER_SYMBOL, ns(0), 2, 3, 1)), "depthUpdate"),
+        (json.dumps(aster_trade(ASTER_SYMBOL, ns(0), 4)), "trade"),
+        (json.dumps(aster_premium_index(ASTER_SYMBOL, ns(0))), "premiumIndex"),
+    ],
+)
+def test_aster_frames_classify_under_the_binance_rules(raw, stream):
+    """Pinned against real Aster frames, not against the claim that the venue is
+    a clone: if it ever diverges, this is where it shows up rather than as a day
+    of `unclassified_frame`.
+    """
+    assert qr.classify(qr.BINANCE, json.loads(raw)) == stream
+
+
+def test_a_complete_aster_day_is_checked_and_never_red(tmp_path):
+    d = aster_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "aster")
+    day = report["venues"]["aster"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][ASTER_SYMBOL.lower()]
+    assert set(sym["streams"]) == {"bookTicker", "depthUpdate", "trade", "premiumIndex"}
+    assert sym["unclassified_frames"] == 0
+    assert sym["missing_optional"] == []
+
+
+def test_an_aster_day_with_no_trades_is_not_red_and_not_exit_2(tmp_path):
+    """A day of an Aster altcoin perp with no print at all is ordinary: measured
+    2026-08-04, ETHFIUSDT printed 57 times in 8.2h and NEARUSDT 77. `trade` is
+    therefore informational — absent is silent — and the day stays green.
+    """
+    d = aster_dir(tmp_path, streams=("bookTicker", "depthUpdate", "premiumIndex"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, "a missing Aster stream must never block a build"
+    day = report["venues"]["aster"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][ASTER_SYMBOL.lower()]
+    assert sym["missing_required"] == []
+    assert sym["missing_optional"] == []
+    assert sym["missing_informational"] == ["trade"]
+
+
+# --------------------------------------------------------------------------
+# fail-closed: a venue nobody taught the report
+# --------------------------------------------------------------------------
+
+
+def test_an_untaught_exchange_is_still_fail_closed(tmp_path):
+    """Paradex and Aster get explicit entries; nothing gets a blanket fallback.
+
+    A venue this report has never seen must still raise, because the alternative
+    — some permissive default — would silently pass a recording whose streams,
+    cadences and expectations nobody has looked at. That is the whole failure
+    this file exists to prevent, and it is why the two additions above are two
+    named cases rather than one `else`.
+    """
+    with pytest.raises(ValueError, match="unknown exchange"):
+        qr.family_of("bitmex")
+    with pytest.raises(ValueError, match="no expected stream set"):
+        qr.expected_streams("mode-a-v1", "bitmex", {})
+
+    # End to end, it is exit 2 — the gate refusing to grade what it cannot read.
+    d = tmp_path / "bitmex"
+    d.mkdir()
+    write_gz(d / f"xbtusd_{DAY}.gz", [(ns(0), {"table": "quote"})])
+    write_meta(d, "bitmex", DAY, [(ns(0), session_start("bitmex", ["XBTUSD"]))])
+    assert run(d)[0] == 2
+
+
+# --------------------------------------------------------------------------
 # 5./8. cadence gaps and their explanation
 # --------------------------------------------------------------------------
 
