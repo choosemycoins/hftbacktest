@@ -43,9 +43,10 @@ What it checks, per finalized UTC day per venue directory:
 6. **`local_ts` monotonicity, per stream** — with a tolerance for the order two
    streams are interleaved in, allowed only where a second producer exists to
    have raced (a stream with a hand-off of its own, `_SECOND_PRODUCER`, or a
-   venue that opens one socket per channel, `_FANS_OUT_PER_CHANNEL`) and only as
-   far as the hand-offs the *late* row of the pair crossed alone can hold it
-   back (`interleave_kind`): the socket hop where the REST snapshot went first
+   venue that opens one socket per channel, `FANS_OUT_PER_CHANNEL` in the
+   `_TOPOLOGY` registry) and only as far as the hand-offs the *late* row of the
+   pair crossed alone can hold it back (`interleave_kind`): the socket hop where
+   the REST snapshot went first
    (`CROSS_STREAM_TOLERANCE_NS`),
    that same figure as a reused ceiling where two channel sockets of one runtime
    raced, no bound at all where the `premiumIndex` poll went first, because the
@@ -136,7 +137,7 @@ EXPLAIN_MARGIN_NS = SEC_NS // 10
 #: `WS_HOP` is here because a *fan-out* venue's second producer is upstream of
 #: it rather than past it: several socket tasks feed this one hop, so it is the
 #: first queue their frames share and therefore the first thing that stops
-#: holding them apart. See `_FANS_OUT_PER_CHANNEL`.
+#: holding them apart. See `FANS_OUT_PER_CHANNEL`.
 #:
 #: Mirrored rather than imported, like the capacities below, and pinned against
 #: the Rust by `test_the_poller_still_has_a_hand_off_of_its_own` and
@@ -167,7 +168,7 @@ class Producer:
 #: written out of `local_ts` order, so it is also what decides whether an
 #: inversion is tolerable at all, and — through `Producer.hop` — how far.
 #: Where no entry matches **and the venue does not fan out per channel**
-#: (`_FANS_OUT_PER_CHANNEL`), the venue has one WS reader stamping and queueing
+#: (`fans_out_per_channel`), the venue has one WS reader stamping and queueing
 #: every frame of a symbol file, write order IS receive order, and a step
 #: backwards is a defect at any size — see `scan_symbol_file`, which records
 #: where that was verified per venue.
@@ -258,15 +259,123 @@ _NO_SECOND_PRODUCER = (
 #: ignorance rather than by anything in the recording, and it prints the
 #: `_NO_SECOND_PRODUCER` sentence over a venue that has one.
 #:
-#: Keyed by exchange rather than by family: which sockets get opened is a
-#: property of the backend and of nothing else. Membership is a claim about
-#: `collector/src/`, so it is pinned to it in both directions —
+#: Declared per backend in `_TOPOLOGY` rather than by family: which sockets get
+#: opened is a property of the backend and of nothing else. The declaration is a
+#: claim about `collector/src/`, so it is pinned to it in both directions —
 #: `test_extended_still_opens_one_socket_per_channel` fails if Extended is ever
 #: refactored onto one socket (the exemption would then be tolerating a real
 #: defect for up to a second, silently), and
 #: `test_paradex_still_multiplexes_every_channel_onto_one_socket` fails if a
 #: single-reader venue grows a fan-out (its red would then be a false one).
-_FANS_OUT_PER_CHANNEL = frozenset({"extended"})
+FANS_OUT_PER_CHANNEL = "fans_out_per_channel"
+
+#: One WS reader multiplexes every channel of a symbol file onto one socket.
+#:
+#: The other topology, and the one the report was written around: one task
+#: reads, stamps `Utc::now()` and enqueues in that order, and every hand-off
+#: from there to the file is a FIFO — so **write order IS receive order** and a
+#: cross-stream step backwards is a defect at a nanosecond. There is no
+#: mechanism to tolerate, which is why the tolerances below are granted on the
+#: producer and never on the size.
+#:
+#: A venue may be `SINGLE_READER` and still have named second producers — see
+#: `Topology.producers` and `_SECOND_PRODUCER`. That is the Binance base: one
+#: multiplexed socket for the WS streams, plus a REST fetcher and/or a poller
+#: writing rows of their own beside it.
+SINGLE_READER = "single_reader"
+
+
+@dataclass(frozen=True)
+class Topology:
+    """How one backend's producers reach the writer.
+
+    `backend` is the directory under `collector/src/` that records this venue —
+    two spellings of one backend (`binance`/`binancespot`) name the same one,
+    because topology is a property of the sockets a backend opens and not of the
+    word the operator typed. It is also where the mirror pin reads the Rust.
+
+    `kind` is `SINGLE_READER` or `FANS_OUT_PER_CHANNEL`, and it is what
+    `interleave_kind` turns into a verdict.
+
+    `producers` names the `_SECOND_PRODUCER` entries this backend actually runs.
+    A claim about the backend, checked against it in **both** directions by
+    `test_the_topology_the_registry_declares_is_the_one_the_backend_has` — a
+    backend that grows a poller or a REST fetcher without declaring it here has
+    a real race the model has no tolerance for and would call corruption. It is
+    deliberately not consulted to gate `_SECOND_PRODUCER`, which stays keyed by
+    stream: those two stream names exist only in the Binance frame family, so
+    the per-stream key is already exact, and gating would change a verdict
+    rather than only declaring one.
+    """
+
+    backend: str
+    kind: str
+    producers: tuple = ()
+
+
+#: Every venue the collector can record, and the producer topology of each.
+#:
+#: **The one source of truth for that question, and there is no default.** It
+#: exists because the gate learned each venue's topology reactively, one
+#: production alert per venue: Extended opens a socket per channel, nothing said
+#: so, and the interleave model — which simply assumed a single reader for any
+#: venue it had not been told about — went red on an ordinary bounded race
+#: (896a51d). Omission is now impossible in both directions: `topology_of`
+#: refuses an exchange it has no entry for the way `family_of` does, and
+#: `test_every_backend_the_collector_dispatches_has_a_topology` reads the arms
+#: of `collector/src/main.rs` and fails on a backend that is not declared here.
+#:
+#: Keyed by the spelling `session_start.exchange` can carry, exactly as
+#: `_FAMILY` is — the aliases are listed rather than resolved so that nothing
+#: here depends on `canonical_exchange` having been called first.
+_TOPOLOGY = {
+    # One WS reader, no producer of any other kind: red at a nanosecond between
+    # any two streams of a symbol file.
+    "bybit": Topology("bybit", SINGLE_READER),
+    "hyperliquid": Topology("hyperliquid", SINGLE_READER),
+    "lighter": Topology("lighter", SINGLE_READER),
+    "paradex": Topology("paradex", SINGLE_READER),
+    # The Binance base: one multiplexed socket, plus the named producers beside
+    # it. Which of the two a backend runs is not uniform — COIN-M and spot have
+    # the REST snapshot fetcher and no poller, because the venue still serves
+    # their mark-price class on the stream — so it is stated per backend rather
+    # than inherited from the family.
+    "binance": Topology("binance", SINGLE_READER, ("depthSnapshot",)),
+    "binancespot": Topology("binance", SINGLE_READER, ("depthSnapshot",)),
+    "binancefuturescm": Topology("binancefuturescm", SINGLE_READER, ("depthSnapshot",)),
+    "binancefutures": Topology(
+        "binancefuturesum", SINGLE_READER, ("depthSnapshot", "premiumIndex")
+    ),
+    "binancefuturesum": Topology(
+        "binancefuturesum", SINGLE_READER, ("depthSnapshot", "premiumIndex")
+    ),
+    # A Binance USD-M clone down to the poller — see `_FAMILY`, and note that
+    # sharing the frame family says nothing about the sockets: this entry is
+    # what says the two agree here.
+    "aster": Topology("aster", SINGLE_READER, ("depthSnapshot", "premiumIndex")),
+    # The one fan-out venue.
+    "extended": Topology("extended", FANS_OUT_PER_CHANNEL),
+}
+
+
+def topology_of(exchange: str) -> Topology:
+    """The producer topology of a `session_start.exchange` value.
+
+    Refuses rather than assumes, and that refusal is the point of the registry:
+    a venue nobody has modelled must not be classified by a default. Same shape
+    as `family_of`, because it is the same kind of ignorance — this report has
+    been handed a recording from a backend it does not know.
+    """
+    try:
+        return _TOPOLOGY[exchange]
+    except KeyError:
+        raise ValueError(
+            f"unknown exchange {exchange!r}: no producer topology is declared "
+            f"for it, so how its streams reach the writer is not known and its "
+            f"interleaves cannot be classified. Declare it in _TOPOLOGY; "
+            f"known: {', '.join(sorted(_TOPOLOGY))}"
+        ) from None
+
 
 #: What a fan-out venue's second producer is, written out for the operator.
 #:
@@ -287,10 +396,14 @@ _FAN_OUT_PRODUCER = Producer(
 def fans_out_per_channel(exchange: str) -> bool:
     """True where each channel of a symbol file arrives on a socket of its own.
 
-    The single place `_FANS_OUT_PER_CHANNEL` is consulted, so the classification
-    and the sentence explaining it cannot come to different answers.
+    The single place the topology `kind` is compared, so the classification and
+    the sentence explaining it cannot come to different answers.
+
+    A membership test would answer `False` for a venue it has never heard of,
+    which is the silent single-reader default this registry exists to remove —
+    so it goes through `topology_of`, which refuses instead.
     """
-    return exchange in _FANS_OUT_PER_CHANNEL
+    return topology_of(exchange).kind == FANS_OUT_PER_CHANNEL
 
 
 def second_producer_of(exchange, prev_stream, stream) -> Optional[Producer]:
@@ -312,6 +425,11 @@ def second_producer_of(exchange, prev_stream, stream) -> Optional[Producer]:
     venue has a poller or a REST fetcher today; the order is written down so
     that the day one does, the answer does not depend on which check runs first.
     """
+    # The venue is *answered* last, for the reason above — but it is
+    # *validated* first, or a pair naming one of the streams below would be
+    # classified for a backend nobody has modelled. That is the silent default
+    # in its last hiding place; `_TOPOLOGY` is where it stops.
+    topology_of(exchange)
     found = [
         _SECOND_PRODUCER[name] for name in (prev_stream, stream) if name in _SECOND_PRODUCER
     ]
@@ -327,7 +445,7 @@ def second_producer_of(exchange, prev_stream, stream) -> Optional[Producer]:
         # `UNCLASSIFIED` is one of those keys and is answered here too, on
         # purpose: what this report could not name still came off one of these
         # sockets. It is safe because misclassification is a different failure
-        # from reordering and has its own finding — `_FANS_OUT_PER_CHANNEL`
+        # from reordering and has its own finding — `FANS_OUT_PER_CHANNEL`
         # carries the argument, the one residual it does not cover, and the
         # pin.
         return _FAN_OUT_PRODUCER
@@ -393,7 +511,7 @@ SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 #: own design corruption on every burst day.
 #:
 #: A second pair is held to this same figure, and for a different reason: two
-#: channel sockets of a fan-out venue (`_FANS_OUT_PER_CHANNEL`) share *both*
+#: channel sockets of a fan-out venue (`FANS_OUT_PER_CHANNEL`) share *both*
 #: hops, so what is left between them is a scheduler slice rather than a queue.
 #: That is a ceiling reused, not a derivation — `interleave_kind`'s last
 #: alternative is where it is argued and its cost named.
@@ -403,7 +521,7 @@ SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 #: red — including on a fan-out venue, where one stream is still one socket
 #: task reading, stamping and enqueueing in that order. It does not apply where
 #: no second producer exists — see `_SECOND_PRODUCER` and
-#: `_FANS_OUT_PER_CHANNEL`; a venue with one WS reader gets no tolerance at all,
+#: `FANS_OUT_PER_CHANNEL`; a venue with one WS reader gets no tolerance at all,
 #: whatever the size, because there is no mechanism to tolerate. And **it does
 #: not apply where the `premiumIndex` poll was written first** — that pair has
 #: no bound at all, because the row it overtook then waited in the writer hop
@@ -512,7 +630,7 @@ def interleave_kind(exchange: str, prev_stream: str, stream: str, delta_ns: int)
       queue after it is a FIFO, so write order IS receive order.
       `INTERLEAVE_EXCESS`, red, at a nanosecond.
     * **Two channel sockets of a fan-out venue** — Extended, and see
-      `_FANS_OUT_PER_CHANNEL` for why it is the only one. Both rows do cross the
+      `FANS_OUT_PER_CHANNEL` for why it is the only one. Both rows do cross the
       same socket hop and the same writer hop, so both cancel; the un-shared
       segment is upstream of the first queue, the window between one task's
       `Utc::now()` and its `send`, in which the runtime may poll the sibling
@@ -1800,7 +1918,8 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     `premiumIndex`, and every pair on Extended — so the tolerance is granted on
     the mechanism, not on the venue and not on the size:
     `_SECOND_PRODUCER` has to name one of the two streams, or
-    `_FANS_OUT_PER_CHANNEL` the venue, before any tolerance is consulted at all.
+    `_TOPOLOGY` the venue `FANS_OUT_PER_CHANNEL`, before any tolerance is
+    consulted at all.
     A step backwards between two Hyperliquid cadences, or between `bookTicker`
     and `trade`, is red at a nanosecond, because the one
     reader that stamped them also queued them in that order. Which tolerance —

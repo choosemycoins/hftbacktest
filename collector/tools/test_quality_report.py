@@ -2493,7 +2493,7 @@ def test_an_extended_inversion_against_an_unclassified_frame_is_yellow(tmp_path)
     and two recordings in one file fail `gzip_integrity`. Failing closed instead
     — the exemption restricted to two named streams — would red exactly the
     frames the report has just admitted it cannot name, i.e. refuse a build over
-    its own ignorance. See `_FANS_OUT_PER_CHANNEL`, which carries the argument
+    its own ignorance. See `FANS_OUT_PER_CHANNEL`, which carries the argument
     and the one residual it does not cover.
     """
     d = tmp_path / "ext-unclassified"
@@ -2635,8 +2635,9 @@ def test_no_fan_out_venue_has_a_stream_with_a_hand_off_of_its_own():
     site stops being dead. Give Extended a REST poller and it goes live, and
     this failing is how that gets noticed rather than discovered in a report.
     """
-    assert qr._FANS_OUT_PER_CHANNEL, "the set is empty; nothing below is checked"
-    for exchange in qr._FANS_OUT_PER_CHANNEL:
+    fans_out = [e for e, t in qr._TOPOLOGY.items() if t.kind == qr.FANS_OUT_PER_CHANNEL]
+    assert fans_out, "no venue fans out; nothing below is checked"
+    for exchange in fans_out:
         expected = qr.expected_streams("mode-a-v1", exchange, {})
         streams = (
             set(expected.required)
@@ -4304,7 +4305,7 @@ def test_extended_still_opens_one_socket_per_channel(tmp_path):
     ), (
         "extended::keep_connections no longer spawns one task per channel URL; "
         "if the backend now multiplexes, drop 'extended' from "
-        "_FANS_OUT_PER_CHANNEL — its cross-stream inversions are single-reader "
+        "FANS_OUT_PER_CHANNEL — its cross-stream inversions are single-reader "
         "defects again"
     )
     # Each task stamps its own receive moment, which is what makes them two
@@ -4341,13 +4342,13 @@ def test_paradex_still_multiplexes_every_channel_onto_one_socket(tmp_path):
     and queues every frame of a symbol file — one `keep_connection` over
     `CHANNELS.to_vec()` to one `WS_URL` (`collector/src/paradex/mod.rs`). Should
     it ever fan out the way Extended does, that red becomes a false one and the
-    venue needs adding to `_FANS_OUT_PER_CHANNEL`; failing here is how that gets
+    venue needs redeclaring `FANS_OUT_PER_CHANNEL`; failing here is how that gets
     decided rather than endured.
     """
     mod = collector_src("paradex", "mod.rs")
     assert "keep_connection(CHANNELS.to_vec(), markets, ws_tx)" in mod, (
         "paradex no longer hands every channel to one connection; if it now "
-        "opens a socket per channel, add it to _FANS_OUT_PER_CHANNEL"
+        "opens a socket per channel, declare it FANS_OUT_PER_CHANNEL"
     )
     assert "keep_connection_one" not in mod
     assert len(re.findall(r"tokio::spawn\(", mod)) == 0, (
@@ -4383,6 +4384,351 @@ def test_the_socket_hop_the_fan_out_shares_is_the_one_the_rust_names(tmp_path):
     # The fan-out producer must not look like the poller's: that hop is what
     # `crosses_a_hand_off_of_its_own` selects the unbounded yellow on.
     assert not qr.crosses_a_hand_off_of_its_own("orderbook")
+
+
+# --------------------------------------------------------------------------
+# the venue-topology registry: completeness, no silent default, mirror pins
+#
+# The cycle these exist to break: the gate is Binance/Bybit-shaped, and each new
+# venue taught it another axis of that assumption REACTIVELY, one production
+# alert per venue. Paradex and Aster had no `expected_streams` branch and exited
+# 2 (aedbc99); Extended's per-channel socket fan-out was not modelled and the
+# gate, silently assuming a single reader, went false-RED on an ordinary
+# interleave (896a51d). Both failures are loud rather than dangerous, but both
+# were discovered in production at 01:00 instead of here.
+#
+# So: "a collector backend the gate does not model" and "a venue declared with
+# the wrong topology" are pytest failures, read off the collector's own dispatch
+# and the backend sources.
+# --------------------------------------------------------------------------
+
+
+def dispatched_backends() -> dict:
+    """`{cli spelling: the arm's body}` for every backend the collector runs.
+
+    THE authoritative list of venues: `collector/src/main.rs` matches
+    `args.exchange.as_str()` and every arm but the fallback is a backend that
+    can produce a recording this report will one day be handed. Read rather than
+    restated, so that a new arm is a failing test here instead of an exit 2 at
+    01:00.
+
+    Parsed on the arm-head shape (eight spaces, string literals, `=> {`), which
+    excludes the inner `match mode.as_str()` of the Hyperliquid arm — its
+    `"slow"`/`"fast"` arms are indented deeper and are not backends. The parse
+    is itself pinned by `test_the_dispatch_parse_reads_the_arms_it_claims_to`,
+    because a regex that quietly matched nothing would make every test below
+    vacuously green — the exact failure mode this section exists against.
+    """
+    main_rs = collector_src("main.rs")
+    block = re.search(
+        r"let collection_task = match args\.exchange\.as_str\(\) \{\n(.*?)"
+        r"\n        exchange => \{",
+        main_rs,
+        re.S,
+    )
+    assert block, (
+        "collector/src/main.rs no longer dispatches on `args.exchange.as_str()` "
+        "with a catch-all `exchange =>` arm last; this parse is the "
+        "authoritative venue list and cannot be left guessing"
+    )
+    heads = list(
+        re.finditer(r'^ {8}("[a-z]+"(?: *\| *"[a-z]+")*) *=> *\{', block.group(1), re.M)
+    )
+    arms = {}
+    for i, head in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(block.group(1))
+        body = block.group(1)[head.start() : end]
+        for name in re.findall(r'"([a-z]+)"', head.group(1)):
+            arms[name] = body
+    return arms
+
+
+def test_the_dispatch_parse_reads_the_arms_it_claims_to():
+    """The vacuity guard for every completeness test below.
+
+    A parse that matched nothing would turn "every backend is modelled" into
+    "no backend is checked", green for ever. So this pins the shape from the
+    other side: a handful of spellings that must be there, and the fallback arm
+    that makes the list closed.
+    """
+    arms = dispatched_backends()
+    assert {"bybit", "hyperliquid", "extended", "paradex", "aster"} <= set(arms), (
+        f"the dispatch parse found {sorted(arms)}, which is missing venues this "
+        f"repository certainly records; the arm shape in main.rs has moved"
+    )
+    assert len(arms) >= 9
+    assert "is not supported." in collector_src("main.rs"), (
+        "the fallback arm is what makes the parsed list exhaustive"
+    )
+
+
+def test_every_backend_the_collector_dispatches_has_a_topology():
+    """INV-1. A backend the gate does not model is a failure HERE.
+
+    The registry is the one place the interleave model asks what a venue's
+    producers look like. A backend in `main.rs` with no entry is the Extended
+    bug in its general form: the gate would answer the question anyway, from a
+    default, and be wrong in whichever direction the default happens to point.
+    """
+    missing = sorted(set(dispatched_backends()) - set(qr._TOPOLOGY))
+    assert not missing, (
+        f"{missing} can be recorded by collector/src/main.rs but has no entry "
+        f"in quality_report._TOPOLOGY. Declare its producer topology — "
+        f"SINGLE_READER if one WS reader multiplexes every channel, "
+        f"FANS_OUT_PER_CHANNEL if it opens a socket per channel — and pin it "
+        f"against the backend source in the parametrised test below"
+    )
+    # Frame shapes are the other half of modelling a venue, and it already fails
+    # loudly; asserted here so one test answers "is this venue known at all".
+    for exchange in dispatched_backends():
+        assert qr.family_of(exchange)
+
+
+def test_the_registry_declares_no_venue_the_collector_cannot_record():
+    """The converse, so the registry cannot rot in the other direction.
+
+    An entry for a venue no arm dispatches is a topology claim about a backend
+    that is not there — it pins nothing, and the mirror-pin below would be
+    reading a directory that no longer exists.
+    """
+    extra = sorted(set(qr._TOPOLOGY) - set(dispatched_backends()))
+    assert not extra, (
+        f"{extra} is declared in _TOPOLOGY but collector/src/main.rs dispatches "
+        f"no such exchange; a removed backend must lose its entry too"
+    )
+
+
+def test_two_spellings_of_one_backend_get_one_topology():
+    """`binancefutures`/`binancefuturesum` and `binance`/`binancespot`.
+
+    Topology is a property of the BACKEND, not of the word the operator typed:
+    one arm, one set of sockets. Declaring the two spellings separately is
+    explicit on purpose — `_FAMILY` does the same — but they must not be able to
+    disagree.
+    """
+    by_backend = {}
+    for exchange, topology in qr._TOPOLOGY.items():
+        by_backend.setdefault(topology.backend, {})[exchange] = topology
+    for backend, entries in by_backend.items():
+        kinds = {(t.kind, t.producers) for t in entries.values()}
+        assert len(kinds) == 1, (
+            f"{sorted(entries)} are spellings of the one backend {backend!r} "
+            f"but declare different topologies: {kinds}"
+        )
+
+
+def test_every_backend_the_collector_dispatches_has_an_expected_stream_set():
+    """The axis Paradex and Aster fell through, pinned the same way.
+
+    `expected_streams` already refuses an unknown venue loudly, which is right —
+    but the refusal arrived as `gate@all` exiting 2 in production, taking every
+    other venue's report down with it. Reading the dispatch here means a new
+    backend fails this test on the day the arm is written.
+    """
+    for exchange in sorted(dispatched_backends()):
+        if exchange in NO_MODE_A_STREAM_SET:
+            with pytest.raises(ValueError, match="defines no expected stream set"):
+                qr.expected_streams("mode-a-v1", exchange, session_start(exchange, ["X"]))
+            continue
+        expected = qr.expected_streams("mode-a-v1", exchange, session_start(exchange, ["X"]))
+        assert isinstance(expected, qr.Expected), (
+            f"{exchange!r} is dispatched by collector/src/main.rs but "
+            f"expected_streams has no branch for it; the gate exits 2 on the "
+            f"first recording it is handed"
+        )
+
+
+#: The dispatched spellings `expected_streams` refuses on purpose.
+#:
+#: Binance spot has no converter in this repository, so there is no mode-A
+#: dataset it could be part of and no stream set to state. Declared rather than
+#: inferred: a NEW venue with no branch must fail the test above, and it can
+#: only do that if the deliberate refusals are enumerated.
+NO_MODE_A_STREAM_SET = {"binance", "binancespot"}
+
+
+def test_the_deliberate_refusals_are_venues_that_still_exist():
+    """`NO_MODE_A_STREAM_SET` is an exemption list, so it needs its own floor."""
+    assert NO_MODE_A_STREAM_SET <= set(dispatched_backends())
+
+
+def test_an_unknown_venue_is_refused_rather_than_assumed_single_reader():
+    """INV-2. There is no path where omission means "one WS reader".
+
+    This is the Extended failure written as a rule. Before the registry,
+    `fans_out_per_channel` answered `False` for every venue it had never heard
+    of, so a new backend was classified single-reader by SILENCE — red at a
+    nanosecond on a venue whose sockets nobody had looked at. The answer to "I
+    do not know this venue" is now the same as `family_of`'s: refuse, and name
+    what is known.
+    """
+    unknown = "newvenue"
+    assert unknown not in qr._TOPOLOGY
+    for call in (
+        lambda: qr.topology_of(unknown),
+        lambda: qr.fans_out_per_channel(unknown),
+        lambda: qr.second_producer_of(unknown, "trades", "bbo"),
+        lambda: qr.interleave_kind(unknown, "trades", "bbo", 1),
+        # The pair that answers from `_SECOND_PRODUCER` before the venue is
+        # consulted at all: it must still refuse, or the last hiding place of
+        # the default is a stream name rather than a venue.
+        lambda: qr.second_producer_of(unknown, "depthSnapshot", "trade"),
+        lambda: qr.interleave_kind(unknown, "depthSnapshot", "trade", 1),
+    ):
+        with pytest.raises(ValueError, match="unknown exchange"):
+            call()
+    # And the refusal has to be usable: it says where to declare the venue.
+    with pytest.raises(ValueError, match="paradex"):
+        qr.topology_of(unknown)
+
+
+def test_the_named_second_producers_and_the_registry_do_not_drift():
+    """Every `_SECOND_PRODUCER` stream is claimed by a backend, and vice versa.
+
+    The per-stream table stays the refinement it is — which stream of a venue
+    has a hand-off of its own — while the registry says which BACKENDS run one.
+    Two tables that can name different producers are two sources of truth again,
+    which is what this section exists to remove.
+    """
+    claimed = set()
+    for topology in qr._TOPOLOGY.values():
+        claimed |= set(topology.producers)
+    assert claimed == set(qr._SECOND_PRODUCER), (
+        "a named second producer nobody runs, or a backend claiming a producer "
+        "the model has no hop for"
+    )
+
+
+#: The `pump` closure each single-reader backend must still show, verbatim.
+#:
+#: One `pump(..)` is one `ws_tx`, i.e. one reader stamping and enqueueing every
+#: frame of a symbol file; the closure is what says every channel/topic/
+#: subscription of that venue goes into that one connection. Together they are
+#: the claim `SINGLE_READER` makes, and they are what entitles the model to call
+#: a cross-stream step backwards red at a nanosecond.
+#:
+#: Pinned on substrings rather than on line numbers or whole statements, the
+#: same convention as the two bespoke pins above: the load-bearing fact is the
+#: shape of the call, and it survives ordinary edits around it.
+ONE_CONNECTION = {
+    "binance": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "binancefuturesum": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "binancefuturescm": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "aster": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "bybit": "|ws_tx| keep_connection(topics, symbols, ws_tx)",
+    "hyperliquid": "|ws_tx| keep_connection(subscriptions, symbols, ws_tx)",
+    "lighter": "|ws_tx| keep_connection(subscriptions, markets, resub_rx, ws_tx)",
+    "paradex": "|ws_tx| keep_connection(CHANNELS.to_vec(), markets, ws_tx)",
+}
+
+
+def test_every_single_reader_backend_has_a_connection_anchor():
+    """The anchor table is itself covered by the registry, not by hand.
+
+    A new SINGLE_READER venue with no anchor would parametrise a test that
+    asserts nothing about it. Derived from `_TOPOLOGY` so that adding the venue
+    is what demands the anchor.
+    """
+    single = {
+        t.backend for t in qr._TOPOLOGY.values() if t.kind == qr.SINGLE_READER
+    }
+    assert set(ONE_CONNECTION) == single
+
+
+@pytest.mark.parametrize("exchange", sorted(qr._TOPOLOGY))
+def test_the_topology_the_registry_declares_is_the_one_the_backend_has(exchange):
+    """INV-3. Every registry entry is a claim about `collector/src/`. Read it.
+
+    This is the layer that would have caught Extended BEFORE production: the
+    declaration and the sockets are checked against each other for every venue,
+    on every run, rather than for whichever venue last surprised someone.
+    Parametrised over the registry itself, so a new entry with no readable
+    backend fails immediately.
+
+    Extended and Paradex additionally have bespoke pins above
+    (`test_extended_still_opens_one_socket_per_channel`,
+    `test_paradex_still_multiplexes_every_channel_onto_one_socket`); those carry
+    the full argument and the residuals, this one carries the coverage.
+    """
+    topology = qr._TOPOLOGY[exchange]
+    mod = collector_src(topology.backend, "mod.rs")
+    http = collector_src(topology.backend, "http.rs")
+
+    if topology.kind == qr.SINGLE_READER:
+        assert mod.count("pump(") == 1, (
+            f"{topology.backend} no longer runs exactly one pump, i.e. no longer "
+            f"one reader into one ws_tx; if it now fans out, its cross-stream "
+            f"reds are false ones and _TOPOLOGY must say FANS_OUT_PER_CHANNEL"
+        )
+        assert ONE_CONNECTION[topology.backend] in mod, (
+            f"{topology.backend} no longer hands every channel to one "
+            f"keep_connection; SINGLE_READER is the claim that it does"
+        )
+        assert "keep_connection_one" not in mod + http, (
+            f"{topology.backend} has grown Extended's per-channel connection "
+            f"function; declare FANS_OUT_PER_CHANNEL or its inversions are red "
+            f"at a nanosecond for a race that is bounded"
+        )
+    else:
+        assert topology.kind == qr.FANS_OUT_PER_CHANNEL
+        assert re.search(
+            r"for url in urls \{(?:.|\n)*?"
+            r"tokio::spawn\(keep_connection_one\(url, ws_tx\.clone\(\)\)\)",
+            http,
+        ), (
+            f"{topology.backend} no longer spawns one task per channel URL; if "
+            f"it now multiplexes, drop FANS_OUT_PER_CHANNEL — the exemption "
+            f"would be tolerating a real single-reader defect for up to a second"
+        )
+
+    # The named second producers, both directions. A backend that claims one
+    # must run it, and a backend that does not must not have grown one quietly:
+    # the second is the direction that matters, because an unclaimed producer is
+    # a real race the model has no tolerance for and would call corruption.
+    if "depthSnapshot" in topology.producers:
+        assert "tokio::spawn(async move {" in mod and "fetch_depth_snapshot(" in mod, (
+            f"{topology.backend} claims the detached REST depth-snapshot "
+            f"fetcher but no longer spawns one"
+        )
+    else:
+        assert "fetch_depth_snapshot" not in mod, (
+            f"{topology.backend} has grown a REST depth-snapshot producer; add "
+            f"'depthSnapshot' to its _TOPOLOGY producers or its snapshot rows "
+            f"are red against every WS frame"
+        )
+
+    if "premiumIndex" in topology.producers:
+        assert "poll_premium_index(" in mod, (
+            f"{topology.backend} claims the premium-index poller but no longer "
+            f"runs one"
+        )
+        assert re.search(r"poller_tx: Tx<Record>,\s*\)", mod), (
+            f"{topology.backend} no longer takes a hand-off of its own for the "
+            f"poll; merged into writer_tx it is not a second producer any more"
+        )
+    else:
+        assert "poller_tx" not in mod, (
+            f"{topology.backend} has grown a poller hop; add 'premiumIndex' to "
+            f"its _TOPOLOGY producers"
+        )
+
+
+def test_only_the_backends_claiming_the_poller_are_handed_the_poller_hop():
+    """`main.rs` claims `POLLER_HOP` for one arm; the registry must name it.
+
+    The hop is taken with `poller_tx.take()`, once, in the arm of the backend
+    that runs the poll — so the dispatch itself says which venues have that
+    producer, and the registry either agrees or is wrong about a mechanism the
+    interleave classes are derived from.
+    """
+    for exchange, body in sorted(dispatched_backends().items()):
+        has_hop = "poller_tx.take()" in body
+        claims = "premiumIndex" in qr._TOPOLOGY[exchange].producers
+        assert has_hop == claims, (
+            f"collector/src/main.rs {'hands' if has_hop else 'does not hand'} "
+            f"{exchange!r} the poller hop, but _TOPOLOGY says "
+            f"{'it has one' if claims else 'it has none'}"
+        )
 
 
 #: The per-symbol JSON key set a venue with no poller has always had, in order.
