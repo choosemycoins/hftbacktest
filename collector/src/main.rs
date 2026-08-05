@@ -12,10 +12,10 @@ use crate::{
     watchdog::Source,
 };
 
+mod aster;
 mod backoff;
 mod binance;
 mod binancefuturescm;
-mod aster;
 mod binancefuturesum;
 mod bybit;
 mod clock;
