@@ -1698,6 +1698,168 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
+    // The hold ceiling.
+    // ---------------------------------------------------------------------------------------
+
+    /// A connector that opens a batch and never closes it, on a feed that never goes quiet —
+    /// the shape a lost `BatchEnd` leaves behind, and the one case where deferring the return
+    /// has no natural end.
+    ///
+    /// It hands out a bounded number of frames and then **fails** rather than looping forever,
+    /// so a broken ceiling shows up as a red test with a message instead of a hung run. This
+    /// repository has no harness timeout to fall back on.
+    struct StuckBatchChannel {
+        opened: bool,
+        /// Handed out once, right after the batch opens: whatever this `elapse` is waiting for.
+        trigger: Option<LiveEvent>,
+        /// Frames left before the channel declares the ceiling broken.
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    /// Real time has to move for a ceiling measured in real time to expire, so each receive
+    /// costs a little of it. The ceiling in these tests is 5 ms, so the good case ends after a
+    /// handful of frames and the broken one burns its budget in well under a second.
+    const STUCK_FRAME: Duration = Duration::from_millis(1);
+
+    impl Channel for StuckBatchChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                opened: false,
+                trigger: None,
+                budget: 400,
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            if !self.opened {
+                self.opened = true;
+                return Ok((0, LiveEvent::BatchStart));
+            }
+            if let Some(trigger) = self.trigger.take() {
+                return Ok((0, trigger));
+            }
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "the batch held this elapse past every plausible ceiling".to_string(),
+                ));
+            }
+            Ok((0, bid("BTCUSDT", 100.0, 5.0)))
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    fn make_stuck_batch_bot(
+        trigger: Option<LiveEvent>,
+    ) -> LiveBot<StuckBatchChannel, HashMapMarketDepth> {
+        LiveBot::new(
+            42,
+            StuckBatchChannel {
+                opened: false,
+                trigger,
+                budget: 400,
+                sent: Vec::new(),
+            },
+            vec![Instrument::new(
+                "hl",
+                "BTCUSDT",
+                0.01,
+                1.0,
+                HashMapMarketDepth::new(0.01, 1.0),
+                0,
+            )],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// **An unclosed batch must not hold the bot for ever.** It keeps heartbeating from inside
+    /// the loop, so its connector goes on considering it alive while it has silently stopped
+    /// quoting — and per-connector batch state removed the accidental cure, where any other
+    /// connector's `BatchEnd` cleared the one shared flag.
+    #[test]
+    fn an_orphaned_batch_start_cannot_hold_the_bot_past_its_hold_ceiling() {
+        let mut bot = make_stuck_batch_bot(None);
+        bot.max_batch_hold = Duration::from_millis(5);
+
+        let started = Instant::now();
+        let result = bot.elapse(1_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= Duration::from_millis(5),
+            "the batch must defer the return until the ceiling, not sail through it: {held:?}"
+        );
+        assert!(
+            held < Duration::from_millis(200),
+            "and the ceiling must end the hold: {held:?}"
+        );
+    }
+
+    /// **The path the ceiling has to bound is the 60-second one.** `submit_order(.., wait =
+    /// true)` and `cancel(.., wait = true)` both wait a hardcoded 60 s for their own response;
+    /// with the response already received and deferred behind an unclosed batch, only the
+    /// ceiling can hand it over. Returning at the duration gate — which is what a ceiling
+    /// written as an early return in that gate would do — is a minute too late.
+    #[test]
+    fn a_wait_order_response_is_released_at_the_hold_ceiling() {
+        let mut bot = make_stuck_batch_bot(Some(order_event("BTCUSDT", 7, 100.0)));
+        bot.max_batch_hold = Duration::from_millis(5);
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held < Duration::from_millis(200),
+            "the deferred response must be released at the ceiling, not at the 60 s timeout: \
+             {held:?}"
+        );
+        assert_eq!(bot.orders(0).len(), 1, "and the response was applied");
+    }
+
+    /// The ceiling arithmetic and the name it reports, on a clock the test controls rather than
+    /// one it waits for. "Something somewhere is open" is not something an operator can act on.
+    #[test]
+    fn the_ceiling_names_the_connector_whose_batch_is_stuck() {
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, vec![]);
+        bot.max_batch_hold = Duration::from_millis(5);
+
+        bot.open_batch(1, Duration::from_millis(10)); // Binance opened one at t = 10 ms
+
+        assert!(bot.batch_holds(Duration::from_millis(14)));
+        assert!(
+            bot.stuck_connectors(Duration::from_millis(14)).is_empty(),
+            "a batch inside its ceiling is not stuck"
+        );
+
+        assert!(!bot.batch_holds(Duration::from_millis(16)));
+        assert_eq!(bot.stuck_connectors(Duration::from_millis(16)), vec!["bnc"]);
+
+        // Closing it takes the hold away entirely, ceiling or no ceiling.
+        bot.close_batch(1);
+        assert!(!bot.batch_holds(Duration::from_millis(14)));
+        assert!(bot.stuck_connectors(Duration::from_millis(16)).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Single-connector equivalence.
     // ---------------------------------------------------------------------------------------
 
