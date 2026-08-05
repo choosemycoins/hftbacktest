@@ -66,7 +66,24 @@ fn handle(
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(data.as_str())?;
     let stream = route(&j).to_string();
-    writer_tx.send((recv_time, stream, data.to_string()))?;
+    // The record separator belongs to the writer, which writes
+    // `"{timestamp} {data}\n"` (`file.rs`). Paradex — alone among the four
+    // backends — newline-terminates its WebSocket text frames, so forwarding
+    // the frame verbatim the way bybit/hyperliquid/lighter do put a second
+    // newline in every record and made half of every Paradex file blank. The
+    // other three do not trim because their frames carry no terminator; adding
+    // it there would be a change with nothing to fix.
+    //
+    // Only the trailing line terminator is removed, and only as text: the frame
+    // is written byte for byte otherwise. Re-serialising the parsed `j` would
+    // be shorter and is wrong — `serde_json::Value` sorts object keys and
+    // renormalises numbers, i.e. it would rewrite the venue's bytes, and this
+    // collector's contract is to record feeds as they are. Paradex sends
+    // compact JSON, so there are no interior newlines to consider; one would
+    // still split a record, but it cannot be removed without rewriting the
+    // frame, and it has never been observed.
+    let frame = data.as_str().trim_end_matches(['\r', '\n']);
+    writer_tx.send((recv_time, stream, frame.to_string()))?;
     Ok(())
 }
 
@@ -171,6 +188,98 @@ pub async fn run_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::{self, WRITER_HOP};
+
+    /// Drains everything `handle` handed to the writer.
+    fn written(frames: &[&str]) -> Vec<(String, String)> {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 8);
+        let now = Utc::now();
+        for frame in frames {
+            handle(&tx, now, (*frame).into()).unwrap();
+        }
+        drop(tx);
+
+        let mut got = Vec::new();
+        while let Ok((_, stream, payload)) = rx.try_recv() {
+            got.push((stream, payload));
+        }
+        got
+    }
+
+    /// A data frame, with its keys deliberately NOT in sorted order: any fix
+    /// that re-serialised the parsed `Value` would reorder them (`Value` is a
+    /// `BTreeMap` here — `preserve_order` is off), which is a rewrite of the
+    /// venue's bytes and exactly what the collector's "record feeds as they
+    /// are" contract forbids.
+    const UNSORTED: &str = concat!(
+        r#"{"params":{"channel":"bbo.BTC-USD-PERP","data":{"market":"BTC-USD-PERP","#,
+        r#""ask":"2.0","bid":"1.0"}},"method":"subscription","jsonrpc":"2.0"}"#
+    );
+
+    /// The writer owns the record separator (`file.rs`: `"{timestamp} {data}\n"`),
+    /// so a frame that arrives already newline-terminated writes a blank line
+    /// after every record — half the tape. Paradex is the only venue of the four
+    /// that terminates its text frames, so it is the only backend that trims.
+    #[test]
+    fn a_newline_terminated_frame_is_written_without_it() {
+        let got = written(&[&format!("{UNSORTED}\n")]);
+        assert_eq!(got.len(), 1);
+        assert!(
+            !got[0].1.ends_with('\n'),
+            "the transport newline reached the writer: {:?}",
+            got[0].1
+        );
+        assert_eq!(got[0].1, UNSORTED);
+    }
+
+    #[test]
+    fn a_crlf_terminated_frame_is_written_without_it() {
+        let got = written(&[&format!("{UNSORTED}\r\n")]);
+        assert_eq!(got.len(), 1);
+        assert!(
+            !got[0].1.ends_with('\n') && !got[0].1.ends_with('\r'),
+            "a CRLF terminator reached the writer: {:?}",
+            got[0].1
+        );
+        assert_eq!(got[0].1, UNSORTED);
+    }
+
+    /// The trim removes the transport terminator and nothing else: an
+    /// unterminated frame must reach the writer byte for byte, key order
+    /// included.
+    #[test]
+    fn an_unterminated_frame_is_written_byte_for_byte() {
+        let got = written(&[UNSORTED]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, UNSORTED, "the venue's bytes were rewritten");
+    }
+
+    /// Routing reads the parsed frame, and `serde_json` tolerates trailing
+    /// whitespace — so the terminator never disturbed it, and the trim must not
+    /// disturb it either.
+    #[test]
+    fn routing_is_unchanged_by_the_trim() {
+        let got = written(&[
+            "{\"params\":{\"channel\":\"bbo.BTC-USD-PERP\",\"data\":{}},\"method\":\"subscription\"}\n",
+            "{\"params\":{\"channel\":\"trades.ETH-USD-PERP\",\"data\":[]},\"method\":\"subscription\"}\n",
+            "{\"params\":{\"channel\":\"funding_data.SOL-USD-PERP\",\"data\":{}},\"method\":\"subscription\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"result\":{\"channel\":\"bbo.BTC-USD-PERP\"},\"id\":1}\n",
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"bad channel\"},\"id\":2}\n",
+            "{\"_collector\":\"connected\",\"url\":\"wss://x\"}\n",
+        ]);
+        let streams: Vec<&str> = got.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            streams,
+            [
+                "BTC-USD-PERP",
+                "ETH-USD-PERP",
+                "SOL-USD-PERP",
+                META_STREAM,
+                META_STREAM,
+                META_STREAM
+            ]
+        );
+    }
 
     #[test]
     fn a_data_frame_is_routed_to_the_market_in_its_channel() {
