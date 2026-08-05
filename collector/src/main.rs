@@ -15,18 +15,21 @@ use crate::{
 mod backoff;
 mod binance;
 mod binancefuturescm;
+mod aster;
 mod binancefuturesum;
 mod bybit;
 mod clock;
 mod cpu;
 mod disk;
 mod error;
+mod extended;
 mod file;
 mod hyperliquid;
 mod lighter;
 mod liveness;
 mod lock;
 mod meta;
+mod paradex;
 mod pump;
 mod queue;
 mod throttler;
@@ -511,6 +514,19 @@ async fn main() -> Result<(), anyhow::Error> {
                 poller_tx.take().expect("the poller hop is claimed once"),
             ))
         }
+        "aster" => {
+            let streams = aster::STREAMS
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
+
+            tokio::spawn(aster::run_collection(
+                streams,
+                args.symbols,
+                writer_tx,
+                poller_tx.take().expect("the poller hop is claimed once"),
+            ))
+        }
         "binancefuturescm" => {
             let streams = binancefuturescm::STREAMS
                 .iter()
@@ -597,6 +613,34 @@ async fn main() -> Result<(), anyhow::Error> {
             );
 
             tokio::spawn(lighter::run_collection(markets, writer_tx))
+        }
+        "paradex" => {
+            // Markets are addressed by symbol (BTC-USD-PERP), so no catalog
+            // pre-resolution is needed the way Lighter's integer market ids are;
+            // `run_collection` confirms each exists and records the universe.
+            info!(
+                markets = args.symbols.len(),
+                channels = ?paradex::CHANNELS,
+                subscriptions = args.symbols.len() * paradex::CHANNELS.len(),
+                "paradex markets"
+            );
+
+            tokio::spawn(paradex::run_collection(
+                args.symbols,
+                writer_tx,
+                !args.no_symbol_check,
+            ))
+        }
+        "extended" => {
+            // URL-based public feed: no subscribe frames, one socket per
+            // channel. `--no-symbol-check` skips the catalog lookup that
+            // resolves market type and the RFQ flag; leave it on so an unknown
+            // symbol refuses to start and RFQ markets get their executable book.
+            tokio::spawn(extended::run_collection(
+                args.symbols,
+                writer_tx,
+                !args.no_symbol_check,
+            ))
         }
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));

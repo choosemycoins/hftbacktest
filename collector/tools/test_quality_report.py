@@ -862,6 +862,710 @@ def test_a_quiet_lighter_ticker_over_a_live_book_is_not_reported(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Extended: URL-based channels, RFQ sibling files
+# --------------------------------------------------------------------------
+
+
+def extended_book(symbol, ts, seq, kind="DELTA"):
+    return {
+        "type": kind,
+        "data": {"t": kind, "m": symbol, "b": [], "a": [], "d": "f"},
+        "ts": ms_of(ts),
+        "seq": seq,
+    }
+
+
+def extended_trade(symbol, ts, seq):
+    return {
+        "data": [{"i": seq, "m": symbol, "S": "BUY", "tT": "TRADE", "T": ms_of(ts), "p": "1", "q": "1"}],
+        "ts": ms_of(ts),
+        "seq": seq,
+    }
+
+
+def extended_mark(symbol, ts, seq):
+    return {"type": "MP", "data": {"m": symbol, "p": "1", "ts": 0}, "ts": ms_of(ts), "seq": seq}
+
+
+def extended_funding(symbol, ts, seq):
+    return {"ts": ms_of(ts), "data": {"m": symbol, "T": ms_of(ts), "f": "0.001"}, "seq": seq}
+
+
+def extended_dir(tmp_path, streams=("orderbook", "trades", "mark", "funding"), rfq=False, day=DAY):
+    """A minimal, complete Extended recording for BTC-USD.
+
+    Each stream present spans the same window (a frame at t=0 and t=5), so a
+    complete day has a non-empty coverage window — the intersection across the
+    streams — rather than four disjoint single points. `rfq=True` also writes
+    the `{market}-rfq` sibling file (executable book).
+    """
+    d = tmp_path / "extended"
+    d.mkdir()
+    recs = []
+    seq = 0
+    for t in (0, 5):
+        if "orderbook" in streams:
+            seq += 1
+            kind = "SNAPSHOT" if t == 0 else "DELTA"
+            recs.append((ns(t), extended_book("BTC-USD", ns(t), seq, kind=kind)))
+        if "trades" in streams:
+            seq += 1
+            recs.append((ns(t), extended_trade("BTC-USD", ns(t), seq)))
+        if "mark" in streams:
+            seq += 1
+            recs.append((ns(t), extended_mark("BTC-USD", ns(t), seq)))
+        if "funding" in streams:
+            seq += 1
+            recs.append((ns(t), extended_funding("BTC-USD", ns(t), seq)))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"btc-usd_{day}.gz", recs)
+    if rfq:
+        write_gz(
+            d / f"btc-usd-rfq_{day}.gz",
+            [
+                (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+                (ns(1), extended_book("BTC-USD", ns(1), 2)),
+            ],
+        )
+    write_meta(d, "extended", day, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    return d
+
+
+#: The four stream classes of an Extended symbol file, and how to make one.
+#:
+#: One entry per class because on this venue one class IS one socket — the
+#: firehose `/orderbooks`, and `/publicTrades/{m}`, `/funding/{m}`,
+#: `/prices/mark/{m}` per market (`collector/src/extended/mod.rs::channel_urls`).
+#: That is the whole content of the fan-out exemption, so the tests below build
+#: their pairs by naming two classes rather than two frame shapes.
+EXTENDED_FRAME = {
+    "orderbook": lambda ts, seq: extended_book("BTC-USD", ts, seq),
+    "trades": lambda ts, seq: extended_trade("BTC-USD", ts, seq),
+    "mark": lambda ts, seq: extended_mark("BTC-USD", ts, seq),
+    "funding": lambda ts, seq: extended_funding("BTC-USD", ts, seq),
+}
+
+
+def extended_inverted(tmp_path, name, first, second, delta_ns, day=DAY):
+    """An Extended recording holding one out-of-order pair and nothing else odd.
+
+    Write order is `first` then `second`, with `second` stamped `delta_ns`
+    *before* `first` — i.e. exactly the shape the daily gate saw on 20260804.
+    A book snapshot leads so the file has the one stream its profile calls for.
+    """
+    d = tmp_path / name
+    d.mkdir()
+    base = ns(1)
+    write_gz(
+        d / f"btc-usd_{day}.gz",
+        [
+            (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+            (base, EXTENDED_FRAME[first](base, 2)),
+            (base - delta_ns, EXTENDED_FRAME[second](base - delta_ns, 3)),
+        ],
+    )
+    write_meta(d, "extended", day, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    return d
+
+
+def test_family_of_and_expected_streams_know_extended():
+    """The report used to raise `ValueError` on `session_start.exchange` =
+    "extended", so a recorded day could not be gate-checked at all.
+
+    Extended is not part of a mode-A dataset, so — like Bybit and Lighter —
+    nothing it does can make one red: `required` is empty. The book is optional
+    (every file carries one), the conditional feeds are informational.
+    """
+    assert qr.family_of("extended") == qr.EXTENDED
+
+    expected = qr.expected_streams("mode-a-v1", "extended", {})
+    assert expected.required == ()
+    assert expected.optional == ("orderbook",)
+    assert set(expected.informational) == {"trades", "funding", "mark"}
+    assert expected.violation is None
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")), "orderbook"),
+        (json.dumps(extended_book("BTC-USD", ns(0), 2)), "orderbook"),
+        (json.dumps(extended_trade("BTC-USD", ns(0), 3)), "trades"),
+        (json.dumps(extended_mark("BTC-USD", ns(0), 4)), "mark"),
+        (json.dumps(extended_funding("BTC-USD", ns(0), 5)), "funding"),
+    ],
+)
+def test_extended_frames_are_classified_not_lumped_as_unknown(raw, stream):
+    """Each of the four shapes has to become a stream of its own.
+
+    `mark` and `funding` are the trap: both are `{data:{m, …}}` objects, told
+    apart only by `type:MP` versus the funding rate `f`. Getting it wrong would
+    make the whole feed `(unclassified)` and every Extended day yellow.
+    """
+    assert qr.classify(qr.EXTENDED, json.loads(raw)) == stream
+
+
+def test_a_complete_extended_day_is_checked_and_never_red(tmp_path):
+    """A day with all four feeds is green and reports a coverage window.
+
+    Nothing is required (Extended is not a mode-A venue), so with the book
+    present and the informational feeds present-and-checked there is nothing to
+    warn about.
+    """
+    d = extended_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "extended")
+    day = report["venues"]["extended"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"]["btc-usd"]
+    assert set(sym["streams"]) == {"orderbook", "trades", "mark", "funding"}
+    assert sym["unclassified_frames"] == 0
+    assert sym["missing_optional"] == []
+    cov = sym["coverage"]
+    assert cov["first_local_ts"] is not None and cov["last_local_ts"] is not None
+
+
+def test_an_extended_book_absent_is_a_warning_not_a_crash(tmp_path):
+    """The one stream every Extended file must carry is the book.
+
+    A file with no book is a real, actionable yellow (`missing_optional`); the
+    conditional feeds staying absent raise nothing, because an RFQ sibling or a
+    spot market legitimately has none. Never red — Extended blocks no dataset.
+    """
+    d = extended_dir(tmp_path, streams=("trades",))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, "a missing Extended stream must never block a build"
+    day = report["venues"]["extended"]["days"][DAY]
+    assert day["verdict"] == "yellow", day["issues"]
+    sym = day["symbols"]["btc-usd"]
+    assert sym["missing_required"] == []
+    assert "orderbook" in sym["missing_optional"]
+    # The conditional feeds are informational: absent is silent, not a warning.
+    assert set(sym["missing_informational"]) == {"trades", "funding", "mark"} - {"trades"}
+
+
+def test_extended_rfq_sibling_file_is_expected_not_a_leftover(tmp_path):
+    """`{market}-rfq` is the executable book recorded on purpose beside the
+    plain one, so it must not read as `unexpected_symbol` — the check that
+    otherwise fires for any file whose symbol was not in `session_start`.
+    """
+    d = extended_dir(tmp_path, rfq=True)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    checks = checks_of(report, "extended")
+    assert "unexpected_symbol" not in checks, issues_of(report, "extended")
+    day = report["venues"]["extended"]["days"][DAY]
+    # The sibling is still checked: it carries only the book, which satisfies
+    # its optional set, and its informational feeds stay silent when absent.
+    rfq_sym = day["symbols"]["btc-usd-rfq"]
+    assert set(rfq_sym["streams"]) == {"orderbook"}
+    assert rfq_sym["missing_optional"] == []
+
+
+# --------------------------------------------------------------------------
+# Paradex: JSON-RPC channels, two books
+# --------------------------------------------------------------------------
+#
+# Every fixture below is a real frame captured from the Tokyo recorder on
+# 2026-08-04 (`/opt/hft-collector/data/paradex`), trimmed of its level arrays.
+# A synthetic shape would have pinned this report against a guess about the
+# venue rather than against the venue.
+
+
+def paradex_frame(channel, data):
+    """The JSON-RPC envelope every Paradex data update arrives in."""
+    return {"jsonrpc": "2.0", "method": "subscription", "params": {"channel": channel, "data": data}}
+
+
+def paradex_bbo(market, ts, seq):
+    return paradex_frame(
+        f"bbo.{market}",
+        {
+            "market": market,
+            "seq_no": seq,
+            "ask": "1.75",
+            "ask_size": "425.4",
+            "bid": "1.725",
+            "bid_size": "115.8",
+            "last_updated_at": ms_of(ts),
+        },
+    )
+
+
+def paradex_book(market, ts, seq, feed="snapshot"):
+    """`order_book.{market}.{feed}@15@100ms` — the depth and refresh are in the
+    channel name, so the feed word is the second `.`-segment of a three-segment
+    channel whose market itself contains dashes."""
+    return paradex_frame(
+        f"order_book.{market}.{feed}@15@100ms",
+        {
+            "seq_no": seq,
+            "market": market,
+            "last_updated_at": ms_of(ts),
+            "update_type": "s",
+            "inserts": [{"side": "BUY", "price": "1.721", "size": "288.3"}],
+            "updates": [],
+            "deletes": [],
+        },
+    )
+
+
+def paradex_trade(market, ts, seq):
+    return paradex_frame(
+        f"trades.{market}",
+        {
+            "id": f"{ms_of(ts)}2017092384900{seq:02d}",
+            "market": market,
+            "side": "BUY",
+            "size": "0.0002",
+            "price": "63502.5",
+            "created_at": ms_of(ts),
+            "trade_type": "RPI",
+        },
+    )
+
+
+def paradex_funding(market, ts):
+    return paradex_frame(
+        f"funding_data.{market}",
+        {
+            "market": market,
+            "funding_index": "0.02992082550491794701",
+            "funding_premium": "0.0001231622482595002781",
+            "funding_rate": "0.00007100916923",
+            "created_at": ms_of(ts),
+        },
+    )
+
+
+MARKET = "NEAR-USD-PERP"
+
+
+def paradex_dir(
+    tmp_path,
+    streams=("book_snapshot", "book_interactive", "bbo", "trades", "funding"),
+    day=DAY,
+    times=(0, 5),
+):
+    """A Paradex recording for one market, `streams` present at each of `times`."""
+    d = tmp_path / "paradex"
+    d.mkdir()
+    recs = []
+    seq = 0
+    for t in times:
+        for stream in streams:
+            seq += 1
+            if stream == "book_snapshot":
+                recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="snapshot")))
+            elif stream == "book_interactive":
+                recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="interactive")))
+            elif stream == "bbo":
+                recs.append((ns(t), paradex_bbo(MARKET, ns(t), seq)))
+            elif stream == "trades":
+                recs.append((ns(t), paradex_trade(MARKET, ns(t), seq)))
+            elif stream == "funding":
+                recs.append((ns(t), paradex_funding(MARKET, ns(t))))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"{MARKET.lower()}_{day}.gz", recs)
+    write_meta(d, "paradex", day, [(ns(0), session_start("paradex", [MARKET]))])
+    return d
+
+
+def test_family_of_and_expected_streams_know_paradex():
+    """The gate exited 2 on `session_start.exchange` = "paradex": no family, and
+    `expected_streams` fell through to its fail-closed raise. One venue doing
+    that fails the whole `gate@all` service, so a venue recording perfectly well
+    took the report down for every other venue with it.
+
+    Paradex is collect-only — no mode-A dataset reads it — so nothing it does
+    may be red: `required` is empty. Both books are the norm on every file and
+    are optional; the three per-market feeds are informational, because a thin
+    perp legitimately prints nothing for hours (measured: 15 trades in 8.1h on
+    NEAR-USD-PERP, 2026-08-04).
+    """
+    assert qr.family_of("paradex") == qr.PARADEX
+
+    expected = qr.expected_streams("mode-a-v1", "paradex", {})
+    assert expected.required == ()
+    assert expected.optional == ("book_snapshot", "book_interactive")
+    assert set(expected.informational) == {"bbo", "trades", "funding"}
+    assert expected.violation is None
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(paradex_bbo(MARKET, ns(0), 1)), "bbo"),
+        (json.dumps(paradex_book(MARKET, ns(0), 2, feed="snapshot")), "book_snapshot"),
+        (json.dumps(paradex_book(MARKET, ns(0), 3, feed="interactive")), "book_interactive"),
+        (json.dumps(paradex_trade(MARKET, ns(0), 4)), "trades"),
+        (json.dumps(paradex_funding(MARKET, ns(0))), "funding"),
+    ],
+)
+def test_paradex_frames_are_classified_not_lumped_as_unknown(raw, stream):
+    """The two books are the trap: same envelope, same payload shape, told apart
+    only by the `snapshot`/`interactive` word inside the third `.`-segment. They
+    are DIFFERENT books — the RPI-inclusive one against the plain one is the
+    whole reason this venue is recorded — so collapsing them into one stream
+    would hide either going silent.
+    """
+    assert qr.classify(qr.PARADEX, json.loads(raw)) == stream
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps({"jsonrpc": "2.0", "result": {"channel": f"bbo.{MARKET}"}, "id": 1}),
+        json.dumps({"jsonrpc": "2.0", "error": {"code": -32000, "message": "bad channel"}, "id": 2}),
+        json.dumps({"jsonrpc": "2.0", "result": {}, "id": 3}),
+        json.dumps({"params": {"channel": f"order_book.{MARKET}.deltas@15@100ms", "data": {}}}),
+    ],
+)
+def test_a_paradex_frame_with_no_data_channel_is_not_a_stream(raw):
+    """Acks, venue errors and pongs carry no `params.channel` and are meta, the
+    same call `collector/src/paradex/mod.rs::route` makes — classifying one as a
+    stream would give it a cadence expectation it can never meet.
+
+    A channel the collector records and this report has not been taught (the
+    full-depth `deltas` feed, reserved for a core set) deliberately falls here
+    too: an `unclassified_frame` yellow is the signal that says teach the report,
+    which a name derived from the channel would have swallowed silently.
+    """
+    assert qr.classify(qr.PARADEX, json.loads(raw)) is None
+
+
+def test_a_complete_paradex_day_is_checked_and_never_red(tmp_path):
+    """All five feeds present: green, everything classified, coverage reported."""
+    d = paradex_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "paradex")
+    day = report["venues"]["paradex"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][MARKET.lower()]
+    assert set(sym["streams"]) == {"book_snapshot", "book_interactive", "bbo", "trades", "funding"}
+    assert sym["unclassified_frames"] == 0
+    assert sym["missing_optional"] == []
+
+
+def test_a_paradex_day_of_books_alone_is_green_and_never_exit_2(tmp_path):
+    """The normal shape of a thin market: both books, and hours with no print,
+    no top-of-book change and (on a short run) no funding tick.
+
+    Books satisfy the optional set; the three informational feeds absent is
+    silent, not a warning. Nothing here may cost the gate a non-zero exit — one
+    venue's exit 2 fails `gate@all` for every venue.
+    """
+    d = paradex_dir(tmp_path, streams=("book_snapshot", "book_interactive"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "paradex")
+    day = report["venues"]["paradex"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][MARKET.lower()]
+    assert sym["missing_required"] == []
+    assert sym["missing_optional"] == []
+    assert set(sym["missing_informational"]) == {"bbo", "trades", "funding"}
+
+
+def test_a_paradex_book_absent_is_a_warning_not_a_crash(tmp_path):
+    """One book without the other is a real, actionable yellow: the pair is the
+    measurement (RPI-inclusive against plain), so half of it is not the dataset
+    this venue is recorded for. Still never red — it blocks no build.
+    """
+    d = paradex_dir(tmp_path, streams=("book_snapshot", "bbo"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, "a missing Paradex stream must never block a build"
+    day = report["venues"]["paradex"]["days"][DAY]
+    assert day["verdict"] == "yellow", day["issues"]
+    sym = day["symbols"][MARKET.lower()]
+    assert sym["missing_required"] == []
+    assert sym["missing_optional"] == ["book_interactive"]
+
+
+def test_a_paradex_trades_drought_is_not_a_cadence_gap(tmp_path):
+    """`trades` has no cadence limit at all, on purpose.
+
+    Measured 2026-08-04 over 8.1h: NEAR-USD-PERP printed 15 times (worst hole
+    1h33m), SOL-USD-PERP 37 times (worst 1h43m). Any limit that does not flag
+    those is not a limit, and one that does flags a healthy thin market every
+    day — so the honest answer is that this feed has no cadence to check.
+    """
+    d = paradex_dir(
+        tmp_path,
+        streams=("book_snapshot", "book_interactive", "trades"),
+        times=(0, 100, 200, 300, 400, 500, 600, 7_000),
+    )
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    sym = report["venues"]["paradex"]["days"][DAY]["symbols"][MARKET.lower()]
+    assert sym["streams"]["trades"]["gap_count"] == 0, "trades must carry no cadence limit"
+    gaps = [i for i in issues_of(report, "paradex") if i["check"] == "cadence_gap"]
+    assert [g for g in gaps if "trades" in g["detail"]] == []
+
+
+def test_a_quiet_paradex_bbo_hole_the_books_disprove_is_not_reported(tmp_path):
+    """`bbo` fires on a change of the touch and on nothing else, so a thin market
+    in a quiet hour emits nothing while the socket is healthy.
+
+    Measured 2026-08-04, 8.1h: 13 such holes on NEAR-USD-PERP and 20 on
+    ONDO-USD-PERP past the 300s limit (worst 41 minutes), with both books
+    running across every one of them — worst book hole on those two markets,
+    173.7s, inside their own limit. That is the same shape, and the same
+    measured count, that earned Hyperliquid's `bbo` its reference.
+    """
+    d = tmp_path / "paradex"
+    d.mkdir()
+    recs = []
+    seq = 0
+    for t in range(100, 801, 100):
+        seq += 1
+        recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="snapshot")))
+        seq += 1
+        recs.append((ns(t), paradex_book(MARKET, ns(t), seq, feed="interactive")))
+    # One bbo at each end of the books' window and nothing between: a 700s hole,
+    # spanned by two books that had none. The window starts at t=100 so that the
+    # `session_start` record does not fall inside the hole — a hole the sidecar
+    # already accounts for is never suppressed, and this test is about the case
+    # where the sidecar has nothing to say.
+    recs.append((ns(100), paradex_bbo(MARKET, ns(100), 900)))
+    recs.append((ns(800), paradex_bbo(MARKET, ns(800), 901)))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"{MARKET.lower()}_{DAY}.gz", recs)
+    write_meta(d, "paradex", DAY, [(ns(0), session_start("paradex", [MARKET]))])
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0
+    assert "cadence_gap" not in checks_of(report, "paradex"), issues_of(report, "paradex")
+    bbo = report["venues"]["paradex"]["days"][DAY]["symbols"][MARKET.lower()]["streams"]["bbo"]
+    # Measured either way: the hole is recorded, and recorded as disproved.
+    assert bbo["gap_count"] == 1
+    assert bbo["suppressed_gap_count"] == 1
+
+
+# --------------------------------------------------------------------------
+# Aster: a literal Binance USD-M clone
+# --------------------------------------------------------------------------
+#
+# Frames captured from the Tokyo recorder on 2026-08-04
+# (`/opt/hft-collector/data/aster`), verbatim but for shortened level arrays.
+
+
+def aster_book_ticker(symbol, ts, u):
+    return {
+        "stream": f"{symbol.lower()}@bookTicker",
+        "data": {
+            "e": "bookTicker",
+            "u": u,
+            "s": symbol,
+            "b": "0.4026000",
+            "B": "19318.4",
+            "a": "0.4035000",
+            "A": "2993.4",
+            "T": ms_of(ts) - 40,
+            "E": ms_of(ts),
+        },
+    }
+
+
+def aster_depth(symbol, ts, first_u, last_u, prev_u):
+    return {
+        "stream": f"{symbol.lower()}@depth@0ms",
+        "data": {
+            "e": "depthUpdate",
+            "E": ms_of(ts),
+            "T": ms_of(ts) - 50,
+            "s": symbol,
+            "U": first_u,
+            "u": last_u,
+            "pu": prev_u,
+            "b": [],
+            "a": [["0.4039000", "18568.9"]],
+        },
+    }
+
+
+def aster_trade(symbol, ts, tid):
+    return {
+        "stream": f"{symbol.lower()}@trade",
+        "data": {
+            "e": "trade",
+            "E": ms_of(ts),
+            "T": ms_of(ts) - 30,
+            "s": symbol,
+            "t": tid,
+            "p": "0.4022000",
+            "q": "20.1",
+            "X": "MARKET",
+            "m": True,
+        },
+    }
+
+
+def aster_premium_index(symbol, ts):
+    """The REST poller's element, written bare — no envelope, no `e`, and the
+    symbol under `symbol` rather than `s`. Identical to Binance USD-M's, because
+    the venue is a clone down to `GET /fapi/v1/premiumIndex`."""
+    return {
+        "symbol": symbol,
+        "markPrice": "0.40330000",
+        "indexPrice": "0.40383338",
+        "estimatedSettlePrice": "0.40091637",
+        "lastFundingRate": "-0.00004455",
+        "interestRate": "0.00010000",
+        "nextFundingTime": ms_of(ts) + 3_600_000,
+        "time": ms_of(ts),
+    }
+
+
+ASTER_SYMBOL = "ETHFIUSDT"
+
+
+def aster_dir(
+    tmp_path,
+    streams=("bookTicker", "depthUpdate", "trade", "premiumIndex"),
+    day=DAY,
+    times=(0, 5),
+):
+    d = tmp_path / "aster"
+    d.mkdir()
+    recs = []
+    u = 499_657_978_442
+    # The `pu` chain is per stream: each depth frame links to the LAST update id
+    # of the previous depth frame, not to whatever id was handed out in between.
+    # Chaining it wrong would make every fixture here report a sequence break.
+    last_depth_u = u
+    for t in times:
+        for stream in streams:
+            if stream == "bookTicker":
+                u += 1
+                recs.append((ns(t), aster_book_ticker(ASTER_SYMBOL, ns(t), u)))
+            elif stream == "depthUpdate":
+                first_u, u = u + 1, u + 2
+                recs.append((ns(t), aster_depth(ASTER_SYMBOL, ns(t), first_u, u, last_depth_u)))
+                last_depth_u = u
+            elif stream == "trade":
+                recs.append((ns(t), aster_trade(ASTER_SYMBOL, ns(t), 29_045 + int(t))))
+            elif stream == "premiumIndex":
+                recs.append((ns(t), aster_premium_index(ASTER_SYMBOL, ns(t))))
+    recs.sort(key=lambda pair: pair[0])
+    write_gz(d / f"{ASTER_SYMBOL.lower()}_{day}.gz", recs)
+    write_meta(d, "aster", day, [(ns(0), session_start("aster", [ASTER_SYMBOL]))])
+    return d
+
+
+def test_family_of_and_expected_streams_know_aster():
+    """Aster is a literal Binance USD-M clone — combined-stream `sym@channel`
+    envelope, the same `data.e` event names, the same bare `premiumIndex`
+    elements from the same REST path — so it reuses the Binance family rather
+    than growing a second copy of those rules.
+
+    Its expectations are its own, and they are permissive: Aster is collect-only,
+    so unlike `binancefuturesum` (whose `bookTicker` mode A depends on) nothing
+    it does may be red.
+    """
+    assert qr.family_of("aster") == qr.BINANCE
+
+    expected = qr.expected_streams("mode-a-v1", "aster", {})
+    assert expected.required == ()
+    assert expected.optional == ("bookTicker", "depthUpdate")
+    assert set(expected.informational) == {"trade", "premiumIndex"}
+    assert expected.violation is None
+    # The signal venue keeps its required stream: permissiveness is per exchange,
+    # not a loosening of the family they share.
+    assert qr.expected_streams("mode-a-v1", "binancefuturesum", {}).required == ("bookTicker",)
+
+
+@pytest.mark.parametrize(
+    "raw,stream",
+    [
+        (json.dumps(aster_book_ticker(ASTER_SYMBOL, ns(0), 1)), "bookTicker"),
+        (json.dumps(aster_depth(ASTER_SYMBOL, ns(0), 2, 3, 1)), "depthUpdate"),
+        (json.dumps(aster_trade(ASTER_SYMBOL, ns(0), 4)), "trade"),
+        (json.dumps(aster_premium_index(ASTER_SYMBOL, ns(0))), "premiumIndex"),
+    ],
+)
+def test_aster_frames_classify_under_the_binance_rules(raw, stream):
+    """Pinned against real Aster frames, not against the claim that the venue is
+    a clone: if it ever diverges, this is where it shows up rather than as a day
+    of `unclassified_frame`.
+    """
+    assert qr.classify(qr.BINANCE, json.loads(raw)) == stream
+
+
+def test_a_complete_aster_day_is_checked_and_never_red(tmp_path):
+    d = aster_dir(tmp_path)
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, issues_of(report, "aster")
+    day = report["venues"]["aster"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][ASTER_SYMBOL.lower()]
+    assert set(sym["streams"]) == {"bookTicker", "depthUpdate", "trade", "premiumIndex"}
+    assert sym["unclassified_frames"] == 0
+    assert sym["missing_optional"] == []
+
+
+def test_an_aster_day_with_no_trades_is_not_red_and_not_exit_2(tmp_path):
+    """A day of an Aster altcoin perp with no print at all is ordinary: measured
+    2026-08-04, ETHFIUSDT printed 57 times in 8.2h and NEARUSDT 77. `trade` is
+    therefore informational — absent is silent — and the day stays green.
+    """
+    d = aster_dir(tmp_path, streams=("bookTicker", "depthUpdate", "premiumIndex"))
+    out = tmp_path / "r.json"
+    code, report = run(d, out=out)
+
+    assert code == 0, "a missing Aster stream must never block a build"
+    day = report["venues"]["aster"]["days"][DAY]
+    assert day["verdict"] == "green", day["issues"]
+    sym = day["symbols"][ASTER_SYMBOL.lower()]
+    assert sym["missing_required"] == []
+    assert sym["missing_optional"] == []
+    assert sym["missing_informational"] == ["trade"]
+
+
+# --------------------------------------------------------------------------
+# fail-closed: a venue nobody taught the report
+# --------------------------------------------------------------------------
+
+
+def test_an_untaught_exchange_is_still_fail_closed(tmp_path):
+    """Paradex and Aster get explicit entries; nothing gets a blanket fallback.
+
+    A venue this report has never seen must still raise, because the alternative
+    — some permissive default — would silently pass a recording whose streams,
+    cadences and expectations nobody has looked at. That is the whole failure
+    this file exists to prevent, and it is why the two additions above are two
+    named cases rather than one `else`.
+    """
+    with pytest.raises(ValueError, match="unknown exchange"):
+        qr.family_of("bitmex")
+    with pytest.raises(ValueError, match="no expected stream set"):
+        qr.expected_streams("mode-a-v1", "bitmex", {})
+
+    # End to end, it is exit 2 — the gate refusing to grade what it cannot read.
+    d = tmp_path / "bitmex"
+    d.mkdir()
+    write_gz(d / f"xbtusd_{DAY}.gz", [(ns(0), {"table": "quote"})])
+    write_meta(d, "bitmex", DAY, [(ns(0), session_start("bitmex", ["XBTUSD"]))])
+    assert run(d)[0] == 2
+
+
+# --------------------------------------------------------------------------
 # 5./8. cadence gaps and their explanation
 # --------------------------------------------------------------------------
 
@@ -1648,6 +2352,304 @@ def test_a_cross_stream_inversion_with_no_second_producer_is_red_at_any_size(
     # The old text said "within the bound, so nothing is missing" in the same
     # breath as reporting a defect.
     assert "nothing is missing" not in detail
+
+
+# --------------------------------------------------------------------------
+# Fan-out venues: one socket per channel, so every stream is its own producer
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "first,second,delta_ns",
+    [
+        # The two findings that reddened the daily gate on 20260804 and paged.
+        ("orderbook", "mark", 15_153),  # btc-usd, 4 occurrences, worst 15.153us
+        ("trades", "mark", 489),  # sol-usd, 2 occurrences, worst 489ns
+    ],
+)
+def test_an_extended_cross_stream_micro_inversion_is_the_race_it_is(
+    tmp_path, first, second, delta_ns
+):
+    """A false red that paged daily, because the model called Extended
+    single-reader when the backend is nothing of the kind.
+
+    Extended dials one WebSocket per channel and
+    `keep_connections` (`collector/src/extended/http.rs`) spawns one task per
+    URL. Each stamps its own `Utc::now()` at its own read and races the others
+    into the one shared socket hop, so two streams of a symbol file are two
+    concurrent producers — the second-producer case, not the single-reader one.
+    Both magnitudes here are the real ones, off the recording that paged: they
+    are the width of a scheduler slice, five orders of magnitude inside the
+    bound, and calling them corruption refuses a build over nothing.
+    """
+    d = extended_inverted(tmp_path, f"ext-{first}-{second}", first, second, delta_ns)
+    code, report = run(d, out=tmp_path / f"r-{first}-{second}.json")
+    assert code == 0, issues_of(report, "extended")
+    assert "interleave_excess" not in checks_of(report, "extended")
+    assert "interleave_inversion" in checks_of(report, "extended", severity="yellow")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["interleave_inversion"]["max_delta_ns"] == delta_ns
+    assert symbol["interleave_inversion"]["previous_stream"] == first
+    assert symbol["interleave_inversion"]["stream"] == second
+    assert symbol["interleave_excess"] is None
+
+    # The explanation has to be the same decision as the finding: the venue's
+    # own mechanism, not the "no second producer" sentence this used to print,
+    # and not the snapshot pair's either — that one names the socket hop as
+    # "the only queue these two do not share", which here is false twice over.
+    detail = next(
+        i for i in issues_of(report, "extended") if i["check"] == "interleave_inversion"
+    )["detail"]
+    assert "no second producer" not in detail
+    assert "keep_connection_one per URL" in detail, "the mechanism, from the Rust"
+    assert "two socket tasks" in detail, "the verdict, in the venue's own terms"
+    assert "the only queue these two do not share" not in detail
+    assert "nothing is missing" in detail
+
+
+def test_an_extended_cross_stream_inversion_past_the_bound_is_still_red(tmp_path):
+    """The exemption is bounded, so the gate is not blinded.
+
+    A fan-out venue's two rows still meet in the shared socket hop and the
+    shared writer hop, both FIFOs, so the only thing that can separate their
+    stamps is the moment between one task's `Utc::now()` and its `send`. Past
+    `CROSS_STREAM_TOLERANCE_NS` that stops being a scheduler slice and becomes
+    the same two hypotheses every other venue's red carries.
+    """
+    delta_ns = 1_200 * MS
+    assert delta_ns > qr.CROSS_STREAM_TOLERANCE_NS
+    d = extended_inverted(tmp_path, "ext-over-bound", "orderbook", "mark", delta_ns)
+    code, report = run(d, out=tmp_path / "r.json")
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "extended", severity="red")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["interleave_excess"]["max_delta_ns"] == delta_ns
+    detail = next(
+        i for i in issues_of(report, "extended") if i["check"] == "interleave_excess"
+    )["detail"]
+    assert "nothing is missing" not in detail
+    # And it says the true thing about this venue rather than the snapshot
+    # pair's: a deep socket hop delays BOTH of these rows, so "check _meta for a
+    # burst" is not a lead here, and the hop is not a queue they fail to share.
+    assert "the only queue these two do not share" not in detail
+    assert "both FIFOs" in detail
+    assert "two recordings" in detail
+
+
+@pytest.mark.parametrize("delta_ns", [1, 15_153, 2 * SEC])
+def test_an_extended_inversion_within_one_stream_is_red_at_any_size(tmp_path, delta_ns):
+    """The fan-out exemption is about two sockets; one socket keeps no tolerance.
+
+    Each Extended channel is one task reading, stamping and enqueueing in that
+    order, so within a stream write order IS receive order — the single-reader
+    argument survives intact per channel, and a step backwards there is a clock
+    or two recordings whatever its size. `interleave_kind` is never consulted
+    for it: `scan_symbol_file` files a same-stream step under
+    `monotonic_violation`, and that path is untouched by this change.
+    """
+    d = tmp_path / f"ext-within-{delta_ns}"
+    d.mkdir()
+    base = ns(1)
+    write_gz(
+        d / f"btc-usd_{DAY}.gz",
+        [
+            (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+            (base, extended_mark("BTC-USD", base, 2)),
+            (base - delta_ns, extended_mark("BTC-USD", base - delta_ns, 3)),
+        ],
+    )
+    write_meta(d, "extended", DAY, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    code, report = run(d, out=tmp_path / f"r-{delta_ns}.json")
+    assert code == 1
+    assert "monotonicity" in checks_of(report, "extended", severity="red")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["monotonic_violation"]["max_delta_ns"] == delta_ns
+    assert symbol["interleave_inversion"] is None
+    assert symbol["interleave_excess"] is None
+
+
+def test_an_extended_inversion_against_an_unclassified_frame_is_yellow(tmp_path):
+    """The decision the fan-out change made about frames it cannot name, pinned.
+
+    A frame this report does not recognise is bucketed under `UNCLASSIFIED`,
+    which is a key like any other, so a cross-key inversion involving it reaches
+    the fan-out exemption: before 2026-08-05 such a pair was `interleave_excess`,
+    red, at a nanosecond, and at HEAD it is a bounded yellow. That flip is
+    deliberate and this is where it is decided rather than left to fall out.
+
+    **Yellow, because the premise of the exemption holds for it too**: an
+    Extended socket task is spawned per channel URL, so whatever the backend
+    wrote came off one of those sockets and did race the row it is out of order
+    with. Recording a channel the report has not been taught is the ordinary way
+    to get here — the same shape as Paradex's full-depth `deltas` feed — and
+    that is a new socket, not a new producer of some other kind.
+
+    **And safe, because it cannot arrive quietly.** The naming failure is its
+    own finding on the same file and the same day (`unclassified_frame`,
+    asserted below, which is why it is asserted below), and misclassification is
+    a different failure from reordering: every defect the red exists for still
+    reaches a detector this bucket cannot dull — a clock step lands inside the
+    busiest *classified* stream as `monotonic_violation`, red at a nanosecond,
+    and two recordings in one file fail `gzip_integrity`. Failing closed instead
+    — the exemption restricted to two named streams — would red exactly the
+    frames the report has just admitted it cannot name, i.e. refuse a build over
+    its own ignorance. See `FANS_OUT_PER_CHANNEL`, which carries the argument
+    and the one residual it does not cover.
+    """
+    d = tmp_path / "ext-unclassified"
+    d.mkdir()
+    base = ns(1)
+    # `type` is neither SNAPSHOT/DELTA nor MP and `data` carries no funding rate,
+    # so `classify` returns None: a channel of this venue the report has not
+    # been taught, which on Extended means a socket of its own.
+    foreign = {"type": "STATS", "data": {"m": "BTC-USD", "x": "1"}, "ts": ms_of(base), "seq": 3}
+    write_gz(
+        d / f"btc-usd_{DAY}.gz",
+        [
+            (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+            (base, extended_mark("BTC-USD", base, 2)),
+            (base - 500, foreign),  # 500ns backwards, the width of the race
+        ],
+    )
+    write_meta(d, "extended", DAY, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    code, report = run(d, out=tmp_path / "r.json")
+
+    assert code == 0, issues_of(report, "extended")
+    checks = checks_of(report, "extended", severity="yellow")
+    assert "interleave_inversion" in checks
+    assert "interleave_excess" not in checks_of(report, "extended")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["interleave_inversion"]["max_delta_ns"] == 500
+    assert symbol["interleave_inversion"]["previous_stream"] == "mark"
+    assert symbol["interleave_inversion"]["stream"] == qr.UNCLASSIFIED
+    assert symbol["interleave_excess"] is None
+    # Not a within-stream step: the two came off two sockets, and the report
+    # says which pair it is looking at.
+    assert symbol["monotonic_violation"] is None
+
+    # The other half of the decision, and the reason the first half is safe: the
+    # frame the report could not name is reported as such, on this same file.
+    # Drop this finding and the yellow above becomes a silent tolerance.
+    assert "unclassified_frame" in checks
+    assert symbol["unclassified_frames"] == 1
+
+    # And it is answered by the fan-out verdict path, not by some third text:
+    # one classifier, one explanation.
+    detail = next(
+        i for i in issues_of(report, "extended") if i["check"] == "interleave_inversion"
+    )["detail"]
+    assert "two socket tasks" in detail
+    assert "no second producer" not in detail
+
+
+@pytest.mark.parametrize(
+    "first,second", [("bbo", "trades"), ("book_snapshot", "book_interactive")]
+)
+def test_a_paradex_cross_stream_inversion_stays_red_at_a_nanosecond(
+    tmp_path, first, second
+):
+    """Paradex is genuinely single-reader and must not ride Extended's exemption.
+
+    `collector/src/paradex/mod.rs` makes ONE `keep_connection(CHANNELS.to_vec(),
+    markets, ws_tx)` to one `WS_URL`, every channel multiplexed on that one
+    socket, so one reader stamps and queues every frame of a symbol file and
+    write order IS receive order. The venue passed the gate on the same day
+    Extended reddened it; a per-venue exemption written as a per-family or
+    per-"new venue" one would have taken this red with it.
+    """
+    d = tmp_path / f"pdx-{first}-{second}"
+    d.mkdir()
+    make = {
+        "bbo": lambda ts, seq: paradex_bbo(MARKET, ts, seq),
+        "trades": lambda ts, seq: paradex_trade(MARKET, ts, seq),
+        "book_snapshot": lambda ts, seq: paradex_book(MARKET, ts, seq, feed="snapshot"),
+        "book_interactive": lambda ts, seq: paradex_book(
+            MARKET, ts, seq, feed="interactive"
+        ),
+    }
+    base = ns(1)
+    write_gz(
+        d / f"{MARKET.lower()}_{DAY}.gz",
+        [
+            (ns(0), paradex_book(MARKET, ns(0), 1, feed="snapshot")),
+            (base, make[first](base, 2)),
+            (base - 1, make[second](base - 1, 3)),
+        ],
+    )
+    write_meta(d, "paradex", DAY, [(ns(0), session_start("paradex", [MARKET]))])
+    code, report = run(d, out=tmp_path / f"r-{first}-{second}.json")
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "paradex", severity="red")
+    detail = next(
+        i for i in issues_of(report, "paradex") if i["check"] == "interleave_excess"
+    )["detail"]
+    assert "no second producer" in detail
+
+
+@pytest.mark.parametrize(
+    "exchange",
+    ["bybit", "hyperliquid", "lighter", "binance", "binancefuturesum",
+     "binancefuturescm", "paradex", "aster"],
+)
+def test_extended_is_the_only_venue_the_fan_out_exemption_reaches(exchange):
+    """The set is named, closed, and its members are the ones with the shape.
+
+    Written against every venue the report knows rather than against Extended
+    alone: the failure this guards is a predicate that widens — an exemption
+    keyed on "not Binance", on a family, or on "the venues added recently" —
+    and only a test over the whole list can see that.
+    """
+    assert qr.fans_out_per_channel(exchange) is False
+    assert qr.interleave_kind(exchange, "orderbook", "mark", 1) == qr.INTERLEAVE_EXCESS
+    assert qr.second_producer_of(exchange, "orderbook", "mark") is None
+
+    assert qr.fans_out_per_channel("extended") is True
+    assert (
+        qr.interleave_kind("extended", "orderbook", "mark", 1)
+        == qr.INTERLEAVE_INVERSION
+    )
+    assert (
+        qr.interleave_kind(
+            "extended", "orderbook", "mark", qr.CROSS_STREAM_TOLERANCE_NS
+        )
+        == qr.INTERLEAVE_INVERSION
+    )
+    assert (
+        qr.interleave_kind(
+            "extended", "orderbook", "mark", qr.CROSS_STREAM_TOLERANCE_NS + 1
+        )
+        == qr.INTERLEAVE_EXCESS
+    )
+
+
+def test_no_fan_out_venue_has_a_stream_with_a_hand_off_of_its_own():
+    """The invariant that keeps one binding point enough. Fails when it lapses.
+
+    `scan_symbol_file` has two cursors, and which one catches an out-of-order
+    pair depends on whether the late row is a `_SECOND_PRODUCER` stream. While
+    no fan-out venue HAS such a stream, only the shared-chain cursor can ever
+    classify a fan-out pair — so a venue dropped from the other call site would
+    be caught by nothing, which is exactly what a mutation of that site showed
+    (it survived the whole suite). `pair_kind` binds the venue once so the site
+    cannot be got wrong; this test is the other half, and says when the second
+    site stops being dead. Give Extended a REST poller and it goes live, and
+    this failing is how that gets noticed rather than discovered in a report.
+    """
+    fans_out = [e for e, t in qr._TOPOLOGY.items() if t.kind == qr.FANS_OUT_PER_CHANNEL]
+    assert fans_out, "no venue fans out; nothing below is checked"
+    for exchange in fans_out:
+        expected = qr.expected_streams("mode-a-v1", exchange, {})
+        streams = (
+            set(expected.required)
+            | set(expected.optional)
+            | set(expected.informational)
+        )
+        assert streams, f"{exchange} declares no streams, so this checks nothing"
+        assert streams.isdisjoint(qr._SECOND_PRODUCER), (
+            f"{exchange} fans out AND has a stream with a hand-off of its own; "
+            f"the adjacent-pair cursor in scan_symbol_file can now classify one "
+            f"of its pairs, and needs a test of its own"
+        )
 
 
 def test_an_inversion_between_two_binance_websocket_streams_is_red(tmp_path):
@@ -3273,6 +4275,460 @@ def test_the_poller_still_has_a_hand_off_of_its_own(tmp_path):
         r"poller_tx: Tx<Record>,\s*\)",
         um_rs,
     ), "binancefuturesum::run_collection no longer takes a poller hop of its own"
+
+
+def collector_src(*parts):
+    """A file of `collector/src/`, read as text. The model mirrors the Rust; the
+    tests below are what make the Rust fail this file when it moves."""
+    return (Path(__file__).resolve().parent.parent / "src" / Path(*parts)).read_text()
+
+
+def test_extended_still_opens_one_socket_per_channel(tmp_path):
+    """The fan-out exemption is a claim about the backend. Read the backend.
+
+    `fans_out_per_channel("extended")` downgrades a cross-stream inversion from
+    red to a bounded yellow, and the only thing that entitles it to is that
+    Extended really does spawn one socket task per channel. Refactor the backend
+    onto one multiplexed socket — which is what every other venue here does —
+    and the exemption becomes a hole that tolerates a real single-reader defect
+    up to a full second, silently. This test is what turns that into a failure.
+
+    Pinned on substrings rather than on line numbers or on the whole statement:
+    the load-bearing facts are that the spawn is per URL and that each stream
+    class has a URL of its own, and both survive ordinary edits around them.
+    """
+    http = collector_src("extended", "http.rs")
+    assert re.search(
+        r"for url in urls \{(?:.|\n)*?"
+        r"tokio::spawn\(keep_connection_one\(url, ws_tx\.clone\(\)\)\)",
+        http,
+    ), (
+        "extended::keep_connections no longer spawns one task per channel URL; "
+        "if the backend now multiplexes, drop 'extended' from "
+        "FANS_OUT_PER_CHANNEL — its cross-stream inversions are single-reader "
+        "defects again"
+    )
+    # Each task stamps its own receive moment, which is what makes them two
+    # producers rather than one reader handing frames on in order.
+    #
+    # Residual, and the edge of what this pin guarantees: these two substrings
+    # say the KNOWN send site still stamps at receive, not that it is the only
+    # one. A second `ws_tx.send` added beside it with a request-time or
+    # venue-copied stamp would leave both assertions true while creating the
+    # sub-second lookahead the exemption tolerates — the same shape as the
+    # premiumIndex stamp defect `interleave_kind` keeps a bound for. There is
+    # one send site in `extended/http.rs` today; a stricter form (count the
+    # sends, require every one to carry `recv_time`) is possible but pins the
+    # backend's shape rather than its behaviour, so it is deliberately not
+    # taken here — same mirror-pin convention as the tests around it.
+    assert "let recv_time = Utc::now();" in http
+    assert "ws_tx.send((recv_time, text))" in http
+
+    # And one stream class really is one socket: the model's unit of exemption
+    # is the stream, so two classes sharing a URL would be one producer wearing
+    # two names.
+    mod = collector_src("extended", "mod.rs")
+    for path in ('/orderbooks"', "/publicTrades/{}", "/funding/{}", "/prices/mark/{}"):
+        assert path in mod, (
+            f"{path} is no longer a channel URL of its own; the fan-out "
+            f"exemption assumes one socket per stream class"
+        )
+
+
+def test_paradex_still_multiplexes_every_channel_onto_one_socket(tmp_path):
+    """The converse pin: a single-reader venue must not drift into the exemption.
+
+    Paradex is red at a nanosecond between two streams because one reader stamps
+    and queues every frame of a symbol file — one `keep_connection` over
+    `CHANNELS.to_vec()` to one `WS_URL` (`collector/src/paradex/mod.rs`). Should
+    it ever fan out the way Extended does, that red becomes a false one and the
+    venue needs redeclaring `FANS_OUT_PER_CHANNEL`; failing here is how that gets
+    decided rather than endured.
+    """
+    mod = collector_src("paradex", "mod.rs")
+    assert "keep_connection(CHANNELS.to_vec(), markets, ws_tx)" in mod, (
+        "paradex no longer hands every channel to one connection; if it now "
+        "opens a socket per channel, declare it FANS_OUT_PER_CHANNEL"
+    )
+    assert "keep_connection_one" not in mod
+    assert len(re.findall(r"tokio::spawn\(", mod)) == 0, (
+        "paradex::mod.rs spawns nothing today; a new spawned producer here is "
+        "exactly what the single-reader red assumes does not exist"
+    )
+    assert qr.fans_out_per_channel("paradex") is False
+
+    http = collector_src("paradex", "http.rs")
+    assert "connect(WS_URL, subscriptions, ws_tx.clone(), &mut connected_at)" in http, (
+        "paradex no longer dials one URL with all its subscriptions"
+    )
+
+
+def test_the_socket_hop_the_fan_out_shares_is_the_one_the_rust_names(tmp_path):
+    """`WS_HOP` is mirrored, so it is pinned like the other two hop names.
+
+    The fan-out mechanism sentence names this hop as the one both channel
+    sockets DO share — which is the reason their disagreement is bounded at all.
+    A rename in `queue.rs` would leave the report explaining a hand-off that no
+    longer exists by that name.
+    """
+    queue_rs = collector_src("queue.rs")
+
+    def hop_name(const):
+        match = re.search(rf'pub const {const}: &str = "([^"]+)";', queue_rs)
+        assert match, f"{const} is no longer a &str constant of collector/src/queue.rs"
+        return match.group(1)
+
+    assert qr.WS_HOP == hop_name("WS_HOP")
+    assert qr.WS_HOP != qr.WRITER_HOP != qr.POLLER_HOP
+    assert qr._FAN_OUT_PRODUCER.hop == qr.WS_HOP
+    # The fan-out producer must not look like the poller's: that hop is what
+    # `crosses_a_hand_off_of_its_own` selects the unbounded yellow on.
+    assert not qr.crosses_a_hand_off_of_its_own("orderbook")
+
+
+# --------------------------------------------------------------------------
+# the venue-topology registry: completeness, no silent default, mirror pins
+#
+# The cycle these exist to break: the gate is Binance/Bybit-shaped, and each new
+# venue taught it another axis of that assumption REACTIVELY, one production
+# alert per venue. Paradex and Aster had no `expected_streams` branch and exited
+# 2 (aedbc99); Extended's per-channel socket fan-out was not modelled and the
+# gate, silently assuming a single reader, went false-RED on an ordinary
+# interleave (896a51d). Both failures are loud rather than dangerous, but both
+# were discovered in production at 01:00 instead of here.
+#
+# So: "a collector backend the gate does not model" and "a venue declared with
+# the wrong topology" are pytest failures, read off the collector's own dispatch
+# and the backend sources.
+# --------------------------------------------------------------------------
+
+
+def dispatched_backends() -> dict:
+    """`{cli spelling: the arm's body}` for every backend the collector runs.
+
+    THE authoritative list of venues: `collector/src/main.rs` matches
+    `args.exchange.as_str()` and every arm but the fallback is a backend that
+    can produce a recording this report will one day be handed. Read rather than
+    restated, so that a new arm is a failing test here instead of an exit 2 at
+    01:00.
+
+    Parsed on the arm-head shape (eight spaces, string literals, `=> {`), which
+    excludes the inner `match mode.as_str()` of the Hyperliquid arm — its
+    `"slow"`/`"fast"` arms are indented deeper and are not backends. The parse
+    is itself pinned by `test_the_dispatch_parse_reads_the_arms_it_claims_to`,
+    because a regex that quietly matched nothing would make every test below
+    vacuously green — the exact failure mode this section exists against.
+    """
+    main_rs = collector_src("main.rs")
+    block = re.search(
+        r"let collection_task = match args\.exchange\.as_str\(\) \{\n(.*?)"
+        r"\n        exchange => \{",
+        main_rs,
+        re.S,
+    )
+    assert block, (
+        "collector/src/main.rs no longer dispatches on `args.exchange.as_str()` "
+        "with a catch-all `exchange =>` arm last; this parse is the "
+        "authoritative venue list and cannot be left guessing"
+    )
+    heads = list(
+        re.finditer(r'^ {8}("[a-z]+"(?: *\| *"[a-z]+")*) *=> *\{', block.group(1), re.M)
+    )
+    arms = {}
+    for i, head in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(block.group(1))
+        body = block.group(1)[head.start() : end]
+        for name in re.findall(r'"([a-z]+)"', head.group(1)):
+            arms[name] = body
+    return arms
+
+
+def test_the_dispatch_parse_reads_the_arms_it_claims_to():
+    """The vacuity guard for every completeness test below.
+
+    A parse that matched nothing would turn "every backend is modelled" into
+    "no backend is checked", green for ever. So this pins the shape from the
+    other side: a handful of spellings that must be there, and the fallback arm
+    that makes the list closed.
+    """
+    arms = dispatched_backends()
+    assert {"bybit", "hyperliquid", "extended", "paradex", "aster"} <= set(arms), (
+        f"the dispatch parse found {sorted(arms)}, which is missing venues this "
+        f"repository certainly records; the arm shape in main.rs has moved"
+    )
+    assert len(arms) >= 9
+    assert "is not supported." in collector_src("main.rs"), (
+        "the fallback arm is what makes the parsed list exhaustive"
+    )
+
+
+def test_every_backend_the_collector_dispatches_has_a_topology():
+    """INV-1. A backend the gate does not model is a failure HERE.
+
+    The registry is the one place the interleave model asks what a venue's
+    producers look like. A backend in `main.rs` with no entry is the Extended
+    bug in its general form: the gate would answer the question anyway, from a
+    default, and be wrong in whichever direction the default happens to point.
+    """
+    missing = sorted(set(dispatched_backends()) - set(qr._TOPOLOGY))
+    assert not missing, (
+        f"{missing} can be recorded by collector/src/main.rs but has no entry "
+        f"in quality_report._TOPOLOGY. Declare its producer topology — "
+        f"SINGLE_READER if one WS reader multiplexes every channel, "
+        f"FANS_OUT_PER_CHANNEL if it opens a socket per channel — and pin it "
+        f"against the backend source in the parametrised test below"
+    )
+    # Frame shapes are the other half of modelling a venue, and it already fails
+    # loudly; asserted here so one test answers "is this venue known at all".
+    for exchange in dispatched_backends():
+        assert qr.family_of(exchange)
+
+
+def test_the_registry_declares_no_venue_the_collector_cannot_record():
+    """The converse, so the registry cannot rot in the other direction.
+
+    An entry for a venue no arm dispatches is a topology claim about a backend
+    that is not there — it pins nothing, and the mirror-pin below would be
+    reading a directory that no longer exists.
+    """
+    extra = sorted(set(qr._TOPOLOGY) - set(dispatched_backends()))
+    assert not extra, (
+        f"{extra} is declared in _TOPOLOGY but collector/src/main.rs dispatches "
+        f"no such exchange; a removed backend must lose its entry too"
+    )
+
+
+def test_two_spellings_of_one_backend_get_one_topology():
+    """`binancefutures`/`binancefuturesum` and `binance`/`binancespot`.
+
+    Topology is a property of the BACKEND, not of the word the operator typed:
+    one arm, one set of sockets. Declaring the two spellings separately is
+    explicit on purpose — `_FAMILY` does the same — but they must not be able to
+    disagree.
+    """
+    by_backend = {}
+    for exchange, topology in qr._TOPOLOGY.items():
+        by_backend.setdefault(topology.backend, {})[exchange] = topology
+    for backend, entries in by_backend.items():
+        kinds = {(t.kind, t.producers) for t in entries.values()}
+        assert len(kinds) == 1, (
+            f"{sorted(entries)} are spellings of the one backend {backend!r} "
+            f"but declare different topologies: {kinds}"
+        )
+
+
+def test_every_backend_the_collector_dispatches_has_an_expected_stream_set():
+    """The axis Paradex and Aster fell through, pinned the same way.
+
+    `expected_streams` already refuses an unknown venue loudly, which is right —
+    but the refusal arrived as `gate@all` exiting 2 in production, taking every
+    other venue's report down with it. Reading the dispatch here means a new
+    backend fails this test on the day the arm is written.
+    """
+    for exchange in sorted(dispatched_backends()):
+        if exchange in NO_MODE_A_STREAM_SET:
+            with pytest.raises(ValueError, match="defines no expected stream set"):
+                qr.expected_streams("mode-a-v1", exchange, session_start(exchange, ["X"]))
+            continue
+        expected = qr.expected_streams("mode-a-v1", exchange, session_start(exchange, ["X"]))
+        assert isinstance(expected, qr.Expected), (
+            f"{exchange!r} is dispatched by collector/src/main.rs but "
+            f"expected_streams has no branch for it; the gate exits 2 on the "
+            f"first recording it is handed"
+        )
+
+
+#: The dispatched spellings `expected_streams` refuses on purpose.
+#:
+#: Binance spot has no converter in this repository, so there is no mode-A
+#: dataset it could be part of and no stream set to state. Declared rather than
+#: inferred: a NEW venue with no branch must fail the test above, and it can
+#: only do that if the deliberate refusals are enumerated.
+NO_MODE_A_STREAM_SET = {"binance", "binancespot"}
+
+
+def test_the_deliberate_refusals_are_venues_that_still_exist():
+    """`NO_MODE_A_STREAM_SET` is an exemption list, so it needs its own floor."""
+    assert NO_MODE_A_STREAM_SET <= set(dispatched_backends())
+
+
+def test_an_unknown_venue_is_refused_rather_than_assumed_single_reader():
+    """INV-2. There is no path where omission means "one WS reader".
+
+    This is the Extended failure written as a rule. Before the registry,
+    `fans_out_per_channel` answered `False` for every venue it had never heard
+    of, so a new backend was classified single-reader by SILENCE — red at a
+    nanosecond on a venue whose sockets nobody had looked at. The answer to "I
+    do not know this venue" is now the same as `family_of`'s: refuse, and name
+    what is known.
+    """
+    unknown = "newvenue"
+    assert unknown not in qr._TOPOLOGY
+    for call in (
+        lambda: qr.topology_of(unknown),
+        lambda: qr.fans_out_per_channel(unknown),
+        lambda: qr.second_producer_of(unknown, "trades", "bbo"),
+        lambda: qr.interleave_kind(unknown, "trades", "bbo", 1),
+        # The pair that answers from `_SECOND_PRODUCER` before the venue is
+        # consulted at all: it must still refuse, or the last hiding place of
+        # the default is a stream name rather than a venue.
+        lambda: qr.second_producer_of(unknown, "depthSnapshot", "trade"),
+        lambda: qr.interleave_kind(unknown, "depthSnapshot", "trade", 1),
+    ):
+        with pytest.raises(ValueError, match="unknown exchange"):
+            call()
+    # And the refusal has to be usable: it says where to declare the venue.
+    with pytest.raises(ValueError, match="paradex"):
+        qr.topology_of(unknown)
+
+
+def test_the_named_second_producers_and_the_registry_do_not_drift():
+    """Every `_SECOND_PRODUCER` stream is claimed by a backend, and vice versa.
+
+    The per-stream table stays the refinement it is — which stream of a venue
+    has a hand-off of its own — while the registry says which BACKENDS run one.
+    Two tables that can name different producers are two sources of truth again,
+    which is what this section exists to remove.
+    """
+    claimed = set()
+    for topology in qr._TOPOLOGY.values():
+        claimed |= set(topology.producers)
+    assert claimed == set(qr._SECOND_PRODUCER), (
+        "a named second producer nobody runs, or a backend claiming a producer "
+        "the model has no hop for"
+    )
+
+
+#: The `pump` closure each single-reader backend must still show, verbatim.
+#:
+#: One `pump(..)` is one `ws_tx`, i.e. one reader stamping and enqueueing every
+#: frame of a symbol file; the closure is what says every channel/topic/
+#: subscription of that venue goes into that one connection. Together they are
+#: the claim `SINGLE_READER` makes, and they are what entitles the model to call
+#: a cross-stream step backwards red at a nanosecond.
+#:
+#: Pinned on substrings rather than on line numbers or whole statements, the
+#: same convention as the two bespoke pins above: the load-bearing fact is the
+#: shape of the call, and it survives ordinary edits around it.
+ONE_CONNECTION = {
+    "binance": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "binancefuturesum": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "binancefuturescm": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "aster": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
+    "bybit": "|ws_tx| keep_connection(topics, symbols, ws_tx)",
+    "hyperliquid": "|ws_tx| keep_connection(subscriptions, symbols, ws_tx)",
+    "lighter": "|ws_tx| keep_connection(subscriptions, markets, resub_rx, ws_tx)",
+    "paradex": "|ws_tx| keep_connection(CHANNELS.to_vec(), markets, ws_tx)",
+}
+
+
+def test_every_single_reader_backend_has_a_connection_anchor():
+    """The anchor table is itself covered by the registry, not by hand.
+
+    A new SINGLE_READER venue with no anchor would parametrise a test that
+    asserts nothing about it. Derived from `_TOPOLOGY` so that adding the venue
+    is what demands the anchor.
+    """
+    single = {
+        t.backend for t in qr._TOPOLOGY.values() if t.kind == qr.SINGLE_READER
+    }
+    assert set(ONE_CONNECTION) == single
+
+
+@pytest.mark.parametrize("exchange", sorted(qr._TOPOLOGY))
+def test_the_topology_the_registry_declares_is_the_one_the_backend_has(exchange):
+    """INV-3. Every registry entry is a claim about `collector/src/`. Read it.
+
+    This is the layer that would have caught Extended BEFORE production: the
+    declaration and the sockets are checked against each other for every venue,
+    on every run, rather than for whichever venue last surprised someone.
+    Parametrised over the registry itself, so a new entry with no readable
+    backend fails immediately.
+
+    Extended and Paradex additionally have bespoke pins above
+    (`test_extended_still_opens_one_socket_per_channel`,
+    `test_paradex_still_multiplexes_every_channel_onto_one_socket`); those carry
+    the full argument and the residuals, this one carries the coverage.
+    """
+    topology = qr._TOPOLOGY[exchange]
+    mod = collector_src(topology.backend, "mod.rs")
+    http = collector_src(topology.backend, "http.rs")
+
+    if topology.kind == qr.SINGLE_READER:
+        assert mod.count("pump(") == 1, (
+            f"{topology.backend} no longer runs exactly one pump, i.e. no longer "
+            f"one reader into one ws_tx; if it now fans out, its cross-stream "
+            f"reds are false ones and _TOPOLOGY must say FANS_OUT_PER_CHANNEL"
+        )
+        assert ONE_CONNECTION[topology.backend] in mod, (
+            f"{topology.backend} no longer hands every channel to one "
+            f"keep_connection; SINGLE_READER is the claim that it does"
+        )
+        assert "keep_connection_one" not in mod + http, (
+            f"{topology.backend} has grown Extended's per-channel connection "
+            f"function; declare FANS_OUT_PER_CHANNEL or its inversions are red "
+            f"at a nanosecond for a race that is bounded"
+        )
+    else:
+        assert topology.kind == qr.FANS_OUT_PER_CHANNEL
+        assert re.search(
+            r"for url in urls \{(?:.|\n)*?"
+            r"tokio::spawn\(keep_connection_one\(url, ws_tx\.clone\(\)\)\)",
+            http,
+        ), (
+            f"{topology.backend} no longer spawns one task per channel URL; if "
+            f"it now multiplexes, drop FANS_OUT_PER_CHANNEL — the exemption "
+            f"would be tolerating a real single-reader defect for up to a second"
+        )
+
+    # The named second producers, both directions. A backend that claims one
+    # must run it, and a backend that does not must not have grown one quietly:
+    # the second is the direction that matters, because an unclaimed producer is
+    # a real race the model has no tolerance for and would call corruption.
+    if "depthSnapshot" in topology.producers:
+        assert "tokio::spawn(async move {" in mod and "fetch_depth_snapshot(" in mod, (
+            f"{topology.backend} claims the detached REST depth-snapshot "
+            f"fetcher but no longer spawns one"
+        )
+    else:
+        assert "fetch_depth_snapshot" not in mod, (
+            f"{topology.backend} has grown a REST depth-snapshot producer; add "
+            f"'depthSnapshot' to its _TOPOLOGY producers or its snapshot rows "
+            f"are red against every WS frame"
+        )
+
+    if "premiumIndex" in topology.producers:
+        assert "poll_premium_index(" in mod, (
+            f"{topology.backend} claims the premium-index poller but no longer "
+            f"runs one"
+        )
+        assert re.search(r"poller_tx: Tx<Record>,\s*\)", mod), (
+            f"{topology.backend} no longer takes a hand-off of its own for the "
+            f"poll; merged into writer_tx it is not a second producer any more"
+        )
+    else:
+        assert "poller_tx" not in mod, (
+            f"{topology.backend} has grown a poller hop; add 'premiumIndex' to "
+            f"its _TOPOLOGY producers"
+        )
+
+
+def test_only_the_backends_claiming_the_poller_are_handed_the_poller_hop():
+    """`main.rs` claims `POLLER_HOP` for one arm; the registry must name it.
+
+    The hop is taken with `poller_tx.take()`, once, in the arm of the backend
+    that runs the poll — so the dispatch itself says which venues have that
+    producer, and the registry either agrees or is wrong about a mechanism the
+    interleave classes are derived from.
+    """
+    for exchange, body in sorted(dispatched_backends().items()):
+        has_hop = "poller_tx.take()" in body
+        claims = "premiumIndex" in qr._TOPOLOGY[exchange].producers
+        assert has_hop == claims, (
+            f"collector/src/main.rs {'hands' if has_hop else 'does not hand'} "
+            f"{exchange!r} the poller hop, but _TOPOLOGY says "
+            f"{'it has one' if claims else 'it has none'}"
+        )
 
 
 #: The per-symbol JSON key set a venue with no poller has always had, in order.
