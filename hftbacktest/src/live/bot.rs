@@ -49,6 +49,16 @@ pub enum BotError {
     Timeout,
     #[error("Interrupted")]
     Interrupted,
+    /// A transport failure on the channel of one named connector.
+    ///
+    /// The name is stamped by the receiving side, which knows which channel it just polled or
+    /// failed to send on — it is not carried over the wire, and no connector has to be rebuilt
+    /// for it to appear. It exists so that a consumer can tell "the connector I trade on is
+    /// unreachable" from "a market-data-only connector hiccuped" without parsing prose; the
+    /// library names the connector and the consumer decides what it is worth
+    /// (`AGENTS.md` §1.1).
+    #[error("Channel({connector}): {message}")]
+    Channel { connector: String, message: String },
     #[error("Custom: {0}")]
     Custom(String),
 }
