@@ -109,34 +109,107 @@ const MIN_RECV_CHUNK: Duration = Duration::from_millis(1);
 /// the second connector goes live.
 const MAX_BATCH_HOLD: Duration = Duration::from_millis(250);
 
-/// How many batches one connector currently has open, and since when.
+/// Open batches, per connector, and since when the strategy has been held by them.
 ///
-/// Per connector rather than one flag for the bot, because the receiver round-robins between
-/// connectors: their batches interleave 1:1 whenever both have traffic, so a shared flag lets
-/// one connector's `BatchEnd` release another's open batch and hand the strategy a
-/// half-applied book (design note §2.1).
-#[derive(Default, Clone, Copy)]
-struct BatchHold {
-    /// `BatchStart`s not yet matched by a `BatchEnd`.
+/// The depths are per connector rather than one flag for the bot, because the receiver
+/// round-robins between connectors: their batches interleave 1:1 whenever both have traffic,
+/// so a shared flag lets one connector's `BatchEnd` release another's open batch and hand the
+/// strategy a half-applied book (design note §2.1).
+///
+/// The clock, on the other hand, is **one for the bot**, and that is the whole subtlety. See
+/// [`Self::held_since`].
+#[derive(Default)]
+struct BatchState {
+    /// `BatchStart`s not yet matched by a `BatchEnd`, per connector.
     ///
     /// A count, not a flag: a connector nests its own batches — a registration batch is
     /// assembled whole inside one `handle_msg` and can land between a market-data
     /// `BatchStart` and its `BatchEnd` — and with a flag the inner end would release the outer
     /// batch (design note §3.6). An unmatched `BatchEnd` saturates at zero rather than
     /// wrapping; an unmatched `BatchStart` is what the ceiling is for.
-    depth: u32,
-    /// When the depth last went from zero to one, measured from the start of this `elapse_`.
-    since: Option<Duration>,
+    depth: Vec<u32>,
+    /// When the union of those batches last became non-empty, measured from the start of this
+    /// `elapse_`; `None` while every connector is closed.
+    ///
+    /// **What the ceiling bounds is how long the strategy has been held, not how old any one
+    /// batch is.** A per-connector clock looks right and is not: two connectors whose batches
+    /// overlap — `hl` opens, `bnc` opens, `hl` closes, `hl` re-opens — keep the union open
+    /// continuously while every individual batch it can see was opened a frame ago, so the
+    /// ceiling never expires and the bot never quotes again. That is the outcome the ceiling
+    /// exists to prevent, reached with no lost marker at all, and it would be a liveness
+    /// regression against the single flag this replaced, which released on any `BatchEnd`.
+    ///
+    /// So the clock starts when the union goes empty → non-empty and is cleared when it
+    /// empties again. Re-opening while something else is still open does *not* restart it:
+    /// nothing was handed to the strategy in between, so nothing was un-held. The cost is that
+    /// a quarter-second unbroken run of legitimately short batches is force-released too — at
+    /// which point the connector is producing batches faster than the bot can be let out of
+    /// them, and that is a fault either way.
+    held_since: Option<Duration>,
 }
 
-impl BatchHold {
-    /// Whether this connector's batch still defers the return, i.e. it is open *and* has not
-    /// been open longer than the ceiling.
+impl BatchState {
+    fn new(connectors: usize) -> Self {
+        Self {
+            depth: vec![0; connectors],
+            held_since: None,
+        }
+    }
+
+    /// Back to the state `elapse_` starts in. Per call, exactly as the single `batch_mode` flag
+    /// this replaces was: a batch that crosses a call boundary is not protected — it never was
+    /// (design note §10).
+    fn reset(&mut self) {
+        self.depth.fill(0);
+        self.held_since = None;
+    }
+
+    fn open(&mut self, conn: usize, elapsed: Duration) {
+        if !self.any_open() {
+            self.held_since = Some(elapsed);
+        }
+        self.depth[conn] = self.depth[conn].saturating_add(1);
+    }
+
+    fn close(&mut self, conn: usize) {
+        self.depth[conn] = self.depth[conn].saturating_sub(1);
+        if !self.any_open() {
+            self.held_since = None;
+        }
+    }
+
+    fn any_open(&self) -> bool {
+        self.depth.iter().any(|depth| *depth > 0)
+    }
+
+    /// Whether a batch still defers returning to the strategy: something is open *and* the
+    /// hold has not outlasted the ceiling.
+    ///
+    /// One rule for every return in `elapse_`, deliberately: the question a gate answers is not
+    /// "whose frame is this" but "may the strategy run", and a strategy that runs reads *every*
+    /// book, position and order set. Making the gate per-connector — releasing on a foreign
+    /// connector's feed while ours is mid-batch — would leave the tear in place on the very
+    /// path this exists to protect (design note §3.3).
     fn holds(&self, elapsed: Duration, ceiling: Duration) -> bool {
-        self.depth > 0
+        self.any_open()
             && self
-                .since
+                .held_since
                 .is_none_or(|since| elapsed.saturating_sub(since) <= ceiling)
+    }
+
+    /// The connectors holding a batch open past the ceiling — what an operator needs named,
+    /// since "something somewhere is open" is not actionable. Empty while the hold is still
+    /// within its ceiling, so that the caller can use it as the report of a breach.
+    fn stuck(&self, elapsed: Duration, ceiling: Duration) -> Vec<usize> {
+        if self.holds(elapsed, ceiling) {
+            return Vec::new();
+        }
+        self.depth
+            .iter()
+            .enumerate()
+            .filter(|(_, depth)| **depth > 0)
+            .map(|(conn, _)| conn)
+            .collect()
     }
 }
 
@@ -314,9 +387,9 @@ pub struct LiveBot<CH, MD> {
     /// Which connector each instrument belongs to: an index into `connector_names`, one entry
     /// per instrument. Derived once in [`LiveBot::new`], never afterwards.
     conn_of_inst: Vec<usize>,
-    /// Open batches per connector, for the current `elapse_` only — reset at its start, which
-    /// is exactly the lifetime the single `batch_mode` flag it replaces had.
-    batches: Vec<BatchHold>,
+    /// Open batches, for the current `elapse_` only — reset at its start, which is exactly the
+    /// lifetime the single `batch_mode` flag it replaces had.
+    batches: BatchState,
     /// See [`MAX_BATCH_HOLD`]. A field so tests can shorten it; not a builder option, because
     /// it guards against a protocol violation rather than expressing a trading policy.
     max_batch_hold: Duration,
@@ -345,7 +418,7 @@ impl<CH, MD> LiveBot<CH, MD> {
                 });
             conn_of_inst.push(conn);
         }
-        let batches = vec![BatchHold::default(); connector_names.len()];
+        let batches = BatchState::new(connector_names.len());
 
         Self {
             id,
@@ -381,47 +454,45 @@ impl<CH, MD> LiveBot<CH, MD> {
     }
 
     fn open_batch(&mut self, conn: usize, elapsed: Duration) {
-        let batch = &mut self.batches[conn];
-        if batch.depth == 0 {
-            batch.since = Some(elapsed);
-        }
-        batch.depth = batch.depth.saturating_add(1);
+        self.batches.open(conn, elapsed);
     }
 
     fn close_batch(&mut self, conn: usize) {
-        let batch = &mut self.batches[conn];
-        batch.depth = batch.depth.saturating_sub(1);
-        if batch.depth == 0 {
-            batch.since = None;
-        }
+        self.batches.close(conn);
     }
 
-    /// Whether any connector's open batch still defers returning to the strategy.
-    ///
-    /// One rule for every return in `elapse_`, deliberately: the question a gate answers is not
-    /// "whose frame is this" but "may the strategy run", and a strategy that runs reads *every*
-    /// book, position and order set. Making the gate per-connector — releasing on a foreign
-    /// connector's feed while ours is mid-batch — would leave the tear in place on the very
-    /// path this exists to protect (design note §3.3).
+    /// See [`BatchState::holds`].
     fn batch_holds(&self, elapsed: Duration) -> bool {
-        self.batches
-            .iter()
-            .any(|batch| batch.holds(elapsed, self.max_batch_hold))
+        self.batches.holds(elapsed, self.max_batch_hold)
     }
 
-    fn any_batch_open(&self) -> bool {
-        self.batches.iter().any(|batch| batch.depth > 0)
-    }
-
-    /// The connectors whose batch is open but has been held past the ceiling — what an operator
-    /// needs named, since "something somewhere is open" is not actionable.
+    /// The connectors holding a batch open past the ceiling, by name.
     fn stuck_connectors(&self, elapsed: Duration) -> Vec<&str> {
         self.batches
-            .iter()
-            .enumerate()
-            .filter(|(_, batch)| batch.depth > 0 && !batch.holds(elapsed, self.max_batch_hold))
-            .map(|(conn, _)| self.connector_names[conn].as_str())
+            .stuck(elapsed, self.max_batch_hold)
+            .into_iter()
+            .map(|conn| self.connector_names[conn].as_str())
             .collect()
+    }
+
+    /// Says once, per `elapse_`, that the ceiling — and not a `BatchEnd` — is what let this
+    /// call return. Silent while nothing is open or the hold is still inside its ceiling.
+    ///
+    /// `reported` is the caller's, not a field: the condition stays true for the rest of the
+    /// call once it is true, and the state belongs to the call the way the batches do. `holds`
+    /// likewise comes from the caller, which has already asked — this runs on the receive hot
+    /// path, and the breach case is the only one that walks the connectors.
+    fn report_a_stuck_batch_once(&self, elapsed: Duration, holds: bool, reported: &mut bool) {
+        if *reported || holds || !self.batches.any_open() {
+            return;
+        }
+        *reported = true;
+        warn!(
+            stuck = ?self.stuck_connectors(elapsed),
+            ceiling = ?self.max_batch_hold,
+            "A batch has held this elapse past its ceiling; returning on a possibly torn book \
+             rather than never returning."
+        );
     }
 }
 
@@ -558,6 +629,15 @@ where
     /// holds the money. The name in [`BotError::Channel`] is what lets the consumer decide
     /// which failure is which; that decision is not the library's (`AGENTS.md` §1.1).
     ///
+    /// **And every connector it could not reach is reported, not just the first.** One
+    /// `Result` can carry one error, so the first is what propagates and keeps the shape a
+    /// consumer matches on; the rest would otherwise be dropped in silence, and each of them
+    /// is a venue about to cancel this bot's resting orders. So each failure gets its own
+    /// `error!` naming its connector, and the returned error's message lists the ones behind
+    /// it. The residual is honest and worth knowing: a consumer whose tolerance branches on
+    /// `connector` alone still sees only the first name, so a heartbeat `Channel` error must
+    /// be read as "at least this connector" (design note §11.3).
+    ///
     /// `last_heartbeat` advances even when a send failed, so the failure is reported at the
     /// heartbeat's cadence rather than on every call. A consumer that tolerates it calls
     /// `elapse` again straight away, and retrying each time would be a busy loop reporting the
@@ -572,16 +652,40 @@ where
         {
             return Ok(());
         }
-        let mut first_failure = None;
+        let mut failures: Vec<(String, BotError)> = Vec::new();
         for inst_no in 0..self.instruments.len() {
             if let Err(error) = self.channel.send(self.id, inst_no, LiveRequest::Heartbeat) {
-                first_failure.get_or_insert(error);
+                // The channel names itself when it can; the bot's own table is the fallback,
+                // so a failure that is not a `Channel` error still comes out attributed.
+                let connector = match &error {
+                    BotError::Channel { connector, .. } => connector.clone(),
+                    _ => self.connector_names[self.conn_of_inst[inst_no]].clone(),
+                };
+                error!(
+                    connector = connector.as_str(),
+                    reason = %error,
+                    "The heartbeat could not be delivered; this connector will cancel this \
+                     bot's resting orders once its liveness window runs out."
+                );
+                failures.push((connector, error));
             }
         }
         self.last_heartbeat = Some(now);
-        match first_failure {
-            Some(error) => Err(error),
-            None => Ok(()),
+
+        let mut failures = failures.into_iter();
+        let Some((_, first)) = failures.next() else {
+            return Ok(());
+        };
+        let others: Vec<String> = failures.map(|(connector, _)| connector).collect();
+        if others.is_empty() {
+            return Err(first);
+        }
+        match first {
+            BotError::Channel { connector, message } => Err(BotError::Channel {
+                connector,
+                message: format!("{message}; also unreachable: {}", others.join(", ")),
+            }),
+            other => Err(other),
         }
     }
 
@@ -618,9 +722,7 @@ where
         self.heartbeat(instant)?;
         let duration = Duration::from_nanos(duration as u64);
         let mut remaining_duration = duration;
-        // Per call, exactly as the single `batch_mode` flag this replaces was. A batch that
-        // crosses a call boundary is not protected — it never was (design note §10).
-        self.batches.fill(BatchHold::default());
+        self.batches.reset();
         let mut wait_resp_received = false;
         let mut reported_a_stuck_batch = false;
 
@@ -666,16 +768,7 @@ where
                     }
 
                     let holds = self.batch_holds(elapsed);
-                    if !holds && self.any_batch_open() && !reported_a_stuck_batch {
-                        // Once per call: the condition stays true for the rest of it.
-                        reported_a_stuck_batch = true;
-                        warn!(
-                            stuck = ?self.stuck_connectors(elapsed),
-                            ceiling = ?self.max_batch_hold,
-                            "A batch has held this elapse past its ceiling; returning on a \
-                             possibly torn book rather than never returning."
-                        );
-                    }
+                    self.report_a_stuck_batch_once(elapsed, holds, &mut reported_a_stuck_batch);
                     // A result deferred by a batch is released when the last batch closes — or
                     // when the ceiling stops it holding. This is also the path a `BatchEnd`
                     // takes, which is why it no longer returns from its own arm.
@@ -701,6 +794,17 @@ where
                     // nothing to do passes through, and it is where a quiet feed used to go
                     // silent for the whole `elapse`.
                     self.heartbeat(instant + elapsed)?;
+                    // **The ceiling has to be consulted here too.** A connector that dies
+                    // between its two markers stops producing anything at all, so this is the
+                    // arm every later iteration takes — and the deferred result sitting behind
+                    // its unclosed batch would otherwise wait out the call's own duration,
+                    // which for `wait_order_response` is a hardcoded 60 s, six times the
+                    // connector's liveness window.
+                    let holds = self.batch_holds(elapsed);
+                    self.report_a_stuck_batch_once(elapsed, holds, &mut reported_a_stuck_batch);
+                    if wait_resp_received && !holds {
+                        return Ok(ElapseResult::Ok);
+                    }
                     // A *capped* receive expiring is not this call expiring. Without the cap
                     // the channel's timeout was the call's, and this is the end of it.
                     if chunk >= remaining_duration || elapsed >= duration {
@@ -1038,7 +1142,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Once, time::Duration};
+
+    use tracing::{
+        Level,
+        Metadata,
+        Subscriber,
+        field::{Field, Visit},
+        span,
+    };
 
     use super::*;
     use crate::{
@@ -1057,6 +1169,99 @@ mod tests {
             TimeInForce,
         },
     };
+
+    // -----------------------------------------------------------------------------------------
+    // Log capture.
+    //
+    // A structured log line is the observable for a fault that has nowhere else to go — the
+    // second unreachable connector, when only the first can be returned. Capturing it needs
+    // care: `tracing`'s interest cache is process-global while `set_default` is thread-local,
+    // so the usual per-test subscriber makes callsites go dark for whichever test happens to
+    // rebuild the cache (`AGENTS.md` §4.2 records three flakes in sixty runs of exactly that
+    // shape in the connector). The cure is the one described there: **one** process-global
+    // subscriber, installed once, routing into a thread-local buffer. There is then always
+    // exactly one live `Dispatch` and it is always interested, and tests running side by side
+    // cannot see each other's events.
+    // -----------------------------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct CapturedEvent {
+        level: Level,
+        /// The `connector` field, if the call site set one. The field, never the prose: the
+        /// message is free to be reworded, the field is what an operator greps for.
+        connector: Option<String>,
+    }
+
+    thread_local! {
+        static CAPTURED: RefCell<Option<Vec<CapturedEvent>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Default)]
+    struct ConnectorField(Option<String>);
+
+    impl Visit for ConnectorField {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "connector" {
+                self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "connector" {
+                self.0 = Some(value.to_string());
+            }
+        }
+    }
+
+    struct CaptureSubscriber;
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            CAPTURED.with(|captured| {
+                let mut captured = captured.borrow_mut();
+                let Some(buffer) = captured.as_mut() else {
+                    // A test that is not capturing, or another test's thread.
+                    return;
+                };
+                let mut connector = ConnectorField::default();
+                event.record(&mut connector);
+                buffer.push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    connector: connector.0,
+                });
+            });
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    /// Runs `body` with this thread's log buffer switched on, and hands back what it emitted.
+    fn capturing_logs<T>(body: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            // Ignored on purpose: another test binary in the same process having got here
+            // first is fine, and a capture test that then sees nothing fails loudly anyway.
+            let _ = tracing::subscriber::set_global_default(CaptureSubscriber);
+        });
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        let out = body();
+        let events = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+        (out, events)
+    }
 
     /// In-memory `Channel` for unit testing. `recv_timeout` drains a pre-seeded queue of events;
     /// once drained it returns `Timeout`, which lets `elapse_` terminate deterministically. `send`
@@ -1714,6 +1919,12 @@ mod tests {
     /// receiver that reports one out of range is a bug in the receiver, but the bot must say so
     /// rather than write past the end of its own state — and it must say so *before* the batch
     /// arms index the connector table, which they do earlier than `process_event` runs.
+    ///
+    /// **This pins `connector_of`, and only it.** The two marker cases are the load-bearing
+    /// ones: they never reach `process_event` at all, so deleting the check in `connector_of`
+    /// turns them into a silent `open_batch(0, ..)` on somebody else's connector and this test
+    /// goes red. The feed case is shielded by `connector_of` running first, so it says nothing
+    /// about the check at the head of `process_event` — that one has its own pin below.
     #[test]
     fn an_out_of_range_instrument_is_reported_not_indexed() {
         let mut bot = make_bot(&["BTCUSDT"], vec![(9, bid("BTCUSDT", 100.0, 5.0))]);
@@ -2377,5 +2588,472 @@ mod tests {
             vec![Duration::from_millis(30)],
             "with no heartbeat there is nothing to wake up for"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The ceiling on the two roads the first cut missed: silence, and churn.
+    //
+    // Both are timed against real `Instant`s, because that is what the ceiling is measured in.
+    // The channels below hand out 1 ms frames and give up after a fixed budget, so a broken
+    // ceiling is a red test with a message inside half a second rather than a run that hangs
+    // for the 60 s an order wait is allowed to take.
+    // ---------------------------------------------------------------------------------------
+
+    /// Twenty frames' worth, so that a deferral which is *supposed* to reach the ceiling cannot
+    /// be confused with two 1 ms sleeps overshooting on a loaded machine.
+    const TEST_CEILING: Duration = Duration::from_millis(20);
+
+    /// The budget every timed channel below starts with: 400 frames ≈ 400 ms, twenty times the
+    /// ceiling under test and a hundredth of the 60 s wait it has to beat.
+    const TIMED_BUDGET: usize = 400;
+
+    fn timed_bot<CH>(channel: CH) -> LiveBot<CH, HashMapMarketDepth> {
+        let mut bot = LiveBot::new(
+            42,
+            channel,
+            vec![
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        );
+        bot.max_batch_hold = TEST_CEILING;
+        bot
+    }
+
+    /// One connector opens a batch, hands over whatever this `elapse` is waiting for, and then
+    /// **everything goes quiet** — no `BatchEnd`, no further frames on any channel.
+    ///
+    /// This is a connector dying between its two markers on an otherwise silent feed, and it is
+    /// the road the busy-feed channel above cannot reach: every receive from here on expires
+    /// instead of returning an event.
+    struct SilentAfterBatchChannel {
+        opened: bool,
+        trigger: Option<LiveEvent>,
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl SilentAfterBatchChannel {
+        fn new(trigger: LiveEvent) -> Self {
+            Self {
+                opened: false,
+                trigger: Some(trigger),
+                budget: TIMED_BUDGET,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Channel for SilentAfterBatchChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            if !self.opened {
+                self.opened = true;
+                return Ok((0, LiveEvent::BatchStart));
+            }
+            if let Some(trigger) = self.trigger.take() {
+                return Ok((0, trigger));
+            }
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "silence behind an unclosed batch held this elapse past every plausible \
+                     ceiling"
+                        .to_string(),
+                ));
+            }
+            Err(BotError::Timeout)
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// **The ceiling has to hold on the road where nothing arrives.** A connector that dies
+    /// between `BatchStart` and `BatchEnd` stops producing anything at all, so every later
+    /// receive expires — and an expiry that does not consult the ceiling leaves the deferred
+    /// response sitting there until the call's own duration runs out. For
+    /// `wait_order_response` that duration is a hardcoded 60 s, six times the connector's
+    /// liveness window: the bot goes on heartbeating from inside the loop and has its resting
+    /// grid cancelled underneath it while it waits.
+    #[test]
+    fn an_orphaned_batch_and_then_total_silence_releases_at_the_ceiling() {
+        let mut bot = timed_bot(SilentAfterBatchChannel::new(order_event("BTC", 7, 100.0)));
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= TEST_CEILING,
+            "the batch must defer the response until the ceiling, not sail through it: {held:?}"
+        );
+        assert!(
+            held < Duration::from_secs(1),
+            "and silence must not postpone the release to the 60 s timeout: {held:?}"
+        );
+        assert_eq!(bot.orders(0).len(), 1, "and the response was applied");
+    }
+
+    /// Two connectors handing the open batch back and forth so that the union of their batches
+    /// is **never** empty, while no single batch is ever old.
+    ///
+    /// `hl` opens, `bnc` opens, `hl` closes, `hl` re-opens, `bnc` closes, and around again. A
+    /// ceiling clocked per connector sees nothing wrong here — every batch it looks at was
+    /// opened a frame or two ago — while the strategy has not been allowed to run since the
+    /// first `BatchStart`.
+    struct HandoffChannel {
+        step: usize,
+        trigger: Option<LiveEvent>,
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl HandoffChannel {
+        fn new(trigger: LiveEvent) -> Self {
+            Self {
+                step: 0,
+                trigger: Some(trigger),
+                budget: TIMED_BUDGET,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Channel for HandoffChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "a handoff between two connectors held this elapse past every plausible \
+                     ceiling"
+                        .to_string(),
+                ));
+            }
+            let step = self.step;
+            self.step += 1;
+            Ok(match step {
+                0 => (0, LiveEvent::BatchStart),
+                1 => (0, self.trigger.take().expect("one trigger, once")),
+                // hl is open on entry to every cycle; the union never empties.
+                _ => match (step - 2) % 4 {
+                    0 => (1, LiveEvent::BatchStart),
+                    1 => (0, LiveEvent::BatchEnd),
+                    2 => (0, LiveEvent::BatchStart),
+                    _ => (1, LiveEvent::BatchEnd),
+                },
+            })
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// **What the ceiling bounds is how long the strategy has been held, not how old one
+    /// connector's batch is.** Two chatty connectors whose batches overlap keep the union open
+    /// for ever while each individual batch stays young, so a clock that restarts on every
+    /// re-open never expires and the bot never quotes again — the very outcome the ceiling
+    /// exists to prevent, reached without a single lost marker.
+    #[test]
+    fn an_endless_handoff_between_two_connectors_is_released_at_the_ceiling() {
+        let mut bot = timed_bot(HandoffChannel::new(order_event("BTC", 7, 100.0)));
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= TEST_CEILING,
+            "an overlapping batch is still a batch: the response waits for the ceiling: {held:?}"
+        );
+        assert!(
+            held < Duration::from_secs(1),
+            "but connectors trading the batch back and forth must not defer it for ever: {held:?}"
+        );
+        assert_eq!(bot.orders(0).len(), 1, "and the response was applied");
+    }
+
+    /// One connector's batch never closes; the other opens and closes one every other frame.
+    struct StuckWithChurnChannel {
+        step: usize,
+        trigger: Option<LiveEvent>,
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl Channel for StuckWithChurnChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "a stuck batch outlived every plausible ceiling while its neighbour churned"
+                        .to_string(),
+                ));
+            }
+            let step = self.step;
+            self.step += 1;
+            Ok(match step {
+                0 => (0, LiveEvent::BatchStart),
+                1 => (0, self.trigger.take().expect("one trigger, once")),
+                _ if (step - 2).is_multiple_of(2) => (1, LiveEvent::BatchStart),
+                _ => (1, LiveEvent::BatchEnd),
+            })
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// **A neighbour's healthy churn must not buy a stuck batch more time.** This is the case
+    /// the ceiling was written for, with traffic on the other connector added: whatever clock
+    /// the ceiling uses, a batch that opened at the start and never closed has to be released
+    /// on schedule, and a clock that restarts whenever *any* connector opens a batch would keep
+    /// it alive for as long as the neighbour keeps talking.
+    #[test]
+    fn a_stuck_batch_is_released_at_the_ceiling_while_another_connector_churns() {
+        let mut bot = timed_bot(StuckWithChurnChannel {
+            step: 0,
+            trigger: Some(order_event("BTC", 7, 100.0)),
+            budget: TIMED_BUDGET,
+            sent: Vec::new(),
+        });
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= TEST_CEILING,
+            "the stuck batch defers the response until the ceiling: {held:?}"
+        );
+        assert!(
+            held < Duration::from_secs(1),
+            "and the neighbour's traffic must not extend it: {held:?}"
+        );
+    }
+
+    /// **The ordinary case must still return the moment the books agree, not at the ceiling.**
+    /// Two connectors batching every tick are the normal picture, and a gate that waited out
+    /// the ceiling on each of them would add a quarter of a second to every quote — which is
+    /// why the ceiling here is set absurdly high: the only thing that can end these calls on
+    /// time is the all-closed window itself.
+    #[test]
+    fn a_chatty_pair_of_connectors_returns_at_every_all_closed_window() {
+        let tick = |px: f64| {
+            vec![
+                (0, LiveEvent::BatchStart),
+                (1, LiveEvent::BatchStart),
+                (0, bid("BTC", px, 5.0)),
+                (0, LiveEvent::BatchEnd),
+                (1, LiveEvent::BatchEnd),
+            ]
+        };
+        let mut script = tick(99.0);
+        script.extend(tick(100.0));
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, script);
+        bot.max_batch_hold = Duration::from_secs(10);
+
+        assert_eq!(
+            bot.wait_next_feed(false, 1_000_000_000).unwrap(),
+            ElapseResult::Ok
+        );
+        assert_eq!(
+            consumed(&bot, scripted),
+            5,
+            "the first tick ends when the last batch of that tick closes"
+        );
+        assert_eq!(bot.depth(0).best_bid(), 99.0);
+
+        assert_eq!(
+            bot.wait_next_feed(false, 1_000_000_000).unwrap(),
+            ElapseResult::Ok
+        );
+        assert_eq!(consumed(&bot, scripted), 10, "and so does the second");
+        assert_eq!(bot.depth(0).best_bid(), 100.0);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The bounds check, precisely.
+    // ---------------------------------------------------------------------------------------
+
+    /// **The check at the head of `process_event` is the one that guards the `unsafe`, and
+    /// nothing in `elapse_` reaches it.** Every index is cleared by `connector_of` first —
+    /// `conn_of_inst` is as long as `instruments` by construction — so the pin above stays
+    /// green with this check deleted, and only calling the method directly says whether it is
+    /// there at all. It is defence in depth, kept because the invariant it rests on lives in
+    /// another function and the next line writes through `get_unchecked_mut`.
+    ///
+    /// Deleting the check does not make this test fail politely: measured, it aborts the test
+    /// binary with SIGABRT from a non-unwinding panic on the reference `get_unchecked_mut`
+    /// produces past the end of a one-element `Vec`. That *is* the finding — the check is what
+    /// turns undefined behaviour into an error a consumer can read.
+    #[test]
+    fn process_event_refuses_an_out_of_range_instrument_before_it_indexes() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+
+        let result =
+            bot.process_event::<false>(9, bid("BTCUSDT", 100.0, 5.0), WaitOrderResponse::None);
+
+        assert!(matches!(result, Err(BotError::InstrumentNotFound)));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Every connector that could not be heartbeated.
+    // ---------------------------------------------------------------------------------------
+
+    /// A channel that can reach nobody.
+    struct AllUnreachableChannel {
+        attempts: usize,
+    }
+
+    impl Channel for AllUnreachableChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            Err(BotError::Timeout)
+        }
+
+        fn send(
+            &mut self,
+            _id: u64,
+            inst_no: usize,
+            _request: LiveRequest,
+        ) -> Result<(), BotError> {
+            self.attempts += 1;
+            Err(BotError::Channel {
+                connector: if inst_no == 0 { "bnc" } else { "hl" }.to_string(),
+                message: format!("SendError on {inst_no}"),
+            })
+        }
+    }
+
+    /// **A second unreachable connector must not vanish behind the first.** The heartbeat is
+    /// what keeps a connector from cancelling this bot's resting orders, so every connector it
+    /// could not reach is a venue about to sweep a grid. A consumer's tolerance branches on the
+    /// name in [`BotError::Channel`] — return only the first and a policy of "hl is fatal,
+    /// market data is not" tolerates the failure that matters, on the strength of the one that
+    /// does not.
+    #[test]
+    fn every_connector_that_could_not_be_reached_is_reported() {
+        let mut bot = LiveBot::new(
+            42,
+            AllUnreachableChannel { attempts: 0 },
+            vec![
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        );
+
+        let (result, logged) = capturing_logs(|| bot.elapse(1_000_000));
+
+        match result {
+            Err(BotError::Channel { connector, message }) => {
+                assert_eq!(connector, "bnc", "the first failure keeps the shape it had");
+                assert!(
+                    message.contains("hl"),
+                    "and the ones behind it are not dropped: {message}"
+                );
+            }
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+
+        let named: Vec<&str> = logged
+            .iter()
+            .filter(|event| event.level == Level::ERROR)
+            .filter_map(|event| event.connector.as_deref())
+            .collect();
+        assert!(
+            named.contains(&"bnc") && named.contains(&"hl"),
+            "both unreachable connectors must be named in the log, got {named:?}"
+        );
+        assert_eq!(bot.channel.attempts, 2, "and both were actually attempted");
     }
 }

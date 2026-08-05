@@ -340,6 +340,58 @@ impl<T: PolledSource> PolledSource for Rc<T> {
     }
 }
 
+/// One connector channel a request can be handed to, as [`send_to`] sees it.
+///
+/// The mirror of [`PolledSource`], and there for the same reason: [`IceoryxChannel::new`]
+/// stands up real iceoryx services, so the one place in the process where a *send-side*
+/// [`BotError::Channel`] is built from a real channel's name could not otherwise be exercised
+/// at all. Every bot-side test of that error fabricates the name in its own fake, which pins
+/// what the bot does with a name and nothing about where the name comes from.
+trait SendTarget {
+    fn name(&self) -> &str;
+    fn send(&self, id: u64, request: &LiveRequest) -> Result<(), ChannelError>;
+}
+
+impl SendTarget for IceoryxChannel<LiveRequest, LiveEvent> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn send(&self, id: u64, request: &LiveRequest) -> Result<(), ChannelError> {
+        IceoryxChannel::send(self, id, request)
+    }
+}
+
+impl<T: SendTarget> SendTarget for Rc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn send(&self, id: u64, request: &LiveRequest) -> Result<(), ChannelError> {
+        SendTarget::send(&**self, id, request)
+    }
+}
+
+/// Hands a request to the channel that carries `inst_no`, naming that channel if it will not
+/// take it.
+///
+/// The channel that could not be reached is the one that names itself. `LiveBot::heartbeat`
+/// sends to every connector in turn, so an anonymous failure here is indistinguishable from a
+/// failure on any other connector — and a consumer that cannot tell which venue went quiet
+/// has to treat all of them as fatal (`AGENTS.md` §2.2, road 3).
+fn send_to<T: SendTarget>(
+    targets: &[T],
+    id: u64,
+    inst_no: usize,
+    request: &LiveRequest,
+) -> Result<(), BotError> {
+    let target = targets.get(inst_no).ok_or(BotError::InstrumentNotFound)?;
+    target.send(id, request).map_err(|err| BotError::Channel {
+        connector: target.name().to_string(),
+        message: err.to_string(),
+    })
+}
+
 /// Which instrument an event belongs to, from the point of view of the channel that delivered
 /// it.
 ///
@@ -499,20 +551,7 @@ impl Channel for IceoryxUnifiedChannel {
     }
 
     fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
-        let channel = self
-            .channel
-            .get(inst_no)
-            .ok_or(BotError::InstrumentNotFound)?;
-        // The channel that could not be reached is the one that names itself. `heartbeat` sends
-        // to every connector, so an anonymous failure here stops trading on all of them
-        // (`AGENTS.md` §2.2, road 3).
-        channel
-            .send(id, &request)
-            .map_err(|err| BotError::Channel {
-                connector: channel.name().to_string(),
-                message: err.to_string(),
-            })?;
-        Ok(())
+        send_to(&self.channel, id, inst_no, &request)
     }
 }
 
@@ -738,5 +777,93 @@ mod tests {
             3,
             "and a refused registration changes nothing"
         );
+    }
+
+    /// One connector's outgoing half with the iceoryx taken out: either it takes the request
+    /// or it refuses it with the venue's own words.
+    struct FakeSink {
+        name: String,
+        refusal: Option<String>,
+        taken: RefCell<Vec<(u64, LiveRequest)>>,
+    }
+
+    impl FakeSink {
+        fn healthy(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                refusal: None,
+                taken: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn broken(name: &str, refusal: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                refusal: Some(refusal.to_string()),
+                taken: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SendTarget for FakeSink {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn send(&self, id: u64, request: &LiveRequest) -> Result<(), ChannelError> {
+            match &self.refusal {
+                Some(refusal) => Err(ChannelError::BuildError(refusal.clone())),
+                None => {
+                    self.taken.borrow_mut().push((id, request.clone()));
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// **Road 3, at the one place in the process where its name is actually chosen.** Every
+    /// bot-side pin of a send failure builds the name in its own fake, so all of them stay
+    /// green if this routing hands back the wrong channel's name — or a constant. The
+    /// heartbeat goes to every connector in turn, and a consumer that cannot tell which one
+    /// stopped answering has to treat every venue as fatal.
+    #[test]
+    fn a_failed_send_names_the_channel_that_carries_that_instrument() {
+        // Two instruments, two connectors, deliberately failing on the *second*: a routing
+        // that ignores `inst_no` and takes the first channel reports "hl".
+        let targets = vec![
+            FakeSink::healthy("hl"),
+            FakeSink::broken("bnc", "PublisherDisconnected"),
+        ];
+
+        match send_to(&targets, 42, 1, &LiveRequest::Heartbeat) {
+            Err(BotError::Channel { connector, message }) => {
+                assert_eq!(connector, "bnc");
+                assert!(
+                    message.contains("PublisherDisconnected"),
+                    "the transport's own words must survive: {message}"
+                );
+            }
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+
+        assert!(
+            send_to(&targets, 42, 0, &LiveRequest::Heartbeat).is_ok(),
+            "and the connector that can be reached still hears it"
+        );
+        assert_eq!(targets[0].taken.borrow().len(), 1);
+        assert!(targets[1].taken.borrow().is_empty());
+    }
+
+    /// An index no channel carries is refused rather than routed to whichever channel happens
+    /// to sit at that position — the send-side twin of the bounds check in `LiveBot`.
+    #[test]
+    fn a_send_to_an_instrument_no_channel_carries_is_refused() {
+        let targets = vec![FakeSink::healthy("hl")];
+
+        assert!(matches!(
+            send_to(&targets, 42, 9, &LiveRequest::Heartbeat),
+            Err(BotError::InstrumentNotFound)
+        ));
+        assert!(targets[0].taken.borrow().is_empty());
     }
 }
