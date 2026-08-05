@@ -228,11 +228,35 @@ _NO_SECOND_PRODUCER = (
 #: reads, stamps and enqueues in that order, so a same-class step backwards
 #: keeps no tolerance at all — `scan_symbol_file` files it under
 #: `monotonic_violation`, red at a nanosecond, and nothing here reaches it.
-#: An unclassifiable frame gets the exemption too, and costs nothing by it: it
-#: came off one of these same sockets, and if it came off the row's own socket
-#: the two are sequential and cannot invert at all, so the tolerance can only
-#: ever apply where it is earned. That it could not be classified is its own
-#: finding (`unclassified_frame`).
+#:
+#: **An unclassifiable frame gets the exemption too, and that is a decision,
+#: not a fall-out** — pinned by
+#: `test_an_extended_inversion_against_an_unclassified_frame_is_yellow`, because
+#: before this exemption existed such a pair was red at a nanosecond and a
+#: silent flip is the defect this whole file is written against. Whatever the
+#: backend wrote came off one of these same per-channel sockets — recording a
+#: channel this report has not been taught is the ordinary way to get here, and
+#: on this venue a new channel is a new socket — so the pair really is two tasks
+#: racing, unless the frame came off the *other* row's own socket, and one task
+#: reads, stamps and enqueues in that order, so a same-socket pair cannot invert
+#: at all.
+#:
+#: The residual is that last clause read backwards: frames of one socket split
+#: between this bucket and their own stream share no monotonic cursor, so if
+#: such a pair inverts anyway it collects the cross-stream tolerance instead of
+#: the red a correctly named pair would get. Accepted, because it cannot arrive
+#: quietly. It needs the classifier to be out of date, which is its own finding
+#: on the same file and the same day (`unclassified_frame`); misclassification
+#: is a different failure from reordering and that finding is its detector; and
+#: every defect the red exists for reaches a detector this bucket cannot dull —
+#: a clock step lands inside the busiest *classified* stream
+#: (`monotonic_violation`, red at a nanosecond), and two recordings in one file
+#: disorder every stream against every other and fail `gzip_integrity` first.
+#: Failing closed instead — the exemption restricted to two named streams — was
+#: tried and rejected: it reds exactly the frames the report has just said it
+#: cannot name, which is a hard build refusal earned by this file's own
+#: ignorance rather than by anything in the recording, and it prints the
+#: `_NO_SECOND_PRODUCER` sentence over a venue that has one.
 #:
 #: Keyed by exchange rather than by family: which sockets get opened is a
 #: property of the backend and of nothing else. Membership is a claim about
@@ -298,8 +322,14 @@ def second_producer_of(exchange, prev_stream, stream) -> Optional[Producer]:
         return found[0]
     if fans_out_per_channel(exchange):
         # Every stream of this venue is a socket task of its own, and this pair
-        # is two different streams (`scan_symbol_file` sends a same-stream step
-        # to `monotonic_violation` instead), so it is two tasks by construction.
+        # is two different keys (`scan_symbol_file` sends a same-key step to
+        # `monotonic_violation` instead), so it is two tasks by construction.
+        # `UNCLASSIFIED` is one of those keys and is answered here too, on
+        # purpose: what this report could not name still came off one of these
+        # sockets. It is safe because misclassification is a different failure
+        # from reordering and has its own finding — `_FANS_OUT_PER_CHANNEL`
+        # carries the argument, the one residual it does not cover, and the
+        # pin.
         return _FAN_OUT_PRODUCER
     return None
 
@@ -1864,8 +1894,17 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
                 # is the relation nothing can explain: what a second producer
                 # wrote between them crossed a different hop and cannot have
                 # reordered either. Classified through the same function as
-                # every other pair, which for two shared-chain streams can only
-                # answer `INTERLEAVE_EXCESS` — there is one classifier, not two.
+                # every other pair — there is one classifier, not two — and what
+                # it answers depends on the venue, not on which cursor caught
+                # the pair. On a single-reader venue that is `INTERLEAVE_EXCESS`
+                # and nothing else. On a fan-out venue
+                # (`fans_out_per_channel`) every stream is a socket task of its
+                # own, so this is where its cross-stream pairs get the bounded
+                # second-producer verdict — and this cursor is the ONLY one they
+                # reach, because none of that venue's streams is in
+                # `_SECOND_PRODUCER`, so `shares_the_whole_chain` holds for all
+                # of them — see `pair_kind` above, and the test named there for
+                # when that stops being true.
                 kind = pair_kind(prev_shared_stream, key, prev_shared_ts - ts)
                 scan.interleave[kind] = _note_inversion(
                     scan.interleave.get(kind),

@@ -2468,6 +2468,80 @@ def test_an_extended_inversion_within_one_stream_is_red_at_any_size(tmp_path, de
     assert symbol["interleave_excess"] is None
 
 
+def test_an_extended_inversion_against_an_unclassified_frame_is_yellow(tmp_path):
+    """The decision the fan-out change made about frames it cannot name, pinned.
+
+    A frame this report does not recognise is bucketed under `UNCLASSIFIED`,
+    which is a key like any other, so a cross-key inversion involving it reaches
+    the fan-out exemption: before 2026-08-05 such a pair was `interleave_excess`,
+    red, at a nanosecond, and at HEAD it is a bounded yellow. That flip is
+    deliberate and this is where it is decided rather than left to fall out.
+
+    **Yellow, because the premise of the exemption holds for it too**: an
+    Extended socket task is spawned per channel URL, so whatever the backend
+    wrote came off one of those sockets and did race the row it is out of order
+    with. Recording a channel the report has not been taught is the ordinary way
+    to get here — the same shape as Paradex's full-depth `deltas` feed — and
+    that is a new socket, not a new producer of some other kind.
+
+    **And safe, because it cannot arrive quietly.** The naming failure is its
+    own finding on the same file and the same day (`unclassified_frame`,
+    asserted below, which is why it is asserted below), and misclassification is
+    a different failure from reordering: every defect the red exists for still
+    reaches a detector this bucket cannot dull — a clock step lands inside the
+    busiest *classified* stream as `monotonic_violation`, red at a nanosecond,
+    and two recordings in one file fail `gzip_integrity`. Failing closed instead
+    — the exemption restricted to two named streams — would red exactly the
+    frames the report has just admitted it cannot name, i.e. refuse a build over
+    its own ignorance. See `_FANS_OUT_PER_CHANNEL`, which carries the argument
+    and the one residual it does not cover.
+    """
+    d = tmp_path / "ext-unclassified"
+    d.mkdir()
+    base = ns(1)
+    # `type` is neither SNAPSHOT/DELTA nor MP and `data` carries no funding rate,
+    # so `classify` returns None: a channel of this venue the report has not
+    # been taught, which on Extended means a socket of its own.
+    foreign = {"type": "STATS", "data": {"m": "BTC-USD", "x": "1"}, "ts": ms_of(base), "seq": 3}
+    write_gz(
+        d / f"btc-usd_{DAY}.gz",
+        [
+            (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+            (base, extended_mark("BTC-USD", base, 2)),
+            (base - 500, foreign),  # 500ns backwards, the width of the race
+        ],
+    )
+    write_meta(d, "extended", DAY, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    code, report = run(d, out=tmp_path / "r.json")
+
+    assert code == 0, issues_of(report, "extended")
+    checks = checks_of(report, "extended", severity="yellow")
+    assert "interleave_inversion" in checks
+    assert "interleave_excess" not in checks_of(report, "extended")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["interleave_inversion"]["max_delta_ns"] == 500
+    assert symbol["interleave_inversion"]["previous_stream"] == "mark"
+    assert symbol["interleave_inversion"]["stream"] == qr.UNCLASSIFIED
+    assert symbol["interleave_excess"] is None
+    # Not a within-stream step: the two came off two sockets, and the report
+    # says which pair it is looking at.
+    assert symbol["monotonic_violation"] is None
+
+    # The other half of the decision, and the reason the first half is safe: the
+    # frame the report could not name is reported as such, on this same file.
+    # Drop this finding and the yellow above becomes a silent tolerance.
+    assert "unclassified_frame" in checks
+    assert symbol["unclassified_frames"] == 1
+
+    # And it is answered by the fan-out verdict path, not by some third text:
+    # one classifier, one explanation.
+    detail = next(
+        i for i in issues_of(report, "extended") if i["check"] == "interleave_inversion"
+    )["detail"]
+    assert "two socket tasks" in detail
+    assert "no second producer" not in detail
+
+
 @pytest.mark.parametrize(
     "first,second", [("bbo", "trades"), ("book_snapshot", "book_interactive")]
 )
@@ -4235,6 +4309,17 @@ def test_extended_still_opens_one_socket_per_channel(tmp_path):
     )
     # Each task stamps its own receive moment, which is what makes them two
     # producers rather than one reader handing frames on in order.
+    #
+    # Residual, and the edge of what this pin guarantees: these two substrings
+    # say the KNOWN send site still stamps at receive, not that it is the only
+    # one. A second `ws_tx.send` added beside it with a request-time or
+    # venue-copied stamp would leave both assertions true while creating the
+    # sub-second lookahead the exemption tolerates — the same shape as the
+    # premiumIndex stamp defect `interleave_kind` keeps a bound for. There is
+    # one send site in `extended/http.rs` today; a stricter form (count the
+    # sends, require every one to carry `recv_time`) is possible but pins the
+    # backend's shape rather than its behaviour, so it is deliberately not
+    # taken here — same mirror-pin convention as the tests around it.
     assert "let recv_time = Utc::now();" in http
     assert "ws_tx.send((recv_time, text))" in http
 
