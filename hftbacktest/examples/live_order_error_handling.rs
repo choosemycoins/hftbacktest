@@ -27,22 +27,24 @@ fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
             HashMapMarketDepth::new(0.001, 1.0),
             0,
         ))
-        .error_handler(|error| {
+        // The connector the error came from — see `gridtrading_live_bybit.rs` for why it is
+        // worth branching on rather than only logging.
+        .error_handler(|connector, error| {
             match error.kind {
                 ErrorKind::ConnectionInterrupted => {
-                    error!("ConnectionInterrupted");
+                    error!(%connector, "ConnectionInterrupted");
                 }
                 ErrorKind::CriticalConnectionError => {
-                    error!("CriticalConnectionError");
+                    error!(%connector, "CriticalConnectionError");
                 }
                 ErrorKind::OrderError => {
                     let error = error.value();
                     match error {
                         Value::String(err) => {
-                            error!(?err, "OrderError");
+                            error!(%connector, ?err, "OrderError");
                         }
                         Value::Map(err) => {
-                            error!(?err, "OrderError");
+                            error!(%connector, ?err, "OrderError");
                         }
                         _ => {}
                     }

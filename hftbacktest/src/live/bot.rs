@@ -63,7 +63,13 @@ pub enum BotError {
     Custom(String),
 }
 
-pub type ErrorHandler = Box<dyn Fn(LiveError) -> Result<(), BotError>>;
+/// Called with the name of the connector the error came from, and the error.
+///
+/// The name is what makes the difference between "the venue I trade on dropped its stream" and
+/// "the venue I only read a signal from did", which are the same [`LiveError`] on the wire and
+/// have opposite right answers. Deciding which is which is the consumer's job — the library
+/// only says who (`AGENTS.md` §1.1).
+pub type ErrorHandler = Box<dyn Fn(&str, LiveError) -> Result<(), BotError>>;
 pub type OrderRecvHook = Box<dyn Fn(&Order, &Order) -> Result<(), BotError>>;
 
 /// How often a [`LiveBot`] tells its connectors that its event loop is still turning.
@@ -184,7 +190,7 @@ impl<MD> LiveBotBuilder<MD> {
     /// Registers the error handler to deal with an error from connectors.
     pub fn error_handler<Handler>(self, handler: Handler) -> Self
     where
-        Handler: Fn(LiveError) -> Result<(), BotError> + 'static,
+        Handler: Fn(&str, LiveError) -> Result<(), BotError> + 'static,
     {
         Self {
             error_handler: Some(Box::new(handler)),
@@ -511,8 +517,12 @@ where
                 instrument.position_observed = true;
             }
             LiveEvent::Error(error) => {
-                if let Some(handler) = self.error_handler.as_mut() {
-                    handler(error)?;
+                // `conn_of_inst` is as long as `instruments`, which the check above has
+                // already cleared. Read before the handler and through a shared borrow —
+                // `ErrorHandler` is `Fn`, so both can be held at once.
+                let connector = self.connector_names[self.conn_of_inst[inst_no]].as_str();
+                if let Some(handler) = self.error_handler.as_ref() {
+                    handler(connector, error)?;
                 }
             }
             LiveEvent::SnapshotComplete { .. } => {
@@ -540,6 +550,18 @@ where
     /// A failure propagates. It is the same treatment [`Self::submit_order`] gives a failed
     /// send, and it is the honest one: a bot that cannot reach its connector is a bot whose
     /// orders that connector is about to cancel.
+    ///
+    /// **But it propagates only after every connector has been told.** Reporting from inside
+    /// the loop would mean an unreachable connector starves the ones behind it of their
+    /// heartbeat, and starving a connector is how a healthy bot gets its resting grid
+    /// cancelled — so a market-data-only venue nobody trades on could sweep the venue that
+    /// holds the money. The name in [`BotError::Channel`] is what lets the consumer decide
+    /// which failure is which; that decision is not the library's (`AGENTS.md` §1.1).
+    ///
+    /// `last_heartbeat` advances even when a send failed, so the failure is reported at the
+    /// heartbeat's cadence rather than on every call. A consumer that tolerates it calls
+    /// `elapse` again straight away, and retrying each time would be a busy loop reporting the
+    /// same thing.
     fn heartbeat(&mut self, now: Instant) -> Result<(), BotError> {
         let Some(interval) = self.heartbeat_interval else {
             return Ok(());
@@ -550,12 +572,17 @@ where
         {
             return Ok(());
         }
+        let mut first_failure = None;
         for inst_no in 0..self.instruments.len() {
-            self.channel
-                .send(self.id, inst_no, LiveRequest::Heartbeat)?;
+            if let Err(error) = self.channel.send(self.id, inst_no, LiveRequest::Heartbeat) {
+                first_failure.get_or_insert(error);
+            }
         }
         self.last_heartbeat = Some(now);
-        Ok(())
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The longest a single [`Channel::recv_timeout`] may block, given how much of the
@@ -1011,13 +1038,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Duration};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
 
     use super::*;
     use crate::{
         depth::HashMapMarketDepth,
         live::{Instrument, ipc::Channel},
-        types::{BuildError, LiveEvent, LiveRequest, OrdType, Order, Side, Status, TimeInForce},
+        types::{
+            BuildError,
+            ErrorKind,
+            LiveError,
+            LiveEvent,
+            LiveRequest,
+            OrdType,
+            Order,
+            Side,
+            Status,
+            TimeInForce,
+        },
     };
 
     /// In-memory `Channel` for unit testing. `recv_timeout` drains a pre-seeded queue of events;
@@ -1695,6 +1733,327 @@ mod tests {
             bot.elapse(1_000_000),
             Err(BotError::InstrumentNotFound)
         ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Where an error came from. Three roads, all anonymous before this: the handler's
+    // `LiveError`, a failed receive, and a failed send (`AGENTS.md` §2.2). All three end in the
+    // same place for a consumer — `Err` out of `elapse`, which `myhft` treats as fatal — so
+    // without a name, a market-data-only connector's routine reconnect stops trading on the
+    // venue that holds the money.
+    // ---------------------------------------------------------------------------------------
+
+    fn recording_handler(log: Rc<RefCell<Vec<(String, ErrorKind)>>>) -> ErrorHandler {
+        Box::new(move |connector, error| {
+            log.borrow_mut().push((connector.to_string(), error.kind));
+            Ok(())
+        })
+    }
+
+    /// A consumer's policy, in the shape #20 step 4 needs: the connector it trades on is fatal,
+    /// the one it only reads a signal from is not.
+    fn hl_is_fatal() -> ErrorHandler {
+        Box::new(|connector, _error| match connector {
+            "hl" => Err(BotError::Interrupted),
+            _ => Ok(()),
+        })
+    }
+
+    #[test]
+    fn an_error_is_attributed_to_the_connector_it_came_from() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut bot = make_multi_connector_bot(
+            &HL_AND_BNC,
+            vec![
+                // `1` is Binance's representative instrument, `0` is Hyperliquid's — which is
+                // all the channel can say about an event that carries no symbol.
+                (
+                    1,
+                    LiveEvent::Error(LiveError::new(ErrorKind::ConnectionInterrupted)),
+                ),
+                (
+                    0,
+                    LiveEvent::Error(LiveError::new(ErrorKind::CriticalConnectionError)),
+                ),
+            ],
+        );
+        bot.error_handler = Some(recording_handler(log.clone()));
+
+        bot.elapse(1_000_000).unwrap();
+
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                ("bnc".to_string(), ErrorKind::ConnectionInterrupted),
+                ("hl".to_string(), ErrorKind::CriticalConnectionError),
+            ]
+        );
+    }
+
+    /// **The main money pin.** Every backend publishes `ConnectionInterrupted` on a routine
+    /// reconnect, and a consumer that treats it as fatal exits the process. With two
+    /// connectors that means Binance reconnecting stops Hyperliquid trading. The bot has to be
+    /// able to tolerate one and not the other, and carry on with the tick.
+    #[test]
+    fn a_tolerated_market_data_fault_does_not_end_the_elapse() {
+        let mut bot = make_multi_connector_bot(
+            &HL_AND_BNC,
+            vec![
+                (
+                    1,
+                    LiveEvent::Error(LiveError::new(ErrorKind::ConnectionInterrupted)),
+                ),
+                (0, bid("BTC", 99.0, 5.0)),
+            ],
+        );
+        bot.error_handler = Some(hl_is_fatal());
+
+        let result = bot.elapse(1_000_000).unwrap();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert_eq!(
+            bot.depth(0).best_bid(),
+            99.0,
+            "the events after the tolerated fault must still be processed"
+        );
+    }
+
+    /// ...and the direction that must not change: a fault on the connector the consumer calls
+    /// fatal is still fatal, and the tick ends there.
+    #[test]
+    fn a_fault_on_the_trading_connector_still_propagates() {
+        let mut bot = make_multi_connector_bot(
+            &HL_AND_BNC,
+            vec![
+                (
+                    0,
+                    LiveEvent::Error(LiveError::new(ErrorKind::ConnectionInterrupted)),
+                ),
+                (0, bid("BTC", 99.0, 5.0)),
+            ],
+        );
+        bot.error_handler = Some(hl_is_fatal());
+
+        assert!(matches!(bot.elapse(1_000_000), Err(BotError::Interrupted)));
+        assert!(
+            bot.depth(0).best_bid().is_nan(),
+            "the call ends at the fault"
+        );
+    }
+
+    /// A channel whose first receive fails, with the rest of the script behind it.
+    struct FaultyChannel {
+        fault: Option<BotError>,
+        rest: VecDeque<(usize, LiveEvent)>,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl Channel for FaultyChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                fault: None,
+                rest: VecDeque::new(),
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            match self.fault.take() {
+                Some(fault) => Err(fault),
+                None => self.rest.pop_front().ok_or(BotError::Timeout),
+            }
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// Road 1: a failed receive. It bypasses the error handler entirely and comes straight out
+    /// of `elapse`, so the name has to survive that far — it is what a consumer's tolerance is
+    /// built on.
+    ///
+    /// The second half is the part that is easy to forget and expensive to discover: tolerating
+    /// this one means tolerating a **truncated** tick. Unlike a tolerated `LiveError`, which
+    /// lets the loop carry on, this returns immediately, and the events behind it are still in
+    /// the queue (design note §4.3(2)).
+    #[test]
+    fn a_channel_fault_names_the_connector_it_came_from() {
+        let mut bot = LiveBot::new(
+            42,
+            FaultyChannel {
+                fault: Some(BotError::Channel {
+                    connector: "bnc".to_string(),
+                    message: "DecodeError".to_string(),
+                }),
+                rest: vec![(0, bid("BTC", 99.0, 5.0))].into(),
+                sent: Vec::new(),
+            },
+            vec![
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        );
+
+        match bot.elapse(1_000_000) {
+            Err(BotError::Channel { connector, message }) => {
+                assert_eq!(connector, "bnc");
+                assert_eq!(message, "DecodeError");
+            }
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+        assert!(
+            bot.depth(0).best_bid().is_nan(),
+            "the tick is cut short: what was behind the fault is not applied"
+        );
+        assert_eq!(bot.channel.rest.len(), 1, "...and is still queued");
+    }
+
+    /// A channel that cannot reach one connector. Records every delivery, and counts every
+    /// attempt including the failed ones.
+    struct SendFailingChannel {
+        unreachable_inst_no: usize,
+        attempts: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl Channel for SendFailingChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                unreachable_inst_no: 0,
+                attempts: 0,
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            Err(BotError::Timeout)
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.attempts += 1;
+            if inst_no == self.unreachable_inst_no {
+                return Err(BotError::Channel {
+                    connector: "bnc".to_string(),
+                    message: "SendError".to_string(),
+                });
+            }
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// Binance first, deliberately: the heartbeat walks the instruments in order, so with the
+    /// failure on index 0 an implementation that gives up at the first error never reaches
+    /// Hyperliquid at all.
+    fn make_send_failing_bot() -> LiveBot<SendFailingChannel, HashMapMarketDepth> {
+        LiveBot::new(
+            42,
+            SendFailingChannel {
+                unreachable_inst_no: 0,
+                attempts: 0,
+                sent: Vec::new(),
+            },
+            vec![
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// **Road 3, and the reason it is not merely cosmetic.** The heartbeat goes to every
+    /// connector, so one unreachable connector must not cost the others theirs: a connector
+    /// that stops hearing from a bot cancels its resting orders. Giving up at the first failure
+    /// means a market-data-only connector nobody trades on can have the trading connector sweep
+    /// a healthy grid.
+    #[test]
+    fn a_failed_heartbeat_send_names_the_connector_it_could_not_reach() {
+        let mut bot = make_send_failing_bot();
+
+        match bot.elapse(1_000_000) {
+            Err(BotError::Channel { connector, .. }) => assert_eq!(connector, "bnc"),
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+
+        let reached_hl = bot
+            .channel
+            .sent
+            .iter()
+            .filter(|(_, inst_no, request)| {
+                *inst_no == 1 && matches!(request, LiveRequest::Heartbeat)
+            })
+            .count();
+        assert_eq!(
+            reached_hl, 1,
+            "the connector that *can* be reached must still hear the heartbeat"
+        );
+    }
+
+    /// ...and the failure is reported at the heartbeat's cadence, not on every call. A consumer
+    /// that tolerates this fault calls `elapse` again immediately; retrying the send each time
+    /// would turn that into a busy loop that never reports anything new.
+    #[test]
+    fn a_heartbeat_that_could_not_be_delivered_does_not_retry_before_its_interval() {
+        let mut bot = make_send_failing_bot();
+        bot.heartbeat_interval = Some(Duration::from_secs(30));
+
+        assert!(bot.elapse(1_000_000).is_err());
+        let attempts = bot.channel.attempts;
+
+        assert!(
+            bot.elapse(1_000_000).is_ok(),
+            "the next call inside the interval must not retry, and so must not fail again"
+        );
+        assert_eq!(bot.channel.attempts, attempts);
     }
 
     // ---------------------------------------------------------------------------------------

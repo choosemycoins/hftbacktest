@@ -26,20 +26,23 @@ fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
             HashMapMarketDepth::new(0.000001, 1.0),
             0,
         ))
-        .error_handler(|error| {
+        // The connector the error came from. With one connector it is always the same name;
+        // with two it is the difference between "the venue I trade on dropped its stream" and
+        // "the venue I only read a signal from did", which are the same `ErrorKind`.
+        .error_handler(|connector, error| {
             match error.kind {
                 ErrorKind::ConnectionInterrupted => {
-                    error!("ConnectionInterrupted");
+                    error!(%connector, "ConnectionInterrupted");
                 }
                 ErrorKind::CriticalConnectionError => {
-                    error!("CriticalConnectionError");
+                    error!(%connector, "CriticalConnectionError");
                 }
                 ErrorKind::OrderError => {
                     let error = error.value();
-                    error!(?error, "OrderError");
+                    error!(%connector, ?error, "OrderError");
                 }
                 ErrorKind::Custom(errno) => {
-                    error!(%errno, "custom");
+                    error!(%connector, %errno, "custom");
                 }
             }
             Ok(())
