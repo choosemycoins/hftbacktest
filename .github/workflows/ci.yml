@@ -1,0 +1,84 @@
+name: ci
+
+# Minimal fork CI, on the integration branch `develop` (NOT master — master is a
+# fast-forward mirror of upstream nkaz001/hftbacktest and must not carry fork
+# workflows). Branches cut from develop inherit this file, so a PR back to
+# develop is checked; a direct push to develop or a feat/**/fix/** branch is too.
+#
+# Scope is deliberately the offline suites only — everything here runs with no
+# network and no venue keys, because the test suite is built that way on purpose
+# (MockChannel, string-parsed exchange messages, synthetic feeds). It closes the
+# classes that have actually bitten us: public-API/examples rot, a red data-quality
+# gate reaching prod un-tested, and a broken commit landing on develop under the
+# myhft pin. Live venue behaviour and a zero-warnings clippy gate are out of scope
+# by design (see the notes on each job).
+
+on:
+  push:
+    branches: [develop, "feat/**", "fix/**"]
+  pull_request:
+    branches: [develop]
+
+# One run per ref; a new push cancels the superseded run to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (stable) — check --all-targets + offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets is what catches public-API drift from outside: it is how the
+      # examples silently rotted last time (a break there stops `cargo test` before
+      # a single test runs, which reads as "tests failed", not "did not build").
+      - name: cargo check --all-targets
+        run: cargo check --workspace --exclude py-hftbacktest --all-targets
+      # The offline unit/parsing suites: hftbacktest, connector (bin-only), collector
+      # (bin-only). No network, no keys. `--lib --bins` is the repo's standard filter.
+      - name: cargo test (lib + bins)
+        run: cargo test --workspace --exclude py-hftbacktest --lib --bins
+    # py-hftbacktest is excluded on purpose: it has 0 Rust tests and pulls the heavy
+    # PyO3 + aws-lc-rs (s3/aws-config) toolchain surface. It is covered by the
+    # separate release-python.yml wheel build. To fold it in later, add
+    # actions/setup-python + `apt-get install cmake clang` and drop the --exclude.
+
+  fmt:
+    name: rustfmt (nightly — the only nightly need)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustfmt.toml sets unstable options (imports_granularity, imports_layout,
+      # group_imports); STABLE rustfmt silently ignores them, so `fmt --check` on
+      # stable is a false green. Build/test are pure stable — only this job is nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: cargo +nightly fmt --check
+        run: cargo +nightly fmt --all --check
+
+  python-tools:
+    name: python — collector data-quality gate (quality_report etc.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # quality_report.py itself is stdlib-only; the wider tools tests use numpy.
+      - name: install test deps
+        run: python -m pip install --upgrade numpy pytest
+      # Scope is collector/tools/ ONLY. py-hftbacktest/tests/test_hftbacktest.py is
+      # deliberately NOT run here: it fails unconditionally on a missing
+      # tmp_20240501.npz fixture that is not in the repo.
+      - name: pytest collector/tools
+        run: python -m pytest collector/tools/ -q
