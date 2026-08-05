@@ -42,14 +42,17 @@ What it checks, per finalized UTC day per venue directory:
    the sidecar already accounts for.
 6. **`local_ts` monotonicity, per stream** — with a tolerance for the order two
    streams are interleaved in, allowed only where a second producer exists to
-   have raced (`_SECOND_PRODUCER`) and only as far as the hand-offs the *late*
-   row of the pair crossed alone can hold it back (`interleave_kind`): the
-   socket hop where the REST snapshot went first (`CROSS_STREAM_TOLERANCE_NS`),
-   no bound at all where the `premiumIndex` poll went first, because the late
-   row then waited in the writer hop too, and a ceiling of its own where the
-   poll is itself the late row (`POLLER_HOP_CEILING_NS`) — its own hand-off is
-   all it can have waited in, and a poll stamped anywhere but at receive shows
-   up here or nowhere.
+   have raced (a stream with a hand-off of its own, `_SECOND_PRODUCER`, or a
+   venue that opens one socket per channel, `_FANS_OUT_PER_CHANNEL`) and only as
+   far as the hand-offs the *late* row of the pair crossed alone can hold it
+   back (`interleave_kind`): the socket hop where the REST snapshot went first
+   (`CROSS_STREAM_TOLERANCE_NS`),
+   that same figure as a reused ceiling where two channel sockets of one runtime
+   raced, no bound at all where the `premiumIndex` poll went first, because the
+   late row then waited in the writer hop too, and a ceiling of its own where
+   the poll is itself the late row (`POLLER_HOP_CEILING_NS`) — its own hand-off
+   is all it can have waited in, and a poll stamped anywhere but at receive
+   shows up here or nowhere.
 7. **Coverage at both ends**, reported **per symbol** as the interval in which
    *every* required stream of that symbol is live (max of the firsts, min of the
    lasts). That — not the venue-wide union — is what Phase 3 must trim to: a
@@ -124,15 +127,22 @@ MAX_GAP_ISSUES = 10
 #: of the recording starts "explaining" every gap in the day.
 EXPLAIN_MARGIN_NS = SEC_NS // 10
 
-#: The names `collector/src/queue.rs` gives the two hand-offs that carry a record
-#: the last step, into `Writer::write`. A WS frame reaches `WRITER_HOP` only
-#: after the socket hop (`queue::WS_HOP`) ahead of it; a second producer can put
-#: one there directly, or — the poller, and only the poller — bypass it entirely
-#: with a hop of its own.
+#: The names `collector/src/queue.rs` gives the hand-offs a record crosses on its
+#: way into `Writer::write`. A WS frame reaches `WRITER_HOP` only after the
+#: socket hop (`WS_HOP`) ahead of it; a second producer can put one there
+#: directly, or — the poller, and only the poller — bypass it entirely with a hop
+#: of its own.
+#:
+#: `WS_HOP` is here because a *fan-out* venue's second producer is upstream of
+#: it rather than past it: several socket tasks feed this one hop, so it is the
+#: first queue their frames share and therefore the first thing that stops
+#: holding them apart. See `_FANS_OUT_PER_CHANNEL`.
 #:
 #: Mirrored rather than imported, like the capacities below, and pinned against
-#: the Rust by `test_the_poller_still_has_a_hand_off_of_its_own` — because which
-#: hop a producer uses is now the whole of the interleave model.
+#: the Rust by `test_the_poller_still_has_a_hand_off_of_its_own` and
+#: `test_the_socket_hop_the_fan_out_shares_is_the_one_the_rust_names` — because
+#: which hop a producer uses is now the whole of the interleave model.
+WS_HOP = "websocket->parser"
 WRITER_HOP = "parser->writer"
 POLLER_HOP = "poller->writer"
 
@@ -156,10 +166,15 @@ class Producer:
 #: Load-bearing, not decoration: this is the whole reason two streams may be
 #: written out of `local_ts` order, so it is also what decides whether an
 #: inversion is tolerable at all, and — through `Producer.hop` — how far.
-#: Where no entry matches, the venue has one WS reader stamping and queueing
+#: Where no entry matches **and the venue does not fan out per channel**
+#: (`_FANS_OUT_PER_CHANNEL`), the venue has one WS reader stamping and queueing
 #: every frame of a symbol file, write order IS receive order, and a step
 #: backwards is a defect at any size — see `scan_symbol_file`, which records
 #: where that was verified per venue.
+#:
+#: Keyed by stream, because on the venues below the second producer is one
+#: particular feed. A fan-out venue is the other shape — there the second
+#: producer is *every* other stream — and is keyed by exchange instead.
 _SECOND_PRODUCER = {
     "depthSnapshot": Producer(
         WRITER_HOP,
@@ -184,6 +199,10 @@ _SECOND_PRODUCER = {
 #: shared-chain rows against each other across whatever a second producer wrote
 #: between them: on Binance the venue does have second producers, just not on
 #: this pair, and the two rows named need not be adjacent lines.
+#:
+#: Never printed for a fan-out venue: there every cross-stream pair has a second
+#: producer by construction, and `second_producer_of` says so before this text
+#: can be reached.
 _NO_SECOND_PRODUCER = (
     "no second producer stands between these two streams: one WS reader stamps "
     "both at receive and hands them on in that order, through hops that are "
@@ -191,8 +210,66 @@ _NO_SECOND_PRODUCER = (
     "off a different hand-off and cannot have reordered either"
 )
 
+#: Venues that open one socket per channel instead of multiplexing every channel
+#: onto one, so that **every** stream of a symbol file is its own producer.
+#:
+#: Extended is the one, and the mechanism is per-URL fan-out:
+#: `channel_urls` (`collector/src/extended/mod.rs`) gives each recorded stream a
+#: WebSocket of its own — the `/orderbooks` firehose, and `/publicTrades/{m}`,
+#: `/funding/{m}`, `/prices/mark/{m}` per market — and `keep_connections`
+#: (`extended/http.rs`) spawns one `keep_connection_one` task per URL. Each task
+#: stamps its own `Utc::now()` at its own read and then sends into the one
+#: shared socket hop, so two streams can reach that hop in the other order from
+#: the one they were stamped in. That is a second-producer race, not a
+#: single-reader defect, and it is bounded — see `interleave_kind`.
+#:
+#: **One stream class is one socket, which is why the exemption is per pair and
+#: not per venue.** Two rows of the *same* class came off the same task, which
+#: reads, stamps and enqueues in that order, so a same-class step backwards
+#: keeps no tolerance at all — `scan_symbol_file` files it under
+#: `monotonic_violation`, red at a nanosecond, and nothing here reaches it.
+#: An unclassifiable frame gets the exemption too, and costs nothing by it: it
+#: came off one of these same sockets, and if it came off the row's own socket
+#: the two are sequential and cannot invert at all, so the tolerance can only
+#: ever apply where it is earned. That it could not be classified is its own
+#: finding (`unclassified_frame`).
+#:
+#: Keyed by exchange rather than by family: which sockets get opened is a
+#: property of the backend and of nothing else. Membership is a claim about
+#: `collector/src/`, so it is pinned to it in both directions —
+#: `test_extended_still_opens_one_socket_per_channel` fails if Extended is ever
+#: refactored onto one socket (the exemption would then be tolerating a real
+#: defect for up to a second, silently), and
+#: `test_paradex_still_multiplexes_every_channel_onto_one_socket` fails if a
+#: single-reader venue grows a fan-out (its red would then be a false one).
+_FANS_OUT_PER_CHANNEL = frozenset({"extended"})
 
-def second_producer_of(prev_stream, stream) -> Optional[Producer]:
+#: What a fan-out venue's second producer is, written out for the operator.
+#:
+#: `hop` is `WS_HOP` and that is the point: unlike the two producers above, this
+#: one shares *every* queue with the row it raced — the socket hop and the
+#: writer hop both — so those cancel and what is left is only the window between
+#: one task's stamp and its enqueue.
+_FAN_OUT_PRODUCER = Producer(
+    WS_HOP,
+    "this venue opens one socket per channel and spawns a task for each "
+    "(extended/http.rs: keep_connections spawns keep_connection_one per URL), "
+    "so the other stream IS a second producer: it stamps its own Utc::now() at "
+    "its own read and races this one into the shared %s hop, and the two hops "
+    "from there to the file are FIFOs that both rows cross" % WS_HOP,
+)
+
+
+def fans_out_per_channel(exchange: str) -> bool:
+    """True where each channel of a symbol file arrives on a socket of its own.
+
+    The single place `_FANS_OUT_PER_CHANNEL` is consulted, so the classification
+    and the sentence explaining it cannot come to different answers.
+    """
+    return exchange in _FANS_OUT_PER_CHANNEL
+
+
+def second_producer_of(exchange, prev_stream, stream) -> Optional[Producer]:
     """The concurrent producer whose hand-off explains this pair, if any.
 
     This answers *which mechanism to name*, not *how far it stretches* — the
@@ -204,16 +281,27 @@ def second_producer_of(prev_stream, stream) -> Optional[Producer]:
     `POLLER_HOP` shares none, so it wins, and it is the mechanism in either
     direction: what changes with the direction is which of the two rows waited,
     not which hand-off made waiting possible.
+
+    The venue is consulted **last**, for the same reason: a named stream
+    producer shares fewer queues than a sibling channel socket does, so where
+    both apply the named one is still what holds the pair apart. No fan-out
+    venue has a poller or a REST fetcher today; the order is written down so
+    that the day one does, the answer does not depend on which check runs first.
     """
     found = [
         _SECOND_PRODUCER[name] for name in (prev_stream, stream) if name in _SECOND_PRODUCER
     ]
-    if not found:
-        return None
     for producer in found:
         if producer.hop == POLLER_HOP:
             return producer
-    return found[0]
+    if found:
+        return found[0]
+    if fans_out_per_channel(exchange):
+        # Every stream of this venue is a socket task of its own, and this pair
+        # is two different streams (`scan_symbol_file` sends a same-stream step
+        # to `monotonic_violation` instead), so it is two tasks by construction.
+        return _FAN_OUT_PRODUCER
+    return None
 
 
 def crosses_a_hand_off_of_its_own(stream) -> bool:
@@ -274,10 +362,18 @@ SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 #: separate decision, and the alternative is a gate that calls the collector's
 #: own design corruption on every burst day.
 #:
+#: A second pair is held to this same figure, and for a different reason: two
+#: channel sockets of a fan-out venue (`_FANS_OUT_PER_CHANNEL`) share *both*
+#: hops, so what is left between them is a scheduler slice rather than a queue.
+#: That is a ceiling reused, not a derivation — `interleave_kind`'s last
+#: alternative is where it is argued and its cost named.
+#:
 #: Three things this bound is NOT. It does not apply within one stream: there is
 #: one producer appending in receive order, so a step backwards of any size is
-#: red. It does not apply where no second producer exists — see
-#: `_SECOND_PRODUCER`; a venue with one WS reader gets no tolerance at all,
+#: red — including on a fan-out venue, where one stream is still one socket
+#: task reading, stamping and enqueueing in that order. It does not apply where
+#: no second producer exists — see `_SECOND_PRODUCER` and
+#: `_FANS_OUT_PER_CHANNEL`; a venue with one WS reader gets no tolerance at all,
 #: whatever the size, because there is no mechanism to tolerate. And **it does
 #: not apply where the `premiumIndex` poll was written first** — that pair has
 #: no bound at all, because the row it overtook then waited in the writer hop
@@ -366,7 +462,7 @@ def interleave_json(found: dict) -> dict:
     }
 
 
-def interleave_kind(prev_stream: str, stream: str, delta_ns: int) -> str:
+def interleave_kind(exchange: str, prev_stream: str, stream: str, delta_ns: int) -> str:
     """Which finding an out-of-order pair of streams is, from its mechanism.
 
     The pair is read in **write order**: `prev_stream` was written first,
@@ -375,13 +471,25 @@ def interleave_kind(prev_stream: str, stream: str, delta_ns: int) -> str:
     hand-offs that late row crossed **alone**, because those are the only queues
     it can have waited in while the other row went past:
 
-    * **Both rows crossed the same hops** — every WS pair on every venue, and
-      every pair at all on the venues with no second producer: Hyperliquid,
-      Bybit, Lighter, Extended and Paradex (whose only non-WS writes — the
-      universe catalog and the refusal-to-start record — go to `_meta`, not to
-      a symbol file). One reader stamps at receive and hands frames on in that
-      order, and every queue after it is a FIFO, so write order IS receive
-      order. `INTERLEAVE_EXCESS`, red, at a nanosecond.
+    * **Both rows crossed the same hops, off the same reader** — every WS pair
+      on the venues with one socket: Hyperliquid, Bybit, Lighter and Paradex.
+      The last is worth naming because it looks like the venue below and is not:
+      `collector/src/paradex/mod.rs` makes ONE `keep_connection(CHANNELS
+      .to_vec(), markets, ws_tx)` to one `WS_URL`, every channel multiplexed
+      onto that socket, and its only non-WS writes — the universe catalog and
+      the refusal-to-start record — go to `_meta` rather than to a symbol file.
+      One reader stamps at receive and hands frames on in that order, and every
+      queue after it is a FIFO, so write order IS receive order.
+      `INTERLEAVE_EXCESS`, red, at a nanosecond.
+    * **Two channel sockets of a fan-out venue** — Extended, and see
+      `_FANS_OUT_PER_CHANNEL` for why it is the only one. Both rows do cross the
+      same socket hop and the same writer hop, so both cancel; the un-shared
+      segment is upstream of the first queue, the window between one task's
+      `Utc::now()` and its `send`, in which the runtime may poll the sibling
+      socket and let it stamp later and enqueue first.
+      `CROSS_STREAM_TOLERANCE_NS` bounds it, with the same two verdicts as the
+      snapshot pair below — argued at the end of this docstring, because it is
+      a reused ceiling rather than a derivation.
     * **The late row is the poll** — it crossed `queue::POLLER_HOP` and nothing
       else, so that hop plus one turn of `main`'s `select!` is the whole of what
       it can have waited in, and `queue.rs` says in as many words that this hop
@@ -547,8 +655,25 @@ def interleave_kind(prev_stream: str, stream: str, delta_ns: int) -> str:
     worst that direction has ever produced is well inside the bound it already
     has. The poller split earned its complexity by being wrong in production, in
     the direction that costs a detector. This one has not.
+
+    **A constant of its own for the fan-out pair.** Reusing
+    `CROSS_STREAM_TOLERANCE_NS` there is a ceiling, not a derivation, and the
+    honest figure is smaller: the un-shared segment is a scheduler slice, not a
+    queue, and the worst ever recorded is 15.153us (btc-usd, 20260804, against
+    489ns on sol-usd the same day). What argues for a figure of this order all
+    the same is that the slice has no ceiling of its own — a socket task waits
+    between its stamp and its enqueue for as long as the runtime is busy
+    elsewhere, and the longest single thing on that runtime is the parser
+    draining a full socket hop, which is exactly what `SOCKET_HOP_NS` measures.
+    So the number is at least the right order, and it is a number this file
+    already measures and already pins to the Rust. Minting a tighter one off a
+    single day's observation is the move rejected two paragraphs up; the day
+    something measures the runtime's worst poll delay, split it. Until then the
+    cost is named: a genuine fan-out inversion between 15us and 1s is yellow.
+    It would have to come from a defect that leaves both `monotonic_violation`
+    and `gzip_integrity` clean, and none of the three the red exists for does.
     """
-    if second_producer_of(prev_stream, stream) is None:
+    if second_producer_of(exchange, prev_stream, stream) is None:
         # One producer, every hop shared and every hop a FIFO.
         return INTERLEAVE_EXCESS
     if crosses_a_hand_off_of_its_own(stream):
@@ -559,7 +684,10 @@ def interleave_kind(prev_stream: str, stream: str, delta_ns: int) -> str:
     if crosses_a_hand_off_of_its_own(prev_stream):
         # The poll went first; the late row waited in both hops it skipped.
         return INTERLEAVE_INVERSION_POLLER
-    # The snapshot and a WS frame, either way round: the writer hop cancels.
+    # Two producers that do meet in a shared FIFO: the snapshot and a WS frame
+    # either way round (the writer hop cancels, the socket hop is left), or two
+    # channel sockets of a fan-out venue (both hops cancel, the scheduler slice
+    # is left). One verdict path, because one bound is being applied.
     return INTERLEAVE_INVERSION if delta_ns <= CROSS_STREAM_TOLERANCE_NS else INTERLEAVE_EXCESS
 
 
@@ -1624,16 +1752,30 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
       clock, not a race. `premiumIndex` (USD-M only): one poller awaiting each
       response before the next tick, so two polls cannot overtake each other at
       all.
+    * Paradex — one reader again, and it has to be said explicitly because this
+      venue looks like the next one and is not: `paradex/mod.rs` makes ONE
+      `keep_connection(CHANNELS.to_vec(), markets, ws_tx)` to one `WS_URL`, so
+      `bbo`, both books, `trades` and `funding` are multiplexed onto a single
+      socket. Lighter is the same shape (one connection, `lighter::CHANNELS`).
+    * Extended — **not** one reader, and the one venue here that is not: one
+      WebSocket per channel and one spawned task per socket
+      (`extended/http.rs::keep_connections`), so each stream of a symbol file
+      has a producer of its own. Within a stream it still holds, for a reason
+      of its own rather than by inheritance: that stream is one task, which
+      reads, stamps `Utc::now()` and enqueues in that order, so a step
+      backwards inside it is a clock or two recordings at any size.
 
     *Between two streams* it holds exactly where the venue has one producer,
-    which is everywhere in the list above except `depthSnapshot` and
-    `premiumIndex` — so the tolerance is granted on the mechanism, not on the
-    venue and not on the size:
-    `_SECOND_PRODUCER` has to name one of the two streams before any tolerance
-    is consulted at all. A step backwards between two Hyperliquid cadences, or
-    between `bookTicker` and `trade`, is red at a nanosecond, because the one
+    which is everywhere in the list above except `depthSnapshot`,
+    `premiumIndex`, and every pair on Extended — so the tolerance is granted on
+    the mechanism, not on the venue and not on the size:
+    `_SECOND_PRODUCER` has to name one of the two streams, or
+    `_FANS_OUT_PER_CHANNEL` the venue, before any tolerance is consulted at all.
+    A step backwards between two Hyperliquid cadences, or between `bookTicker`
+    and `trade`, is red at a nanosecond, because the one
     reader that stamped them also queued them in that order. Which tolerance —
-    the socket hop's occupancy, a ceiling on the poller's own hop, or none at
+    the socket hop's occupancy, a ceiling on the poller's own hop, that same
+    figure reused for two channel sockets of one runtime, or none at
     all — follows from the hand-offs the *late* row of the pair crossed alone;
     `interleave_kind` is where that is decided and argued.
 
@@ -1655,10 +1797,12 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     real recordings: zero such inversions across the whole of
     `binancefuturesum-b` for 2026-07-29 — 23 symbol files, 136.3M shared-chain
     rows, with 110 677 poll rows and 395 REST snapshots landing among them — on
-    the same recording whose adjacent-pair inversions run to 1.046s. On a venue
-    with no second producer at all the two cursors are the same row every time,
-    so nothing about this reaches Hyperliquid, Bybit, Lighter, Extended or
-    Paradex.
+    the same recording whose adjacent-pair inversions run to 1.046s. The two
+    cursors are the same row every time on any venue whose streams are all in
+    the shared chain, which is every venue but Binance — Extended included: its
+    channels are separate *sockets*, but they all reach the writer through the
+    same two hops, so `_SECOND_PRODUCER` names none of them and nothing here
+    reaches Hyperliquid, Bybit, Lighter, Extended or Paradex.
     """
     path = Path(path)
     family = family_of(exchange)
@@ -1672,6 +1816,20 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
     prev_shared_stream = None
     last_of_stream: dict = {}
     prev_id: dict = {}
+
+    def pair_kind(earlier_stream, later_stream, delta_ns) -> str:
+        """`interleave_kind` for the venue this file was recorded on.
+
+        Bound once, outside the loop, rather than passed at each of the two
+        cursors below. Which cursor catches a pair depends on what a second
+        producer happened to write between the two rows, so a venue threaded to
+        one site and not the other is a model that classifies the same file two
+        different ways depending on the traffic — and the site that would be
+        left behind is the one no venue exercises today (an adjacent pair whose
+        late row is a `_SECOND_PRODUCER` stream, which no fan-out venue has),
+        so nothing would fail. One binding, and that cannot be written.
+        """
+        return interleave_kind(exchange, earlier_stream, later_stream, delta_ns)
 
     try:
         for lineno, raw in enumerate(iter_gz_lines(path), start=1):
@@ -1708,7 +1866,7 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
                 # reordered either. Classified through the same function as
                 # every other pair, which for two shared-chain streams can only
                 # answer `INTERLEAVE_EXCESS` — there is one classifier, not two.
-                kind = interleave_kind(prev_shared_stream, key, prev_shared_ts - ts)
+                kind = pair_kind(prev_shared_stream, key, prev_shared_ts - ts)
                 scan.interleave[kind] = _note_inversion(
                     scan.interleave.get(kind),
                     lineno,
@@ -1723,7 +1881,7 @@ def scan_symbol_file(path, exchange: str) -> FileScan:
                 # hand-offs the late row crossed alone, not on the size on its
                 # own — see `interleave_kind`, which the explanation reads too,
                 # so the two cannot disagree.
-                kind = interleave_kind(prev_stream, key, prev_ts - ts)
+                kind = pair_kind(prev_stream, key, prev_ts - ts)
                 scan.interleave[kind] = _note_inversion(
                     scan.interleave.get(kind), lineno, prev_stream, key, prev_ts, ts
                 )
@@ -2199,21 +2357,25 @@ def issue(severity: str, check: str, detail: str) -> dict:
     return {"severity": severity, "check": check, "detail": detail}
 
 
-def interleave_detail(name: str, kind: str, record: dict) -> str:
+def interleave_detail(exchange: str, name: str, kind: str, record: dict) -> str:
     """Why two streams are out of order, and whether that is still credible.
 
     `kind` is the class `scan_symbol_file` filed the pair under, passed in
     rather than recomputed: the finding and its explanation have to be the same
-    decision, or the report prints "nothing is missing" on a red.
+    decision, or the report prints "nothing is missing" on a red. `exchange` is
+    read for the same reason — `interleave_kind` reads it, and a text that did
+    not would have gone on calling a fan-out venue single-reader while the
+    classification had stopped doing so.
 
-    Six verdicts, because the class alone does not say what happened: the poller
-    pair is two different findings depending on which of the two rows waited,
-    and a text naming the wrong one is the same defect as a bound applied to the
-    wrong one. This one printed "what separates them is the WS row's own wait"
-    over a pair whose WS row was written first and waited for nothing.
+    Eight verdicts, because the class alone does not say what happened: the
+    poller pair is two different findings depending on which of the two rows
+    waited, and a text naming the wrong one is the same defect as a bound
+    applied to the wrong one. This one printed "what separates them is the WS
+    row's own wait" over a pair whose WS row was written first and waited for
+    nothing.
     """
     delta = record["max_delta_ns"]
-    producer = second_producer_of(record["previous_stream"], record["stream"])
+    producer = second_producer_of(exchange, record["previous_stream"], record["stream"])
     mechanism = _NO_SECOND_PRODUCER if producer is None else producer.mechanism
     # Which of the two rows waited decides the class, so it also decides what
     # there is to say — see `interleave_kind`. The poll written last waited on
@@ -2268,6 +2430,29 @@ def interleave_detail(name: str, kind: str, record: dict) -> str:
             "nothing on the WS side held it up, and nothing here is missing or "
             "mis-stamped — only the write order and the receive order disagree"
             % fmt_short(POLLER_HOP_CEILING_NS)
+        )
+    elif fans_out_per_channel(exchange) and kind == INTERLEAVE_EXCESS:
+        # Both hops cancel here, so the backlog hypothesis the next branch
+        # offers is not available: a deep socket hop delays both of these rows
+        # equally. What is left is the pair of failures that reorder a file
+        # regardless of any queue.
+        verdict = (
+            "further apart than two sockets of the same runtime can be: both "
+            "rows crossed the same %s and %s hops, both FIFOs, so all that "
+            "separates their stamps is the moment between one task's Utc::now() "
+            "and its send — %s of scheduling is not that (worst observed on a "
+            "real day: 15.153us). Either a clock stepped, which the "
+            "monotonicity check reports on the busiest stream first, or the "
+            "file holds two recordings"
+            % (WS_HOP, WRITER_HOP, fmt_short(CROSS_STREAM_TOLERANCE_NS))
+        )
+    elif fans_out_per_channel(exchange):
+        verdict = (
+            "within the %s ceiling these channel sockets are held to, so nothing "
+            "is missing and nothing is mis-stamped — two socket tasks stamped "
+            "their own reads and reached the shared hop in the other order, "
+            "which is what a venue with one socket per channel does"
+            % fmt_short(CROSS_STREAM_TOLERANCE_NS)
         )
     elif kind == INTERLEAVE_EXCESS:
         # Two hypotheses, and they need different responses. The backlog one is
@@ -2541,7 +2726,7 @@ def check_day(
                     issue(
                         INTERLEAVE_SEVERITY[check],
                         check,
-                        interleave_detail(name, check, record),
+                        interleave_detail(exchange, name, check, record),
                     )
                 )
 

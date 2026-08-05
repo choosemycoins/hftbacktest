@@ -931,6 +931,43 @@ def extended_dir(tmp_path, streams=("orderbook", "trades", "mark", "funding"), r
     return d
 
 
+#: The four stream classes of an Extended symbol file, and how to make one.
+#:
+#: One entry per class because on this venue one class IS one socket — the
+#: firehose `/orderbooks`, and `/publicTrades/{m}`, `/funding/{m}`,
+#: `/prices/mark/{m}` per market (`collector/src/extended/mod.rs::channel_urls`).
+#: That is the whole content of the fan-out exemption, so the tests below build
+#: their pairs by naming two classes rather than two frame shapes.
+EXTENDED_FRAME = {
+    "orderbook": lambda ts, seq: extended_book("BTC-USD", ts, seq),
+    "trades": lambda ts, seq: extended_trade("BTC-USD", ts, seq),
+    "mark": lambda ts, seq: extended_mark("BTC-USD", ts, seq),
+    "funding": lambda ts, seq: extended_funding("BTC-USD", ts, seq),
+}
+
+
+def extended_inverted(tmp_path, name, first, second, delta_ns, day=DAY):
+    """An Extended recording holding one out-of-order pair and nothing else odd.
+
+    Write order is `first` then `second`, with `second` stamped `delta_ns`
+    *before* `first` — i.e. exactly the shape the daily gate saw on 20260804.
+    A book snapshot leads so the file has the one stream its profile calls for.
+    """
+    d = tmp_path / name
+    d.mkdir()
+    base = ns(1)
+    write_gz(
+        d / f"btc-usd_{day}.gz",
+        [
+            (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+            (base, EXTENDED_FRAME[first](base, 2)),
+            (base - delta_ns, EXTENDED_FRAME[second](base - delta_ns, 3)),
+        ],
+    )
+    write_meta(d, "extended", day, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    return d
+
+
 def test_family_of_and_expected_streams_know_extended():
     """The report used to raise `ValueError` on `session_start.exchange` =
     "extended", so a recorded day could not be gate-checked at all.
@@ -2315,6 +2352,229 @@ def test_a_cross_stream_inversion_with_no_second_producer_is_red_at_any_size(
     # The old text said "within the bound, so nothing is missing" in the same
     # breath as reporting a defect.
     assert "nothing is missing" not in detail
+
+
+# --------------------------------------------------------------------------
+# Fan-out venues: one socket per channel, so every stream is its own producer
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "first,second,delta_ns",
+    [
+        # The two findings that reddened the daily gate on 20260804 and paged.
+        ("orderbook", "mark", 15_153),  # btc-usd, 4 occurrences, worst 15.153us
+        ("trades", "mark", 489),  # sol-usd, 2 occurrences, worst 489ns
+    ],
+)
+def test_an_extended_cross_stream_micro_inversion_is_the_race_it_is(
+    tmp_path, first, second, delta_ns
+):
+    """A false red that paged daily, because the model called Extended
+    single-reader when the backend is nothing of the kind.
+
+    Extended dials one WebSocket per channel and
+    `keep_connections` (`collector/src/extended/http.rs`) spawns one task per
+    URL. Each stamps its own `Utc::now()` at its own read and races the others
+    into the one shared socket hop, so two streams of a symbol file are two
+    concurrent producers — the second-producer case, not the single-reader one.
+    Both magnitudes here are the real ones, off the recording that paged: they
+    are the width of a scheduler slice, five orders of magnitude inside the
+    bound, and calling them corruption refuses a build over nothing.
+    """
+    d = extended_inverted(tmp_path, f"ext-{first}-{second}", first, second, delta_ns)
+    code, report = run(d, out=tmp_path / f"r-{first}-{second}.json")
+    assert code == 0, issues_of(report, "extended")
+    assert "interleave_excess" not in checks_of(report, "extended")
+    assert "interleave_inversion" in checks_of(report, "extended", severity="yellow")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["interleave_inversion"]["max_delta_ns"] == delta_ns
+    assert symbol["interleave_inversion"]["previous_stream"] == first
+    assert symbol["interleave_inversion"]["stream"] == second
+    assert symbol["interleave_excess"] is None
+
+    # The explanation has to be the same decision as the finding: the venue's
+    # own mechanism, not the "no second producer" sentence this used to print,
+    # and not the snapshot pair's either — that one names the socket hop as
+    # "the only queue these two do not share", which here is false twice over.
+    detail = next(
+        i for i in issues_of(report, "extended") if i["check"] == "interleave_inversion"
+    )["detail"]
+    assert "no second producer" not in detail
+    assert "keep_connection_one per URL" in detail, "the mechanism, from the Rust"
+    assert "two socket tasks" in detail, "the verdict, in the venue's own terms"
+    assert "the only queue these two do not share" not in detail
+    assert "nothing is missing" in detail
+
+
+def test_an_extended_cross_stream_inversion_past_the_bound_is_still_red(tmp_path):
+    """The exemption is bounded, so the gate is not blinded.
+
+    A fan-out venue's two rows still meet in the shared socket hop and the
+    shared writer hop, both FIFOs, so the only thing that can separate their
+    stamps is the moment between one task's `Utc::now()` and its `send`. Past
+    `CROSS_STREAM_TOLERANCE_NS` that stops being a scheduler slice and becomes
+    the same two hypotheses every other venue's red carries.
+    """
+    delta_ns = 1_200 * MS
+    assert delta_ns > qr.CROSS_STREAM_TOLERANCE_NS
+    d = extended_inverted(tmp_path, "ext-over-bound", "orderbook", "mark", delta_ns)
+    code, report = run(d, out=tmp_path / "r.json")
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "extended", severity="red")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["interleave_excess"]["max_delta_ns"] == delta_ns
+    detail = next(
+        i for i in issues_of(report, "extended") if i["check"] == "interleave_excess"
+    )["detail"]
+    assert "nothing is missing" not in detail
+    # And it says the true thing about this venue rather than the snapshot
+    # pair's: a deep socket hop delays BOTH of these rows, so "check _meta for a
+    # burst" is not a lead here, and the hop is not a queue they fail to share.
+    assert "the only queue these two do not share" not in detail
+    assert "both FIFOs" in detail
+    assert "two recordings" in detail
+
+
+@pytest.mark.parametrize("delta_ns", [1, 15_153, 2 * SEC])
+def test_an_extended_inversion_within_one_stream_is_red_at_any_size(tmp_path, delta_ns):
+    """The fan-out exemption is about two sockets; one socket keeps no tolerance.
+
+    Each Extended channel is one task reading, stamping and enqueueing in that
+    order, so within a stream write order IS receive order — the single-reader
+    argument survives intact per channel, and a step backwards there is a clock
+    or two recordings whatever its size. `interleave_kind` is never consulted
+    for it: `scan_symbol_file` files a same-stream step under
+    `monotonic_violation`, and that path is untouched by this change.
+    """
+    d = tmp_path / f"ext-within-{delta_ns}"
+    d.mkdir()
+    base = ns(1)
+    write_gz(
+        d / f"btc-usd_{DAY}.gz",
+        [
+            (ns(0), extended_book("BTC-USD", ns(0), 1, kind="SNAPSHOT")),
+            (base, extended_mark("BTC-USD", base, 2)),
+            (base - delta_ns, extended_mark("BTC-USD", base - delta_ns, 3)),
+        ],
+    )
+    write_meta(d, "extended", DAY, [(ns(0), session_start("extended", ["BTC-USD"]))])
+    code, report = run(d, out=tmp_path / f"r-{delta_ns}.json")
+    assert code == 1
+    assert "monotonicity" in checks_of(report, "extended", severity="red")
+    symbol = report["venues"]["extended"]["days"][DAY]["symbols"]["btc-usd"]
+    assert symbol["monotonic_violation"]["max_delta_ns"] == delta_ns
+    assert symbol["interleave_inversion"] is None
+    assert symbol["interleave_excess"] is None
+
+
+@pytest.mark.parametrize(
+    "first,second", [("bbo", "trades"), ("book_snapshot", "book_interactive")]
+)
+def test_a_paradex_cross_stream_inversion_stays_red_at_a_nanosecond(
+    tmp_path, first, second
+):
+    """Paradex is genuinely single-reader and must not ride Extended's exemption.
+
+    `collector/src/paradex/mod.rs` makes ONE `keep_connection(CHANNELS.to_vec(),
+    markets, ws_tx)` to one `WS_URL`, every channel multiplexed on that one
+    socket, so one reader stamps and queues every frame of a symbol file and
+    write order IS receive order. The venue passed the gate on the same day
+    Extended reddened it; a per-venue exemption written as a per-family or
+    per-"new venue" one would have taken this red with it.
+    """
+    d = tmp_path / f"pdx-{first}-{second}"
+    d.mkdir()
+    make = {
+        "bbo": lambda ts, seq: paradex_bbo(MARKET, ts, seq),
+        "trades": lambda ts, seq: paradex_trade(MARKET, ts, seq),
+        "book_snapshot": lambda ts, seq: paradex_book(MARKET, ts, seq, feed="snapshot"),
+        "book_interactive": lambda ts, seq: paradex_book(
+            MARKET, ts, seq, feed="interactive"
+        ),
+    }
+    base = ns(1)
+    write_gz(
+        d / f"{MARKET.lower()}_{DAY}.gz",
+        [
+            (ns(0), paradex_book(MARKET, ns(0), 1, feed="snapshot")),
+            (base, make[first](base, 2)),
+            (base - 1, make[second](base - 1, 3)),
+        ],
+    )
+    write_meta(d, "paradex", DAY, [(ns(0), session_start("paradex", [MARKET]))])
+    code, report = run(d, out=tmp_path / f"r-{first}-{second}.json")
+    assert code == 1
+    assert "interleave_excess" in checks_of(report, "paradex", severity="red")
+    detail = next(
+        i for i in issues_of(report, "paradex") if i["check"] == "interleave_excess"
+    )["detail"]
+    assert "no second producer" in detail
+
+
+@pytest.mark.parametrize(
+    "exchange",
+    ["bybit", "hyperliquid", "lighter", "binance", "binancefuturesum",
+     "binancefuturescm", "paradex", "aster"],
+)
+def test_extended_is_the_only_venue_the_fan_out_exemption_reaches(exchange):
+    """The set is named, closed, and its members are the ones with the shape.
+
+    Written against every venue the report knows rather than against Extended
+    alone: the failure this guards is a predicate that widens — an exemption
+    keyed on "not Binance", on a family, or on "the venues added recently" —
+    and only a test over the whole list can see that.
+    """
+    assert qr.fans_out_per_channel(exchange) is False
+    assert qr.interleave_kind(exchange, "orderbook", "mark", 1) == qr.INTERLEAVE_EXCESS
+    assert qr.second_producer_of(exchange, "orderbook", "mark") is None
+
+    assert qr.fans_out_per_channel("extended") is True
+    assert (
+        qr.interleave_kind("extended", "orderbook", "mark", 1)
+        == qr.INTERLEAVE_INVERSION
+    )
+    assert (
+        qr.interleave_kind(
+            "extended", "orderbook", "mark", qr.CROSS_STREAM_TOLERANCE_NS
+        )
+        == qr.INTERLEAVE_INVERSION
+    )
+    assert (
+        qr.interleave_kind(
+            "extended", "orderbook", "mark", qr.CROSS_STREAM_TOLERANCE_NS + 1
+        )
+        == qr.INTERLEAVE_EXCESS
+    )
+
+
+def test_no_fan_out_venue_has_a_stream_with_a_hand_off_of_its_own():
+    """The invariant that keeps one binding point enough. Fails when it lapses.
+
+    `scan_symbol_file` has two cursors, and which one catches an out-of-order
+    pair depends on whether the late row is a `_SECOND_PRODUCER` stream. While
+    no fan-out venue HAS such a stream, only the shared-chain cursor can ever
+    classify a fan-out pair — so a venue dropped from the other call site would
+    be caught by nothing, which is exactly what a mutation of that site showed
+    (it survived the whole suite). `pair_kind` binds the venue once so the site
+    cannot be got wrong; this test is the other half, and says when the second
+    site stops being dead. Give Extended a REST poller and it goes live, and
+    this failing is how that gets noticed rather than discovered in a report.
+    """
+    assert qr._FANS_OUT_PER_CHANNEL, "the set is empty; nothing below is checked"
+    for exchange in qr._FANS_OUT_PER_CHANNEL:
+        expected = qr.expected_streams("mode-a-v1", exchange, {})
+        streams = (
+            set(expected.required)
+            | set(expected.optional)
+            | set(expected.informational)
+        )
+        assert streams, f"{exchange} declares no streams, so this checks nothing"
+        assert streams.isdisjoint(qr._SECOND_PRODUCER), (
+            f"{exchange} fans out AND has a stream with a hand-off of its own; "
+            f"the adjacent-pair cursor in scan_symbol_file can now classify one "
+            f"of its pairs, and needs a test of its own"
+        )
 
 
 def test_an_inversion_between_two_binance_websocket_streams_is_red(tmp_path):
@@ -3940,6 +4200,104 @@ def test_the_poller_still_has_a_hand_off_of_its_own(tmp_path):
         r"poller_tx: Tx<Record>,\s*\)",
         um_rs,
     ), "binancefuturesum::run_collection no longer takes a poller hop of its own"
+
+
+def collector_src(*parts):
+    """A file of `collector/src/`, read as text. The model mirrors the Rust; the
+    tests below are what make the Rust fail this file when it moves."""
+    return (Path(__file__).resolve().parent.parent / "src" / Path(*parts)).read_text()
+
+
+def test_extended_still_opens_one_socket_per_channel(tmp_path):
+    """The fan-out exemption is a claim about the backend. Read the backend.
+
+    `fans_out_per_channel("extended")` downgrades a cross-stream inversion from
+    red to a bounded yellow, and the only thing that entitles it to is that
+    Extended really does spawn one socket task per channel. Refactor the backend
+    onto one multiplexed socket — which is what every other venue here does —
+    and the exemption becomes a hole that tolerates a real single-reader defect
+    up to a full second, silently. This test is what turns that into a failure.
+
+    Pinned on substrings rather than on line numbers or on the whole statement:
+    the load-bearing facts are that the spawn is per URL and that each stream
+    class has a URL of its own, and both survive ordinary edits around them.
+    """
+    http = collector_src("extended", "http.rs")
+    assert re.search(
+        r"for url in urls \{(?:.|\n)*?"
+        r"tokio::spawn\(keep_connection_one\(url, ws_tx\.clone\(\)\)\)",
+        http,
+    ), (
+        "extended::keep_connections no longer spawns one task per channel URL; "
+        "if the backend now multiplexes, drop 'extended' from "
+        "_FANS_OUT_PER_CHANNEL — its cross-stream inversions are single-reader "
+        "defects again"
+    )
+    # Each task stamps its own receive moment, which is what makes them two
+    # producers rather than one reader handing frames on in order.
+    assert "let recv_time = Utc::now();" in http
+    assert "ws_tx.send((recv_time, text))" in http
+
+    # And one stream class really is one socket: the model's unit of exemption
+    # is the stream, so two classes sharing a URL would be one producer wearing
+    # two names.
+    mod = collector_src("extended", "mod.rs")
+    for path in ('/orderbooks"', "/publicTrades/{}", "/funding/{}", "/prices/mark/{}"):
+        assert path in mod, (
+            f"{path} is no longer a channel URL of its own; the fan-out "
+            f"exemption assumes one socket per stream class"
+        )
+
+
+def test_paradex_still_multiplexes_every_channel_onto_one_socket(tmp_path):
+    """The converse pin: a single-reader venue must not drift into the exemption.
+
+    Paradex is red at a nanosecond between two streams because one reader stamps
+    and queues every frame of a symbol file — one `keep_connection` over
+    `CHANNELS.to_vec()` to one `WS_URL` (`collector/src/paradex/mod.rs`). Should
+    it ever fan out the way Extended does, that red becomes a false one and the
+    venue needs adding to `_FANS_OUT_PER_CHANNEL`; failing here is how that gets
+    decided rather than endured.
+    """
+    mod = collector_src("paradex", "mod.rs")
+    assert "keep_connection(CHANNELS.to_vec(), markets, ws_tx)" in mod, (
+        "paradex no longer hands every channel to one connection; if it now "
+        "opens a socket per channel, add it to _FANS_OUT_PER_CHANNEL"
+    )
+    assert "keep_connection_one" not in mod
+    assert len(re.findall(r"tokio::spawn\(", mod)) == 0, (
+        "paradex::mod.rs spawns nothing today; a new spawned producer here is "
+        "exactly what the single-reader red assumes does not exist"
+    )
+    assert qr.fans_out_per_channel("paradex") is False
+
+    http = collector_src("paradex", "http.rs")
+    assert "connect(WS_URL, subscriptions, ws_tx.clone(), &mut connected_at)" in http, (
+        "paradex no longer dials one URL with all its subscriptions"
+    )
+
+
+def test_the_socket_hop_the_fan_out_shares_is_the_one_the_rust_names(tmp_path):
+    """`WS_HOP` is mirrored, so it is pinned like the other two hop names.
+
+    The fan-out mechanism sentence names this hop as the one both channel
+    sockets DO share — which is the reason their disagreement is bounded at all.
+    A rename in `queue.rs` would leave the report explaining a hand-off that no
+    longer exists by that name.
+    """
+    queue_rs = collector_src("queue.rs")
+
+    def hop_name(const):
+        match = re.search(rf'pub const {const}: &str = "([^"]+)";', queue_rs)
+        assert match, f"{const} is no longer a &str constant of collector/src/queue.rs"
+        return match.group(1)
+
+    assert qr.WS_HOP == hop_name("WS_HOP")
+    assert qr.WS_HOP != qr.WRITER_HOP != qr.POLLER_HOP
+    assert qr._FAN_OUT_PRODUCER.hop == qr.WS_HOP
+    # The fan-out producer must not look like the poller's: that hop is what
+    # `crosses_a_hand_off_of_its_own` selects the unbounded yellow on.
+    assert not qr.crosses_a_hand_off_of_its_own("orderbook")
 
 
 #: The per-symbol JSON key set a venue with no poller has always had, in order.
