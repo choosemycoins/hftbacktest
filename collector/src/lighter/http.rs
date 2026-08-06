@@ -383,7 +383,7 @@ pub async fn keep_connection(
         // what was going to be asked for.
         meta::emit(
             &ws_tx,
-            meta::subscribe(WS_URL, attempt, serde_json::json!(&frames)),
+            meta::subscribe(WS_URL.as_str(), attempt, serde_json::json!(&frames)),
         );
         attempt += 1;
 
@@ -395,7 +395,15 @@ pub async fn keep_connection(
         let dial_time = Instant::now();
         let mut connected_at = None;
 
-        match connect(WS_URL, frames, &ws_tx, &mut resub_rx, &mut connected_at).await {
+        match connect(
+            WS_URL.as_str(),
+            frames,
+            &ws_tx,
+            &mut resub_rx,
+            &mut connected_at,
+        )
+        .await
+        {
             Err(error) => {
                 error!(?error, "websocket error");
                 // A disconnect is otherwise indistinguishable from a quiet

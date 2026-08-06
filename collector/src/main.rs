@@ -399,8 +399,12 @@ async fn main() -> Result<(), anyhow::Error> {
     // the integer, so a recording that does not carry the key cannot be read
     // back after the venue relists a market.
     let lighter_markets = if args.exchange == "lighter" {
-        match lighter::resolve_markets(&args.symbols, lighter::REST_URL, !args.no_symbol_check)
-            .await
+        match lighter::resolve_markets(
+            &args.symbols,
+            lighter::REST_URL.as_str(),
+            !args.no_symbol_check,
+        )
+        .await
         {
             Ok(markets) => Some(markets),
             Err(error) => {

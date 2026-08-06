@@ -47,8 +47,26 @@ use crate::{
 
 /// Mainnet endpoints. Testnet lives at `testnet.zklighter.elliot.ai` and has
 /// its own market ids, so it is not a drop-in substitution.
-pub const WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
-pub const REST_URL: &str = "https://mainnet.zklighter.elliot.ai";
+///
+/// Both endpoints are overridable at process start via environment variables —
+/// `LIGHTER_WS_URL` for the stream socket, `LIGHTER_REST_URL` for the
+/// catalog/REST base — each falling back to the mainnet literal below when
+/// unset. This is how the operator points the collector at testnet; note that
+/// testnet's market ids differ, so the symbol set must be adjusted to match.
+/// The overrides are read once, at first use of the static.
+const MAINNET_WS: &str = "wss://mainnet.zklighter.elliot.ai/stream";
+const MAINNET_REST: &str = "https://mainnet.zklighter.elliot.ai";
+
+/// Reads `key` from the environment, falling back to `default` when the
+/// variable is unset or not valid UTF-8.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+pub static WS_URL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| env_or("LIGHTER_WS_URL", MAINNET_WS));
+pub static REST_URL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| env_or("LIGHTER_REST_URL", MAINNET_REST));
 
 /// The channels taken for every market.
 ///
@@ -707,7 +725,7 @@ pub async fn run_collection(
     // indistinguishable from a network error while REST keeps working — so the
     // catalog fetch above proves nothing about the socket. Without this the
     // collector would reconnect for ever, recording nothing, and exit 0.
-    if let Err(error) = http::probe(WS_URL).await {
+    if let Err(error) = http::probe(WS_URL.as_str()).await {
         // `probe_failed`, not `symbol_check_failed`: every symbol resolved a
         // moment ago (`main` does it before `session_start`), and what refused
         // is the WebSocket upgrade. Borrowing the nearer name would have the
@@ -717,7 +735,7 @@ pub async fn run_collection(
         if let Err(queue_error) = writer_tx.send((
             Utc::now(),
             META_STREAM.to_string(),
-            meta::probe_failed(WS_URL, &error.to_string()).to_string(),
+            meta::probe_failed(WS_URL.as_str(), &error.to_string()).to_string(),
         )) {
             error!(
                 ?queue_error,
@@ -872,8 +890,8 @@ mod route_tests {
     #[test]
     fn every_lifecycle_record_reaches_the_sidecar() {
         for value in [
-            meta::subscribe(WS_URL, 0, serde_json::json!([])),
-            meta::connected(WS_URL),
+            meta::subscribe(WS_URL.as_str(), 0, serde_json::json!([])),
+            meta::connected(WS_URL.as_str()),
             meta::disconnected("Connection reset without closing handshake", 1194),
             meta::dial_failed("connection refused", 12),
             meta::stream_ended(1194),
@@ -881,6 +899,24 @@ mod route_tests {
         ] {
             assert_eq!(route(&value, &markets()), META_STREAM, "{value}");
         }
+    }
+
+    /// The endpoint override reads the environment when the variable is set and
+    /// the mainnet literal otherwise. Uses a process-unique key so it cannot
+    /// race the (once-read, process-global) `WS_URL`/`REST_URL` statics or any
+    /// parallel test touching the same variable.
+    #[test]
+    fn env_or_prefers_the_environment_and_falls_back_to_the_default() {
+        let key = "LIGHTER_ENV_OR_TEST_KEY_UNIQUE_9f3c";
+        let unset = "LIGHTER_ENV_OR_TEST_KEY_UNSET_9f3c";
+
+        // SAFETY: single-threaded within this test; the key is unique to it so
+        // no other thread reads or writes it.
+        unsafe { std::env::set_var(key, "wss://override.example/stream") };
+        assert_eq!(env_or(key, MAINNET_WS), "wss://override.example/stream");
+        unsafe { std::env::remove_var(key) };
+
+        assert_eq!(env_or(unset, MAINNET_REST), MAINNET_REST);
     }
 
     /// Every frame is written, and written byte for byte. A deletion on this
@@ -1265,7 +1301,7 @@ mod nonce_tests {
     fn a_reconnect_starts_the_chain_again() {
         let mut h = Harness::new();
         h.feed(ORDER_BOOK_AFTER_SNAPSHOT_ETH);
-        h.feed_record(meta::connected(WS_URL));
+        h.feed_record(meta::connected(WS_URL.as_str()));
         h.feed(ORDER_BOOK_DELETE_ETH);
 
         assert!(
