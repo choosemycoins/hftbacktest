@@ -67,12 +67,14 @@ fn handle(
     let j: serde_json::Value = serde_json::from_str(data.as_str())?;
     let stream = route(&j).to_string();
     // The record separator belongs to the writer, which writes
-    // `"{timestamp} {data}\n"` (`file.rs`). Paradex — alone among the four
+    // `"{timestamp} {data}\n"` (`file.rs`). Paradex — alone among the nine
     // backends — newline-terminates its WebSocket text frames, so forwarding
-    // the frame verbatim the way bybit/hyperliquid/lighter do put a second
-    // newline in every record and made half of every Paradex file blank. The
-    // other three do not trim because their frames carry no terminator; adding
-    // it there would be a change with nothing to fix.
+    // the frame verbatim the way the others do put a second newline in every
+    // record and made half of every Paradex file blank. The other eight do not
+    // trim because their frames carry no terminator (measured 2026-08-06:
+    // zero blank lines in fresh recordings of every other venue); adding a
+    // trim there would be a change with nothing to fix, and `file.rs` now
+    // `debug_assert`s the no-terminator contract at the writer itself.
     //
     // Only the trailing line terminator is removed, and only as text: the frame
     // is written byte for byte otherwise. Re-serialising the parsed `j` would

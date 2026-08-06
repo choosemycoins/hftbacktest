@@ -121,6 +121,19 @@ impl RotatingFile {
             info!(%date, %self.path, "date is changed");
         }
         let timestamp = datetime.timestamp_nanos_opt().unwrap();
+        // The writer owns the record separator: exactly one `\n` per record,
+        // appended below. A payload that already carries a terminator writes a
+        // blank line into the file — silently, with a plausible-looking file
+        // as the only evidence (the Paradex fault: its venue newline-terminates
+        // WS frames, trimmed at `paradex/mod.rs`). Enforced here, at the owner
+        // of the separator, so any future backend that forwards a terminated
+        // frame reds its tests instead of recording damaged days. Debug-only:
+        // free in release, and the offline quality gate remains the backstop.
+        debug_assert!(
+            !data.contains('\n'),
+            "a record must not carry a line terminator; the writer appends the \
+             one separator itself (payload: {data:?})"
+        );
         let file = self.file.as_mut().unwrap();
         file.write_all(format!("{timestamp} {data}\n").as_bytes())?;
 
@@ -192,6 +205,24 @@ mod rotating_file_tests {
             .read_to_string(&mut out)
             .unwrap();
         out
+    }
+
+    /// The writer owns the record separator: `write` appends exactly one `\n`
+    /// per record, so a payload that already carries a line terminator would
+    /// put a blank line into the file — the Paradex fault (`paradex/mod.rs`
+    /// trims at its send site). This pin enforces the invariant at the
+    /// component that owns the separator: the NEXT backend that forwards a
+    /// terminated frame fails its tests here instead of writing
+    /// plausible-looking damaged files. `debug_assert`, so it is free in
+    /// release and the hot path is untouched.
+    #[test]
+    #[should_panic(expected = "line terminator")]
+    fn a_payload_carrying_a_line_terminator_is_refused_in_debug() {
+        let dir = scratch("terminator");
+        let path = format!("{dir}/btcusdt");
+        let t = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap();
+        let mut f = RotatingFile::new(t, path, Encoding::Gzip).unwrap();
+        f.write(t, "{\"px\":1}\n".to_string()).unwrap();
     }
 
     /// Restarting the collector on the same UTC day must not destroy the data
