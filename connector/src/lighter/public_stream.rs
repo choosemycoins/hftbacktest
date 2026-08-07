@@ -24,7 +24,9 @@
 //!   in the protocol, so a subscription that did not take is a symbol with no data on a
 //!   perfectly healthy connection. Acks are counted instead, and a symbol without one past a
 //!   deadline is reported to the bots **by name** (§3.6).
-//! * **Silence is reported, not assumed to be a quiet market**, for the same reason.
+//! * **Silence is reported — and repaired — not assumed to be a quiet market**, for the same
+//!   reason. The report goes to the bots by name (policy is theirs, `AGENTS.md` §1.1); the
+//!   repair is the connector mending its own subscription, once per episode.
 //!
 //! Calibration worth knowing before touching the repair path: over a full recorded day —
 //! 8–15 markets, ~1.9 M book frames — the chain broke **zero** times (§2.2). The risk here
@@ -433,6 +435,11 @@ impl MarketState {
         out
     }
 
+    /// The venue's id for a tracked symbol — what [`repair_frames`] addresses a market by.
+    pub fn market_id(&self, symbol: &str) -> Option<i64> {
+        self.by_symbol.get(symbol).copied()
+    }
+
     /// Whether this market's cooldown has expired. Read-only: the cooldown is spent by
     /// [`Self::repair_sent`], when the repair is actually on the wire, because a repair the
     /// message budget refused cost the venue nothing and must not cost a cooldown either.
@@ -446,11 +453,26 @@ impl MarketState {
         }
     }
 
-    /// Records a repair that reached the socket, starting its cooldown.
+    /// Records a repair that reached the socket, starting its cooldown — and re-arming the
+    /// deadlines, because **a repair's subscribe is a subscribe**. The clocks restart
+    /// exactly as they do for a fresh one ([`Self::awaiting_ack`]): the ack deadline from
+    /// now, the silence watchdog from the frames the repair brings back, and the `reported`
+    /// latch open so either escalation is heard. A repair the venue swallows is then named
+    /// [`Concern::Unacknowledged`] at the deadline instead of being silently trusted —
+    /// without this, a silence-triggered repair that went unanswered left the market dead
+    /// with its latch stuck, and nothing ever said so again.
+    ///
+    /// One caveat, accepted: a print clears `awaiting_ack` (see [`Self::on_frame`]), so on a
+    /// market whose tape is alive an unanswered *book* repair is not named at the ack
+    /// deadline — it resurfaces as the next `Silent` episode instead, because `last_frame`
+    /// restarted here. Loud either way; only the name differs.
     pub fn repair_sent(&mut self, market_id: i64, now: Instant) {
         self.counts.repairs_sent += 1;
         if let Some(market) = self.markets.get_mut(&market_id) {
             market.last_repair = Some(now);
+            market.awaiting_ack = Some(now);
+            market.last_frame = Some(now);
+            market.reported = false;
         }
     }
 
@@ -1157,9 +1179,26 @@ impl PublicStream {
         Ok(())
     }
 
-    /// Tells the bots about symbols the venue is not serving, **by name**.
+    /// Tells the bots about symbols the venue is not serving, **by name** — and queues the
+    /// one repair a silent market is owed.
+    ///
+    /// Only [`Concern::Silent`] earns a repair. A silent book is exactly the shape
+    /// [`repair_frames`] mends: the channel is held and acknowledged and has stopped
+    /// serving, and an unsubscribe/subscribe brings a fresh snapshot. An `Unacknowledged`
+    /// subscription holds no acknowledged channel to unsubscribe, and queueing on it would
+    /// ping-pong a dead market between the two concerns for ever — so it stays report-only.
+    /// Riding on [`MarketState::concerns`]' once-per-episode latch bounds this to one repair
+    /// per silence, and [`Self::flush_repairs`]' cooldown and budget bound it further. The
+    /// report itself is unchanged, byte for byte: policy stays with the consumer's
+    /// `error_handler` (`AGENTS.md` §1.1) — the repair is this connector mending its own
+    /// subscription, not a policy decision made for anyone.
     fn report_concerns(&mut self, now: Instant) {
         for (symbol, concern) in self.state.concerns(now) {
+            if concern == Concern::Silent
+                && let Some(market_id) = self.state.market_id(&symbol)
+            {
+                self.pending_repairs.insert(market_id);
+            }
             let error = match concern {
                 Concern::Unacknowledged => LighterError::SubscriptionUnacknowledged(format!(
                     "Lighter never acknowledged the subscription for {symbol}; its refusals \
@@ -1312,6 +1351,7 @@ mod tests {
                 CLIENT_MSG_BUDGET_PER_MIN,
                 Concern,
                 FeedCounts,
+                HOUSEKEEPING_INTERVAL,
                 Handled,
                 IDLE_TIMEOUT,
                 MarketState,
@@ -2005,6 +2045,168 @@ mod tests {
             state.concerns(quiet + SYMBOL_SILENCE_TIMEOUT + Duration::from_secs(1)),
             [("CRV".to_string(), Concern::Silent)]
         );
+    }
+
+    /// **A silent market is repaired, not only reported.** The 120 s watchdog used to be
+    /// report-only, so the one self-healing lever this connection has — the
+    /// unsubscribe/subscribe that brings a fresh snapshot — was never pulled by the one
+    /// detector built to notice a book that stopped (2026-08-07: the report fired and
+    /// nothing else did). The report itself is unchanged, byte for byte: policy stays with
+    /// the consumer's `error_handler` (`AGENTS.md` §1.1); the repair is the connector
+    /// mending its own subscription, which was always its job.
+    #[tokio::test]
+    async fn a_silent_market_is_queued_for_exactly_one_repair_and_it_reaches_the_wire() {
+        let (mut stream, mut ev_rx) = stream(&["CRV"], &[crv()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let now = Instant::now();
+        stream.state.track(&[crv()]);
+        stream.state.awaiting_ack(&names(&["CRV"]), now);
+        stream
+            .state
+            .on_frame(parse_frame(ORDER_BOOK_SNAPSHOT_CRV).unwrap(), NOW_NS, now);
+
+        let quiet = now + SYMBOL_SILENCE_TIMEOUT + Duration::from_secs(1);
+        stream.report_concerns(quiet);
+
+        // The report is what it always was: one error to the bots, by name.
+        let reported = errors(&mut ev_rx);
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(reported[0].contains("SymbolSilent"), "{reported:?}");
+        assert!(reported[0].contains("CRV"), "{reported:?}");
+        // And the market now owes exactly one repair, which the same tick's flush writes —
+        // the housekeeping arm reports first, then flushes.
+        assert_eq!(
+            stream.pending_repairs.iter().copied().collect::<Vec<_>>(),
+            [36]
+        );
+        stream.flush_repairs(&mut sink, quiet).await.unwrap();
+        assert_eq!(sink.sent, repair_frames(36));
+        assert!(stream.pending_repairs.is_empty());
+    }
+
+    /// One repair per silence episode, even while it stays owed. Driven through the shape
+    /// that can tell: a budget that will not pay, so the repair sits in `pending_repairs`
+    /// across ticks — the `reported` latch is what keeps the second tick from re-reporting
+    /// and re-queueing, and the repair waits in the same budget machinery every repair uses
+    /// rather than in some parallel path of its own.
+    #[tokio::test]
+    async fn a_second_tick_in_the_same_episode_neither_re_reports_nor_re_queues() {
+        let (mut stream, mut ev_rx) = stream(&["CRV"], &[crv()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let now = Instant::now();
+        stream.state.track(&[crv()]);
+        stream.state.awaiting_ack(&names(&["CRV"]), now);
+        stream
+            .state
+            .on_frame(parse_frame(ORDER_BOOK_SNAPSHOT_CRV).unwrap(), NOW_NS, now);
+
+        let quiet = now + SYMBOL_SILENCE_TIMEOUT + Duration::from_secs(1);
+        stream.budget.try_spend(CLIENT_MSG_BUDGET_PER_MIN, quiet);
+        // Two housekeeping ticks, in the arm's order: report, then flush.
+        stream.report_concerns(quiet);
+        stream.flush_repairs(&mut sink, quiet).await.unwrap();
+        let second = quiet + HOUSEKEEPING_INTERVAL;
+        stream.report_concerns(second);
+        stream.flush_repairs(&mut sink, second).await.unwrap();
+
+        assert_eq!(errors(&mut ev_rx).len(), 1, "one report per episode");
+        assert_eq!(
+            stream.pending_repairs.iter().copied().collect::<Vec<_>>(),
+            [36],
+            "one repair per episode, still owed"
+        );
+        assert!(sink.sent.is_empty(), "{:?}", sink.sent);
+        assert_eq!(stream.state.counts().repairs_deferred, 2);
+
+        // The budget is a sliding minute; once it frees, the owed repair goes out.
+        stream
+            .flush_repairs(&mut sink, quiet + Duration::from_secs(61))
+            .await
+            .unwrap();
+        assert_eq!(sink.sent, repair_frames(36));
+        assert!(stream.pending_repairs.is_empty());
+    }
+
+    /// **The awaiting-ack decision, pinned: a repair's subscribe is a subscribe.**
+    /// `repair_sent` re-arms the ack deadline exactly as a fresh subscribe does, so a repair
+    /// the venue never answers is escalated to `Unacknowledged` rather than silently
+    /// trusted — before this, a swallowed repair left the market dead with its `reported`
+    /// latch stuck and nothing ever said so again. `Unacknowledged` earns no repair of its
+    /// own: it holds no acknowledged channel to unsubscribe, and queueing on it would
+    /// ping-pong a dead market between the two concerns for ever.
+    #[tokio::test]
+    async fn a_repair_the_venue_never_answers_is_reported_unacknowledged() {
+        let (mut stream, mut ev_rx) = stream(&["CRV"], &[crv()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let now = Instant::now();
+        stream.state.track(&[crv()]);
+        stream.state.awaiting_ack(&names(&["CRV"]), now);
+        stream
+            .state
+            .on_frame(parse_frame(ORDER_BOOK_SNAPSHOT_CRV).unwrap(), NOW_NS, now);
+
+        let quiet = now + SYMBOL_SILENCE_TIMEOUT + Duration::from_secs(1);
+        stream.report_concerns(quiet);
+        stream.flush_repairs(&mut sink, quiet).await.unwrap();
+        assert_eq!(sink.sent, repair_frames(36), "the repair went out");
+
+        // Nothing answers it. The next tick is inside the ack deadline and says nothing...
+        stream.report_concerns(quiet + HOUSEKEEPING_INTERVAL);
+        // ...but past the deadline the market is named again, as Unacknowledged.
+        stream.report_concerns(quiet + SUBSCRIBE_ACK_DEADLINE + Duration::from_secs(1));
+        let reported = errors(&mut ev_rx);
+        assert_eq!(reported.len(), 2, "{reported:?}");
+        assert!(
+            reported[1].contains("SubscriptionUnacknowledged"),
+            "{reported:?}"
+        );
+        assert!(
+            stream.pending_repairs.is_empty(),
+            "an unacknowledged subscription earns no repair"
+        );
+    }
+
+    /// A repair the venue answers re-arms the watchdog: the snapshot clears the ack deadline
+    /// and restarts the book clock, so a market that goes quiet *again* is a new episode —
+    /// reported again, repaired again. Episodes are 120 s apart by construction, so the 60 s
+    /// repair cooldown never gates the silence path; it stays as the floor under chain-break
+    /// repairs.
+    #[tokio::test]
+    async fn an_answered_repair_re_arms_the_watchdog_for_the_next_episode() {
+        let (mut stream, mut ev_rx) = stream(&["CRV"], &[crv()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let now = Instant::now();
+        stream.state.track(&[crv()]);
+        stream.state.awaiting_ack(&names(&["CRV"]), now);
+        stream
+            .state
+            .on_frame(parse_frame(ORDER_BOOK_SNAPSHOT_CRV).unwrap(), NOW_NS, now);
+
+        let quiet = now + SYMBOL_SILENCE_TIMEOUT + Duration::from_secs(1);
+        stream.report_concerns(quiet);
+        stream.flush_repairs(&mut sink, quiet).await.unwrap();
+        // The repair's snapshot comes back.
+        let answered = quiet + Duration::from_secs(1);
+        stream.state.on_frame(
+            parse_frame(&later(ORDER_BOOK_SNAPSHOT_CRV)).unwrap(),
+            NOW_NS,
+            answered,
+        );
+        // Past what would have been the repair's ack deadline: nothing new to say.
+        stream.report_concerns(quiet + SUBSCRIBE_ACK_DEADLINE + Duration::from_secs(2));
+        assert_eq!(
+            errors(&mut ev_rx).len(),
+            1,
+            "the answered repair raised nothing beyond the original report"
+        );
+
+        // A second silence is a second episode: reported again, repaired again.
+        let quiet_again = answered + SYMBOL_SILENCE_TIMEOUT + Duration::from_secs(1);
+        stream.report_concerns(quiet_again);
+        assert_eq!(errors(&mut ev_rx).len(), 1);
+        sink.sent.clear();
+        stream.flush_repairs(&mut sink, quiet_again).await.unwrap();
+        assert_eq!(sink.sent, repair_frames(36));
     }
 
     /// **The budget exists because going over it is not answered with an error** — the venue
