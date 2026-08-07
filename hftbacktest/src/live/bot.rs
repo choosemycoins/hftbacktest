@@ -6,7 +6,7 @@ use std::{
 use chrono::Utc;
 use rand::Rng;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     depth::{L2MarketDepth, MarketDepth},
@@ -49,11 +49,27 @@ pub enum BotError {
     Timeout,
     #[error("Interrupted")]
     Interrupted,
+    /// A transport failure on the channel of one named connector.
+    ///
+    /// The name is stamped by the receiving side, which knows which channel it just polled or
+    /// failed to send on — it is not carried over the wire, and no connector has to be rebuilt
+    /// for it to appear. It exists so that a consumer can tell "the connector I trade on is
+    /// unreachable" from "a market-data-only connector hiccuped" without parsing prose; the
+    /// library names the connector and the consumer decides what it is worth
+    /// (`AGENTS.md` §1.1).
+    #[error("Channel({connector}): {message}")]
+    Channel { connector: String, message: String },
     #[error("Custom: {0}")]
     Custom(String),
 }
 
-pub type ErrorHandler = Box<dyn Fn(LiveError) -> Result<(), BotError>>;
+/// Called with the name of the connector the error came from, and the error.
+///
+/// The name is what makes the difference between "the venue I trade on dropped its stream" and
+/// "the venue I only read a signal from did", which are the same [`LiveError`] on the wire and
+/// have opposite right answers. Deciding which is which is the consumer's job — the library
+/// only says who (`AGENTS.md` §1.1).
+pub type ErrorHandler = Box<dyn Fn(&str, LiveError) -> Result<(), BotError>>;
 pub type OrderRecvHook = Box<dyn Fn(&Order, &Order) -> Result<(), BotError>>;
 
 /// How often a [`LiveBot`] tells its connectors that its event loop is still turning.
@@ -69,6 +85,133 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// The floor on a single receive, so that a pathologically small heartbeat interval polls
 /// the channel rather than spinning on it. See [`LiveBot::recv_chunk`].
 const MIN_RECV_CHUNK: Duration = Duration::from_millis(1);
+
+/// The longest one connector's open batch may hold a single `elapse` from returning.
+///
+/// A batch defers the return so that the strategy never reads a half-applied frame. A
+/// `BatchStart` whose `BatchEnd` never arrives would therefore defer it forever: on a busy feed
+/// the receive never times out, and the bot keeps heartbeating from inside the loop, so it goes
+/// on looking alive to its connector while it has stopped quoting. That failure predates this
+/// ceiling — a lost marker did it with one connector too — but per-connector batch state
+/// removes the accidental cure, where any other connector's `BatchEnd` cleared the single flag.
+///
+/// Choosing to return on a possibly torn book is a fail-closed choice, not a departure from one
+/// (`AGENTS.md` §1.1): a torn read heals on the next frame and is visible to a consumer's
+/// staleness gate, whereas an `elapse` that never returns is a bot that has stopped managing
+/// money and does not say so.
+///
+/// The number is bounded from above and not yet from below. It must stay well under the
+/// connector's 10 s liveness window and a consumer's staleness gate (5 s in `myhft`), or it is
+/// decoration. Below, it must stay well above the drain of the largest real batch — a
+/// 200-level Binance snapshot is ~400 separate messages — and *that has not been measured*
+/// (design note §9.1; this repository has no benchmarks). 250 ms is two orders of magnitude
+/// above any plausible drain and twenty times under the tightest gate above it; measure before
+/// the second connector goes live.
+const MAX_BATCH_HOLD: Duration = Duration::from_millis(250);
+
+/// Open batches, per connector, and since when the strategy has been held by them.
+///
+/// The depths are per connector rather than one flag for the bot, because the receiver
+/// round-robins between connectors: their batches interleave 1:1 whenever both have traffic,
+/// so a shared flag lets one connector's `BatchEnd` release another's open batch and hand the
+/// strategy a half-applied book (design note §2.1).
+///
+/// The clock, on the other hand, is **one for the bot**, and that is the whole subtlety. See
+/// [`Self::held_since`].
+#[derive(Default)]
+struct BatchState {
+    /// `BatchStart`s not yet matched by a `BatchEnd`, per connector.
+    ///
+    /// A count, not a flag: a connector nests its own batches — a registration batch is
+    /// assembled whole inside one `handle_msg` and can land between a market-data
+    /// `BatchStart` and its `BatchEnd` — and with a flag the inner end would release the outer
+    /// batch (design note §3.6). An unmatched `BatchEnd` saturates at zero rather than
+    /// wrapping; an unmatched `BatchStart` is what the ceiling is for.
+    depth: Vec<u32>,
+    /// When the union of those batches last became non-empty, measured from the start of this
+    /// `elapse_`; `None` while every connector is closed.
+    ///
+    /// **What the ceiling bounds is how long the strategy has been held, not how old any one
+    /// batch is.** A per-connector clock looks right and is not: two connectors whose batches
+    /// overlap — `hl` opens, `bnc` opens, `hl` closes, `hl` re-opens — keep the union open
+    /// continuously while every individual batch it can see was opened a frame ago, so the
+    /// ceiling never expires and the bot never quotes again. That is the outcome the ceiling
+    /// exists to prevent, reached with no lost marker at all, and it would be a liveness
+    /// regression against the single flag this replaced, which released on any `BatchEnd`.
+    ///
+    /// So the clock starts when the union goes empty → non-empty and is cleared when it
+    /// empties again. Re-opening while something else is still open does *not* restart it:
+    /// nothing was handed to the strategy in between, so nothing was un-held. The cost is that
+    /// a quarter-second unbroken run of legitimately short batches is force-released too — at
+    /// which point the connector is producing batches faster than the bot can be let out of
+    /// them, and that is a fault either way.
+    held_since: Option<Duration>,
+}
+
+impl BatchState {
+    fn new(connectors: usize) -> Self {
+        Self {
+            depth: vec![0; connectors],
+            held_since: None,
+        }
+    }
+
+    /// Back to the state `elapse_` starts in. Per call, exactly as the single `batch_mode` flag
+    /// this replaces was: a batch that crosses a call boundary is not protected — it never was
+    /// (design note §10).
+    fn reset(&mut self) {
+        self.depth.fill(0);
+        self.held_since = None;
+    }
+
+    fn open(&mut self, conn: usize, elapsed: Duration) {
+        if !self.any_open() {
+            self.held_since = Some(elapsed);
+        }
+        self.depth[conn] = self.depth[conn].saturating_add(1);
+    }
+
+    fn close(&mut self, conn: usize) {
+        self.depth[conn] = self.depth[conn].saturating_sub(1);
+        if !self.any_open() {
+            self.held_since = None;
+        }
+    }
+
+    fn any_open(&self) -> bool {
+        self.depth.iter().any(|depth| *depth > 0)
+    }
+
+    /// Whether a batch still defers returning to the strategy: something is open *and* the
+    /// hold has not outlasted the ceiling.
+    ///
+    /// One rule for every return in `elapse_`, deliberately: the question a gate answers is not
+    /// "whose frame is this" but "may the strategy run", and a strategy that runs reads *every*
+    /// book, position and order set. Making the gate per-connector — releasing on a foreign
+    /// connector's feed while ours is mid-batch — would leave the tear in place on the very
+    /// path this exists to protect (design note §3.3).
+    fn holds(&self, elapsed: Duration, ceiling: Duration) -> bool {
+        self.any_open()
+            && self
+                .held_since
+                .is_none_or(|since| elapsed.saturating_sub(since) <= ceiling)
+    }
+
+    /// The connectors holding a batch open past the ceiling — what an operator needs named,
+    /// since "something somewhere is open" is not actionable. Empty while the hold is still
+    /// within its ceiling, so that the caller can use it as the report of a breach.
+    fn stuck(&self, elapsed: Duration, ceiling: Duration) -> Vec<usize> {
+        if self.holds(elapsed, ceiling) {
+            return Vec::new();
+        }
+        self.depth
+            .iter()
+            .enumerate()
+            .filter(|(_, depth)| **depth > 0)
+            .map(|(conn, _)| conn)
+            .collect()
+    }
+}
 
 fn generate_random_id() -> u64 {
     // Initialize the random number generator
@@ -120,7 +263,7 @@ impl<MD> LiveBotBuilder<MD> {
     /// Registers the error handler to deal with an error from connectors.
     pub fn error_handler<Handler>(self, handler: Handler) -> Self
     where
-        Handler: Fn(LiveError) -> Result<(), BotError> + 'static,
+        Handler: Fn(&str, LiveError) -> Result<(), BotError> + 'static,
     {
         Self {
             error_handler: Some(Box::new(handler)),
@@ -196,15 +339,14 @@ impl<MD> LiveBotBuilder<MD> {
                 .map_err(|error| BuildError::Error(anyhow::Error::from(error)))?;
         }
 
-        Ok(LiveBot {
+        Ok(LiveBot::new(
             id,
             channel,
-            instruments: self.instruments,
-            error_handler: self.error_handler,
-            order_hook: self.order_hook,
-            heartbeat_interval: self.heartbeat_interval,
-            last_heartbeat: None,
-        })
+            self.instruments,
+            self.error_handler,
+            self.order_hook,
+            self.heartbeat_interval,
+        ))
     }
 }
 
@@ -240,6 +382,118 @@ pub struct LiveBot<CH, MD> {
     heartbeat_interval: Option<Duration>,
     /// When the last heartbeat went out; `None` until the first one does.
     last_heartbeat: Option<Instant>,
+    /// Name of each connector, in order of first appearance in `instruments`.
+    connector_names: Vec<String>,
+    /// Which connector each instrument belongs to: an index into `connector_names`, one entry
+    /// per instrument. Derived once in [`LiveBot::new`], never afterwards.
+    conn_of_inst: Vec<usize>,
+    /// Open batches, for the current `elapse_` only — reset at its start, which is exactly the
+    /// lifetime the single `batch_mode` flag it replaces had.
+    batches: BatchState,
+    /// See [`MAX_BATCH_HOLD`]. A field so tests can shorten it; not a builder option, because
+    /// it guards against a protocol violation rather than expressing a trading policy.
+    max_batch_hold: Duration,
+}
+
+impl<CH, MD> LiveBot<CH, MD> {
+    /// The one place a [`LiveBot`] is assembled, so that the tables derived from `instruments`
+    /// cannot drift out of step with them.
+    fn new(
+        id: u64,
+        channel: CH,
+        instruments: Vec<Instrument<MD>>,
+        error_handler: Option<ErrorHandler>,
+        order_hook: Option<OrderRecvHook>,
+        heartbeat_interval: Option<Duration>,
+    ) -> Self {
+        let mut connector_names: Vec<String> = Vec::new();
+        let mut conn_of_inst = Vec::with_capacity(instruments.len());
+        for instrument in &instruments {
+            let conn = connector_names
+                .iter()
+                .position(|name| *name == instrument.connector_name)
+                .unwrap_or_else(|| {
+                    connector_names.push(instrument.connector_name.clone());
+                    connector_names.len() - 1
+                });
+            conn_of_inst.push(conn);
+        }
+        let batches = BatchState::new(connector_names.len());
+
+        Self {
+            id,
+            channel,
+            instruments,
+            error_handler,
+            order_hook,
+            heartbeat_interval,
+            last_heartbeat: None,
+            connector_names,
+            conn_of_inst,
+            batches,
+            max_batch_hold: MAX_BATCH_HOLD,
+        }
+    }
+
+    /// Which connector an instrument belongs to, refusing an index the channel should never
+    /// have reported. See the same check at the head of [`Self::process_event`] — this one
+    /// exists because the batch arms of `elapse_` reach for the connector *before*
+    /// `process_event` runs.
+    fn connector_of(&self, inst_no: usize) -> Result<usize, BotError> {
+        match self.conn_of_inst.get(inst_no) {
+            Some(conn) => Ok(*conn),
+            None => {
+                error!(
+                    %inst_no,
+                    len = self.conn_of_inst.len(),
+                    "The channel reported an out-of-range instrument."
+                );
+                Err(BotError::InstrumentNotFound)
+            }
+        }
+    }
+
+    fn open_batch(&mut self, conn: usize, elapsed: Duration) {
+        self.batches.open(conn, elapsed);
+    }
+
+    fn close_batch(&mut self, conn: usize) {
+        self.batches.close(conn);
+    }
+
+    /// See [`BatchState::holds`].
+    fn batch_holds(&self, elapsed: Duration) -> bool {
+        self.batches.holds(elapsed, self.max_batch_hold)
+    }
+
+    /// The connectors holding a batch open past the ceiling, by name.
+    fn stuck_connectors(&self, elapsed: Duration) -> Vec<&str> {
+        self.batches
+            .stuck(elapsed, self.max_batch_hold)
+            .into_iter()
+            .map(|conn| self.connector_names[conn].as_str())
+            .collect()
+    }
+
+    /// Says once, per `elapse_`, that the ceiling — and not a `BatchEnd` — is what let this
+    /// call return. Silent while nothing is open or the hold is still inside its ceiling.
+    ///
+    /// `reported` is the caller's, not a field: the condition stays true for the rest of the
+    /// call once it is true, and the state belongs to the call the way the batches do. `holds`
+    /// likewise comes from the caller, which has already asked — this runs on the receive hot
+    /// path, and the breach case is the only one that walks the connectors.
+    fn report_a_stuck_batch_once(&self, elapsed: Duration, holds: bool, reported: &mut bool) {
+        if *reported || holds || !self.batches.any_open() {
+            return;
+        }
+        *reported = true;
+        warn!(
+            stuck = ?self.stuck_connectors(elapsed),
+            ceiling = ?self.max_batch_hold,
+            "A batch has held this elapse past its ceiling; returning on a possibly torn book \
+             rather than never returning."
+        );
+    }
 }
 
 impl<CH, MD> LiveBot<CH, MD>
@@ -253,6 +507,19 @@ where
         ev: LiveEvent,
         wait_order_response: WaitOrderResponse,
     ) -> Result<ElapseResult, BotError> {
+        // Everything below reaches `instruments` through `get_unchecked_mut`, and the index
+        // comes from the channel. One comparison here is what makes those accesses provably in
+        // bounds *locally*, instead of resting on an invariant that lives in another file — and
+        // it has to be a real check: `debug-assertions` is off in both the dev and the release
+        // profile of this workspace, so a `debug_assert!` would exist only in `cargo test`.
+        if inst_no >= self.instruments.len() {
+            error!(
+                %inst_no,
+                len = self.instruments.len(),
+                "The channel reported an out-of-range instrument."
+            );
+            return Err(BotError::InstrumentNotFound);
+        }
         match ev {
             LiveEvent::Feed { event, .. } => {
                 let instrument = unsafe { self.instruments.get_unchecked_mut(inst_no) };
@@ -321,8 +588,12 @@ where
                 instrument.position_observed = true;
             }
             LiveEvent::Error(error) => {
-                if let Some(handler) = self.error_handler.as_mut() {
-                    handler(error)?;
+                // `conn_of_inst` is as long as `instruments`, which the check above has
+                // already cleared. Read before the handler and through a shared borrow —
+                // `ErrorHandler` is `Fn`, so both can be held at once.
+                let connector = self.connector_names[self.conn_of_inst[inst_no]].as_str();
+                if let Some(handler) = self.error_handler.as_ref() {
+                    handler(connector, error)?;
                 }
             }
             LiveEvent::SnapshotComplete { .. } => {
@@ -350,6 +621,27 @@ where
     /// A failure propagates. It is the same treatment [`Self::submit_order`] gives a failed
     /// send, and it is the honest one: a bot that cannot reach its connector is a bot whose
     /// orders that connector is about to cancel.
+    ///
+    /// **But it propagates only after every connector has been told.** Reporting from inside
+    /// the loop would mean an unreachable connector starves the ones behind it of their
+    /// heartbeat, and starving a connector is how a healthy bot gets its resting grid
+    /// cancelled — so a market-data-only venue nobody trades on could sweep the venue that
+    /// holds the money. The name in [`BotError::Channel`] is what lets the consumer decide
+    /// which failure is which; that decision is not the library's (`AGENTS.md` §1.1).
+    ///
+    /// **And every connector it could not reach is reported, not just the first.** One
+    /// `Result` can carry one error, so the first is what propagates and keeps the shape a
+    /// consumer matches on; the rest would otherwise be dropped in silence, and each of them
+    /// is a venue about to cancel this bot's resting orders. So each failure gets its own
+    /// `error!` naming its connector, and the returned error's message lists the ones behind
+    /// it. The residual is honest and worth knowing: a consumer whose tolerance branches on
+    /// `connector` alone still sees only the first name, so a heartbeat `Channel` error must
+    /// be read as "at least this connector" (design note §11.3).
+    ///
+    /// `last_heartbeat` advances even when a send failed, so the failure is reported at the
+    /// heartbeat's cadence rather than on every call. A consumer that tolerates it calls
+    /// `elapse` again straight away, and retrying each time would be a busy loop reporting the
+    /// same thing.
     fn heartbeat(&mut self, now: Instant) -> Result<(), BotError> {
         let Some(interval) = self.heartbeat_interval else {
             return Ok(());
@@ -360,12 +652,41 @@ where
         {
             return Ok(());
         }
+        let mut failures: Vec<(String, BotError)> = Vec::new();
         for inst_no in 0..self.instruments.len() {
-            self.channel
-                .send(self.id, inst_no, LiveRequest::Heartbeat)?;
+            if let Err(error) = self.channel.send(self.id, inst_no, LiveRequest::Heartbeat) {
+                // The channel names itself when it can; the bot's own table is the fallback,
+                // so a failure that is not a `Channel` error still comes out attributed.
+                let connector = match &error {
+                    BotError::Channel { connector, .. } => connector.clone(),
+                    _ => self.connector_names[self.conn_of_inst[inst_no]].clone(),
+                };
+                error!(
+                    connector = connector.as_str(),
+                    reason = %error,
+                    "The heartbeat could not be delivered; this connector will cancel this \
+                     bot's resting orders once its liveness window runs out."
+                );
+                failures.push((connector, error));
+            }
         }
         self.last_heartbeat = Some(now);
-        Ok(())
+
+        let mut failures = failures.into_iter();
+        let Some((_, first)) = failures.next() else {
+            return Ok(());
+        };
+        let others: Vec<String> = failures.map(|(connector, _)| connector).collect();
+        if others.is_empty() {
+            return Err(first);
+        }
+        match first {
+            BotError::Channel { connector, message } => Err(BotError::Channel {
+                connector,
+                message: format!("{message}; also unreachable: {}", others.join(", ")),
+            }),
+            other => Err(other),
+        }
     }
 
     /// The longest a single [`Channel::recv_timeout`] may block, given how much of the
@@ -401,44 +722,71 @@ where
         self.heartbeat(instant)?;
         let duration = Duration::from_nanos(duration as u64);
         let mut remaining_duration = duration;
-        let mut batch_mode = false;
+        self.batches.reset();
         let mut wait_resp_received = false;
+        let mut reported_a_stuck_batch = false;
 
         loop {
             let chunk = self.recv_chunk(remaining_duration);
             match self.channel.recv_timeout(self.id, chunk) {
-                Ok((_, LiveEvent::BatchStart)) => {
-                    batch_mode = true;
-                }
-                Ok((_, LiveEvent::BatchEnd)) => {
-                    batch_mode = false;
-                    // If batch event processing ends and the waiting response has already been
-                    // received, return immediately without checking the elapsed time.
-                    if wait_resp_received {
+                Ok((inst_no, ev)) => {
+                    // Before anything indexes with it, including the batch arms below.
+                    let conn = self.connector_of(inst_no)?;
+                    // One clock reading per iteration: the gates, the ceiling and the heartbeat
+                    // all ask about the same instant, and this is the receive hot path.
+                    let elapsed = instant.elapsed();
+
+                    match ev {
+                        LiveEvent::BatchStart => self.open_batch(conn, elapsed),
+                        LiveEvent::BatchEnd => self.close_batch(conn),
+                        ev => {
+                            match self.process_event::<WAIT_NEXT_FEED>(
+                                inst_no,
+                                ev,
+                                wait_order_response,
+                            )? {
+                                ElapseResult::Ok => {
+                                    // Keeps receiving events until the elapsed time is reached.
+                                }
+                                ElapseResult::EndOfData => {
+                                    unreachable!()
+                                }
+                                ElapseResult::MarketFeed => {
+                                    wait_resp_received = true;
+                                    if !self.batch_holds(elapsed) {
+                                        return Ok(ElapseResult::MarketFeed);
+                                    }
+                                }
+                                ElapseResult::OrderResponse => {
+                                    wait_resp_received = true;
+                                    if !self.batch_holds(elapsed) {
+                                        return Ok(ElapseResult::OrderResponse);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let holds = self.batch_holds(elapsed);
+                    self.report_a_stuck_batch_once(elapsed, holds, &mut reported_a_stuck_batch);
+                    // A result deferred by a batch is released when the last batch closes — or
+                    // when the ceiling stops it holding. This is also the path a `BatchEnd`
+                    // takes, which is why it no longer returns from its own arm.
+                    if wait_resp_received && !holds {
                         return Ok(ElapseResult::Ok);
                     }
-                }
-                Ok((inst_no, ev)) => {
-                    match self.process_event::<WAIT_NEXT_FEED>(inst_no, ev, wait_order_response)? {
-                        ElapseResult::Ok => {
-                            // Keeps receiving events until the elapsed time is reached.
-                        }
-                        ElapseResult::EndOfData => {
-                            unreachable!()
-                        }
-                        ElapseResult::MarketFeed => {
-                            wait_resp_received = true;
-                            if !batch_mode {
-                                return Ok(ElapseResult::MarketFeed);
-                            }
-                        }
-                        ElapseResult::OrderResponse => {
-                            wait_resp_received = true;
-                            if !batch_mode {
-                                return Ok(ElapseResult::OrderResponse);
-                            }
-                        }
+                    // Again from inside the loop, so that a single long `elapse` does not look
+                    // dead for its whole duration. `instant + elapsed` reuses the reading above
+                    // rather than taking another one.
+                    self.heartbeat(instant + elapsed)?;
+                    // While processing events in batch mode, all events in a batch should be
+                    // processed together without interruption.
+                    if !holds && elapsed > duration {
+                        return Ok(ElapseResult::Ok);
                     }
+                    remaining_duration = duration
+                        .saturating_sub(elapsed)
+                        .max(Duration::from_micros(1));
                 }
                 Err(BotError::Timeout) => {
                     let elapsed = instant.elapsed();
@@ -446,6 +794,17 @@ where
                     // nothing to do passes through, and it is where a quiet feed used to go
                     // silent for the whole `elapse`.
                     self.heartbeat(instant + elapsed)?;
+                    // **The ceiling has to be consulted here too.** A connector that dies
+                    // between its two markers stops producing anything at all, so this is the
+                    // arm every later iteration takes — and the deferred result sitting behind
+                    // its unclosed batch would otherwise wait out the call's own duration,
+                    // which for `wait_order_response` is a hardcoded 60 s, six times the
+                    // connector's liveness window.
+                    let holds = self.batch_holds(elapsed);
+                    self.report_a_stuck_batch_once(elapsed, holds, &mut reported_a_stuck_batch);
+                    if wait_resp_received && !holds {
+                        return Ok(ElapseResult::Ok);
+                    }
                     // A *capped* receive expiring is not this call expiring. Without the cap
                     // the channel's timeout was the call's, and this is the end of it.
                     if chunk >= remaining_duration || elapsed >= duration {
@@ -463,20 +822,6 @@ where
                     return Err(error);
                 }
             }
-
-            let elapsed = instant.elapsed();
-            // Again from inside the loop, so that a single long `elapse` does not look dead
-            // for its whole duration. `instant + elapsed` reuses the reading above rather
-            // than taking another one.
-            self.heartbeat(instant + elapsed)?;
-            // While processing events in batch mode, all events in a batch should be processed
-            // together without interruption.
-            if !batch_mode && elapsed > duration {
-                return Ok(ElapseResult::Ok);
-            }
-            remaining_duration = duration
-                .saturating_sub(elapsed)
-                .max(Duration::from_micros(1));
         }
     }
 
@@ -797,14 +1142,126 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Duration};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Once, time::Duration};
+
+    use tracing::{
+        Level,
+        Metadata,
+        Subscriber,
+        field::{Field, Visit},
+        span,
+    };
 
     use super::*;
     use crate::{
         depth::HashMapMarketDepth,
         live::{Instrument, ipc::Channel},
-        types::{BuildError, LiveEvent, LiveRequest, OrdType, Order, Side, Status, TimeInForce},
+        types::{
+            BuildError,
+            ErrorKind,
+            LiveError,
+            LiveEvent,
+            LiveRequest,
+            OrdType,
+            Order,
+            Side,
+            Status,
+            TimeInForce,
+        },
     };
+
+    // -----------------------------------------------------------------------------------------
+    // Log capture.
+    //
+    // A structured log line is the observable for a fault that has nowhere else to go — the
+    // second unreachable connector, when only the first can be returned. Capturing it needs
+    // care: `tracing`'s interest cache is process-global while `set_default` is thread-local,
+    // so the usual per-test subscriber makes callsites go dark for whichever test happens to
+    // rebuild the cache (`AGENTS.md` §4.2 records three flakes in sixty runs of exactly that
+    // shape in the connector). The cure is the one described there: **one** process-global
+    // subscriber, installed once, routing into a thread-local buffer. There is then always
+    // exactly one live `Dispatch` and it is always interested, and tests running side by side
+    // cannot see each other's events.
+    // -----------------------------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct CapturedEvent {
+        level: Level,
+        /// The `connector` field, if the call site set one. The field, never the prose: the
+        /// message is free to be reworded, the field is what an operator greps for.
+        connector: Option<String>,
+    }
+
+    thread_local! {
+        static CAPTURED: RefCell<Option<Vec<CapturedEvent>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Default)]
+    struct ConnectorField(Option<String>);
+
+    impl Visit for ConnectorField {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "connector" {
+                self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "connector" {
+                self.0 = Some(value.to_string());
+            }
+        }
+    }
+
+    struct CaptureSubscriber;
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            CAPTURED.with(|captured| {
+                let mut captured = captured.borrow_mut();
+                let Some(buffer) = captured.as_mut() else {
+                    // A test that is not capturing, or another test's thread.
+                    return;
+                };
+                let mut connector = ConnectorField::default();
+                event.record(&mut connector);
+                buffer.push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    connector: connector.0,
+                });
+            });
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    /// Runs `body` with this thread's log buffer switched on, and hands back what it emitted.
+    fn capturing_logs<T>(body: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            // Ignored on purpose: another test binary in the same process having got here
+            // first is fine, and a capture test that then sees nothing fails loudly anyway.
+            let _ = tracing::subscriber::set_global_default(CaptureSubscriber);
+        });
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        let out = body();
+        let events = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+        (out, events)
+    }
 
     /// In-memory `Channel` for unit testing. `recv_timeout` drains a pre-seeded queue of events;
     /// once drained it returns `Timeout`, which lets `elapse_` terminate deterministically. `send`
@@ -891,13 +1348,13 @@ mod tests {
     }
 
     fn make_quiet_bot(symbol: &str) -> LiveBot<QuietChannel, HashMapMarketDepth> {
-        LiveBot {
-            id: 42,
-            channel: QuietChannel {
+        LiveBot::new(
+            42,
+            QuietChannel {
                 sent: Vec::new(),
                 waits: Vec::new(),
             },
-            instruments: vec![Instrument::new(
+            vec![Instrument::new(
                 "mock",
                 symbol,
                 0.01,
@@ -905,30 +1362,71 @@ mod tests {
                 HashMapMarketDepth::new(0.01, 1.0),
                 0,
             )],
-            error_handler: None,
-            order_hook: None,
-            heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
-            last_heartbeat: None,
-        }
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
     }
 
     fn make_bot(
         symbols: &[&str],
         events: Vec<(usize, LiveEvent)>,
     ) -> LiveBot<MockChannel, HashMapMarketDepth> {
-        let instruments = symbols
+        let instruments: Vec<_> = symbols.iter().map(|s| ("mock", *s)).collect();
+        make_multi_connector_bot(&instruments, events)
+    }
+
+    /// A bot whose instruments live on more than one connector — the configuration every batch
+    /// and every error in this file is about, and the one `make_bot` cannot express.
+    fn make_multi_connector_bot(
+        instruments: &[(&str, &str)],
+        events: Vec<(usize, LiveEvent)>,
+    ) -> LiveBot<MockChannel, HashMapMarketDepth> {
+        let instruments = instruments
             .iter()
-            .map(|s| Instrument::new("mock", s, 0.01, 1.0, HashMapMarketDepth::new(0.01, 1.0), 0))
+            .map(|(connector, symbol)| {
+                Instrument::new(
+                    connector,
+                    symbol,
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                )
+            })
             .collect();
-        LiveBot {
-            id: 42,
-            channel: MockChannel::with(events),
+        LiveBot::new(
+            42,
+            MockChannel::with(events),
             instruments,
-            error_handler: None,
-            order_hook: None,
-            heartbeat_interval: Some(DEFAULT_HEARTBEAT_INTERVAL),
-            last_heartbeat: None,
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// A bid-side depth update. `qty = 0` removes the level, which is how a real feed empties a
+    /// book — and why a mid-batch return is observable as a missing best bid rather than as a
+    /// flag.
+    fn bid(symbol: &str, px: f64, qty: f64) -> LiveEvent {
+        LiveEvent::Feed {
+            symbol: symbol.into(),
+            event: Event {
+                ev: LOCAL_BID_DEPTH_EVENT,
+                exch_ts: 1_700_000_000_000_000_000,
+                local_ts: 1_700_000_000_000_000_001,
+                px,
+                qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
         }
+    }
+
+    /// How many of the scripted events the bot actually consumed before returning.
+    fn consumed(bot: &LiveBot<MockChannel, HashMapMarketDepth>, scripted: usize) -> usize {
+        scripted - bot.channel.incoming.len()
     }
 
     fn snapshot_complete(symbol: &str) -> LiveEvent {
@@ -1261,6 +1759,819 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Batch isolation. Two connectors publish into the bot through one round-robin receiver,
+    // so their batches interleave 1:1 by construction — `AGENTS.md` §2.2 / the design note §2.1.
+    // Every assertion below is money-shaped on purpose: it reads the book the strategy would
+    // have quoted on, not a flag.
+    // ---------------------------------------------------------------------------------------
+
+    const HL_AND_BNC: [(&str, &str); 2] = [("hl", "BTC"), ("bnc", "BTCUSDT")];
+
+    /// **A foreign `BatchEnd` must not release a batch it never opened.** One `bool` for all
+    /// connectors means Binance closing its frame hands the strategy Hyperliquid's book with
+    /// the old best bid deleted and the new one not yet applied.
+    #[test]
+    fn a_foreign_batch_end_cannot_release_a_batch_that_is_still_open() {
+        let script = vec![
+            (0, LiveEvent::BatchStart),
+            (0, bid("BTC", 100.0, 5.0)),
+            (1, LiveEvent::BatchEnd), // Binance's, and Binance never opened one here.
+            (0, bid("BTC", 100.0, 0.0)),
+            (0, bid("BTC", 99.0, 5.0)),
+            (0, LiveEvent::BatchEnd),
+        ];
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, script);
+
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+
+        assert_eq!(
+            bot.depth(0).best_bid(),
+            99.0,
+            "the strategy must never see the half-applied frame"
+        );
+        assert_eq!(consumed(&bot, scripted), scripted);
+    }
+
+    /// **BLOCKER-1.** The gate decides whether the strategy may run at all, not which frame to
+    /// hand it: once it runs it reads *every* book. So a foreign connector's feed cannot
+    /// release the return while somebody else's batch is open, even though that feed is
+    /// perfectly complete in itself.
+    #[test]
+    fn an_open_batch_anywhere_defers_a_foreign_connectors_feed() {
+        let script = vec![
+            (0, LiveEvent::BatchStart),
+            (0, bid("BTC", 100.0, 5.0)),
+            (1, bid("BTCUSDT", 50.0, 5.0)), // complete, and still not a licence to return
+            (0, bid("BTC", 100.0, 0.0)),
+            (0, bid("BTC", 99.0, 5.0)),
+            (0, LiveEvent::BatchEnd),
+        ];
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, script);
+
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+
+        assert_eq!(
+            bot.depth(0).best_bid(),
+            99.0,
+            "returning on the Binance feed would expose the torn Hyperliquid book"
+        );
+        assert_eq!(consumed(&bot, scripted), scripted);
+    }
+
+    /// The liveness half of the pin above — without it, "never return" would satisfy it.
+    /// Also pins the wart the design keeps on purpose (note §10): the release on `BatchEnd`
+    /// reports `Ok`, not the deferred `MarketFeed`.
+    #[test]
+    fn a_return_happens_once_the_last_batch_closes() {
+        let script = vec![
+            (0, LiveEvent::BatchStart),
+            (1, LiveEvent::BatchStart),
+            (0, bid("BTC", 100.0, 5.0)),
+            (1, LiveEvent::BatchEnd),    // one down, one to go
+            (0, LiveEvent::BatchEnd),    // now the bot may return
+            (0, bid("BTC", 101.0, 5.0)), // must be left for the next elapse
+        ];
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, script);
+
+        let result = bot.wait_next_feed(false, 1_000_000_000).unwrap();
+
+        assert_eq!(result, ElapseResult::Ok, "the kept wart, note §10");
+        assert_eq!(
+            consumed(&bot, scripted),
+            5,
+            "it must return at the last BatchEnd: not earlier (a foreign one), not later"
+        );
+        assert_eq!(bot.depth(0).best_bid(), 100.0);
+    }
+
+    /// The same rule for a deferred order response: it waits for the last batch, not the first.
+    #[test]
+    fn a_pending_response_is_released_only_when_the_last_batch_closes() {
+        let script = vec![
+            (0, LiveEvent::BatchStart),
+            (1, LiveEvent::BatchStart),
+            (0, order_event("BTC", 7, 100.0)),
+            (1, LiveEvent::BatchEnd),
+            (0, LiveEvent::BatchEnd),
+            (0, order_event("BTC", 8, 101.0)),
+        ];
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, script);
+
+        bot.wait_order_response(0, 7, 1_000_000_000).unwrap();
+
+        assert_eq!(consumed(&bot, scripted), 5);
+    }
+
+    /// **Nesting inside one connector is real.** A registration batch is assembled whole inside
+    /// one `handle_msg` (`connector/src/main.rs`) while a market-data batch is several separate
+    /// messages (`hyperliquid/public_stream.rs`), so the registration one can land between the
+    /// outer `BatchStart` and its `BatchEnd`. A flag would let the inner end release the outer
+    /// batch — on every registration, i.e. at startup, exactly when the bot is about to quote.
+    #[test]
+    fn a_nested_batch_is_not_released_by_its_inner_batch_end() {
+        let script = vec![
+            (0, LiveEvent::BatchStart), // market data
+            (0, bid("BTC", 100.0, 5.0)),
+            (0, LiveEvent::BatchStart), // registration, nested
+            (0, LiveEvent::BatchEnd),   // ...and its end
+            (0, bid("BTC", 100.0, 0.0)),
+            (0, bid("BTC", 99.0, 5.0)),
+            (0, LiveEvent::BatchEnd), // the outer one
+        ];
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&[("hl", "BTC")], script);
+
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+
+        assert_eq!(bot.depth(0).best_bid(), 99.0);
+        assert_eq!(consumed(&bot, scripted), scripted);
+    }
+
+    /// Executable documentation for the residual the design accepts (note §3.6): isolation is
+    /// per **connector**, not per instrument, because the markers carry no symbol. A batch on
+    /// one Hyperliquid coin defers the return for every other coin on that connector. Change
+    /// this only together with the note.
+    #[test]
+    fn any_open_batch_defers_an_unrelated_symbols_return() {
+        let script = vec![
+            (0, LiveEvent::BatchStart), // opened for BTC's frame...
+            (1, bid("ETH", 50.0, 5.0)), // ...defers ETH, a different instrument
+            (1, bid("ETH", 50.0, 0.0)),
+            (1, bid("ETH", 49.0, 5.0)),
+            (0, LiveEvent::BatchEnd),
+            (1, bid("ETH", 55.0, 5.0)),
+        ];
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&[("hl", "BTC"), ("hl", "ETH")], script);
+
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+
+        assert_eq!(bot.depth(1).best_bid(), 49.0);
+        assert_eq!(consumed(&bot, scripted), 5);
+    }
+
+    /// The `usize` from the channel indexes `instruments` through `get_unchecked_mut`. A
+    /// receiver that reports one out of range is a bug in the receiver, but the bot must say so
+    /// rather than write past the end of its own state — and it must say so *before* the batch
+    /// arms index the connector table, which they do earlier than `process_event` runs.
+    ///
+    /// **This pins `connector_of`, and only it.** The two marker cases are the load-bearing
+    /// ones: they never reach `process_event` at all, so deleting the check in `connector_of`
+    /// turns them into a silent `open_batch(0, ..)` on somebody else's connector and this test
+    /// goes red. The feed case is shielded by `connector_of` running first, so it says nothing
+    /// about the check at the head of `process_event` — that one has its own pin below.
+    #[test]
+    fn an_out_of_range_instrument_is_reported_not_indexed() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![(9, bid("BTCUSDT", 100.0, 5.0))]);
+        assert!(matches!(
+            bot.elapse(1_000_000),
+            Err(BotError::InstrumentNotFound)
+        ));
+
+        let mut bot = make_bot(&["BTCUSDT"], vec![(9, LiveEvent::BatchStart)]);
+        assert!(matches!(
+            bot.elapse(1_000_000),
+            Err(BotError::InstrumentNotFound)
+        ));
+
+        let mut bot = make_bot(&["BTCUSDT"], vec![(9, LiveEvent::BatchEnd)]);
+        assert!(matches!(
+            bot.elapse(1_000_000),
+            Err(BotError::InstrumentNotFound)
+        ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Where an error came from. Three roads, all anonymous before this: the handler's
+    // `LiveError`, a failed receive, and a failed send (`AGENTS.md` §2.2). All three end in the
+    // same place for a consumer — `Err` out of `elapse`, which `myhft` treats as fatal — so
+    // without a name, a market-data-only connector's routine reconnect stops trading on the
+    // venue that holds the money.
+    // ---------------------------------------------------------------------------------------
+
+    fn recording_handler(log: Rc<RefCell<Vec<(String, ErrorKind)>>>) -> ErrorHandler {
+        Box::new(move |connector, error| {
+            log.borrow_mut().push((connector.to_string(), error.kind));
+            Ok(())
+        })
+    }
+
+    /// A consumer's policy, in the shape #20 step 4 needs: the connector it trades on is fatal,
+    /// the one it only reads a signal from is not.
+    fn hl_is_fatal() -> ErrorHandler {
+        Box::new(|connector, _error| match connector {
+            "hl" => Err(BotError::Interrupted),
+            _ => Ok(()),
+        })
+    }
+
+    #[test]
+    fn an_error_is_attributed_to_the_connector_it_came_from() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut bot = make_multi_connector_bot(
+            &HL_AND_BNC,
+            vec![
+                // `1` is Binance's representative instrument, `0` is Hyperliquid's — which is
+                // all the channel can say about an event that carries no symbol.
+                (
+                    1,
+                    LiveEvent::Error(LiveError::new(ErrorKind::ConnectionInterrupted)),
+                ),
+                (
+                    0,
+                    LiveEvent::Error(LiveError::new(ErrorKind::CriticalConnectionError)),
+                ),
+            ],
+        );
+        bot.error_handler = Some(recording_handler(log.clone()));
+
+        bot.elapse(1_000_000).unwrap();
+
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                ("bnc".to_string(), ErrorKind::ConnectionInterrupted),
+                ("hl".to_string(), ErrorKind::CriticalConnectionError),
+            ]
+        );
+    }
+
+    /// **The main money pin.** Every backend publishes `ConnectionInterrupted` on a routine
+    /// reconnect, and a consumer that treats it as fatal exits the process. With two
+    /// connectors that means Binance reconnecting stops Hyperliquid trading. The bot has to be
+    /// able to tolerate one and not the other, and carry on with the tick.
+    #[test]
+    fn a_tolerated_market_data_fault_does_not_end_the_elapse() {
+        let mut bot = make_multi_connector_bot(
+            &HL_AND_BNC,
+            vec![
+                (
+                    1,
+                    LiveEvent::Error(LiveError::new(ErrorKind::ConnectionInterrupted)),
+                ),
+                (0, bid("BTC", 99.0, 5.0)),
+            ],
+        );
+        bot.error_handler = Some(hl_is_fatal());
+
+        let result = bot.elapse(1_000_000).unwrap();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert_eq!(
+            bot.depth(0).best_bid(),
+            99.0,
+            "the events after the tolerated fault must still be processed"
+        );
+    }
+
+    /// ...and the direction that must not change: a fault on the connector the consumer calls
+    /// fatal is still fatal, and the tick ends there.
+    #[test]
+    fn a_fault_on_the_trading_connector_still_propagates() {
+        let mut bot = make_multi_connector_bot(
+            &HL_AND_BNC,
+            vec![
+                (
+                    0,
+                    LiveEvent::Error(LiveError::new(ErrorKind::ConnectionInterrupted)),
+                ),
+                (0, bid("BTC", 99.0, 5.0)),
+            ],
+        );
+        bot.error_handler = Some(hl_is_fatal());
+
+        assert!(matches!(bot.elapse(1_000_000), Err(BotError::Interrupted)));
+        assert!(
+            bot.depth(0).best_bid().is_nan(),
+            "the call ends at the fault"
+        );
+    }
+
+    /// A channel whose first receive fails, with the rest of the script behind it.
+    struct FaultyChannel {
+        fault: Option<BotError>,
+        rest: VecDeque<(usize, LiveEvent)>,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl Channel for FaultyChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                fault: None,
+                rest: VecDeque::new(),
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            match self.fault.take() {
+                Some(fault) => Err(fault),
+                None => self.rest.pop_front().ok_or(BotError::Timeout),
+            }
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// Road 1: a failed receive. It bypasses the error handler entirely and comes straight out
+    /// of `elapse`, so the name has to survive that far — it is what a consumer's tolerance is
+    /// built on.
+    ///
+    /// The second half is the part that is easy to forget and expensive to discover: tolerating
+    /// this one means tolerating a **truncated** tick. Unlike a tolerated `LiveError`, which
+    /// lets the loop carry on, this returns immediately, and the events behind it are still in
+    /// the queue (design note §4.3(2)).
+    #[test]
+    fn a_channel_fault_names_the_connector_it_came_from() {
+        let mut bot = LiveBot::new(
+            42,
+            FaultyChannel {
+                fault: Some(BotError::Channel {
+                    connector: "bnc".to_string(),
+                    message: "DecodeError".to_string(),
+                }),
+                rest: vec![(0, bid("BTC", 99.0, 5.0))].into(),
+                sent: Vec::new(),
+            },
+            vec![
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        );
+
+        match bot.elapse(1_000_000) {
+            Err(BotError::Channel { connector, message }) => {
+                assert_eq!(connector, "bnc");
+                assert_eq!(message, "DecodeError");
+            }
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+        assert!(
+            bot.depth(0).best_bid().is_nan(),
+            "the tick is cut short: what was behind the fault is not applied"
+        );
+        assert_eq!(bot.channel.rest.len(), 1, "...and is still queued");
+    }
+
+    /// A channel that cannot reach one connector. Records every delivery, and counts every
+    /// attempt including the failed ones.
+    struct SendFailingChannel {
+        unreachable_inst_no: usize,
+        attempts: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl Channel for SendFailingChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                unreachable_inst_no: 0,
+                attempts: 0,
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            Err(BotError::Timeout)
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.attempts += 1;
+            if inst_no == self.unreachable_inst_no {
+                return Err(BotError::Channel {
+                    connector: "bnc".to_string(),
+                    message: "SendError".to_string(),
+                });
+            }
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// Binance first, deliberately: the heartbeat walks the instruments in order, so with the
+    /// failure on index 0 an implementation that gives up at the first error never reaches
+    /// Hyperliquid at all.
+    fn make_send_failing_bot() -> LiveBot<SendFailingChannel, HashMapMarketDepth> {
+        LiveBot::new(
+            42,
+            SendFailingChannel {
+                unreachable_inst_no: 0,
+                attempts: 0,
+                sent: Vec::new(),
+            },
+            vec![
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// **Road 3, and the reason it is not merely cosmetic.** The heartbeat goes to every
+    /// connector, so one unreachable connector must not cost the others theirs: a connector
+    /// that stops hearing from a bot cancels its resting orders. Giving up at the first failure
+    /// means a market-data-only connector nobody trades on can have the trading connector sweep
+    /// a healthy grid.
+    #[test]
+    fn a_failed_heartbeat_send_names_the_connector_it_could_not_reach() {
+        let mut bot = make_send_failing_bot();
+
+        match bot.elapse(1_000_000) {
+            Err(BotError::Channel { connector, .. }) => assert_eq!(connector, "bnc"),
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+
+        let reached_hl = bot
+            .channel
+            .sent
+            .iter()
+            .filter(|(_, inst_no, request)| {
+                *inst_no == 1 && matches!(request, LiveRequest::Heartbeat)
+            })
+            .count();
+        assert_eq!(
+            reached_hl, 1,
+            "the connector that *can* be reached must still hear the heartbeat"
+        );
+    }
+
+    /// ...and the failure is reported at the heartbeat's cadence, not on every call. A consumer
+    /// that tolerates this fault calls `elapse` again immediately; retrying the send each time
+    /// would turn that into a busy loop that never reports anything new.
+    #[test]
+    fn a_heartbeat_that_could_not_be_delivered_does_not_retry_before_its_interval() {
+        let mut bot = make_send_failing_bot();
+        bot.heartbeat_interval = Some(Duration::from_secs(30));
+
+        assert!(bot.elapse(1_000_000).is_err());
+        let attempts = bot.channel.attempts;
+
+        assert!(
+            bot.elapse(1_000_000).is_ok(),
+            "the next call inside the interval must not retry, and so must not fail again"
+        );
+        assert_eq!(bot.channel.attempts, attempts);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The hold ceiling.
+    // ---------------------------------------------------------------------------------------
+
+    /// A connector that opens a batch and never closes it, on a feed that never goes quiet —
+    /// the shape a lost `BatchEnd` leaves behind, and the one case where deferring the return
+    /// has no natural end.
+    ///
+    /// It hands out a bounded number of frames and then **fails** rather than looping forever,
+    /// so a broken ceiling shows up as a red test with a message instead of a hung run. This
+    /// repository has no harness timeout to fall back on.
+    struct StuckBatchChannel {
+        opened: bool,
+        /// Handed out once, right after the batch opens: whatever this `elapse` is waiting for.
+        trigger: Option<LiveEvent>,
+        /// Frames left before the channel declares the ceiling broken.
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    /// Real time has to move for a ceiling measured in real time to expire, so each receive
+    /// costs a little of it. The ceiling in these tests is 5 ms, so the good case ends after a
+    /// handful of frames and the broken one burns its budget in well under a second.
+    const STUCK_FRAME: Duration = Duration::from_millis(1);
+
+    impl Channel for StuckBatchChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                opened: false,
+                trigger: None,
+                budget: 400,
+                sent: Vec::new(),
+            })
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            if !self.opened {
+                self.opened = true;
+                return Ok((0, LiveEvent::BatchStart));
+            }
+            if let Some(trigger) = self.trigger.take() {
+                return Ok((0, trigger));
+            }
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "the batch held this elapse past every plausible ceiling".to_string(),
+                ));
+            }
+            Ok((0, bid("BTCUSDT", 100.0, 5.0)))
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    fn make_stuck_batch_bot(
+        trigger: Option<LiveEvent>,
+    ) -> LiveBot<StuckBatchChannel, HashMapMarketDepth> {
+        LiveBot::new(
+            42,
+            StuckBatchChannel {
+                opened: false,
+                trigger,
+                budget: 400,
+                sent: Vec::new(),
+            },
+            vec![Instrument::new(
+                "hl",
+                "BTCUSDT",
+                0.01,
+                1.0,
+                HashMapMarketDepth::new(0.01, 1.0),
+                0,
+            )],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// **An unclosed batch must not hold the bot for ever.** It keeps heartbeating from inside
+    /// the loop, so its connector goes on considering it alive while it has silently stopped
+    /// quoting — and per-connector batch state removed the accidental cure, where any other
+    /// connector's `BatchEnd` cleared the one shared flag.
+    #[test]
+    fn an_orphaned_batch_start_cannot_hold_the_bot_past_its_hold_ceiling() {
+        let mut bot = make_stuck_batch_bot(None);
+        bot.max_batch_hold = Duration::from_millis(5);
+
+        let started = Instant::now();
+        let result = bot.elapse(1_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= Duration::from_millis(5),
+            "the batch must defer the return until the ceiling, not sail through it: {held:?}"
+        );
+        assert!(
+            held < Duration::from_millis(200),
+            "and the ceiling must end the hold: {held:?}"
+        );
+    }
+
+    /// **The path the ceiling has to bound is the 60-second one.** `submit_order(.., wait =
+    /// true)` and `cancel(.., wait = true)` both wait a hardcoded 60 s for their own response;
+    /// with the response already received and deferred behind an unclosed batch, only the
+    /// ceiling can hand it over. Returning at the duration gate — which is what a ceiling
+    /// written as an early return in that gate would do — is a minute too late.
+    #[test]
+    fn a_wait_order_response_is_released_at_the_hold_ceiling() {
+        let mut bot = make_stuck_batch_bot(Some(order_event("BTCUSDT", 7, 100.0)));
+        bot.max_batch_hold = Duration::from_millis(5);
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held < Duration::from_millis(200),
+            "the deferred response must be released at the ceiling, not at the 60 s timeout: \
+             {held:?}"
+        );
+        assert_eq!(bot.orders(0).len(), 1, "and the response was applied");
+    }
+
+    /// The ceiling arithmetic and the name it reports, on a clock the test controls rather than
+    /// one it waits for. "Something somewhere is open" is not something an operator can act on.
+    #[test]
+    fn the_ceiling_names_the_connector_whose_batch_is_stuck() {
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, vec![]);
+        bot.max_batch_hold = Duration::from_millis(5);
+
+        bot.open_batch(1, Duration::from_millis(10)); // Binance opened one at t = 10 ms
+
+        assert!(bot.batch_holds(Duration::from_millis(14)));
+        assert!(
+            bot.stuck_connectors(Duration::from_millis(14)).is_empty(),
+            "a batch inside its ceiling is not stuck"
+        );
+
+        assert!(!bot.batch_holds(Duration::from_millis(16)));
+        assert_eq!(bot.stuck_connectors(Duration::from_millis(16)), vec!["bnc"]);
+
+        // Closing it takes the hold away entirely, ceiling or no ceiling.
+        bot.close_batch(1);
+        assert!(!bot.batch_holds(Duration::from_millis(14)));
+        assert!(bot.stuck_connectors(Duration::from_millis(16)).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Single-connector equivalence.
+    // ---------------------------------------------------------------------------------------
+
+    /// The gates as they were before per-connector batch state, transcribed by hand from
+    /// `elapse_` and deliberately *not* sharing code with it.
+    #[derive(Copy, Clone, Debug)]
+    enum RefEvent {
+        BatchStart,
+        BatchEnd,
+        /// Whatever this call is waiting for: a feed under `wait_next_feed`, the matching order
+        /// response under `wait_order_response`.
+        Trigger,
+        /// An event that is applied and asks for nothing.
+        Inert,
+    }
+
+    fn reference_gates(trace: &[RefEvent], trigger: ElapseResult) -> (ElapseResult, usize) {
+        let mut batch_mode = false;
+        let mut wait_resp_received = false;
+        for (i, ev) in trace.iter().enumerate() {
+            match ev {
+                RefEvent::BatchStart => batch_mode = true,
+                RefEvent::BatchEnd => {
+                    batch_mode = false;
+                    if wait_resp_received {
+                        return (ElapseResult::Ok, i + 1);
+                    }
+                }
+                RefEvent::Trigger => {
+                    wait_resp_received = true;
+                    if !batch_mode {
+                        return (trigger, i + 1);
+                    }
+                }
+                RefEvent::Inert => {}
+            }
+        }
+        // The queue ran dry: the channel reports `Timeout` and the call ends.
+        (ElapseResult::Ok, trace.len())
+    }
+
+    /// Deterministic and dependency-free, so the 10k traces below are the same on every run.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Balanced, non-nested batches only. The two known divergences from the old behaviour —
+    /// the hold ceiling and nesting (note §3.5) — are deliberate, and mixing them in here would
+    /// pin the old behaviour as the reference for cases where we changed it on purpose. They
+    /// have their own pins.
+    fn random_trace(rng: &mut XorShift) -> Vec<RefEvent> {
+        let len = 1 + rng.below(12) as usize;
+        let mut trace = Vec::with_capacity(len + 1);
+        let mut in_batch = false;
+        for _ in 0..len {
+            let roll = rng.below(10);
+            if in_batch {
+                match roll {
+                    0..=3 => {
+                        trace.push(RefEvent::BatchEnd);
+                        in_batch = false;
+                    }
+                    4..=6 => trace.push(RefEvent::Trigger),
+                    _ => trace.push(RefEvent::Inert),
+                }
+            } else {
+                match roll {
+                    0..=2 => {
+                        trace.push(RefEvent::BatchStart);
+                        in_batch = true;
+                    }
+                    3..=6 => trace.push(RefEvent::Trigger),
+                    _ => trace.push(RefEvent::Inert),
+                }
+            }
+        }
+        if in_batch {
+            trace.push(RefEvent::BatchEnd);
+        }
+        trace
+    }
+
+    /// **One connector must behave exactly as it did.** `myhft` runs one today, and the whole
+    /// point of this change is to not pay for the second one with a regression on the first.
+    #[test]
+    fn the_single_connector_gates_match_the_previous_implementation() {
+        let mut rng = XorShift(0x5EED_1234_ABCD_9876);
+
+        for case in 0..10_000 {
+            let trace = random_trace(&mut rng);
+
+            for waiting_for_a_feed in [true, false] {
+                let script: Vec<(usize, LiveEvent)> = trace
+                    .iter()
+                    .map(|ev| {
+                        let live = match ev {
+                            RefEvent::BatchStart => LiveEvent::BatchStart,
+                            RefEvent::BatchEnd => LiveEvent::BatchEnd,
+                            RefEvent::Trigger if waiting_for_a_feed => bid("BTCUSDT", 100.0, 5.0),
+                            RefEvent::Trigger => order_event("BTCUSDT", 7, 100.0),
+                            RefEvent::Inert if waiting_for_a_feed => position_event("BTCUSDT", 1.0),
+                            RefEvent::Inert => bid("BTCUSDT", 100.0, 5.0),
+                        };
+                        (0, live)
+                    })
+                    .collect();
+                let scripted = script.len();
+                let mut bot = make_bot(&["BTCUSDT"], script);
+
+                let (result, events) = if waiting_for_a_feed {
+                    (
+                        bot.wait_next_feed(false, 1_000_000_000).unwrap(),
+                        ElapseResult::MarketFeed,
+                    )
+                } else {
+                    (
+                        bot.wait_order_response(0, 7, 1_000_000_000).unwrap(),
+                        ElapseResult::OrderResponse,
+                    )
+                };
+                let expected = reference_gates(&trace, events);
+
+                assert_eq!(
+                    (result, consumed(&bot, scripted)),
+                    expected,
+                    "case {case} (waiting_for_a_feed = {waiting_for_a_feed}): {trace:?}"
+                );
+            }
+        }
+    }
+
     /// The opt-out keeps the old shape exactly: one receive for the whole duration, and no
     /// waking up to say anything. A bot pointed at a connector that predates the heartbeat
     /// must not pay for a mechanism it has switched off.
@@ -1277,5 +2588,472 @@ mod tests {
             vec![Duration::from_millis(30)],
             "with no heartbeat there is nothing to wake up for"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The ceiling on the two roads the first cut missed: silence, and churn.
+    //
+    // Both are timed against real `Instant`s, because that is what the ceiling is measured in.
+    // The channels below hand out 1 ms frames and give up after a fixed budget, so a broken
+    // ceiling is a red test with a message inside half a second rather than a run that hangs
+    // for the 60 s an order wait is allowed to take.
+    // ---------------------------------------------------------------------------------------
+
+    /// Twenty frames' worth, so that a deferral which is *supposed* to reach the ceiling cannot
+    /// be confused with two 1 ms sleeps overshooting on a loaded machine.
+    const TEST_CEILING: Duration = Duration::from_millis(20);
+
+    /// The budget every timed channel below starts with: 400 frames ≈ 400 ms, twenty times the
+    /// ceiling under test and a hundredth of the 60 s wait it has to beat.
+    const TIMED_BUDGET: usize = 400;
+
+    fn timed_bot<CH>(channel: CH) -> LiveBot<CH, HashMapMarketDepth> {
+        let mut bot = LiveBot::new(
+            42,
+            channel,
+            vec![
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        );
+        bot.max_batch_hold = TEST_CEILING;
+        bot
+    }
+
+    /// One connector opens a batch, hands over whatever this `elapse` is waiting for, and then
+    /// **everything goes quiet** — no `BatchEnd`, no further frames on any channel.
+    ///
+    /// This is a connector dying between its two markers on an otherwise silent feed, and it is
+    /// the road the busy-feed channel above cannot reach: every receive from here on expires
+    /// instead of returning an event.
+    struct SilentAfterBatchChannel {
+        opened: bool,
+        trigger: Option<LiveEvent>,
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl SilentAfterBatchChannel {
+        fn new(trigger: LiveEvent) -> Self {
+            Self {
+                opened: false,
+                trigger: Some(trigger),
+                budget: TIMED_BUDGET,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Channel for SilentAfterBatchChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            if !self.opened {
+                self.opened = true;
+                return Ok((0, LiveEvent::BatchStart));
+            }
+            if let Some(trigger) = self.trigger.take() {
+                return Ok((0, trigger));
+            }
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "silence behind an unclosed batch held this elapse past every plausible \
+                     ceiling"
+                        .to_string(),
+                ));
+            }
+            Err(BotError::Timeout)
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// **The ceiling has to hold on the road where nothing arrives.** A connector that dies
+    /// between `BatchStart` and `BatchEnd` stops producing anything at all, so every later
+    /// receive expires — and an expiry that does not consult the ceiling leaves the deferred
+    /// response sitting there until the call's own duration runs out. For
+    /// `wait_order_response` that duration is a hardcoded 60 s, six times the connector's
+    /// liveness window: the bot goes on heartbeating from inside the loop and has its resting
+    /// grid cancelled underneath it while it waits.
+    #[test]
+    fn an_orphaned_batch_and_then_total_silence_releases_at_the_ceiling() {
+        let mut bot = timed_bot(SilentAfterBatchChannel::new(order_event("BTC", 7, 100.0)));
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= TEST_CEILING,
+            "the batch must defer the response until the ceiling, not sail through it: {held:?}"
+        );
+        assert!(
+            held < Duration::from_secs(1),
+            "and silence must not postpone the release to the 60 s timeout: {held:?}"
+        );
+        assert_eq!(bot.orders(0).len(), 1, "and the response was applied");
+    }
+
+    /// Two connectors handing the open batch back and forth so that the union of their batches
+    /// is **never** empty, while no single batch is ever old.
+    ///
+    /// `hl` opens, `bnc` opens, `hl` closes, `hl` re-opens, `bnc` closes, and around again. A
+    /// ceiling clocked per connector sees nothing wrong here — every batch it looks at was
+    /// opened a frame or two ago — while the strategy has not been allowed to run since the
+    /// first `BatchStart`.
+    struct HandoffChannel {
+        step: usize,
+        trigger: Option<LiveEvent>,
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl HandoffChannel {
+        fn new(trigger: LiveEvent) -> Self {
+            Self {
+                step: 0,
+                trigger: Some(trigger),
+                budget: TIMED_BUDGET,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Channel for HandoffChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "a handoff between two connectors held this elapse past every plausible \
+                     ceiling"
+                        .to_string(),
+                ));
+            }
+            let step = self.step;
+            self.step += 1;
+            Ok(match step {
+                0 => (0, LiveEvent::BatchStart),
+                1 => (0, self.trigger.take().expect("one trigger, once")),
+                // hl is open on entry to every cycle; the union never empties.
+                _ => match (step - 2) % 4 {
+                    0 => (1, LiveEvent::BatchStart),
+                    1 => (0, LiveEvent::BatchEnd),
+                    2 => (0, LiveEvent::BatchStart),
+                    _ => (1, LiveEvent::BatchEnd),
+                },
+            })
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// **What the ceiling bounds is how long the strategy has been held, not how old one
+    /// connector's batch is.** Two chatty connectors whose batches overlap keep the union open
+    /// for ever while each individual batch stays young, so a clock that restarts on every
+    /// re-open never expires and the bot never quotes again — the very outcome the ceiling
+    /// exists to prevent, reached without a single lost marker.
+    #[test]
+    fn an_endless_handoff_between_two_connectors_is_released_at_the_ceiling() {
+        let mut bot = timed_bot(HandoffChannel::new(order_event("BTC", 7, 100.0)));
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= TEST_CEILING,
+            "an overlapping batch is still a batch: the response waits for the ceiling: {held:?}"
+        );
+        assert!(
+            held < Duration::from_secs(1),
+            "but connectors trading the batch back and forth must not defer it for ever: {held:?}"
+        );
+        assert_eq!(bot.orders(0).len(), 1, "and the response was applied");
+    }
+
+    /// One connector's batch never closes; the other opens and closes one every other frame.
+    struct StuckWithChurnChannel {
+        step: usize,
+        trigger: Option<LiveEvent>,
+        budget: usize,
+        sent: Vec<(u64, usize, LiveRequest)>,
+    }
+
+    impl Channel for StuckWithChurnChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            std::thread::sleep(STUCK_FRAME);
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return Err(BotError::Custom(
+                    "a stuck batch outlived every plausible ceiling while its neighbour churned"
+                        .to_string(),
+                ));
+            }
+            let step = self.step;
+            self.step += 1;
+            Ok(match step {
+                0 => (0, LiveEvent::BatchStart),
+                1 => (0, self.trigger.take().expect("one trigger, once")),
+                _ if (step - 2).is_multiple_of(2) => (1, LiveEvent::BatchStart),
+                _ => (1, LiveEvent::BatchEnd),
+            })
+        }
+
+        fn send(&mut self, id: u64, inst_no: usize, request: LiveRequest) -> Result<(), BotError> {
+            self.sent.push((id, inst_no, request));
+            Ok(())
+        }
+    }
+
+    /// **A neighbour's healthy churn must not buy a stuck batch more time.** This is the case
+    /// the ceiling was written for, with traffic on the other connector added: whatever clock
+    /// the ceiling uses, a batch that opened at the start and never closed has to be released
+    /// on schedule, and a clock that restarts whenever *any* connector opens a batch would keep
+    /// it alive for as long as the neighbour keeps talking.
+    #[test]
+    fn a_stuck_batch_is_released_at_the_ceiling_while_another_connector_churns() {
+        let mut bot = timed_bot(StuckWithChurnChannel {
+            step: 0,
+            trigger: Some(order_event("BTC", 7, 100.0)),
+            budget: TIMED_BUDGET,
+            sent: Vec::new(),
+        });
+
+        let started = Instant::now();
+        let result = bot.wait_order_response(0, 7, 60_000_000_000).unwrap();
+        let held = started.elapsed();
+
+        assert_eq!(result, ElapseResult::Ok);
+        assert!(
+            held >= TEST_CEILING,
+            "the stuck batch defers the response until the ceiling: {held:?}"
+        );
+        assert!(
+            held < Duration::from_secs(1),
+            "and the neighbour's traffic must not extend it: {held:?}"
+        );
+    }
+
+    /// **The ordinary case must still return the moment the books agree, not at the ceiling.**
+    /// Two connectors batching every tick are the normal picture, and a gate that waited out
+    /// the ceiling on each of them would add a quarter of a second to every quote — which is
+    /// why the ceiling here is set absurdly high: the only thing that can end these calls on
+    /// time is the all-closed window itself.
+    #[test]
+    fn a_chatty_pair_of_connectors_returns_at_every_all_closed_window() {
+        let tick = |px: f64| {
+            vec![
+                (0, LiveEvent::BatchStart),
+                (1, LiveEvent::BatchStart),
+                (0, bid("BTC", px, 5.0)),
+                (0, LiveEvent::BatchEnd),
+                (1, LiveEvent::BatchEnd),
+            ]
+        };
+        let mut script = tick(99.0);
+        script.extend(tick(100.0));
+        let scripted = script.len();
+        let mut bot = make_multi_connector_bot(&HL_AND_BNC, script);
+        bot.max_batch_hold = Duration::from_secs(10);
+
+        assert_eq!(
+            bot.wait_next_feed(false, 1_000_000_000).unwrap(),
+            ElapseResult::Ok
+        );
+        assert_eq!(
+            consumed(&bot, scripted),
+            5,
+            "the first tick ends when the last batch of that tick closes"
+        );
+        assert_eq!(bot.depth(0).best_bid(), 99.0);
+
+        assert_eq!(
+            bot.wait_next_feed(false, 1_000_000_000).unwrap(),
+            ElapseResult::Ok
+        );
+        assert_eq!(consumed(&bot, scripted), 10, "and so does the second");
+        assert_eq!(bot.depth(0).best_bid(), 100.0);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The bounds check, precisely.
+    // ---------------------------------------------------------------------------------------
+
+    /// **The check at the head of `process_event` is the one that guards the `unsafe`, and
+    /// nothing in `elapse_` reaches it.** Every index is cleared by `connector_of` first —
+    /// `conn_of_inst` is as long as `instruments` by construction — so the pin above stays
+    /// green with this check deleted, and only calling the method directly says whether it is
+    /// there at all. It is defence in depth, kept because the invariant it rests on lives in
+    /// another function and the next line writes through `get_unchecked_mut`.
+    ///
+    /// Deleting the check does not make this test fail politely: measured, it aborts the test
+    /// binary with SIGABRT from a non-unwinding panic on the reference `get_unchecked_mut`
+    /// produces past the end of a one-element `Vec`. That *is* the finding — the check is what
+    /// turns undefined behaviour into an error a consumer can read.
+    #[test]
+    fn process_event_refuses_an_out_of_range_instrument_before_it_indexes() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+
+        let result =
+            bot.process_event::<false>(9, bid("BTCUSDT", 100.0, 5.0), WaitOrderResponse::None);
+
+        assert!(matches!(result, Err(BotError::InstrumentNotFound)));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Every connector that could not be heartbeated.
+    // ---------------------------------------------------------------------------------------
+
+    /// A channel that can reach nobody.
+    struct AllUnreachableChannel {
+        attempts: usize,
+    }
+
+    impl Channel for AllUnreachableChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            Err(BotError::Timeout)
+        }
+
+        fn send(
+            &mut self,
+            _id: u64,
+            inst_no: usize,
+            _request: LiveRequest,
+        ) -> Result<(), BotError> {
+            self.attempts += 1;
+            Err(BotError::Channel {
+                connector: if inst_no == 0 { "bnc" } else { "hl" }.to_string(),
+                message: format!("SendError on {inst_no}"),
+            })
+        }
+    }
+
+    /// **A second unreachable connector must not vanish behind the first.** The heartbeat is
+    /// what keeps a connector from cancelling this bot's resting orders, so every connector it
+    /// could not reach is a venue about to sweep a grid. A consumer's tolerance branches on the
+    /// name in [`BotError::Channel`] — return only the first and a policy of "hl is fatal,
+    /// market data is not" tolerates the failure that matters, on the strength of the one that
+    /// does not.
+    #[test]
+    fn every_connector_that_could_not_be_reached_is_reported() {
+        let mut bot = LiveBot::new(
+            42,
+            AllUnreachableChannel { attempts: 0 },
+            vec![
+                Instrument::new(
+                    "bnc",
+                    "BTCUSDT",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+                Instrument::new(
+                    "hl",
+                    "BTC",
+                    0.01,
+                    1.0,
+                    HashMapMarketDepth::new(0.01, 1.0),
+                    0,
+                ),
+            ],
+            None,
+            None,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        );
+
+        let (result, logged) = capturing_logs(|| bot.elapse(1_000_000));
+
+        match result {
+            Err(BotError::Channel { connector, message }) => {
+                assert_eq!(connector, "bnc", "the first failure keeps the shape it had");
+                assert!(
+                    message.contains("hl"),
+                    "and the ones behind it are not dropped: {message}"
+                );
+            }
+            other => panic!("expected a named channel fault, got {other:?}"),
+        }
+
+        let named: Vec<&str> = logged
+            .iter()
+            .filter(|event| event.level == Level::ERROR)
+            .filter_map(|event| event.connector.as_deref())
+            .collect();
+        assert!(
+            named.contains(&"bnc") && named.contains(&"hl"),
+            "both unreachable connectors must be named in the log, got {named:?}"
+        );
+        assert_eq!(bot.channel.attempts, 2, "and both were actually attempted");
     }
 }

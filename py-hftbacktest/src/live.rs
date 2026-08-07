@@ -24,6 +24,10 @@ fn handle_result(result: Result<ElapseResult, BotError>) -> i64 {
         Err(BotError::InstrumentNotFound) => 16,
         Err(BotError::Timeout) => 17,
         Err(BotError::Interrupted) => 18,
+        Err(BotError::Channel { connector, message }) => {
+            println!("BotError::Channel({connector}): {message:?}");
+            20
+        },
         Err(BotError::Custom(error)) => {
             println!("BotError::Custom: {error:?}");
             19
@@ -81,6 +85,7 @@ pub extern "C" fn hashmaplive_close(hbt_ptr: *mut HashMapMarketDepthLiveBot) -> 
         Err(BotError::InstrumentNotFound) => 16,
         Err(BotError::Timeout) => 17,
         Err(BotError::Interrupted) => 18,
+        Err(BotError::Channel { .. }) => 20,
         Err(BotError::Custom(_)) => 19,
     }
 }
@@ -324,6 +329,7 @@ pub extern "C" fn roiveclive_close(hbt_ptr: *mut ROIVectorMarketDepthLiveBot) ->
         Err(BotError::InstrumentNotFound) => 16,
         Err(BotError::Timeout) => 17,
         Err(BotError::Interrupted) => 18,
+        Err(BotError::Channel { .. }) => 20,
         Err(BotError::Custom(_)) => 19,
     }
 }

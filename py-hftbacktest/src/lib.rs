@@ -722,7 +722,7 @@ pub fn build_hashmap_livebot(instruments: Vec<PyRefMut<LiveInstrument>>) -> PyRe
         ));
     }
     let hbt: HashMapMarketDepthLiveBot = builder
-        .error_handler(|_error| Ok(()))
+        .error_handler(|_connector, _error| Ok(()))
         .order_recv_hook(|_prev, _new| Ok(()))
         .build()
         .unwrap();
@@ -750,7 +750,7 @@ pub fn build_roivec_livebot(instruments: Vec<PyRefMut<LiveInstrument>>) -> PyRes
         ));
     }
     let hbt: ROIVectorMarketDepthLiveBot = builder
-        .error_handler(|_error| Ok(()))
+        .error_handler(|_connector, _error| Ok(()))
         .order_recv_hook(|_prev, _new| Ok(()))
         .build()
         .unwrap();

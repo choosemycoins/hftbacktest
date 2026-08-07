@@ -24,6 +24,20 @@ pub trait Channel {
     /// ignored and this will attempt to receive a [`LiveEvent`] again until the timeout is reached.
     ///
     /// `(instrument_no, LiveEvent)` will be returned if the message is received.
+    ///
+    /// **The `instrument_no` must always be a valid index into the `instruments` this channel
+    /// was built from, and must always belong to the connector the event came from.** For the
+    /// events that carry a symbol that is the instrument named; for the three that do not
+    /// ([`LiveEvent::BatchStart`], [`LiveEvent::BatchEnd`], [`LiveEvent::Error`]) it is a
+    /// *representative* instrument of the originating connector — any one of its registered
+    /// instruments will do, and [`iceoryx::IceoryxUnifiedChannel`] uses the lowest.
+    ///
+    /// The bot reads it as "which connector is this from" ([`LiveBot`](crate::live::LiveBot)
+    /// keys batch state and error origin off it), so a hardcoded `0` — which is what this
+    /// returned before — silently attributes every markerless event to whichever connector was
+    /// registered first. A single-connector implementation is unaffected: there, `0` is the
+    /// representative instrument. Out-of-range values are rejected by the bot rather than
+    /// trusted, but they are a bug in the implementation, not a supported input.
     fn recv_timeout(&mut self, id: u64, timeout: Duration) -> Result<(usize, LiveEvent), BotError>;
 
     /// Sends a [`LiveRequest`] to the connector corresponding to the `inst_no`.
