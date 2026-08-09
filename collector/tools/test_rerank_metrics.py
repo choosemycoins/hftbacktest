@@ -2012,3 +2012,330 @@ def test_the_fixture_is_two_minutes_of_real_lines():
     assert set(spans) == {"hyperliquid", "binancefuturesum-b"}
     for venue, seconds in spans.items():
         assert 60.0 <= seconds <= 180.0, (venue, seconds)
+
+
+# ---------------------------------------------------------------------------
+# funding (#40) — the third term of the pre-committed screen rule
+# ---------------------------------------------------------------------------
+
+
+def hl_ctx(coin, ts, funding, oracle="100.00", mark="100.01", mid="100.02"):
+    """An `activeAssetCtx` frame, the carrier of Hyperliquid's hourly rate."""
+    return {
+        "channel": "activeAssetCtx",
+        "data": {
+            "coin": coin,
+            "ctx": {
+                "funding": funding,
+                "openInterest": "1.0",
+                "prevDayPx": oracle,
+                "premium": "0.0",
+                "oraclePx": oracle,
+                "markPx": mark,
+                "midPx": mid,
+                "impactPxs": [mark, mid],
+            },
+        },
+    }
+
+
+def test_the_time_weighted_quantile_generalises_the_median():
+    """`q=0.5` reproduces `time_weighted_median`, and the quartiles order.
+
+    The median was the special case all along — the body already searched for
+    the weight that reaches half the total. Hardcoding 0.5, or reaching for an
+    unweighted `np.quantile`, breaks one of the two halves of this.
+    """
+    rng = np.random.default_rng(40)
+    for _ in range(20):
+        values = rng.normal(size=25)
+        weights = rng.uniform(0.1, 10.0, size=25)
+        assert rm.time_weighted_quantile(values, weights, 0.5) == rm.time_weighted_median(
+            values, weights
+        )
+        p25 = rm.time_weighted_quantile(values, weights, 0.25)
+        p50 = rm.time_weighted_quantile(values, weights, 0.5)
+        p75 = rm.time_weighted_quantile(values, weights, 0.75)
+        assert p25 <= p50 <= p75
+
+    # and it is WEIGHTED: the same values with the mass moved give a different p25
+    values = np.array([1.0, 2.0, 3.0, 4.0])
+    assert rm.time_weighted_quantile(values, np.array([1.0, 1.0, 1.0, 1.0]), 0.25) == 1.0
+    assert rm.time_weighted_quantile(values, np.array([1.0, 1.0, 1.0, 97.0]), 0.25) == 4.0
+
+
+def test_the_spread_summary_reports_the_quartiles_the_screen_rule_names():
+    """The pre-committed rule names `spread_25th_percentile`; emit it.
+
+    Until now the row carried `p50_bps` only, so the rule could not be evaluated
+    at all — the screen was blocked on a number that did not exist.
+
+    Three regimes, so that p25, p50 and p75 are three DIFFERENT numbers: a
+    fixture where the quartiles coincide cannot tell a p25 from a p50, and the
+    gate reads the p25.
+    """
+    # 4 frames at 0.01 wide, 4 at 0.03, 4 at 0.05, plus a 13th that carries no
+    # weight (the last frame of a series never does). 12 weighted frames: the
+    # quarter mark falls in the first regime, the half in the second, the three
+    # quarters in the third.
+    widths = [0.01] * 4 + [0.03] * 4 + [0.05] * 5
+    series = quotes([(ns(i), 100.0, 100.0 + w) for i, w in enumerate(widths)])
+    out = rm.summarize_spread(series, tick_scaled=None)
+    assert out["p25_bps"] is not None and out["p75_bps"] is not None
+    assert out["p25_bps"] < out["p50_bps"] < out["p75_bps"]
+    # width / mid * 1e4, and the mid is 100 + width/2, not 100
+    assert out["p25_bps"] == pytest.approx(0.01 / 100.005 * 1e4, abs=1e-8)
+    assert out["p50_bps"] == pytest.approx(0.03 / 100.015 * 1e4, abs=1e-8)
+    assert out["p75_bps"] == pytest.approx(0.05 / 100.025 * 1e4, abs=1e-8)
+
+
+def test_the_funding_frames_reach_the_funding_series(tmp_path):
+    """`activeAssetCtx` is counted AND read, not counted and dropped.
+
+    `_read_hl` classified the frame, counted it, gap-tracked it — and then let
+    the payload fall on the floor at `if not book_channel: continue`. The rate
+    the whole screen term needs was passing through that function already.
+    """
+    records = [
+        (ns(0), hl_bbo("PUMP", ns(0), "100.00", "100.01")),
+        (ns(1), hl_ctx("PUMP", ns(1), "0.0000125")),
+        (ns(2), hl_ctx("PUMP", ns(2), "-0.0000400")),
+        (ns(3), hl_bbo("PUMP", ns(3), "100.00", "100.01")),
+    ]
+    samples = rm.DaySamples(day=DAY)
+    write_gz(tmp_path / f"pump_{DAY}.gz", records)
+    rm._read_hl(tmp_path / f"pump_{DAY}.gz", "PUMP", samples)
+
+    assert samples.counts["activeAssetCtx"] == 2
+    assert samples.funding.ts.size == 2
+    assert list(samples.funding.rate) == [0.0000125, -0.0000400]
+    assert list(samples.funding.oracle_px) == [100.0, 100.0]
+
+
+def test_the_funding_series_pools_across_days():
+    """Two days of rates are one series, like every other observation here."""
+    # `pool_days` folds every per-day accumulator, so a bare DaySamples is not
+    # what it consumes: give it the two `read_day` always fills in.
+    empty_windows = rm.vol_windows(rm.BboBuilder().finish())
+    a = rm.DaySamples(day="20260801", windows=empty_windows, leadlag=np.zeros(3))
+    b = rm.DaySamples(day="20260802", windows=empty_windows, leadlag=np.zeros(3))
+    a.funding = rm.FundingSeries(
+        ts=np.array([ns(1)], dtype=np.int64),
+        rate=np.array([1e-5]),
+        oracle_px=np.array([100.0]),
+    )
+    b.funding = rm.FundingSeries(
+        ts=np.array([ns_on("20260802", 1)], dtype=np.int64),
+        rate=np.array([-2e-5]),
+        oracle_px=np.array([101.0]),
+    )
+    pooled = rm.pool_days([a, b])
+    assert pooled.funding.ts.size == 2
+    assert list(pooled.funding.rate) == [1e-5, -2e-5]
+
+
+def _funding_series(rates_bps_per_hour, start=None):
+    """A settled hourly series: one sample per hour mark, rate in bps/hour."""
+    start = start if start is not None else ns(0)
+    hour = 3600 * SEC
+    n = len(rates_bps_per_hour)
+    # a second before each mark, which is where the ~1Hz tape actually prints
+    return rm.FundingSeries(
+        ts=np.array([start + (i + 1) * hour - SEC for i in range(n)], dtype=np.int64),
+        rate=np.array([r / 1e4 for r in rates_bps_per_hour]),
+        oracle_px=np.full(n, 100.0),
+    )
+
+
+def test_a_missing_hold_input_yields_an_unknown_verdict_not_a_default():
+    """No hold, no fee, no adverse => `unknown`, and `unknown` does not pass.
+
+    `expected_hold` is measured from the run being scored or it is not known.
+    There is no default and no fallback to HYPE's numbers: transplanting one
+    coin's hold onto another is the error this whole term exists to stop making.
+    """
+    series = _funding_series([0.125] * 48)
+    for missing in ("hold_mean_s", "hold_p95_s", "fee_rt_bps", "adverse_bps"):
+        kwargs = dict(
+            spread_p25_bps=10.0, hold_mean_s=600.0, hold_p95_s=3000.0,
+            fee_rt_bps=3.0, adverse_bps=1.0,
+        )
+        kwargs[missing] = None
+        out = rm.summarize_funding(series, **kwargs)
+        assert out["verdict"] == "unknown", missing
+        assert out["break_even_hold_hours"] is None, missing
+        # the distribution is still reported — it is the GATE that is unknown
+        assert out["rate_bps_per_hour"]["median"] == pytest.approx(0.125, abs=1e-9)
+
+
+def test_the_gate_uses_a_unit_inventory_bias():
+    """`BE_hold = gross / |rate|` exactly. No 4.7% shrink inside the gate.
+
+    The measured inventory bias of a mid-following grid is 4.7%, from ONE run,
+    ONE coin, 43 hours, 14 charge events. `bias = 1.0` is the one-sided worst
+    case, which is the shortest break-even and therefore fail-closed. The
+    measured number is reported beside the gate, never inside it — multiplying
+    it in would make every coin look 21x safer than the worst case allows.
+    """
+    series = _funding_series([2.0] * 48)  # |median| = 2.0 bps/h
+    out = rm.summarize_funding(
+        series, spread_p25_bps=10.0, fee_rt_bps=3.0, adverse_bps=1.0,
+        hold_mean_s=600.0, hold_p95_s=3000.0,
+    )
+    assert out["gross_capture_bps"] == pytest.approx(6.0, abs=1e-9)
+    assert out["break_even_hold_hours"]["at_median_rate"] == pytest.approx(3.0, abs=1e-9)
+    assert out["inventory_bias_informational"] == pytest.approx(0.047, abs=1e-12)
+
+
+def test_a_coin_whose_mean_rate_erases_the_gross_capture_is_verdict_erased():
+    """ACE-shaped: gross 5.13 bps, |median| 8.93 bps/h, worst hour 77.58.
+
+    Break-even at the median rate is 0.57 h = 2069 s, under a 2400 s mean hold.
+    Comparing against the interest default, or against a signed mean that the
+    long and short hours cancel out of, both miss it.
+    """
+    rates = [-8.93] * 44 + [-77.58, -75.38, -63.49, -56.25]
+    out = rm.summarize_funding(
+        _funding_series(rates), spread_p25_bps=8.13, fee_rt_bps=3.0, adverse_bps=0.0,
+        hold_mean_s=2400.0, hold_p95_s=6000.0,
+    )
+    assert out["gross_capture_bps"] == pytest.approx(5.13, abs=1e-9)
+    assert out["verdict"] == "erased"
+
+
+def test_a_coin_whose_tail_alone_erases_the_gross_capture_is_verdict_tail_risk():
+    """NIL-shaped: the mean is harmless, the tail is not.
+
+    gross 3.82 bps, |median| ~0.125, worst hour 11.64. The mean gate passes and
+    the coin still must not be called immaterial: one hour in 168 carries a rate
+    above the whole gross capture. Dropping the tail branch collapses the term
+    back to "subtract the mean", which measurably reorders NOTHING.
+
+    One hour, not the brief's "p_hour ~= 1.1%". That figure is investigation 3's
+    Monte-Carlo probability that a ROUND TRIP loses more to funding than it
+    captures, which is a different quantity from the share of HOURS whose rate
+    exceeds the capture; NIL's measured per-hour share is above 10% (its 7d p90
+    |rate| is 5.07 against a 3.82 gross), which the pre-committed thresholds
+    would call `erased`, not `tail_risk`. The brief's threshold table and its
+    predicted verdict for NIL cannot both hold. The thresholds are what is
+    pre-committed, so they win, and this fixture is NIL-SHAPED rather than NIL:
+    it exercises the band between the two gates, which is what the test is for.
+    """
+    rates = [0.125] * 167 + [11.64]
+    out = rm.summarize_funding(
+        _funding_series(rates), spread_p25_bps=6.82, fee_rt_bps=3.0, adverse_bps=0.0,
+        hold_mean_s=600.0, hold_p95_s=3000.0,
+    )
+    assert out["gross_capture_bps"] == pytest.approx(3.82, abs=1e-9)
+    assert out["break_even_hold_hours"]["at_median_rate"] > 24.0  # mean gate passes wide
+    assert out["tail"]["p_hour_rate_ge_gross"] > 0.0005
+    assert out["verdict"] == "tail_risk"
+
+
+def test_the_tail_probability_alone_can_reach_tail_risk():
+    """The tail-probability branch, isolated from the break-even branch.
+
+    Both branches can raise `tail_risk`, and the sibling fixture reaches it
+    through the break-even one — so the pre-committed 0.05% probability
+    threshold was free to move without any test noticing. Here the break-even at
+    the worst hour is exactly the p95 hold (4.0 gross / 4.0 bps worst = 1.0 h,
+    and hold_p95 is 3600 s), so that branch does NOT fire; the verdict can only
+    come from one hour in 168 = 0.595% clearing the 0.05% threshold.
+    """
+    rates = [0.125] * 167 + [4.0]
+    out = rm.summarize_funding(
+        _funding_series(rates), spread_p25_bps=7.0, fee_rt_bps=3.0, adverse_bps=0.0,
+        hold_mean_s=600.0, hold_p95_s=3600.0,
+    )
+    assert out["gross_capture_bps"] == pytest.approx(4.0, abs=1e-9)
+    assert out["break_even_hold_hours"]["at_worst_hour"] == pytest.approx(1.0, abs=1e-9)
+    assert out["tail"]["p_hour_rate_ge_gross"] == pytest.approx(1 / 168, abs=1e-9)
+    assert out["verdict"] == "tail_risk"
+
+
+def test_a_quiet_coin_is_immaterial():
+    """The control: the mean gate and the tail gate both pass."""
+    out = rm.summarize_funding(
+        _funding_series([0.125] * 168), spread_p25_bps=12.0, fee_rt_bps=3.0,
+        adverse_bps=1.0, hold_mean_s=600.0, hold_p95_s=3000.0,
+    )
+    assert out["verdict"] == "immaterial"
+
+
+def test_the_funding_block_reports_hours_it_could_not_cover():
+    """Three missing hour marks are counted and warned about, not zero-filled.
+
+    A zero-filled hour is indistinguishable from an hour that genuinely settled
+    at zero, and the screen would read a recording hole as a calm market.
+    """
+    hour = 3600 * SEC
+    kept = [i for i in range(24) if i not in (5, 6, 7)]
+    series = rm.FundingSeries(
+        ts=np.array([ns(0) + (i + 1) * hour - SEC for i in kept], dtype=np.int64),
+        rate=np.full(len(kept), 1.25e-5),
+        oracle_px=np.full(len(kept), 100.0),
+    )
+    out = rm.summarize_funding(
+        series, spread_p25_bps=12.0, fee_rt_bps=3.0, adverse_bps=1.0,
+        hold_mean_s=600.0, hold_p95_s=3000.0,
+    )
+    assert out["hours_covered"] == 21
+    assert out["hours_unresolved"] == 3
+    assert any("funding" in w for w in out["warnings"])
+
+
+def test_the_interest_default_is_reported_as_a_share_not_as_a_floor():
+    """`frac_at_interest_default` is a description; rates below it survive."""
+    out = rm.summarize_funding(
+        _funding_series([0.125] * 3 + [0.0125, -4.0]), spread_p25_bps=12.0,
+        fee_rt_bps=3.0, adverse_bps=1.0, hold_mean_s=600.0, hold_p95_s=3000.0,
+    )
+    assert out["rate_bps_per_hour"]["frac_at_interest_default"] == pytest.approx(0.6, abs=1e-9)
+    assert out["rate_bps_per_hour"]["p05"] < 0.125
+    assert out["interest_default_bps_per_hour"] == pytest.approx(0.125, abs=1e-12)
+
+
+def test_the_funding_block_reaches_the_report_and_the_text(tmp_path):
+    """End to end: a recording with rates in it produces the block and a line."""
+    hour = 3600 * SEC
+    hl = [(ns(0), hl_bbo("PUMP", ns(0), "100.00", "100.01"))]
+    for i in range(1, 7):
+        t = ns(0) + i * hour - SEC
+        hl.append((t, hl_ctx("PUMP", t, "0.0000125")))
+    hl.append((ns(0) + 6 * hour, hl_bbo("PUMP", ns(0) + 6 * hour, "100.00", "100.01")))
+    um = [(ns(0), um_book_ticker("PUMPUSDT", ns(0), 1, "100.00", "100.01"))]
+    hl_dir, um_dir = a_day(tmp_path, hl, um)
+
+    out = tmp_path / "r.json"
+    rc = rm.main([
+        "--hl-dir", str(hl_dir), "--coin", "PUMP", "--um-dir", str(um_dir),
+        "--um-symbol", "PUMPUSDT", "--day", DAY, "--json", str(out),
+        "--fee-rt-bps", "3.0", "--adverse-bps", "1.0",
+        "--hold-mean-s", "600", "--hold-p95-s", "3000",
+    ])
+    assert rc == 0
+    report = json.loads(out.read_text())
+    block = report["rows"][0]["funding"]
+    assert block["source"] == "activeAssetCtx"
+    assert block["interval_hours"] == 1
+    assert block["hours_covered"] == 6
+    assert block["verdict"] in ("immaterial", "tail_risk", "erased")
+    assert "funding" in rm.render_text(report)
+
+
+def test_a_screen_run_without_the_hold_inputs_still_runs_and_says_unknown(tmp_path):
+    """The CLI must not require them — it must refuse to GUESS them."""
+    hour = 3600 * SEC
+    hl = [(ns(0), hl_bbo("PUMP", ns(0), "100.00", "100.01"))]
+    for i in range(1, 4):
+        t = ns(0) + i * hour - SEC
+        hl.append((t, hl_ctx("PUMP", t, "0.0000125")))
+    um = [(ns(0), um_book_ticker("PUMPUSDT", ns(0), 1, "100.00", "100.01"))]
+    hl_dir, um_dir = a_day(tmp_path, hl, um)
+    out = tmp_path / "r.json"
+    rc = rm.main([
+        "--hl-dir", str(hl_dir), "--coin", "PUMP", "--um-dir", str(um_dir),
+        "--um-symbol", "PUMPUSDT", "--day", DAY, "--json", str(out),
+    ])
+    assert rc == 0
+    assert json.loads(out.read_text())["rows"][0]["funding"]["verdict"] == "unknown"

@@ -108,6 +108,11 @@ from quality_report import (  # noqa: E402
     parse_line,
 )
 
+#: The single home of the funding convention (#40). Imported rather than
+#: reimplemented: the settlement rule, the sign and the price basis are measured
+#: against a real ledger in one place, and a second copy of them would drift.
+import funding  # noqa: E402
+
 SCHEMA = "rerank-metrics-v1"
 
 MS = 1_000_000
@@ -333,6 +338,47 @@ class BboSeries:
 
     def __len__(self) -> int:
         return int(self.ts.size)
+
+
+@dataclass
+class FundingSeries:
+    """`activeAssetCtx` rate samples: the raw running rate, not yet settled.
+
+    `rate` is Hyperliquid's running accumulator for the hour in progress, signed
+    and dimensionless; `oracle_px` is the notional basis at the same instant.
+    Turning this into per-hour settled rates is `funding.curve_from_samples`,
+    which is where the venue convention lives — this is only the tape.
+    """
+
+    ts: np.ndarray
+    rate: np.ndarray
+    oracle_px: np.ndarray
+
+    def __len__(self) -> int:
+        return int(self.ts.size)
+
+
+class FundingBuilder:
+    """Accumulates `activeAssetCtx` frames into a `FundingSeries`."""
+
+    def __init__(self) -> None:
+        self._ts = array("q")
+        self._rate = array("d")
+        self._px = array("d")
+
+    def add(self, ts, rate, oracle_px) -> None:
+        self._ts.append(int(ts))
+        self._rate.append(float(rate))
+        self._px.append(float(oracle_px))
+
+    def finish(self) -> FundingSeries:
+        ts = np.frombuffer(self._ts, dtype=np.int64).copy()
+        rate = np.frombuffer(self._rate, dtype=np.float64).copy()
+        px = np.frombuffer(self._px, dtype=np.float64).copy()
+        if ts.size and not np.all(np.diff(ts) >= 0):
+            order = np.argsort(ts, kind="stable")
+            ts, rate, px = ts[order], rate[order], px[order]
+        return FundingSeries(ts=ts, rate=rate, oracle_px=px)
 
 
 class BboBuilder:
@@ -641,8 +687,16 @@ def summarize_tick(bid_counts, ask_counts, mid: np.ndarray, weight=None) -> dict
 # ---------------------------------------------------------------------------
 
 
-def time_weighted_median(values: np.ndarray, weights: np.ndarray) -> Optional[float]:
-    """The smallest value whose cumulative weight reaches half the total."""
+def time_weighted_quantile(
+    values: np.ndarray, weights: np.ndarray, q: float
+) -> Optional[float]:
+    """The smallest value whose cumulative weight reaches `q` of the total.
+
+    The median was always the `q=0.5` case of this; the pre-committed coin
+    screen names the 25th percentile of the spread, so the `0.5` is a parameter
+    now. Weighted, not `np.quantile`: a frame counts for the time it stood, and
+    a burst of quotes in one busy second must not outvote a quiet minute.
+    """
     if values.size == 0:
         return None
     finite = np.isfinite(values) & (weights > 0)
@@ -653,8 +707,13 @@ def time_weighted_median(values: np.ndarray, weights: np.ndarray) -> Optional[fl
     order = np.argsort(v, kind="stable")
     v = v[order]
     cumulative = np.cumsum(w[order])
-    index = int(np.searchsorted(cumulative, 0.5 * cumulative[-1], side="left"))
+    index = int(np.searchsorted(cumulative, q * cumulative[-1], side="left"))
     return float(v[min(index, v.size - 1)])
+
+
+def time_weighted_median(values: np.ndarray, weights: np.ndarray) -> Optional[float]:
+    """The smallest value whose cumulative weight reaches half the total."""
+    return time_weighted_quantile(values, weights, 0.5)
 
 
 def _weight_fraction(mask: np.ndarray, weights: np.ndarray) -> Optional[float]:
@@ -673,7 +732,13 @@ def summarize_spread(series: BboSeries, tick_scaled: Optional[int]) -> dict:
         "frames_weighted": int(weighted.sum()),
         "weighted_seconds": total_ns / SEC,
         "crossed_or_zero_frames": int((series.spread <= 0).sum()),
+        # p25 is what the pre-committed screen rule names
+        # (`spread_p25 > fee_RT + adverse + funding x hold`); p50 and p75 are
+        # here so the row shows the shape of the distribution the gate reads one
+        # point of.
+        "p25_bps": time_weighted_quantile(series.spread_bps, weight, 0.25),
         "p50_bps": time_weighted_median(series.spread_bps, weight),
+        "p75_bps": time_weighted_quantile(series.spread_bps, weight, 0.75),
         "p50_ticks": None,
         "frac_time_at_1_tick": None,
         "frac_time_ge_3_ticks": None,
@@ -686,6 +751,185 @@ def summarize_spread(series: BboSeries, tick_scaled: Optional[int]) -> dict:
         out["frac_time_at_1_tick"] = _weight_fraction(series.spread == tick_scaled, weight)
         out["frac_time_ge_3_ticks"] = _weight_fraction(series.spread >= 3 * tick_scaled, weight)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 2b. funding (#40) — the third term of the pre-committed screen rule
+# ---------------------------------------------------------------------------
+
+
+#: The round-trip maker fee, in bps. MEASURED, not assumed: 139/139 maker fills
+#: on our own Hyperliquid mainnet ledger paid 1.4991-1.5000 bps per side.
+DEFAULT_FEE_RT_BPS = 3.0
+
+#: The inventory bias used INSIDE the gate. One, deliberately: the one-sided
+#: worst case, which gives the shortest break-even hold and is therefore
+#: fail-closed. The MEASURED bias of a mid-following grid is 0.047
+#: (|signed TWA| / |absolute TWA|) — but that is n=1 run, one coin, 43 hours,
+#: 14 charge events, and it is a property of the STRATEGY, not of the coin.
+#: Transplanting it across 18 coins is precisely the error this term exists to
+#: stop; it is reported beside the gate as informational and never multiplied in.
+GATE_INVENTORY_BIAS = 1.0
+MEASURED_INVENTORY_BIAS = 0.047
+
+#: `erased` if a hair over one hour in a hundred carries a rate above the whole
+#: gross capture; `tail_risk` at one in two thousand. Pre-committed 2026-08-09,
+#: before the candidates' data was seen, from the structure of the rule (a mean
+#: gate and a tail gate) rather than tuned against a ranking. Changing either
+#: needs a date and a measurement.
+ERASED_TAIL_P = 0.01
+TAIL_RISK_TAIL_P = 0.0005
+
+
+def summarize_funding(
+    series: "FundingSeries",
+    *,
+    spread_p25_bps: Optional[float] = None,
+    fee_rt_bps: Optional[float] = None,
+    adverse_bps: Optional[float] = None,
+    hold_mean_s: Optional[float] = None,
+    hold_p95_s: Optional[float] = None,
+    interval_ns: int = funding.HL_INTERVAL_NS,
+) -> dict:
+    """Funding as the screen's third term — a distribution and a gate.
+
+    THE STOPPING RULE IS INVERTED, NOT FED A CONSTANT. The pre-committed rule is
+
+        spread_p25 > fee_RT + adverse + funding x hold
+
+    which is the same statement as `hold < BE_hold`, where
+
+        BE_hold_hours = (spread_p25 - fee_RT - adverse) / (bias x |rate|)
+
+    Inverting it is what lets the coin be judged against a hold measured from
+    its OWN run instead of a hold transplanted from HYPE's.
+
+    THE RATE IS A DISTRIBUTION, NEVER A POINT ESTIMATE, and that is measured
+    rather than stylistic. Predicting a day's mean hourly rate with the trailing
+    7-day mean gives MAE 0.610 bps/h across 19 coins x 8 days against 0.640 for
+    the flat interest default — a 5% edge, and WORSE than the constant for 9 of
+    19 coins. A spot read is worse still: CASHCAT moved +4.125 -> +3.030 bps/h
+    and ACE -0.938 -> -1.811 within two hours of the brief that quoted them, and
+    over 168 hours CASHCAT averages +1.18 while ACE averages -8.93. A spot read
+    mis-ranks the very coins the term was introduced to catch. So the gate is
+    evaluated at three named points of the empirical distribution — the median
+    rate, the p95 rate and the worst hour — and no forecast is made.
+
+    `|rate|`, not the signed rate, at every one of those points. A coin whose
+    hours cancel in the mean can still bleed on whichever side inventory
+    happens to sit; fail-closed says assume the paying side.
+
+    A missing input is `unknown`, and `unknown` DOES NOT PASS THE SCREEN. There
+    is no default hold and no fallback to another coin's: `expected_hold` is
+    measured from the run being scored or it is not known. `adverse_bps` comes
+    from the #32 fill-quality harness and this tool refuses to guess it.
+    """
+    curve = funding.curve_from_samples(
+        series.ts, series.rate, series.oracle_px, interval_ns=interval_ns
+    )
+    stats = funding.rate_stats(curve)
+    rates_bps = np.array([abs(b.rate) for b in curve.boundaries], dtype=np.float64) * 1e4
+
+    warnings: list = []
+    if curve.unresolved:
+        warnings.append(
+            f"funding: {len(curve.unresolved)} hour mark(s) inside the recorded span "
+            f"carry no rate; they are reported rather than zero-filled, and every "
+            f"quantile below is over the {stats['hours_covered']} hours that do"
+        )
+
+    have_gate = None not in (spread_p25_bps, fee_rt_bps, adverse_bps, hold_mean_s, hold_p95_s)
+    gross = (
+        float(spread_p25_bps) - float(fee_rt_bps) - float(adverse_bps)
+        if None not in (spread_p25_bps, fee_rt_bps, adverse_bps)
+        else None
+    )
+
+    def _be(rate_bps: Optional[float]) -> Optional[float]:
+        if gross is None or rate_bps is None or rate_bps <= 0:
+            return None
+        return gross / (GATE_INVENTORY_BIAS * rate_bps)
+
+    median_abs = float(np.median(rates_bps)) if rates_bps.size else None
+    p95_abs = float(np.percentile(rates_bps, 95)) if rates_bps.size else None
+    worst_abs = float(rates_bps.max()) if rates_bps.size else None
+    p_tail = (
+        float((rates_bps >= gross).mean())
+        if rates_bps.size and gross is not None and gross > 0
+        else None
+    )
+
+    break_even = (
+        {
+            "at_median_rate": _num(_be(median_abs)),
+            "at_p95_rate": _num(_be(p95_abs)),
+            "at_worst_hour": _num(_be(worst_abs)),
+        }
+        if have_gate and gross is not None
+        else None
+    )
+
+    verdict = "unknown"
+    if have_gate and break_even is not None:
+        mean_h = float(hold_mean_s) / 3600.0
+        p95_h = float(hold_p95_s) / 3600.0
+        be_median = break_even["at_median_rate"]
+        be_worst = break_even["at_worst_hour"]
+        erased = (be_median is not None and be_median < mean_h) or (
+            p_tail is not None and p_tail > ERASED_TAIL_P
+        )
+        tail = (be_worst is not None and be_worst < p95_h) or (
+            p_tail is not None and p_tail > TAIL_RISK_TAIL_P
+        )
+        verdict = "erased" if erased else ("tail_risk" if tail else "immaterial")
+
+    return {
+        "source": "activeAssetCtx",
+        "interval_hours": interval_ns / 3600 / SEC,
+        "hours_covered": stats["hours_covered"],
+        "hours_unresolved": len(curve.unresolved),
+        "rate_bps_per_hour": {
+            "mean": _num(stats["mean"]),
+            "median": _num(stats["median"]),
+            "p05": _num(stats["p05"]),
+            "p95": _num(stats["p95"]),
+            "max_abs": _num(stats["max_abs"]),
+            "median_abs": _num(median_abs),
+            "p95_abs": _num(p95_abs),
+            "frac_at_interest_default": _num(stats["frac_at_interest_default"]),
+            "sign_flips": stats["sign_flips"],
+        },
+        "interest_default_bps_per_hour": funding.HL_INTEREST_DEFAULT * 1e4,
+        "gross_capture_bps": _num(gross),
+        "break_even_hold_hours": break_even,
+        "tail": {
+            "p_hour_rate_ge_gross": _num(p_tail),
+            "worst_hour_bps": _num(worst_abs),
+        },
+        "hold_mean_s": _num(hold_mean_s),
+        "hold_p95_s": _num(hold_p95_s),
+        "fee_rt_bps": _num(fee_rt_bps),
+        "adverse_bps": _num(adverse_bps),
+        "inventory_bias_gate": GATE_INVENTORY_BIAS,
+        "inventory_bias_informational": MEASURED_INVENTORY_BIAS,
+        "expected_funding_bps_per_hour_informational": _num(
+            None if median_abs is None else MEASURED_INVENTORY_BIAS * median_abs
+        ),
+        "verdict": verdict,
+        "warnings": warnings,
+        "caveat": FUNDING_CAVEAT,
+    }
+
+
+FUNDING_CAVEAT = (
+    "rates are the empirical distribution of the settled hourly series, used as "
+    "a risk description and NOT as a forecast (the trailing 7-day mean beats a "
+    "flat constant by 5% across 19 coins and loses to it on 9 of them). the gate "
+    "uses inventory bias 1.0 — the one-sided worst case, fail-closed — not the "
+    "measured 0.047, which is one strategy on one coin over 43 hours. hold is "
+    "supplied per coin from that coin's own run; absent, the verdict is "
+    "'unknown' and the coin does not pass"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1469,6 +1713,10 @@ class DaySamples:
     fast: BookSeries = field(default_factory=lambda: BookBuilder().finish())
     slow: BookSeries = field(default_factory=lambda: BookBuilder().finish())
     windows: Optional[VolWindows] = None
+    #: The `activeAssetCtx` rate samples. Concatenates across days like the
+    #: quote series does: the settled rate of the hour that straddles midnight
+    #: is only recoverable if both days' samples are in one array.
+    funding: "FundingSeries" = field(default_factory=lambda: FundingBuilder().finish())
     #: Price-gap counts over every channel that prints a best price, summed. Kept
     #: per day so that pooling adds counts rather than concatenating series: a
     #: concatenation would count one gap across midnight that no feed ever showed.
@@ -1533,6 +1781,7 @@ def _read_hl(path: Path, coin: str, samples: DaySamples) -> None:
     bbo = BboBuilder()
     fast = BookBuilder()
     slow = BookBuilder()
+    funding = FundingBuilder()
     tracker = _GapTracker()
     first = last = None
     try:
@@ -1559,6 +1808,16 @@ def _read_hl(path: Path, coin: str, samples: DaySamples) -> None:
             tracker.observe(stream, ts)
             first = ts if first is None else first
             last = ts
+            if stream == "activeAssetCtx":
+                # Counted and gap-tracked above, and until #40 the payload was
+                # dropped right here — the funding rate the whole screen term
+                # needs was already passing through this function.
+                ctx = (data.get("ctx") or {}) if isinstance(data, dict) else {}
+                try:
+                    funding.add(ts, ctx["funding"], ctx["oraclePx"])
+                except (KeyError, TypeError, ValueError):
+                    samples.counts["hl_unclassified"] += 1
+                continue
             if not book_channel:
                 continue
             if stream == "bbo":
@@ -1592,6 +1851,7 @@ def _read_hl(path: Path, coin: str, samples: DaySamples) -> None:
     samples.bbo = bbo.finish()
     samples.fast = fast.finish()
     samples.slow = slow.finish()
+    samples.funding = funding.finish()
     samples.gaps.update({f"hl.{k}": v for k, v in tracker.gaps.items()})
     samples.counts["hl_first_local_ts"] = first
     samples.counts["hl_last_local_ts"] = last
@@ -1798,6 +2058,21 @@ def _concat_bbo(parts) -> BboSeries:
     return BboSeries(**joined)
 
 
+def _concat_funding(parts) -> FundingSeries:
+    """Rate samples concatenate, like the quotes.
+
+    Unlike the frame weights and the price-run lifetimes, nothing here is
+    per-day: the hour that straddles midnight settles from the last sample
+    before it, whichever day's file that sample came out of, so splitting the
+    series by day would lose exactly one boundary per day boundary.
+    """
+    return FundingSeries(
+        ts=np.concatenate([p.ts for p in parts]),
+        rate=np.concatenate([p.rate for p in parts]),
+        oracle_px=np.concatenate([p.oracle_px for p in parts]),
+    )
+
+
 def _concat_books(parts) -> BookSeries:
     offset = 0
     rows = []
@@ -1855,6 +2130,7 @@ def pool_days(days: Sequence[DaySamples]) -> DaySamples:
         for stream, (count, worst) in d.gaps.items():
             have_count, have_worst = pooled.gaps.get(stream, (0, 0))
             pooled.gaps[stream] = (have_count + count, max(have_worst, worst))
+    pooled.funding = _concat_funding([d.funding for d in days])
     pooled.bbo = _concat_bbo([d.bbo for d in days])
     pooled.fast = _concat_books([d.fast for d in days])
     pooled.slow = _concat_books([d.slow for d in days])
@@ -1886,7 +2162,7 @@ def pool_days(days: Sequence[DaySamples]) -> DaySamples:
 DECADE_SPLIT_WARN = 0.01
 
 
-def summarize(samples: DaySamples) -> dict:
+def summarize(samples: DaySamples, screen: Optional[dict] = None) -> dict:
     tick = summarize_tick(
         samples.bid_tick_counts,
         samples.ask_tick_counts,
@@ -1906,6 +2182,15 @@ def summarize(samples: DaySamples) -> dict:
             f"the tick is not {used:.3g}; every _ticks number in this row, "
             f"frac_time_ge_3_ticks included, is wrong by up to that share"
         )
+    screen = dict(screen or {})
+    spread = summarize_spread(samples.bbo, tick_scaled)
+    # The gate reads the p25 of THIS row's own pooled spread unless the operator
+    # named one: the screen rule is about the spread the coin actually quoted,
+    # and a Sunday spot reading of it moved 12.56 -> 6.33 bps in five minutes.
+    screen.setdefault("spread_p25_bps", spread["p25_bps"])
+    funding_block = summarize_funding(samples.funding, **screen)
+    warnings.extend(funding_block["warnings"])
+
     return {
         "day": samples.day,
         "window": {
@@ -1916,7 +2201,8 @@ def summarize(samples: DaySamples) -> dict:
         "counts": {k: samples.counts.get(k) for k in ("hl_first_local_ts", "hl_last_local_ts")}
         | {k: samples.counts.get(k, 0) for k in COUNT_KEYS},
         "tick": tick,
-        "spread": summarize_spread(samples.bbo, tick_scaled),
+        "spread": spread,
+        "funding": funding_block,
         "conditional_spread": conditional_spread_curve(samples.windows, samples.bbo),
         "touch": summarize_touch(
             samples.bbo,
@@ -1947,11 +2233,11 @@ def summarize(samples: DaySamples) -> dict:
     }
 
 
-def build_report(hl_dir, coin, um_dirs, um_symbol, days) -> dict:
+def build_report(hl_dir, coin, um_dirs, um_symbol, days, screen=None) -> dict:
     read = [read_day(hl_dir, coin, um_dirs, um_symbol, day) for day in days]
-    rows = [summarize(d) for d in read]
+    rows = [summarize(d, screen) for d in read]
     if len(read) > 1:
-        rows.append(summarize(pool_days(read)))
+        rows.append(summarize(pool_days(read), screen))
     return _plain(
         {
             "schema": SCHEMA,
@@ -2247,6 +2533,33 @@ def render_text(report: dict) -> str:
     lines.append(f"  caveat: {LEADLAG_CAVEAT}")
     lines.append(f"  caveat: {TRAVERSAL_CAVEAT}")
     lines.append("")
+    lines.append("")
+    lines.append("  funding (#40)")
+    lines += _table(
+        ["day", "hours", "unres", "median_bps_h", "p95_abs", "worst", "flips",
+         "gross_bps", "BE_h@med", "BE_h@worst", "p_tail", "verdict"],
+        [
+            [
+                r["day"],
+                _cell(r["funding"]["hours_covered"]),
+                _cell(r["funding"]["hours_unresolved"]),
+                _cell(r["funding"]["rate_bps_per_hour"]["median"], ".4f"),
+                _cell(r["funding"]["rate_bps_per_hour"]["p95_abs"], ".4f"),
+                _cell(r["funding"]["tail"]["worst_hour_bps"], ".3f"),
+                _cell(r["funding"]["rate_bps_per_hour"]["sign_flips"]),
+                _cell(r["funding"]["gross_capture_bps"], ".3f"),
+                _cell((r["funding"]["break_even_hold_hours"] or {}).get("at_median_rate"), ".2f"),
+                _cell((r["funding"]["break_even_hold_hours"] or {}).get("at_worst_hour"), ".2f"),
+                _cell(r["funding"]["tail"]["p_hour_rate_ge_gross"], ".5f"),
+                r["funding"]["verdict"],
+            ]
+            for r in rows
+        ],
+        [10, 7, 7, 14, 10, 9, 7, 11, 11, 12, 9, 10],
+    )
+    lines.append(f"    {FUNDING_CAVEAT}")
+
+    lines.append("")
     lines.append("  warnings")
     any_warning = False
     for r in rows:
@@ -2345,6 +2658,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--day", dest="days", action="append", default=[], metavar="YYYYMMDD",
                        required=True, help="A UTC day to measure. Repeat for several; "
                        "several days also produce a pooled row.")
+    # The funding gate's inputs (#40). Every one of them is MEASURED per coin;
+    # none has a default except the fee, which is measured too.
+    #
+    # --hold-mean-s / --hold-p95-s MUST come from a backtest_first.py run of THIS
+    # coin at the geometry that passes its own request-budget gate. There is no
+    # default and no fallback to another coin's hold: three separate "hold"
+    # measurements already exist for HYPE alone and they differ by 10x (live
+    # median 116s, live mean 687s, a replay of a different geometry 1177s).
+    # DO NOT reintroduce a hold MODEL here. The driftless-random-walk one that
+    # was fitted (hold = 31695 x (spread_bps/sigma_h)^2, one coin, one 43-hour
+    # range-bound window) returns 15s for CASHCAT and 11s for ACE — shorter than
+    # the measured 112s floor — because it has no drift and no adverse
+    # selection, i.e. it omits the effect that dominates. A coin with no run of
+    # its own gets verdict "unknown", and "unknown" does not pass.
+    parser.add_argument("--hold-mean-s", type=float, default=None,
+                       help="Mean inventory-episode length of THIS coin's own run, seconds.")
+    parser.add_argument("--hold-p95-s", type=float, default=None,
+                       help="p95 inventory-episode length of THIS coin's own run, seconds.")
+    parser.add_argument("--fee-rt-bps", type=float, default=DEFAULT_FEE_RT_BPS,
+                       help="Round-trip maker fee in bps (measured default: 3.0 on HL).")
+    parser.add_argument("--adverse-bps", type=float, default=None,
+                       help="Adverse selection in bps, from the #32 fill-quality harness. "
+                            "No default: the tool refuses to guess it.")
+    parser.add_argument("--spread-p25-bps", type=float, default=None,
+                       help="Override the measured p25 spread the gate uses.")
     parser.add_argument("--json", dest="json_out", metavar="OUT", help="Write the report here.")
     parser.add_argument("--txt", dest="txt_out", metavar="OUT", help="Write the table here too.")
     return parser
@@ -2366,8 +2704,19 @@ def main(argv=None) -> int:
         return 2
     days = sorted(dict.fromkeys(args.days))
 
+    screen = {
+        "hold_mean_s": args.hold_mean_s,
+        "hold_p95_s": args.hold_p95_s,
+        "fee_rt_bps": args.fee_rt_bps,
+        "adverse_bps": args.adverse_bps,
+    }
+    if args.spread_p25_bps is not None:
+        screen["spread_p25_bps"] = args.spread_p25_bps
+
     try:
-        report = build_report(args.hl_dir, args.coin, args.um_dirs, args.um_symbol, days)
+        report = build_report(
+            args.hl_dir, args.coin, args.um_dirs, args.um_symbol, days, screen
+        )
     except (ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
