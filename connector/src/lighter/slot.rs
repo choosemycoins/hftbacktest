@@ -18,6 +18,8 @@
 //!    then expire the order and report the error to the bot — never leave it believing a
 //!    one-sided quote is resting (`AGENTS.md` §1.1).
 
+use std::time::Instant;
+
 use crate::lighter::{
     private_msg::AccountOrder,
     rest::{SendOutcome, TxVerdict},
@@ -142,12 +144,88 @@ pub fn deadline_action(confirmed: Option<bool>, has_tx_hash: bool) -> DeadlineAc
     }
 }
 
+/// The clock marks one placement collects on its way out, opened where the connector first
+/// sees the order and carried to the slot on its command.
+///
+/// **Why the outbound path is instrumented at all.** MEASURED on the Lighter testnet
+/// 2026-08-09 over 60_719 order responses: the venue answers in a median 135 ms, but an order
+/// takes a median 913 ms to reach it — all of the latency is outbound, and the connector could
+/// not say which of its own stages spent it. On that path sit a queue shared with cancels, a
+/// nonce that may need a REST refresh, and a Python signer sidecar in its own process. Whether
+/// those 913 ms are ours or the venue's decides whether a signal with a 450–800 ms lead can be
+/// traded here at all, so it is worth one log line per placement.
+///
+/// The spans it yields are all differences of marks taken on **one** clock. That matters:
+/// entry latency as measured downstream is `venue stamp − our stamp`, so any host/venue clock
+/// offset moves silently between the two legs. These do not have that weakness.
+pub struct Outbound {
+    /// `Order::local_timestamp` — stamped in the **bot** process before iceoryx (nanoseconds).
+    pub requested_ns: i64,
+    /// `Utc::now()` when the connector took the order (nanoseconds). Same host and same clock
+    /// as `requested_ns`, so their difference is the hand-off and nothing else.
+    pub received_ns: i64,
+    /// When the order was queued for the slot task.
+    pub queued: Instant,
+}
+
+/// Where one placement's outbound microseconds went. Every field is a span, not a timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundSpans {
+    /// Bot stamp → connector: the iceoryx hand-off. `-1` when the bot did not stamp the
+    /// request (see [`Outbound::spans`]).
+    pub ipc_us: i64,
+    /// Connector → slot task: the head-of-line wait behind whatever the slot was already
+    /// sending. Submits and cancels share one queue and each `.await`s a full REST round trip,
+    /// so a burst of requotes shows up here and nowhere else.
+    pub queue_us: i64,
+    /// Reserving the nonce. Normally in-memory and ~0; an unseeded slot spends a `GET
+    /// /nextNonce` round trip here rather than inflating `sign_us` with it.
+    pub nonce_us: i64,
+    /// The signer sidecar round trip — a line to its stdin, a `ctypes` call into the Go
+    /// c-archive, a line back. Local: the sidecar never talks to the venue.
+    pub sign_us: i64,
+    /// `sendTx`: connection setup, the POST, and the sequencer's answer.
+    pub send_us: i64,
+}
+
+impl Outbound {
+    /// Charges each span to the stage that spent it.
+    ///
+    /// `ipc_us` is `-1` — an impossible span, so unmistakable — when `requested_ns` is not a
+    /// positive stamp. `LiveBot::submit_order` always sets one, but a `0` from any other
+    /// producer would contribute ~1.8e15 us to a percentile and quietly ruin the measurement
+    /// this exists for.
+    pub fn spans(
+        &self,
+        dequeued: Instant,
+        reserved: Instant,
+        signed: Instant,
+        sent: Instant,
+    ) -> OutboundSpans {
+        OutboundSpans {
+            ipc_us: if self.requested_ns > 0 {
+                (self.received_ns - self.requested_ns) / 1_000
+            } else {
+                -1
+            },
+            queue_us: (dequeued - self.queued).as_micros() as i64,
+            nonce_us: (reserved - dequeued).as_micros() as i64,
+            sign_us: (signed - reserved).as_micros() as i64,
+            send_us: (sent - signed).as_micros() as i64,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
         AmbiguousFate,
         DeadlineAction,
         NonceAction,
+        Outbound,
+        OutboundSpans,
         Placement,
         deadline_action,
         fate_of_ambiguous,
@@ -311,5 +389,70 @@ mod tests {
             deadline_action(Some(false), false),
             DeadlineAction::ViaFateCheck
         );
+    }
+
+    /// **Each span is charged to the stage that actually spent it.**
+    ///
+    /// This is the whole value of the instrumentation, so it is the thing pinned. MEASURED on
+    /// the Lighter testnet 2026-08-09, n = 60_719: the outbound leg costs a median 913 ms and
+    /// the return leg 135 ms, and nothing in the connector could say which of its own stages
+    /// spent the 913. Two candidate answers lead to opposite decisions — if it is the venue,
+    /// Lighter cannot carry a signal whose lead is 450–800 ms; if it is our own queue or our
+    /// own Python signer sidecar, it is ours to fix. An off-by-one mark that charged the queue
+    /// wait to signing (or to the venue) would answer the question backwards while looking
+    /// perfectly plausible.
+    ///
+    /// The stages are laid out with distinct durations so no two can be swapped undetected.
+    #[test]
+    fn every_outbound_span_is_charged_to_the_stage_that_spent_it() {
+        let queued = Instant::now();
+        let marks = Outbound {
+            // The bot stamped it 3_000 us before the connector picked it up.
+            requested_ns: 1_000_000_000,
+            received_ns: 1_003_000_000,
+            queued,
+        };
+
+        let spans = marks.spans(
+            queued + Duration::from_micros(70_000), // dequeued: 70 ms behind the queue
+            queued + Duration::from_micros(75_000), // reserved: 5 ms on the nonce
+            queued + Duration::from_micros(79_000), // signed:   4 ms in the sidecar
+            queued + Duration::from_micros(529_000), // sent:     450 ms on the wire
+        );
+
+        assert_eq!(
+            spans,
+            OutboundSpans {
+                ipc_us: 3_000,
+                queue_us: 70_000,
+                nonce_us: 5_000,
+                sign_us: 4_000,
+                send_us: 450_000,
+            }
+        );
+    }
+
+    /// **A request the bot never stamped is reported as unknown, not as a 56-year hand-off.**
+    /// `Order::local_timestamp` is always set by `LiveBot::submit_order`, but a `0` from any
+    /// other producer would otherwise contribute ~1.8e15 us to a percentile and quietly ruin
+    /// the very measurement this exists for. The other four spans are local and stay real.
+    #[test]
+    fn an_unstamped_request_reports_an_unknown_hand_off_rather_than_a_nonsense_one() {
+        let queued = Instant::now();
+        let marks = Outbound {
+            requested_ns: 0,
+            received_ns: 1_786_302_295_222_600_652,
+            queued,
+        };
+
+        let spans = marks.spans(
+            queued + Duration::from_micros(1),
+            queued + Duration::from_micros(2),
+            queued + Duration::from_micros(3),
+            queued + Duration::from_micros(4),
+        );
+
+        assert_eq!(spans.ipc_us, -1, "the sentinel, not a 56-year hand-off");
+        assert_eq!(spans.send_us, 1, "the local spans are unaffected");
     }
 }

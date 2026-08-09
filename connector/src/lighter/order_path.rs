@@ -33,7 +33,9 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    // `Instant` unqualified in this file is `tokio::time::Instant` (the confirmation
+    // deadlines); the outbound stopwatch is plain monotonic time, so it is spelled out.
+    time::{Duration, Instant as StdInstant},
 };
 
 use chrono::Utc;
@@ -64,7 +66,14 @@ use crate::{
         nonce::NonceOwner,
         order::{CancelPlan, OrderManager},
         private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
-        public_stream::{BACKOFF_MAX, BACKOFF_MIN, CONNECT_TIMEOUT, PING_FRAME, PING_INTERVAL},
+        public_stream::{
+            BACKOFF_MAX,
+            BACKOFF_MIN,
+            CONNECT_TIMEOUT,
+            PING_FRAME,
+            PING_INTERVAL,
+            local_now,
+        },
         publish_error,
         rest::{self, MarketInfo, Resolution, SendOutcome},
         signer::{CreateOrder, SignerClient, python_sidecar_command},
@@ -72,6 +81,7 @@ use crate::{
             AmbiguousFate,
             DeadlineAction,
             NonceAction,
+            Outbound,
             Placement,
             deadline_action,
             fate_of_ambiguous,
@@ -227,6 +237,10 @@ enum Command {
     Submit {
         coi: i64,
         order: Box<CreateOrder>,
+        /// The clock marks this placement has collected so far, opened in
+        /// [`OrderPath::submit`]. Carried here because the queue wait it measures is the
+        /// wait on *this* channel, and only the two ends together can see it.
+        outbound: Outbound,
     },
     Cancel {
         coi: i64,
@@ -315,6 +329,14 @@ impl OrderPath {
     /// Registers a new order and queues it to be signed and sent. Acceptance is confirmed off
     /// the private channel, never here (§4.11).
     pub fn submit(&self, symbol: &str, order: &Order, ev_tx: &UnboundedSender<PublishEvent>) {
+        // Open the outbound stopwatch before anything else this call does, so nothing the
+        // connector spends is charged to the venue by omission. `order.local_timestamp` was
+        // stamped in the bot process before iceoryx.
+        let outbound = Outbound {
+            requested_ns: order.local_timestamp,
+            received_ns: local_now(),
+            queued: StdInstant::now(),
+        };
         let plan = {
             let mut manager = self.order_manager.lock().unwrap();
             match manager.market_info(symbol) {
@@ -340,6 +362,7 @@ impl OrderPath {
                     .send(Command::Submit {
                         coi,
                         order: Box::new(wire),
+                        outbound,
                     })
                     .is_err()
                 {
@@ -489,8 +512,8 @@ impl SlotTask {
             select! {
                 command = command_rx.recv() => {
                     match command {
-                        Some(Command::Submit { coi, order }) => {
-                            self.send_order(&mut signer, &mut nonce, coi, &order, &mut awaiting).await;
+                        Some(Command::Submit { coi, order, outbound }) => {
+                            self.send_order(&mut signer, &mut nonce, coi, &order, &outbound, &mut awaiting).await;
                         }
                         Some(Command::Cancel { coi, plan }) => {
                             self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
@@ -547,14 +570,17 @@ impl SlotTask {
         nonce: &mut NonceOwner,
         coi: i64,
         order: &CreateOrder,
+        outbound: &Outbound,
         awaiting: &mut HashMap<i64, Awaiting>,
     ) {
-        let Some(reserved) = self.reserve(nonce).await else {
+        let dequeued = StdInstant::now();
+        let Some(reserved_nonce) = self.reserve(nonce).await else {
             self.expire(coi, "the nonce slot could not be seeded");
             return;
         };
+        let reserved_at = StdInstant::now();
         let signed = match signer
-            .create_order(order, reserved, self.config.api_key_index)
+            .create_order(order, reserved_nonce, self.config.api_key_index)
             .await
         {
             Ok(signed) => signed,
@@ -564,8 +590,26 @@ impl SlotTask {
                 return;
             }
         };
+        let signed_at = StdInstant::now();
         let market_index = order.market_index as i32;
-        match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
+        let sent = rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await;
+
+        // One line per placement, whatever the venue answered — the outbound leg cost what it
+        // cost even when the send failed. `info!`, not `debug!`: the running unit has no
+        // `RUST_LOG` and emits INFO only, so a `debug!` here would be invisible in exactly the
+        // deployment this measures. MEASURED: ~0.23 placements/s, so the volume is nothing.
+        let spans = outbound.spans(dequeued, reserved_at, signed_at, StdInstant::now());
+        info!(
+            coi,
+            ipc_us = spans.ipc_us,
+            queue_us = spans.queue_us,
+            nonce_us = spans.nonce_us,
+            sign_us = spans.sign_us,
+            send_us = spans.send_us,
+            "Lighter placement timing."
+        );
+
+        match sent {
             Ok(outcome) => {
                 self.apply_nonce(nonce, &outcome).await;
                 match outcome {
@@ -1350,7 +1394,11 @@ impl PrivateStreamTask {
                 }
             }
             PrivateFrame::Positions { positions, .. } => {
-                let now = Utc::now().timestamp_micros();
+                // NANOseconds: the unit every other backend publishes on
+                // `LiveEvent::Position.exch_ts` (bybit and both Binance scale their
+                // millisecond source by 1_000_000; Hyperliquid publishes nanoseconds). The
+                // frame carries no venue stamp of its own, so this is the local receive time.
+                let now = local_now();
                 for position in &positions {
                     let mapped = self
                         .order_manager
@@ -1419,6 +1467,7 @@ mod tests {
         time::Duration,
     };
 
+    use chrono::Utc;
     use futures_util::{Stream, stream};
     use hftbacktest::types::{
         ErrorKind,
@@ -1883,6 +1932,43 @@ mod tests {
                 assert_eq!(symbol, "BTC");
                 assert_eq!(qty, 0.0, "a flat position is reported, not swallowed");
             }
+            _ => panic!("the positions snapshot must publish a LiveEvent::Position (§3.4)"),
+        }
+    }
+
+    /// **`LiveEvent::Position.exch_ts` is nanoseconds**, the unit every other backend writes:
+    /// bybit and both Binance multiply their millisecond source by 1_000_000, Hyperliquid
+    /// publishes nanoseconds outright. Lighter stamped it `Utc::now().timestamp_micros()` — a
+    /// thousandfold under.
+    ///
+    /// It is inert today for the same reason the order stamp was: `main.rs`'s position cache
+    /// only compares the field against itself and `LiveBot` ignores it entirely. That is
+    /// exactly why it must be fixed in the same commit as `Order::exch_timestamp` — leaving one
+    /// microsecond field on a backend whose sibling field just became nanoseconds is the
+    /// mixed-unit trap itself, waiting for the first reader that compares the two.
+    ///
+    /// Bracketing the real clock is the pin: microseconds of now are ~1_000x below nanoseconds
+    /// of now, so the wrong unit cannot land inside the bracket by accident.
+    #[test]
+    fn a_position_is_stamped_in_nanoseconds() {
+        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.order_manager.lock().unwrap().track_market(MarketInfo {
+            symbol: "BTC".to_string(),
+            market_id: 1,
+            price_decimals: 1,
+            size_decimals: 5,
+        });
+
+        let before = Utc::now().timestamp_nanos_opt().unwrap();
+        task.on_frame(PRIVATE_POSITIONS_UPDATE_FLAT);
+        let after = Utc::now().timestamp_nanos_opt().unwrap();
+
+        match ev_rx.try_recv() {
+            Ok(PublishEvent::LiveEvent(LiveEvent::Position { exch_ts, .. })) => assert!(
+                (before..=after).contains(&exch_ts),
+                "the position stamp must be nanoseconds of now ({before}..={after}), got \
+                 {exch_ts} — microseconds are ~1000x under and every other backend publishes ns"
+            ),
             _ => panic!("the positions snapshot must publish a LiveEvent::Position (§3.4)"),
         }
     }

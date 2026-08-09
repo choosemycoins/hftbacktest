@@ -354,8 +354,29 @@ impl OrderManager {
             tracked.confirmed = true;
             tracked.order.req = Status::None;
             tracked.order.status = map_status(&update.status);
-            tracked.order.exch_timestamp =
-                tracked.order.exch_timestamp.max(update.transaction_time_us);
+            // §4.12: `transaction_time` is MICROseconds and `Order::exch_timestamp` is
+            // nanoseconds, so the factor is 1_000 — the same conversion `trades.rs` and
+            // `depth.rs` make from this venue's stamps, and NOT the `* 1_000_000` the
+            // millisecond-sourced backends (bybit, both Binance) use.
+            //
+            // `checked_mul` because `overflow-checks` is on for `dev`/`test` and off for
+            // `release`: a bare `*` is a panic — `exit(1)` under the connector's panic hook —
+            // in a test and a silently wrapped stamp in production. Unlike `depth.rs`, which
+            // refuses the frame, an unusable stamp here must not cost the update: it carries
+            // the status and the fill. The last usable stamp stands instead. It must not
+            // saturate either — `i64::MAX` would lead every later venue stamp and `LiveBot`
+            // would drop the rest of this order's life.
+            match update.transaction_time_us.checked_mul(1_000) {
+                Some(exch_ts_ns) => {
+                    tracked.order.exch_timestamp = tracked.order.exch_timestamp.max(exch_ts_ns);
+                }
+                None => warn!(
+                    coi,
+                    transaction_time_us = update.transaction_time_us,
+                    "A Lighter order update whose transaction_time does not fit in nanoseconds; \
+                     applying it under the previous stamp."
+                ),
+            }
             tracked.order.leaves_qty = update.remaining_base_amount;
             // §4.6: `exec_qty` is the amount executed by THIS update, the delta of the
             // cumulative `filled_base_amount`, not the running total.
@@ -622,6 +643,74 @@ mod tests {
         assert_eq!(m.is_confirmed(coi), Some(true), "the channel confirmed it");
         // The order is now cancellable — the order_index has been learned.
         assert!(m.cancel_order("BTC", 1).is_ok());
+    }
+
+    /// **`transaction_time` is MICROseconds and `Order::exch_timestamp` is nanoseconds, so the
+    /// factor is 1_000** — the same conversion `trades.rs` and `depth.rs` already make from the
+    /// same venue's stamps.
+    ///
+    /// The bug this pins wrote the microsecond value straight into the nanosecond field. It ran
+    /// three days on the testnet unnoticed because every value inside this backend comes from
+    /// the one source in the one wrong unit: the series stays monotone, so
+    /// `LiveBot::process_event`'s duplicate/out-of-order guard keeps working. It turns
+    /// dangerous the moment a *second* source writes that field correctly — which is exactly
+    /// what `binancefutures/ordermanager.rs` does on its stale-order-expiry path
+    /// (`Utc::now().timestamp_nanos_opt()`). A ~1.8e18 stamp next to the venue's ~1.8e15 makes
+    /// `order.exch_timestamp >= ex_order.exch_timestamp` false forever, and the bot silently
+    /// discards every later update for that order while it trades on. Today the damage is to
+    /// measurement: read as nanoseconds the stamp lands on 1970-01-21, so a fill-quality join
+    /// anchors there.
+    ///
+    /// Two mutations must fail here. Dropping the multiplier is the bug itself; using the
+    /// `* 1_000_000` the millisecond-sourced backends (bybit, both Binance) use is the far more
+    /// likely *fix*, and it does not merely mis-scale — it overflows `i64`.
+    #[test]
+    fn an_order_update_stamps_the_exchange_time_in_nanoseconds() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        // A real `transaction_time` off the testnet channel: 2026-07-30 17:16:14.184833 UTC.
+        let (_, order) = m
+            .apply_order_update(&account_order(coi, 5, "open", 1_785_431_774_184_833))
+            .expect("our order, opened");
+        assert_eq!(
+            order.exch_timestamp, 1_785_431_774_184_833_000,
+            "microseconds × 1_000 — not the raw microseconds, and not the × 1_000_000 the \
+             millisecond-sourced backends use"
+        );
+    }
+
+    /// **A stamp that will not fit in nanoseconds must not cost the update.** `overflow-checks`
+    /// is on for `dev`/`test` and off for `release` (`depth.rs` documents the same trap), so a
+    /// bare `* 1_000` is a panic — `exit(1)` under the connector's hook — in a test and a
+    /// silently wrapped stamp in production.
+    ///
+    /// The refusal cannot be `depth.rs`'s "drop the frame": this frame carries a fill, and
+    /// money must not be lost to a clock. Nor can it saturate — `i64::MAX` would lead every
+    /// later venue stamp and `LiveBot` would drop the rest of the order's life. The last usable
+    /// stamp stands, so the published value is still `>=` the one before it and the bot applies
+    /// the update.
+    #[test]
+    fn an_exchange_time_that_does_not_fit_in_nanoseconds_still_delivers_the_update() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        m.apply_order_update(&account_order(coi, 5, "open", 1_000));
+
+        let mut absurd = account_order(coi, 5, "filled", i64::MAX / 999);
+        absurd.filled_base_amount = 0.001;
+        let (_, order) = m
+            .apply_order_update(&absurd)
+            .expect("the update is delivered even though its stamp is unusable");
+        assert_eq!(
+            order.status,
+            Status::Filled,
+            "the fill still reaches the bot"
+        );
+        assert_eq!(order.exec_qty, 0.001);
+        assert_eq!(
+            order.exch_timestamp, 1_000_000,
+            "the last usable stamp stands: neither wrapped, nor saturated to a value that would \
+             make LiveBot drop every later update for this order"
+        );
     }
 
     /// **State transitions are ordered by `transaction_time` and only it** (§4.12). A frame
