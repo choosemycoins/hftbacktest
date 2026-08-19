@@ -817,6 +817,56 @@ def test_an_empty_universe_is_a_failure_not_a_delisting():
         assert after.known[entry_key("LIVEUSDT", NOW - DAY_MS)].in_env is True
 
 
+def test_a_renamed_schema_field_is_a_failure_not_a_healthy_empty_universe():
+    """Пол вселенной обязан стоять на РАЗОБРАННЫХ записях, а не на сырой длине массива.
+
+    Переименованное/переехавшее по типу поле — ровно то, чем схема площадки и меняется.
+    До фикса такой тик записывался УСПЕХОМ: universe=0, малформед=872, серия провалов
+    сбрасывалась, пульс писался — оба канала тревоги рапортовали здоровье, а детектор
+    был слеп навсегда (доказано мутацией П1, scratchpad proofs.py задачи #74)."""
+    d = doc(sym("NEWUSDT", NOW - 600_000))
+    for raw_entry in d["symbols"]:
+        raw_entry["onboardTime"] = raw_entry.pop("onboardDate")
+
+    host = _failing_host(Exception("не используется"))
+    host.payload = raw(d)
+    out = tick(host, hostname="tokyo")
+
+    assert "провал" in out
+    assert host.pulses == []            # тишина пульса ⇒ heartbeat увидит STALE
+    assert host.env_writes() == []
+    after = load_state(host.files["/data/state.json"])
+    assert after.consecutive_failures == 1
+    assert after.known[entry_key("LIVEUSDT", NOW - DAY_MS)].in_env is True  # мир не тронут
+
+    # и серия ДОХОДИТ до штатного алерта, а не сбрасывается каждый тик
+    for _ in range(FAIL_ALERT_AFTER - 1):
+        tick(host, hostname="tokyo")
+    assert len(host.telegrams) == 1 and "битых" in host.telegrams[0]
+
+
+def test_a_single_malformed_entry_fails_the_tick_because_it_may_be_the_listing():
+    """Одна битая запись — не статистика, а возможно САМ новый листинг (П1b: у него
+    onboardDate=null). Проглоченная счётчиком, она не даёт ни алерта, ни env — след
+    остаётся только в строке журнала, которую никто не читает. Каждый пропущенный
+    листинг невосполним, поэтому битая запись читается как провал тика целиком."""
+    d = doc(sym("NEWUSDT", NOW - 600_000))
+    for raw_entry in d["symbols"]:
+        if raw_entry["symbol"] == "NEWUSDT":
+            raw_entry["onboardDate"] = None
+
+    host = _failing_host(Exception("не используется"))
+    host.payload = raw(d)
+    out = tick(host, hostname="tokyo")
+
+    assert "провал" in out
+    assert host.pulses == []
+    assert host.env_writes() == []
+    after = load_state(host.files["/data/state.json"])
+    assert after.consecutive_failures == 1
+    assert entry_key("NEWUSDT", NOW - 600_000) not in after.known  # не «запомнен молча»
+
+
 def test_six_consecutive_failures_alert_once_then_every_six_hours():
     """Прецедент: params-poller молча не срабатывал 23 часа. Порог — час тишины, дальше
     напоминание раз в ~6 часов, а не шторм на каждый тик."""
@@ -932,6 +982,55 @@ def test_corrupt_state_rebootstraps_without_restarting_anything():
     after = load_state(host.files["/data/state.json"])
     assert after.known[entry_key("NEWUSDT", fresh)].phase == PHASE_CAPTURING
     assert len(host.telegrams) == 1  # плата за re-bootstrap — один повторный алерт
+
+
+def test_state_loss_never_drops_a_flipped_watch_symbol_from_capture():
+    """Потеря state.json не имеет права оборвать живой захват — а без спасения по env
+    обрывала: env пересобирается ИЗ СОСТОЯНИЯ, и при пустом состоянии символ
+    переклассифицируется по своему onboardDate. Класс GAIBUSDT (PENDING с датой на
+    272 суток в прошлом, уже флипнувший в capturing с якорем ПО НАБЛЮДЕНИЮ) читался
+    как «старьё», уезжал в seeded и ВЫЛЕТАЛ из COLLECTOR_SYMBOLS; наружу уходил
+    обычный 🆕-алерт про соседний символ, а следующий тик видел его уже известным
+    seeded — возврата нет. Триггер не требует бага: state.json переписывается каждые
+    10 минут без fsync (жёсткий ребут даёт нулевую длину или мусор), а read_file
+    глушит OSError. Лечение: env — второй, НЕЗАВИСИМЫЙ носитель факта «мы это ловим»,
+    и символ из него не понижается в seeded."""
+    gaib_onboard = NOW - 272 * DAY_MS
+    world = raw(doc(sym("GAIBUSDT", gaib_onboard), sym("NEWUSDT", NOW - 2 * DAY_MS)))
+    env_now = env_text(["GAIBUSDT", "NEWUSDT"])
+
+    # мусор после ребута / нулевая длина / файла нет — три реальных лица одной потери
+    for broken in ("{не json", "", None):
+        files = {ENV_PATH: env_now}
+        if broken is not None:
+            files["/data/state.json"] = broken
+        host = FakeHost(world, files=files)
+
+        tick(host, hostname="tokyo")
+
+        assert env_symbols(host.files[ENV_PATH]) == ["GAIBUSDT", "NEWUSDT"], broken
+        assert host.env_writes() == [] and host.restarts() == [], broken
+        after = load_state(host.files["/data/state.json"])
+        gaib = after.known[entry_key("GAIBUSDT", gaib_onboard)]
+        assert gaib.phase == PHASE_CAPTURING, broken
+        # Истинный якорь утрачен вместе с состоянием — часы ротации перезапускаются
+        # от наблюдения: продлить захват максимум на окно дешевле, чем оборвать.
+        assert gaib.anchor_ms == NOW, broken
+        assert len(host.telegrams) == 1, broken  # плата — один повторный алерт
+
+
+def test_the_env_rescue_does_not_capture_the_stale_world_outside_the_env():
+    """Спасение по env — точечное: балласт старого мира (сотни давно торгующихся
+    символов, которых в env нет) обязан остаться seeded, иначе re-bootstrap
+    превращается в захват всей вселенной."""
+    host = FakeHost(raw(doc(sym("OLDUSDT", NOW - 100 * DAY_MS))),
+                    files={ENV_PATH: env_text(["OTHERUSDT"])})
+
+    tick(host, hostname="tokyo")
+
+    after = load_state(host.files["/data/state.json"])
+    assert after.known[entry_key("OLDUSDT", NOW - 100 * DAY_MS)].phase == PHASE_SEEDED
+    assert host.telegrams == [] and host.restarts() == []
 
 
 # ==============================================================================
