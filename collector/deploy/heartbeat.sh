@@ -41,6 +41,13 @@ HOST="$(hostname -s)"
 # Порог свежести в МИНУТАХ по классам целей.
 COLLECTOR_STALE_MIN=10   # пишут непрерывно; 10 мин — это уже точно не «тонкий символ»
 POLLER_STALE_MIN=90      # часовой таймер + RandomizedDelaySec до 4 мин + запас
+# day0-поллер тикает раз в 10 мин, и пульс он трогает ТОЛЬКО на успешном тике.
+# Порог = 3 пропущенных тика (3×10 = 30 мин) + 5 мин запас = 35 мин: один провал
+# сети — не событие (сам поллер алертит после 6 провалов подряд, т.е. на ~60-й
+# минуте), а мёртвый таймер — класс отказа params-poller, 23 часа молчания —
+# виден за полчаса. Общие 90 мин здесь не годятся: волна листинга приходит без
+# предупреждения, и полтора часа слепоты стоят первых минут захвата (+13.16 бп).
+DAY0_STALE_MIN=35
 
 if [[ -r "${ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -98,9 +105,16 @@ for env_path in "${ETC_DIR}"/*.env; do
     results+=("$(check_dir "${inst}" "${DATA_ROOT}/${inst}" "${COLLECTOR_STALE_MIN}")")
 done
 
-# поллеры: пишут в домашний каталог сервисного пользователя
-for p in "params:${POLLER_HOME}/params-data" "positions:${POLLER_HOME}/positions-data"; do
-    results+=("$(check_dir "${p%%:*}" "${p#*:}" "${POLLER_STALE_MIN}")")
+# поллеры: пишут в домашний каталог сервисного пользователя; формат «имя:каталог:порог».
+# day0 — поллер листингов дня-0 (тик 10 мин), порог свой (DAY0_STALE_MIN): его тишина
+# стоит дороже прочих — волна приходит раз в ~2 суток без предупреждения, и
+# пропущенный листинг невосполним. Отсутствующий каталог = STALE nodir, как у всех:
+# «не задеплоен» не равно «здоров».
+for p in "params:${POLLER_HOME}/params-data:${POLLER_STALE_MIN}" \
+         "positions:${POLLER_HOME}/positions-data:${POLLER_STALE_MIN}" \
+         "day0:${POLLER_HOME}/day0-data:${DAY0_STALE_MIN}"; do
+    IFS=: read -r p_name p_dir p_limit <<<"${p}"
+    results+=("$(check_dir "${p_name}" "${p_dir}" "${p_limit}")")
 done
 
 stale=(); ok=()
