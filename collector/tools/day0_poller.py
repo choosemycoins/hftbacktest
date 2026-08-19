@@ -35,8 +35,14 @@
 `plan_tick` возвращает `Plan` ДАННЫМИ, а `apply_plan` их исполняет через тонкий слой
 `Host`, подменяемый в тестах. Идемпотентность обязательна: повторный тик над неизменным
 миром не пишет env и не рестартит инстанс, потому что каждый рестарт рвёт запись живым
-символам ровно в самом дорогом окне. Fail-closed: любой провал чтения оставляет мир
-нетронутым, серия провалов алертит (прецедент: params-poller молчал 23 часа).
+символам ровно в самом дорогом окне. Считается она по НАБЛЮДЁННЫМ эффектам, а не по
+намерениям: в состоянии живёт журнал (`Entry.subscribed`, `Entry.timer_armed`), который
+пишет только исполнитель и только по нулевому коду возврата systemd. Без него обрыв
+между записью env и рестартом (или молча отвергнутый рестарт) давал символ, который
+числится в захвате, лежит в COLLECTOR_SYMBOLS и не имеет ни одной подписки — а сторож
+тишины инстанса 1080 мин по построению не заметил бы этого 18 часов. Fail-closed: любой
+провал чтения оставляет мир нетронутым, серия провалов алертит, неисполненный эффект
+алертит и переносится на следующий тик (прецедент: params-poller молчал 23 часа).
 
 Дизайн и обоснования решений: scratchpad DESIGN.md задачи #74 (заморожен 19.08).
 
@@ -252,6 +258,18 @@ class Entry:
     timer_unit: str | None
     phase_changed_local_ms: int
     dead: bool = False
+    # ЖУРНАЛ СОБСТВЕННЫХ ЭФФЕКТОВ — то, что поллер НАБЛЮДАЛ, а не то, что намеревался.
+    # `subscribed`: инстанс был успешно рестартован в момент, когда символ уже лежал в
+    # env (или это сделал его подтверждённый таймер). Пока флага нет, символ числится
+    # в COLLECTOR_SYMBOLS, но подписки может не быть вовсе, а сторож тишины инстанса
+    # (1080 мин) этого по построению не заметит 18 часов.
+    # `timer_armed`: `systemd-run` вернул ноль. Несостоявшаяся постановка иначе
+    # неотличима от состоявшейся, а R-QUIET на флипе считает, что рестарт уже был.
+    # Оба сбрасываются в False по умолчанию: утрата состояния обязана читаться как
+    # «не наблюдали», а не как «всё уже сделано» — цена лишнего рестарта ≤35 с записи,
+    # цена пропущенной переподписки — вся волна (следующая через ~2.1 суток).
+    subscribed: bool = False
+    timer_armed: bool = False
 
 
 @dataclass
@@ -261,6 +279,9 @@ class State:
     failure_alerted: bool = False
     last_success_local_ms: int | None = None
     last_failure_reason: str = ""
+    # Подряд идущие тики, чьи эффекты (рестарт/таймер) вернули ненулевой код. Живёт в
+    # состоянии по той же причине, что и счётчик провалов чтения: тик — oneshot.
+    effect_failures: int = 0
 
 
 def load_state(text: str | None) -> State:
@@ -293,6 +314,7 @@ def load_state(text: str | None) -> State:
             failure_alerted=bool(doc.get("failure_alerted", False)),
             last_success_local_ms=doc.get("last_success_local_ms"),
             last_failure_reason=str(doc.get("last_failure_reason", "")),
+            effect_failures=int(doc.get("effect_failures", 0)),
         )
     except (json.JSONDecodeError, TypeError, ValueError):
         return State()
@@ -307,6 +329,7 @@ def dump_state(state: State) -> str:
             "failure_alerted": state.failure_alerted,
             "last_success_local_ms": state.last_success_local_ms,
             "last_failure_reason": state.last_failure_reason,
+            "effect_failures": state.effect_failures,
         },
         ensure_ascii=False,
         indent=1,
@@ -344,6 +367,17 @@ def env_text(symbols: list[str]) -> str:
     ])
 
 
+def env_symbols_of(text: str | None) -> frozenset[str]:
+    """Символы из COLLECTOR_SYMBOLS текущего env-файла. Терпимая к любому мусору:
+    env — вторичный носитель, и нечитаемость не должна ронять тик."""
+    if not text:
+        return frozenset()
+    for line in text.splitlines():
+        if line.startswith("COLLECTOR_SYMBOLS="):
+            return frozenset(line.removeprefix("COLLECTOR_SYMBOLS=").split())
+    return frozenset()
+
+
 # ==============================================================================
 # План
 # ==============================================================================
@@ -372,6 +406,7 @@ def _new_counters() -> dict[str, int]:
         "seeded_stale": 0, "seeded_unknown_status": 0,
         "wave": 0, "armed": 0, "watch": 0, "capturing": 0,
         "superseded": 0, "rotated": 0, "shelved": 0, "in_env": 0,
+        "env_rescued": 0,
     }
 
 
@@ -397,6 +432,15 @@ def plan_tick(
     wave: list[str] = []      # ключи, ставшие в этом тике watch/armed/capturing
     flips: list[str] = []     # из них — наблюдённые PENDING→TRADING (R-FLIP)
     cancel: list[str] = []
+
+    # env — второй, НЕЗАВИСИМЫЙ носитель факта «мы это ловим». Нужен, потому что
+    # state.json переписывается каждые 10 минут без fsync и после жёсткого ребута
+    # бывает пустым/битым, а load_state читает это как «ничего не знаем». Без него
+    # флипнувший через watch символ (класс GAIBUSDT: onboardDate на 272 суток в
+    # прошлом, якорь ротации — НАБЛЮДЁННЫЙ флип) переклассифицировался бы по своей
+    # дате в «старьё» и молча вылетал из захвата — навсегда: следующий тик уже видит
+    # его известным seeded. Пин: test_state_loss_never_drops_a_flipped_watch_symbol…
+    env_carried = env_symbols_of(env_now)
 
     # Ключи, которые ещё могут быть перенесены (R-MOVE) — только они.
     open_by_symbol: dict[str, list[str]] = {}
@@ -439,7 +483,7 @@ def plan_tick(
         entry = _classify_new(
             symbol=symbol, onboard_ms=onboard_ms, status=status, contract_type=contract_type,
             quote=quote, utype=utype, tradifi=tradifi, now_ms=now_ms, server_ms=server_ms,
-            counters=counters,
+            counters=counters, in_env_now=symbol in env_carried,
         )
         known[key] = entry
         if entry.phase in IN_ENV_PHASES:
@@ -463,10 +507,13 @@ def plan_tick(
 
     if not wave:
         # Между волнами env не трогается вообще: ротация «сама по себе» была бы
-        # невидимой мутацией конфига живого инстанса.
+        # невидимой мутацией конфига живого инстанса. Но НЕЗАКРЫТЫЙ долг по эффектам
+        # (рестарт не состоялся, таймер не встал) добирается и здесь — иначе провал
+        # ждал бы следующей волны, то есть ~2.1 суток.
         counters["in_env"] = sum(1 for e in known.values() if e.in_env)
         return (
-            Plan(cancel_timers=cancel, alerts=alerts, counters=counters,
+            Plan(cancel_timers=cancel, arm_timers=_arm_timers(known, now_ms),
+                 restart_now=_restart_owed(known), alerts=alerts, counters=counters,
                  pulse=_pulse(now_ms, server_ms, known, counters)),
             new_state,
         )
@@ -489,20 +536,8 @@ def plan_tick(
     counters["in_env"] = len(symbols)
 
     env_write = None if env_now == content else (ENV_PATH, content)
-    arm = [
-        (known[k].timer_unit, on_calendar_utc(known[k].onboard_ms - TIMER_LEAD_S * 1000))
-        for k in wave
-        if known[k].phase == PHASE_ARMED
-    ]
-    # Немедленный рестарт нужен только тому, кому подписка нужна СЕЙЧАС. У armed её
-    # подхватит рестарт собственного таймера, и лишний рестарт был бы лишним разрывом.
-    immediate = any(known[k].phase in (PHASE_WATCH, PHASE_CAPTURING) for k in wave)
-    # Отступление от буквы дизайна §6 («нет записи — нет рестарта»), сделанное осознанно:
-    # у R-FLIP env НЕ меняется (символ уже в списке), а рестарт и есть само действие
-    # флипа — свежая подписка после начала торгов. Правило «нет записи — нет рестарта»
-    # существует ради реплея после обрыва, где рестарт уже состоялся; реплей не создаёт
-    # флипов (он идёт от того же состояния), поэтому оба свойства держатся одновременно.
-    restart_now = bool(flips) or (immediate and env_write is not None)
+    arm = _arm_timers(known, now_ms)
+    restart_now = _restart_owed(known)
 
     alerts.append(_wave_alert(hostname, known, wave, flips, rotated + shelved, now_ms, server_ms))
     return (
@@ -513,7 +548,7 @@ def plan_tick(
 
 
 def _classify_new(*, symbol, onboard_ms, status, contract_type, quote, utype, tradifi,
-                  now_ms, server_ms, counters) -> Entry:
+                  now_ms, server_ms, counters, in_env_now: bool = False) -> Entry:
     if contract_type in QUARTERLY_TYPES:
         phase, anchor = PHASE_REJECTED, None
         counters["rejected_quarterly"] += 1
@@ -528,8 +563,18 @@ def _classify_new(*, symbol, onboard_ms, status, contract_type, quote, utype, tr
         else:
             phase, anchor = PHASE_WATCH, None
     elif now_ms - onboard_ms > CAPTURE_MAX_AGE_DAYS * DAY_MS:
-        phase, anchor = PHASE_SEEDED, None
-        counters["seeded_stale"] += 1
+        if in_env_now:
+            # СПАСЕНИЕ ПО ENV: символ старше окна по своей дате, но он уже стоит в
+            # COLLECTOR_SYMBOLS — значит его дата была признана недостоверной раньше
+            # (watch→флип), а состояние с истинным якорем утрачено. Понизить его в
+            # seeded — молча оборвать живой захват без возврата. Якорь — от наблюдения,
+            # как у R-FLIP: продлить захват максимум на окно ротации дешевле, чем
+            # потерять листинг. Балласта вселенной это не касается — его в env нет.
+            phase, anchor = PHASE_CAPTURING, now_ms
+            counters["env_rescued"] += 1
+        else:
+            phase, anchor = PHASE_SEEDED, None
+            counters["seeded_stale"] += 1
     else:
         phase, anchor = PHASE_CAPTURING, onboard_ms
 
@@ -551,6 +596,42 @@ def _classify_new(*, symbol, onboard_ms, status, contract_type, quote, utype, tr
     )
 
 
+def _restart_owed(known: dict[str, Entry]) -> bool:
+    """Рестарт причитается, пока в env лежит символ, которому запись нужна СЕЙЧАС, а
+    подхват env инстансом ни разу не подтверждён нашим же наблюдённым рестартом.
+
+    Считать по факту записи env было НЕЛЬЗЯ, и это измерено: тик, умерший между записью
+    и рестартом, оставляет на диске env, который следующий тик находит совпавшим по
+    байтам, — и рестарта не делает. Символ при этом числится capturing и лежит в
+    COLLECTOR_SYMBOLS, но инстанс не переподписывался ни разу, кадров нет, а сторож
+    тишины инстанса (1080 мин, и он такой не зря) молчит 18 часов. Чинилось это только
+    следующей волной, то есть через ~2.1 суток — при том что вся ценность в первых часах.
+
+    armed сюда не входит намеренно: его подписку подхватит рестарт собственного таймера,
+    а лишний рестарт сейчас — это лишний разрыв записи живым символам.
+    """
+    return any(
+        e.in_env and not e.subscribed and e.phase in (PHASE_WATCH, PHASE_CAPTURING)
+        for e in known.values()
+    )
+
+
+def _arm_timers(known: dict[str, Entry], now_ms: int) -> list[tuple[str, str]]:
+    """Таймеры, постановка которых ещё не подтверждена ненулевым кодом systemd-run.
+
+    Повтор безопасен по построению: имя юнита детерминировано, и повторная постановка
+    читается systemd как «already exists», то есть как успех (см. `systemd_run_timer`).
+    Дата в прошлом не берётся вовсе — systemd-run туда либо стреляет немедленно, либо
+    не стреляет никогда; этот случай ловит флип (`_advance`).
+    """
+    return [
+        (e.timer_unit, on_calendar_utc(e.onboard_ms - TIMER_LEAD_S * 1000))
+        for e in sorted(known.values(), key=lambda e: (e.onboard_ms, e.symbol))
+        if e.phase == PHASE_ARMED and e.timer_unit and not e.timer_armed
+        and e.onboard_ms - TIMER_LEAD_S * 1000 > now_ms
+    ]
+
+
 def _advance(e: Entry, key: str, status: str, now_ms: int,
              wave: list[str], flips: list[str]) -> None:
     """Переходы известного ключа. Мутирует копию записи, живущую в `known`."""
@@ -564,14 +645,26 @@ def _advance(e: Entry, key: str, status: str, now_ms: int,
         e.dead = False
         e.timer_unit = None
         e.phase_changed_local_ms = now_ms
+        # Подписка, сделанная ДО старта торгов, не считается: она принимается площадкой,
+        # но кадров не даёт (урок day0-start). Долг закроет наблюдённый рестарт.
+        e.subscribed = False
         wave.append(key)
         flips.append(key)
     elif status == STATUS_TRADING and e.phase == PHASE_ARMED:
-        # R-QUIET: рестарт уже сделал таймер за 2 минуты до старта. Повтор здесь стоил
-        # бы разрыва записи ровно в окне 0–5 мин, которое и есть самое дорогое.
         e.phase = PHASE_CAPTURING
-        e.timer_unit = None
         e.phase_changed_local_ms = now_ms
+        if e.timer_armed:
+            # R-QUIET: рестарт уже сделал таймер за 2 минуты до старта. Повтор здесь
+            # стоил бы разрыва записи ровно в окне 0–5 мин, которое и есть самое дорогое.
+            # Основание — НАБЛЮДЁННАЯ постановка таймера, а не то, что мы её задумали.
+            e.subscribed = True
+        else:
+            # Таймер не встал (ненулевой код systemd-run) — переподписки не было ни
+            # одной, и молчание здесь стоит всего окна. Ведём себя как R-FLIP.
+            e.subscribed = False
+            wave.append(key)
+            flips.append(key)
+        e.timer_unit = None
     elif status not in LIVE_STATUSES and e.phase in IN_ENV_PHASES:
         # Ушедший из торгов символ занимает подписку и место на диске, но кадров не даёт.
         # Помечаем; выведет следующая волна (env вне волны не трогаем).
@@ -859,15 +952,24 @@ class DryRunHost:
         print(f"--- DRY RUN, пульс: {line}", flush=True)
 
 
-def apply_plan(plan: Plan, new_state: State, host: Host) -> None:
+def apply_plan(plan: Plan, new_state: State, host: Host, *, hostname: str = "") -> None:
     """Исполнение плана в порядке, выбранном под обрыв в любом месте.
 
     cancel → env → таймеры → рестарт → алерты → state → пульс. Всё, что стоит ДО
     сохранения состояния, идемпотентно: env сравнивается по байтам, имена таймеров
-    детерминированы («already exists» = успех), рестарт не делается без записи env.
+    детерминированы («already exists» = успех), а повторный рестарт стоит ≤35 с записи.
     Алерты идут до сохранения намеренно: дубль алерта безопаснее навсегда пропущенной
-    волны. Пульс — последним и только при полном успехе.
+    волны.
+
+    Исполнитель ЖУРНАЛИРУЕТ СВОИ ЭФФЕКТЫ в сохраняемое состояние — и потому мутирует
+    `new_state`. Без этого коды возврата systemd отбрасывались, план коммитился как
+    исполненный, и «рестарт не состоялся» становилось неотличимо от «состоялся»: символ
+    числился capturing, лежал в COLLECTOR_SYMBOLS и не имел ни одной подписки, а сторож
+    тишины инстанса (1080 мин) молчал 18 часов. Планировщик при этом остаётся чистым:
+    он читает журнал, но не пишет его.
     """
+    failures: list[str] = []
+
     for unit in plan.cancel_timers:
         host.systemctl("stop", unit if unit.endswith(".timer") else unit + ".timer")
 
@@ -880,18 +982,58 @@ def apply_plan(plan: Plan, new_state: State, host: Host) -> None:
         host.write_atomic(path, content)
 
     for unit, calendar in plan.arm_timers:
-        host.systemd_run_timer(unit, calendar, ["systemctl", "restart", INSTANCE_UNIT])
+        rc = host.systemd_run_timer(unit, calendar, ["systemctl", "restart", INSTANCE_UNIT])
+        if rc == 0:
+            _mark_timer_armed(new_state, unit)
+        else:
+            failures.append(f"таймер {unit} (systemd-run на {calendar}): rc={rc}")
 
     if plan.restart_now:
-        host.systemctl("restart", INSTANCE_UNIT)
+        rc = host.systemctl("restart", INSTANCE_UNIT)
+        if rc == 0:
+            # Рестарт перечитывает ВЕСЬ env разом, поэтому подтверждается сразу весь
+            # его состав, а не один символ волны.
+            _mark_subscribed(new_state)
+        else:
+            failures.append(f"systemctl restart {INSTANCE_UNIT}: rc={rc}")
 
-    for text in plan.alerts:
+    alerts = list(plan.alerts)
+    if failures:
+        n = new_state.effect_failures + 1
+        new_state.effect_failures = n
+        # Первый отказ — сразу, дальше напоминание раз в ~6 часов: молчать нельзя
+        # (прецедент params-поллера, 23 часа), но и шторм при сломанном systemd не нужен.
+        if n == 1 or n % FAIL_REALERT_EVERY == 0:
+            alerts.append(
+                f"🔴 {hostname}: day0-поллер — эффекты тика не исполнились ({n}-й тик подряд): "
+                + "; ".join(failures)
+            )
+    else:
+        new_state.effect_failures = 0
+
+    for text in alerts:
         host.send_telegram(text)
 
     host.write_atomic(host.state_path, dump_state(new_state))
 
     if plan.pulse is not None:
+        # Пульс — про живость самого поллера (он прочитал мир и записал решение), а не
+        # про успех systemd: неисполненный эффект уже говорит за себя в Telegram, и
+        # глушить им второй канал значило бы путать два разных отказа.
         host.append_pulse(plan.pulse)
+
+
+def _mark_subscribed(state: State) -> None:
+    """Подтверждение подхвата env: наблюдённый рестарт закрывает долг всем, кто в env."""
+    for e in state.known.values():
+        if e.in_env:
+            e.subscribed = True
+
+
+def _mark_timer_armed(state: State, unit: str) -> None:
+    for e in state.known.values():
+        if e.timer_unit == unit:
+            e.timer_armed = True
 
 
 def tick(host: Host, *, hostname: str = "") -> str:
@@ -905,13 +1047,13 @@ def tick(host: Host, *, hostname: str = "") -> str:
         # тишина пульса и есть второй, независимый от Telegram канал тревоги.
         reason = f"{type(exc).__name__}: {exc}"
         plan, new_state = plan_failure(state, reason, now_ms, hostname=hostname)
-        apply_plan(plan, new_state, host)
+        apply_plan(plan, new_state, host, hostname=hostname)
         return f"провал #{new_state.consecutive_failures}: {reason}"
 
     plan, new_state = plan_tick(
         snapshot, state, now_ms, env_now=host.read_file(ENV_PATH), hostname=hostname,
     )
-    apply_plan(plan, new_state, host)
+    apply_plan(plan, new_state, host, hostname=hostname)
     c = plan.counters
     return (
         f"вселенная={c.get('universe', 0)} known={len(new_state.known)} "

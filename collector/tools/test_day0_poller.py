@@ -136,7 +136,12 @@ def entry(
     timer_unit: str | None = None,
     status: str = "TRADING",
     dead: bool = False,
+    subscribed: bool | None = None,
+    timer_armed: bool | None = None,
 ) -> Entry:
+    """Дефолты описывают УСТОЯВШЕЕСЯ состояние: символ в env уже подхвачен инстансом,
+    таймер уже поставлен. Тест, который проверяет обрыв, обязан сказать обратное вслух —
+    иначе «эффект состоялся» и «мы его не наблюдали» снова были бы одним и тем же."""
     return Entry(
         symbol=symbol,
         onboard_ms=onboard_ms,
@@ -153,6 +158,9 @@ def entry(
         timer_unit=timer_unit,
         phase_changed_local_ms=first_seen_local_ms,
         dead=dead,
+        subscribed=(in_env if in_env is not None else phase in (PHASE_WATCH, PHASE_ARMED, PHASE_CAPTURING))
+        if subscribed is None else subscribed,
+        timer_armed=(timer_unit is not None) if timer_armed is None else timer_armed,
     )
 
 
@@ -179,6 +187,11 @@ class FakeHost:
         self.telegrams: list[str] = []
         self.pulses: list[str] = []
         self.fetches = 0
+        # Коды возврата systemd. Двойник, у которого они всегда нули, доказывал бы
+        # только happy path: неудавшийся рестарт неотличим от удавшегося ровно там,
+        # где цена ошибки — потерянная волна.
+        self.systemctl_rc = 0
+        self.timer_rc = 0
 
     # --- часы и сеть
     def now_ms(self) -> int:
@@ -202,11 +215,11 @@ class FakeHost:
     # --- systemd
     def systemctl(self, *args: str) -> int:
         self.calls.append(("systemctl",) + args)
-        return 0
+        return self.systemctl_rc if args[:1] == ("restart",) else 0
 
     def systemd_run_timer(self, unit: str, on_calendar: str, argv: list[str]) -> int:
         self.calls.append(("timer", unit, on_calendar, tuple(argv)))
-        return 0
+        return self.timer_rc
 
     # --- наружу
     def send_telegram(self, text: str) -> bool:
@@ -766,6 +779,136 @@ def test_a_pending_symbol_closer_than_the_lead_is_captured_now_not_timed():
     assert new.known[entry_key("EDGEUSDT", onboard)].phase == PHASE_WATCH
 
 
+# ------------------------------------------------------------------------------
+# НАБЛЮДЕНИЕ СОБСТВЕННЫХ ЭФФЕКТОВ
+#
+# Общий корень трёх пинов ниже: до фикса `apply_plan` не смотрел на то, что вышло из
+# его же действий. Коды возврата `systemctl restart` и `systemd-run` отбрасывались, а
+# долг рестарта считался по ФАКТУ ЗАПИСИ env — и потому исчезал, стоило байтам совпасть.
+# Во всех трёх формах исход одинаков: символ числится capturing и лежит в
+# COLLECTOR_SYMBOLS, но инстанс ни разу не переподписывался, кадров нет, а сторож
+# тишины инстанса (1080 мин, и он такой не зря — см. пин про env) промолчит 18 часов.
+# Чинилось это только СЛЕДУЮЩЕЙ волной, то есть через ~2.1 суток.
+# ------------------------------------------------------------------------------
+
+
+def test_a_crash_between_the_env_write_and_the_restart_replays_the_restart():
+    """Обрыв РОВНО между записью env и рестартом. Реплей видит env, совпавший по
+    байтам, — и обязан всё равно переподписать инстанс: доказательством подхвата
+    служит наш собственный наблюдённый рестарт, а не то, что нужные символы лежат
+    в файле. Измерено до фикса: реплей давал 0 рестартов и 0 таймеров."""
+
+    class DiesOnRestart(FakeHost):
+        def systemctl(self, *args: str) -> int:
+            super().systemctl(*args)
+            if args[:1] == ("restart",):
+                raise RuntimeError("процесс умер между записью env и рестартом")
+            return 0
+
+    fresh = NOW - 600_000
+    dying = DiesOnRestart(raw(doc(sym("NEWUSDT", fresh))))
+    with pytest.raises(RuntimeError):
+        tick(dying, hostname="tokyo")
+    assert dying.env_writes() and dying.state_path not in dying.files
+
+    replay = FakeHost(raw(doc(sym("NEWUSDT", fresh))), files={ENV_PATH: dying.files[ENV_PATH]})
+    tick(replay, hostname="tokyo")
+
+    assert replay.env_writes() == []        # байты те же — env не переписывается
+    assert len(replay.restarts()) == 1      # но переподписка делается
+    after = load_state(replay.files[replay.state_path])
+    assert after.known[entry_key("NEWUSDT", fresh)].subscribed is True
+
+    replay.calls.clear()
+    tick(replay, hostname="tokyo")
+    assert replay.restarts() == [] and replay.env_writes() == []  # долг закрыт наблюдением
+
+
+def test_a_failed_restart_stays_owed_until_it_succeeds_and_says_so():
+    """`systemctl restart` вернул ненулевой код: до фикса план коммитился как
+    исполненный, символ числился capturing, а переподписки не было ни одной и никто
+    об этом не узнавал. Отказ обязан оставлять долг и звучать."""
+    fresh = NOW - 600_000
+    host = FakeHost(raw(doc(sym("NEWUSDT", fresh))))
+    host.systemctl_rc = 5
+    tick(host, hostname="tokyo")
+
+    assert len(host.restarts()) == 1
+    assert any("restart" in t and "5" in t for t in host.telegrams)
+    assert load_state(host.files[host.state_path]).known[entry_key("NEWUSDT", fresh)].subscribed is False
+
+    host.calls.clear()
+    tick(host, hostname="tokyo")
+    assert len(host.restarts()) == 1        # долг переживает тик и пробуется снова
+
+    host.systemctl_rc = 0
+    host.calls.clear()
+    tick(host, hostname="tokyo")
+    assert len(host.restarts()) == 1
+    assert load_state(host.files[host.state_path]).known[entry_key("NEWUSDT", fresh)].subscribed is True
+
+    host.calls.clear()
+    tick(host, hostname="tokyo")
+    assert host.restarts() == []            # и только теперь тишина
+
+
+def test_a_timer_that_failed_to_arm_is_retried_until_it_sticks():
+    """У armed-символа немедленного рестарта нет вовсе — единственное действие таймер,
+    поэтому его несостоявшаяся постановка была неотличима от состоявшейся. Повтор
+    безопасен по построению: имя юнита детерминировано, и systemd читает повтор как
+    «already exists», то есть как успех."""
+    onboard = NOW + 3 * 3600 * 1000
+    unit = timer_unit_name("SOONUSDT", onboard)
+    host = FakeHost(raw(doc(sym("SOONUSDT", onboard, status="PENDING_TRADING"))))
+    host.timer_rc = 1
+    tick(host, hostname="tokyo")
+
+    assert [c[1] for c in host.timers()] == [unit]
+    assert host.restarts() == []            # armed по-прежнему не рвёт запись сейчас
+    assert any("таймер" in t and unit in t for t in host.telegrams)
+    assert load_state(host.files[host.state_path]).known[entry_key("SOONUSDT", onboard)].timer_armed is False
+
+    host.calls.clear()
+    tick(host, hostname="tokyo")
+    assert [c[1] for c in host.timers()] == [unit]   # пробуем снова
+
+    host.timer_rc = 0
+    host.calls.clear()
+    tick(host, hostname="tokyo")
+    assert [c[1] for c in host.timers()] == [unit]
+    assert load_state(host.files[host.state_path]).known[entry_key("SOONUSDT", onboard)].timer_armed is True
+
+    host.calls.clear()
+    tick(host, hostname="tokyo")
+    assert host.timers() == []              # подтверждённый таймер больше не трогаем
+
+
+def test_a_trading_flip_without_a_confirmed_timer_restarts_like_a_flip():
+    """R-QUIET держится на одном допущении: рестарт уже сделал таймер. Если таймер не
+    вставал, допущение ложно, и молчание здесь стоит всего окна 0–5 мин (+13.16 бп).
+    Различие видно только по нашему же наблюдению постановки."""
+    onboard = NOW - 60_000
+    unit = timer_unit_name("SOONUSDT", onboard)
+    never = state_of(entry("SOONUSDT", onboard, PHASE_ARMED, anchor_ms=onboard,
+                           timer_unit=unit, status="PENDING_TRADING", timer_armed=False))
+
+    plan, new = plan_tick(doc(sym("SOONUSDT", onboard)), never, NOW, env_now=env_text(["SOONUSDT"]))
+
+    assert plan.env_write is None           # символ давно в списке
+    assert plan.restart_now is True         # и всё равно переподписка
+    e = new.known[entry_key("SOONUSDT", onboard)]
+    assert e.phase == PHASE_CAPTURING and e.subscribed is False  # долг до наблюдённого рестарта
+
+    # А подтверждённый таймер по-прежнему оставляет тик пустым — R-QUIET цел.
+    confirmed = state_of(entry("SOONUSDT", onboard, PHASE_ARMED, anchor_ms=onboard,
+                               timer_unit=unit, status="PENDING_TRADING", timer_armed=True))
+    quiet, after = plan_tick(doc(sym("SOONUSDT", onboard)), confirmed, NOW,
+                             env_now=env_text(["SOONUSDT"]))
+
+    assert quiet == Plan(counters=quiet.counters, pulse=quiet.pulse)
+    assert after.known[entry_key("SOONUSDT", onboard)].subscribed is True
+
+
 # ==============================================================================
 # FAIL-CLOSED
 # ==============================================================================
@@ -921,10 +1064,13 @@ def test_the_pulse_is_a_gz_file_touched_only_on_success(tmp_path):
     assert [r["t"] for r in lines] == [NOW, NOW + 1]
 
 
-def test_a_crash_between_env_write_and_state_save_heals_idempotently():
+def test_a_crash_before_the_state_is_saved_replays_the_restart_not_the_env_write():
     """Порядок применения выбран под обрыв: всё до сохранения state идемпотентно.
-    Реплей обязан совпасть по байтам env, не рестартить второй раз и лишь продублировать
-    алерт — дубль безопаснее навсегда пропущенной волны."""
+    Реплей обязан совпасть по байтам env и продублировать ровно один алерт — а вот
+    рестарт он ПОВТОРЯЕТ, и это не расточительство: с потерянным состоянием «инстанс
+    уже перечитал env» и «не перечитал никогда» снаружи неразличимы, а цена ошибок
+    несимметрична (≤35 с записи против всей волны). Прежняя редакция этого пина
+    закрепляла ровно ту потерю, ради которой поллер и существует."""
     host = FakeHost(raw(doc(sym("NEWUSDT", NOW - 600_000))))
     before_state = host.files.get(host.state_path)
     tick(host, hostname="tokyo")
@@ -940,9 +1086,9 @@ def test_a_crash_between_env_write_and_state_save_heals_idempotently():
 
     tick(host, hostname="tokyo")
 
-    assert host.env_writes() == []      # байты совпали
-    assert host.restarts() == []        # и потому рестарта нет
-    assert len(host.telegrams) == 1     # дубль ровно один
+    assert host.env_writes() == []       # байты совпали
+    assert len(host.restarts()) == 1     # а вот подхват байт заново подтверждается
+    assert len(host.telegrams) == 1      # дубль ровно один
     assert load_state(host.files[host.state_path]).known  # state доехал со второй попытки
 
 
@@ -966,19 +1112,22 @@ def test_the_alert_goes_out_before_the_state_is_saved():
     healthy = FakeHost(raw(doc(sym("NEWUSDT", NOW - 600_000))), files=dict(host.files))
     tick(healthy, hostname="tokyo")
     assert len(healthy.telegrams) == 1
-    assert healthy.env_writes() == [] and healthy.restarts() == []
+    assert healthy.env_writes() == []          # env идемпотентен по байтам
+    assert len(healthy.restarts()) == 1        # подписка же подтверждается заново
 
 
-def test_corrupt_state_rebootstraps_without_restarting_anything():
+def test_corrupt_state_rebootstraps_without_rewriting_the_env_but_resubscribes():
     """Битое состояние читается как «ничего не знаем» (прецедент positions-поллера).
-    Re-bootstrap не имеет права рвать живую запись: env уже верен, значит тишина."""
+    Env при этом не переписывается — он уже верен, — но подписка подтверждается заново:
+    вместе с состоянием утрачено единственное свидетельство того, что инстанс эти байты
+    подхватил, а молчаливое «наверное, подхватил» и есть форма потери волны."""
     fresh = NOW - 600_000
     host = FakeHost(raw(doc(sym("NEWUSDT", fresh))),
                     files={ENV_PATH: env_text(["NEWUSDT"]), "/data/state.json": "{не json"})
 
     tick(host, hostname="tokyo")
 
-    assert host.env_writes() == [] and host.restarts() == []
+    assert host.env_writes() == [] and len(host.restarts()) == 1
     after = load_state(host.files["/data/state.json"])
     assert after.known[entry_key("NEWUSDT", fresh)].phase == PHASE_CAPTURING
     assert len(host.telegrams) == 1  # плата за re-bootstrap — один повторный алерт
@@ -1009,7 +1158,11 @@ def test_state_loss_never_drops_a_flipped_watch_symbol_from_capture():
         tick(host, hostname="tokyo")
 
         assert env_symbols(host.files[ENV_PATH]) == ["GAIBUSDT", "NEWUSDT"], broken
-        assert host.env_writes() == [] and host.restarts() == [], broken
+        assert host.env_writes() == [], broken            # env уже верен — байты те же
+        # А вот подписка подтверждается заново: вместе с состоянием утрачено
+        # единственное свидетельство того, что инстанс эти байты подхватил (пин
+        # test_a_crash_between_the_env_write_and_the_restart_replays_the_restart).
+        assert len(host.restarts()) == 1, broken
         after = load_state(host.files["/data/state.json"])
         gaib = after.known[entry_key("GAIBUSDT", gaib_onboard)]
         assert gaib.phase == PHASE_CAPTURING, broken
