@@ -427,8 +427,16 @@ def _run_leg(host: Host, leg: Leg) -> LegOutcome:
                                      timezone.utc).strftime("%Y%m%d")
         host.append_jsonl(leg.venue, day, line)
         return LegOutcome(ok=True, symbols=n)
-    except (FundingFetchError, OSError, TimeoutError, ValueError,
-            UnicodeDecodeError) as exc:
+    except Exception as exc:  # noqa: BLE001 — тотально, и это решение
+        # Перечисление классов здесь было БАГОМ, а не строгостью: провод рвётся
+        # и тем, что не наследует OSError — `http.client.IncompleteRead`
+        # (оборванное тело), `EOFError` и `zlib.error` (усечённый или побитый
+        # gzip; gzip получают ровно aster и paradex). Любой из них уносил весь
+        # тик: остальные ноги не опрашивались, состояние не писалось — значит
+        # счётчик провалов не рос и алерт по ноге не наступал НИКОГДА.
+        # Провал не проглочен: класс ошибки едет в строку лога, в состояние и
+        # через FAIL_ALERT_AFTER тиков — в Telegram. BaseException (KeyboardInterrupt,
+        # SystemExit) сюда намеренно не попадает.
         return LegOutcome(ok=False, reason=f"{type(exc).__name__}: {exc}")
 
 

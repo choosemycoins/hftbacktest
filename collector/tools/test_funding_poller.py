@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import gzip
+import http.client
 import json
+import zlib
 from pathlib import Path
 
 import pytest
@@ -238,6 +240,35 @@ def test_a_network_error_is_a_leg_failure_too():
     fp.tick(host, hostname="tokyo")
     assert "paradex" not in [v for v, _, _ in host.jsonl]
     assert len(host.jsonl) == 4
+
+
+# Классы, которыми провод рвётся НА САМОМ ДЕЛЕ. Три из четырёх не наследуют
+# OSError — измерено на python 3.13: IncompleteRead → HTTPException → Exception,
+# EOFError и zlib.error — прямые наследники Exception. Пока `_run_leg` ловил
+# перечисление, любой из них уносил ВЕСЬ тик: остальные ноги не опрашивались,
+# состояние не писалось (счётчик провалов не рос, значит алерт по ноге не
+# наступал никогда), пульса не было. gzip получают ровно те две ноги, что и
+# отдают его — aster и paradex.
+TRANSPORT_FAILURES = [
+    OSError("timed out"),                                   # сокет
+    http.client.IncompleteRead(b"{\"resu"),                 # тело оборвалось
+    EOFError("Compressed file ended before the end-of-stream marker"),
+    zlib.error("Error -3 while decompressing data"),        # gzip побит в пути
+]
+
+
+@pytest.mark.parametrize(
+    "exc", TRANSPORT_FAILURES,
+    ids=lambda e: f"{type(e).__module__}.{type(e).__name__}")
+def test_any_transport_failure_costs_one_leg_and_no_more(exc):
+    host = FakeHost({**GOOD, "paradex.markets-summary": exc})
+    fp.tick(host, hostname="tokyo")
+    assert sorted(v for v, _, _ in host.jsonl) == \
+        ["aster", "hyperliquid", "hyperliquid", "lighter"]
+    # Провал посчитан — иначе серия не накопится и алерт по ноге не наступит.
+    state = json.loads(host.written[host.state_path])
+    assert state["legs"]["paradex.markets-summary"]["consecutive_failures"] == 1
+    assert len(host.pulses) == 1
 
 
 def test_an_undersized_response_is_a_leg_failure():
