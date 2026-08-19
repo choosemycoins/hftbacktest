@@ -468,6 +468,32 @@ def test_missing_or_empty_alert_env_reads_as_not_configured(tmp_path):
     assert fp.read_alert_env(str(path)) == (None, None)
 
 
+@pytest.mark.parametrize(
+    "exc", TRANSPORT_FAILURES,
+    ids=lambda e: f"{type(e).__module__}.{type(e).__name__}")
+def test_send_telegram_reports_false_on_any_transport_failure(tmp_path, capsys, exc):
+    # Зеркало пина _run_leg (03f12ac), тот же класс бага на втором сетевом
+    # вызове того же файла: перечисление (OSError, ValueError) пропускало
+    # наружу http.client.IncompleteRead из resp.read() — РОВНО во время
+    # инцидента (алерт по ноге due) и ДО записи состояния и пульса. Устойчивый
+    # обрыв пути к api.telegram.org давал «данные пишутся, state замер, пульса
+    # нет» — сторож кричал про мёртвый поллер при живой записи. Канал тревоги
+    # не смеет ронять канал данных: send_telegram не кидает НИКОГДА.
+    env = tmp_path / "alert.env"
+    env.write_text("TG_BOT_TOKEN=secret-token\nTG_CHAT_ID=-1001\n",
+                   encoding="utf-8")
+
+    def opener(req, timeout):
+        raise exc
+
+    host = fp.RealHost(tmp_path / "d", tmp_path / "p",
+                       alert_env_path=str(env), _open=opener)
+    assert host.send_telegram("probe") is False
+    out = capsys.readouterr().out
+    assert "secret-token" not in out     # текст ошибки может нести URL с токеном
+    assert type(exc).__name__ in out     # но класс отказа оператору виден
+
+
 def test_dry_run_host_reads_but_never_writes(capsys):
     inner = FakeHost()
     dry = fp.DryRunHost(inner)

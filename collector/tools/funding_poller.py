@@ -366,7 +366,15 @@ class RealHost:
             with self._open(req, timeout=15) as resp:
                 resp.read()
             return True
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 — тотально, зеркало _run_leg
+            # Перечисление классов здесь было тем же багом, что 03f12ac починил
+            # в _run_leg: провод рвётся и тем, что не наследует OSError —
+            # `http.client.IncompleteRead` из resp.read() в первую очередь.
+            # Ветка срабатывает РОВНО во время инцидента (алерт due) и до записи
+            # состояния и пульса: устойчивый обрыв пути к api.telegram.org давал
+            # «данные пишутся, state замер, пульса нет» — сторож кричал про
+            # мёртвый поллер при живой записи. Канал тревоги не смеет ронять
+            # канал данных; BaseException намеренно не ловится.
             # Только класс ошибки: её текст может нести URL, а в URL — токен.
             print(f"funding_poller: TG не доставлен ({type(exc).__name__})",
                   flush=True)

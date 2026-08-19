@@ -903,6 +903,10 @@ class RealHost:
                 resp.read()
             return True
         except (OSError, ValueError) as exc:
+            # TODO(#88, панель): перечисление классов — тот же баг, что был у
+            # funding_poller.py: http.client.IncompleteRead из resp.read() не
+            # наследует OSError и вылетает наружу. Лечится зеркалом funding-фикса
+            # (тотальный `except Exception` + пин send_telegram_reports_false…).
             # Только класс ошибки: её текст может нести URL, а в URL живёт токен.
             print(f"day0_poller: TG не доставлен ({type(exc).__name__})", flush=True)
             return False
