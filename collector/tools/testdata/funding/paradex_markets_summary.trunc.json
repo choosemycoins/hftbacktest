@@ -1,0 +1,58 @@
+{
+ "results": [
+  {
+   "symbol": "BTC-USD-PERP",
+   "mark_price": "69368.46425247",
+   "delta": "0.99955688",
+   "greeks": {
+    "delta": "0.99955688084739",
+    "gamma": "0",
+    "vega": "0"
+   },
+   "last_traded_price": "69388.8",
+   "bid": "69370.2",
+   "bid_size": "0.0002",
+   "ask": "69372.9",
+   "ask_size": "2.89577",
+   "volume_24h": "5928999.777125009",
+   "total_volume": "133654632692.272393",
+   "created_at": 1787177319997,
+   "underlying_price": "69399.21637442",
+   "open_interest": "40.23492",
+   "funding_rate": "0.00009162209923",
+   "price_change_rate_24h": "0.074703",
+   "external_fair_price": "69374.40935844",
+   "risk_free_rate": "0"
+  },
+  {
+   "symbol": "BTC-USD-30OCT26-61000-P",
+   "mark_price": "1655.55928333",
+   "mark_iv": "0.42347047",
+   "delta": "-0.2065489",
+   "greeks": {
+    "delta": "-0.20654889714563726",
+    "gamma": "0.000022025095959047013",
+    "vega": "87.88609784234737",
+    "theta": "-24.48928208766739",
+    "rho": "-3.2390290787862206",
+    "vanna": "0.0019043281210315759",
+    "volga": "1.0891256701518268"
+   },
+   "last_traded_price": "2617.56",
+   "bid": "",
+   "bid_size": "",
+   "ask": "",
+   "ask_size": "",
+   "volume_24h": "0",
+   "total_volume": "64.22855683519",
+   "created_at": 1787177319997,
+   "underlying_price": "69399.21637442",
+   "open_interest": "0.002",
+   "funding_rate": "",
+   "price_change_rate_24h": "-0.344751",
+   "future_funding_rate": "0.00009162",
+   "forward_rate": "0.03995895",
+   "risk_free_rate": "0"
+  }
+ ]
+}

@@ -1,0 +1,38 @@
+[Unit]
+Description=Поллер кросс-венью ставок фандинга (HL/Lighter/aster/paradex) — сырые ответы в jsonl.gz
+Documentation=file:/opt/hft-collector/current/bin/funding_poller.py
+After=network-online.target
+Wants=network-online.target
+# Аутэдж площадки не должен исчерпывать попытки запуска: серию провалов поллер
+# считает сам по НОГАМ (счётчики в state.json, тик — oneshot) и алертит на шестом
+# подряд. Ключ живёт в [Unit], НЕ в [Service] — там systemd его молча игнорирует
+# (класс отказа, пойманный на params-poller).
+StartLimitIntervalSec=0
+
+# Ненулевой выход — это НЕ сеть (сетевые провалы поллер обрабатывает сам,
+# fail-closed по ногам и молча до порога), а баг или отказ записи. Такое обязано
+# быть громким. OnFailure тоже живёт в [Unit]: в [Service] systemd его молча
+# игнорирует — ловится systemd-analyze verify (урок первой редакции day0-юнита).
+OnFailure=hft-collector-alert@%n.service
+
+[Service]
+Type=oneshot
+
+# СИСТЕМНЫЙ юнит от root: данные пишутся на волюм данных
+# /opt/hft-collector/data/funding (его видит офлоад и дисковый гвард heartbeat),
+# а alert.env (root:600) читается в момент отправки TG.
+# Пути абсолютные, без %h: у root домашний каталог /root, а пульс обязан лечь
+# туда, где его ищет heartbeat (Environment=POLLER_HOME=/home/ubuntu).
+# На хосте нет venv — только системный python3, поэтому поллер stdlib-only.
+ExecStart=/usr/bin/python3 /opt/hft-collector/current/bin/funding_poller.py --once --out-dir /opt/hft-collector/data/funding --pulse-dir /home/ubuntu/funding-data
+
+StandardOutput=append:/home/ubuntu/funding-data/poller.log
+StandardError=append:/home/ubuntu/funding-data/poller.log
+
+# Хост 2 vCPU, его работа — не отставать по записи маркетдаты. Поллер уступает
+# всем: 5 HTTP-запросов (~285 КБ на проводе суммарно) раз в 5 минут.
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

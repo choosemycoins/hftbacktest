@@ -48,6 +48,11 @@ POLLER_STALE_MIN=90      # часовой таймер + RandomizedDelaySec до
 # виден за полчаса. Общие 90 мин здесь не годятся: волна листинга приходит без
 # предупреждения, и полтора часа слепоты стоят первых минут захвата (+13.16 бп).
 DAY0_STALE_MIN=35
+# funding-поллер тикает раз в 5 мин; пульс пишется, только если хоть одна нога
+# площадки жива. Порог = 3 пропущенных тика (15 мин) + 5 мин запас = 20 мин.
+# Тишина пульса = все ноги мертвы либо мёртв сам таймер (класс params-poller);
+# частичные провалы (одна площадка из четырёх) алертит сам поллер по ногам.
+FUNDING_STALE_MIN=20
 
 if [[ -r "${ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -112,7 +117,8 @@ done
 # «не задеплоен» не равно «здоров».
 for p in "params:${POLLER_HOME}/params-data:${POLLER_STALE_MIN}" \
          "positions:${POLLER_HOME}/positions-data:${POLLER_STALE_MIN}" \
-         "day0:${POLLER_HOME}/day0-data:${DAY0_STALE_MIN}"; do
+         "day0:${POLLER_HOME}/day0-data:${DAY0_STALE_MIN}" \
+         "funding:${POLLER_HOME}/funding-data:${FUNDING_STALE_MIN}"; do
     IFS=: read -r p_name p_dir p_limit <<<"${p}"
     results+=("$(check_dir "${p_name}" "${p_dir}" "${p_limit}")")
 done
