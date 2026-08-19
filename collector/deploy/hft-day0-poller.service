@@ -1,0 +1,40 @@
+[Unit]
+Description=Поллер листингов дня-0 Binance USDⓈ-M (onboardDate -> env инстанса захвата)
+Documentation=file:/opt/hft-collector/current/bin/day0_poller.py
+After=network-online.target
+Wants=network-online.target
+# Аутэдж площадки не должен исчерпывать попытки запуска. Свою серию провалов поллер
+# считает сам (счётчик живёт в state.json, а не в памяти oneshot-процесса) и алертит
+# на шестом подряд. Ключ живёт в [Unit], НЕ в [Service] — в [Service] systemd его
+# молча игнорирует, наблюдалось у params-poller.
+StartLimitIntervalSec=0
+
+# Ненулевой выход — это НЕ сеть (сетевые провалы поллер обрабатывает сам, fail-closed
+# и молча до порога), а баг или отказ в записи. Такое обязано быть громким.
+# OnFailure тоже живёт в [Unit]: в [Service] systemd его молча игнорирует — поймано
+# `systemd-analyze verify` на первой редакции этого файла.
+OnFailure=hft-collector-alert@%n.service
+
+[Service]
+Type=oneshot
+
+# СИСТЕМНЫЙ юнит от root — в отличие от positions-poller, который пользовательский.
+# Иначе никак: поллер пишет root-owned /opt/hft-collector/etc/binancefuturesum-day0.env,
+# зовёт systemctl на СИСТЕМНОМ hft-collector@…, ставит transient-таймеры systemd-run
+# и читает alert.env (root:600).
+#
+# Пути абсолютные, без %h: у root домашний каталог /root, а пульс обязан лечь туда,
+# где его ищет heartbeat (Environment=POLLER_HOME=/home/ubuntu в hft-heartbeat.service).
+# На хосте нет venv — только системный python3, поэтому поллер stdlib-only.
+ExecStart=/usr/bin/python3 /opt/hft-collector/current/bin/day0_poller.py --once --data-dir /home/ubuntu/day0-data
+
+StandardOutput=append:/home/ubuntu/day0-data/poller.log
+StandardError=append:/home/ubuntu/day0-data/poller.log
+
+# Хост 2 vCPU, и его работа — не отставать по записи маркетдаты. Поллер уступает всем:
+# один HTTP GET (48 КБ на проводе) и разбор 1.1 МБ JSON раз в 10 минут.
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
