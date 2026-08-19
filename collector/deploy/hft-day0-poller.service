@@ -15,6 +15,18 @@ StartLimitIntervalSec=0
 # `systemd-analyze verify` на первой редакции этого файла.
 OnFailure=hft-collector-alert@%n.service
 
+# ExecStart указывает ВНУТРЬ атомарно-свопаемого дерева, а day0_poller.py
+# появляется только в собранных руками релизах (долг #106: build-release.sh
+# поллеры не стейджит). После rollback.sh файла по пути нет: без этого условия
+# юнит падал бы 203/EXEC, OnFailure слал бы сообщение, и таймер повторял бы это
+# каждые 10 минут — 144 ложных алерта в сутки, топящих настоящие тревоги ровно
+# в момент разбора первой аварии (панель #88; дыра была унаследована funding-
+# поллером отсюда). Нет файла — юнит ТИХО пропущен (не failed, OnFailure
+# молчит), а тишину поллера ловит сторож по пульсу (day0:…:35 в heartbeat.sh).
+# Condition* живёт в [Unit]: в [Service] systemd его молча игнорирует — тот же
+# класс отказа, что с OnFailure выше.
+ConditionPathExists=/opt/hft-collector/current/bin/day0_poller.py
+
 [Service]
 Type=oneshot
 

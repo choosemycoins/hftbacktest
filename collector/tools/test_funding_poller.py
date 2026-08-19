@@ -509,6 +509,50 @@ def test_dry_run_host_reads_but_never_writes(capsys):
 
 
 # ------------------------------------------------------------------------
+# Юниты: откат релиза не смеет превращать таймер в шторм ложных алертов
+# ------------------------------------------------------------------------
+
+DEPLOY_DIR = Path(__file__).parent.parent / "deploy"
+
+
+def _unit_sections(text: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            current = s[1:-1]
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(s)
+    return sections
+
+
+@pytest.mark.parametrize("unit", ["hft-funding-poller.service",
+                                  "hft-day0-poller.service"])
+def test_poller_units_skip_quietly_when_the_release_lacks_the_script(unit):
+    # Панель #88 (major): ExecStart указывает ВНУТРЬ атомарно-свопаемого
+    # дерева, а поллеры появляются только в собранных руками релизах (долг
+    # #106 — build-release.sh их не стейджит). После rollback.sh файла по
+    # пути нет: без условия юнит падает 203/EXEC, OnFailure шлёт сообщение,
+    # и таймер повторяет это каждые 5/10 минут — сотни ложных алертов в
+    # сутки, топящих настоящие тревоги ровно в момент, когда оператор
+    # разбирает первую аварию. ConditionPathExists на путь скрипта: нет
+    # файла — юнит ТИХО пропущен (не failed, OnFailure молчит), а тишину
+    # записи ловит сторож по пульсу. Дыра унаследована от day0-выкатки —
+    # оба юнита держит один пин.
+    # Ключ обязан жить в [Unit]: в [Service] systemd молча игнорирует
+    # Condition* — тот же класс отказа, что с OnFailure (day0, редакция 1).
+    sections = _unit_sections((DEPLOY_DIR / unit).read_text(encoding="utf-8"))
+    exec_value = next(l for l in sections["Service"]
+                      if l.startswith("ExecStart=")).split("=", 1)[1]
+    script = next(t for t in exec_value.split() if t.endswith(".py"))
+    assert f"ConditionPathExists={script}" in sections["Unit"]
+    assert not any(l.startswith("ConditionPathExists")
+                   for l in sections["Service"])
+
+
+# ------------------------------------------------------------------------
 # Имя файла данных — контракт с offload.sh, и держит его НАСТОЯЩАЯ day_of,
 # вырезанная из скрипта, а не пересказ её регекспа: разъедутся — упадёт тест,
 # а не доставка.
