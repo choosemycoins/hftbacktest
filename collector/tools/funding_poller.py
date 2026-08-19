@@ -55,6 +55,7 @@ import argparse
 import dataclasses
 import gzip
 import json
+import os
 import socket
 import sys
 import time
@@ -257,6 +258,38 @@ def advance(state: State, outcomes: dict[str, LegOutcome],
 # ==============================================================================
 
 
+def _append_gzip_member(path: Path, line: str) -> None:
+    """Дописать строку одним ПОЛНЫМ gzip-членом за один os.write + fsync.
+
+    Буферизованный `gzip.open(..., "at")` писал член серией write и закрывал
+    его трейлером только на close: убийство процесса посреди дописывания
+    (ребут, OOM, `systemctl stop` на 200-КБ записи paradex) оставляло
+    усечённый член, а усечённый член в СЕРЕДИНЕ файла делает нечитаемым для
+    gzip/zcat весь остаток суток площадки — до 288 записей, не одну строку
+    (панель #88, major; измерено: читатель отдаёт члены до обрыва и падает
+    zlib.error -3). Теперь член собирается в памяти целиком и уходит одним
+    syscall на O_APPEND-дескрипторе; fsync — чтобы тик пережил и падение
+    хоста сразу после записи. Остаточный риск — разрыв НИЖЕ уровня syscall
+    (отказ питания посреди записи страниц); на этот случай каждый член
+    самодостаточен, и читалка с ресинком по магии 1f 8b 08 достаёт всё, что
+    записано после обрыва (пин ticks_after_a_torn_tail_are_recoverable…).
+
+    Частичный os.write на локальной ФС — экзотика; если он всё же случится,
+    честнее упасть (это провал ноги, он считается и алертится), чем молча
+    оставить рваный хвост незамеченным.
+    """
+    member = gzip.compress((line + "\n").encode("utf-8"))
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        written = os.write(fd, member)
+        if written != len(member):
+            raise OSError(f"короткая запись: {written} из {len(member)} байт"
+                          f" в {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def data_file_name(venue: str, day: str) -> str:
     """Имя суточного файла площадки: `funding_<venue>_<YYYYMMDD>.gz`.
 
@@ -353,13 +386,11 @@ class RealHost:
         tmp.replace(p)
 
     def append_jsonl(self, venue: str, day: str, line: str) -> None:
-        """gzip-append: каждый тик — свой gzip-член, zcat читает подряд.
-        Тот же приём, что у positions-поллера. Имя файла — контракт офлоада
-        (data_file_name)."""
+        """gzip-append: каждый тик — свой ПОЛНЫЙ gzip-член одним os.write
+        (_append_gzip_member), zcat читает подряд. Имя файла — контракт
+        офлоада (data_file_name)."""
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        with gzip.open(self.out_dir / data_file_name(venue, day), "at",
-                       encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        _append_gzip_member(self.out_dir / data_file_name(venue, day), line)
 
     def append_pulse(self, line: str) -> None:
         """Пульс — ИМЕННО gzip-файл не глубже второго уровня: heartbeat ищет
@@ -367,9 +398,7 @@ class RealHost:
         self.pulse_dir.mkdir(parents=True, exist_ok=True)
         day = datetime.fromtimestamp(self.now_ns() // 1_000_000_000,
                                      timezone.utc).strftime("%Y%m%d")
-        with gzip.open(self.pulse_dir / f"pulse-{day}.gz", "at",
-                       encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        _append_gzip_member(self.pulse_dir / f"pulse-{day}.gz", line)
 
     def send_telegram(self, text: str) -> bool:
         token, chat = read_alert_env(self._alert_env_path)

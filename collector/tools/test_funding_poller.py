@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import http.client
 import json
+import os
 import subprocess
 import time
 import zlib
@@ -551,6 +552,88 @@ def test_real_host_appends_gzip_jsonl_per_venue_day(tmp_path):
     assert p.exists()
     with gzip.open(p, "rt", encoding="utf-8") as fh:
         assert fh.read() == '{"x":1}\n{"x":2}\n'
+
+
+def _spy_fs(monkeypatch, watched_dir):
+    """Подсматривает os.open/os.write/os.fsync по файлам внутри watched_dir.
+    Фильтр по fd обязателен: os.* глобальны, и без него в события попадали бы
+    чужие записи (capture самого pytest)."""
+    events, fds = [], set()
+    real = {"open": os.open, "write": os.write, "fsync": os.fsync}
+
+    def spy_open(path, flags, *a, **kw):
+        fd = real["open"](path, flags, *a, **kw)
+        if str(path).startswith(str(watched_dir)):
+            fds.add(fd)
+        return fd
+
+    def spy_write(fd, data):
+        if fd in fds:
+            events.append(("write", bytes(data)))
+        return real["write"](fd, data)
+
+    def spy_fsync(fd):
+        if fd in fds:
+            events.append(("fsync", b""))
+        return real["fsync"](fd)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "write", spy_write)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    return events
+
+
+def test_an_append_is_one_complete_gzip_member_in_a_single_write(tmp_path, monkeypatch):
+    # Панель #88 (major): буферизованный gzip.open(.., 'at') писал член серией
+    # write и закрывал его трейлером только на close. Убийство процесса посреди
+    # дописывания (ребут, OOM, systemctl stop на 200-КБ записи paradex)
+    # оставляло усечённый член, а усечённый член в СЕРЕДИНЕ файла делает
+    # нечитаемым для gzip/zcat весь остаток суток площадки — до 288 записей,
+    # не одну строку. И отказ невидим всем трём каналам тревоги: append к битому
+    # хвосту продолжается, пульс зелёный, OnFailure молчит. Член обязан ложиться
+    # на диск ПОЛНЫМ, одним os.write, и быть fsync-нут до возврата: окно
+    # разрыва — один syscall вместо серии буферизованных write.
+    events = _spy_fs(monkeypatch, tmp_path / "data")
+    host = fp.RealHost(tmp_path / "data", tmp_path / "pulse")
+    host.append_jsonl("paradex", "20260820", '{"x":1}')
+
+    writes = [d for kind, d in events if kind == "write"]
+    assert len(writes) == 1
+    assert gzip.decompress(writes[0]) == b'{"x":1}\n'   # член полон уже в write
+    assert [k for k, _ in events] == ["write", "fsync"]  # и на диске до возврата
+
+
+def test_the_pulse_append_is_a_single_complete_member_too(tmp_path, monkeypatch):
+    # Тот же обрыв в pulse-файле ослеплял бы разбор инцидента задним числом.
+    events = _spy_fs(monkeypatch, tmp_path / "pulse")
+    host = fp.RealHost(tmp_path / "data", tmp_path / "pulse",
+                       _now_ns=lambda: 1_787_200_000_000_000_000)
+    host.append_pulse('{"t":1}')
+    writes = [d for kind, d in events if kind == "write"]
+    assert len(writes) == 1
+    assert gzip.decompress(writes[0]) == b'{"t":1}\n'
+
+
+def test_ticks_after_a_torn_tail_are_recoverable_by_gzip_magic_resync(tmp_path):
+    # Радиус поражения обрыва, честно: наивный читатель (gzip.open/zcat)
+    # останавливается на рваном члене, но каждый наш член самодостаточен —
+    # читалка с ресинком по магии 1f 8b 08 достаёт всё, что записано ПОСЛЕ
+    # обрыва. Пин держит самодостаточность членов: без неё после разрыва
+    # (например, от отказа питания ниже уровня syscall) спасать было бы нечего.
+    host = fp.RealHost(tmp_path / "data", tmp_path / "pulse")
+    host.append_jsonl("aster", "20260820", '{"tick":1}')
+    (path,) = (tmp_path / "data").iterdir()
+    torn = gzip.compress(b'{"tick":2}\n')
+    with open(path, "ab") as fh:
+        fh.write(torn[: len(torn) // 2])        # запись оборвана на середине
+    host.append_jsonl("aster", "20260820", '{"tick":3}')
+
+    raw = path.read_bytes()
+    with pytest.raises((EOFError, zlib.error, gzip.BadGzipFile, OSError)):
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            fh.read()                            # наивный читатель падает
+    last = raw.rindex(b"\x1f\x8b\x08")
+    assert gzip.decompress(raw[last:]) == b'{"tick":3}\n'
 
 
 def test_real_host_pulse_is_a_gz_file_heartbeat_can_find(tmp_path):
