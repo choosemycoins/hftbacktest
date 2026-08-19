@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import http.client
 import json
+import subprocess
 import time
 import zlib
 from pathlib import Path
@@ -506,11 +507,47 @@ def test_dry_run_host_reads_but_never_writes(capsys):
     assert "DRY RUN" in out
 
 
+# ------------------------------------------------------------------------
+# Имя файла данных — контракт с offload.sh, и держит его НАСТОЯЩАЯ day_of,
+# вырезанная из скрипта, а не пересказ её регекспа: разъедутся — упадёт тест,
+# а не доставка.
+# ------------------------------------------------------------------------
+
+OFFLOAD_SH = Path(__file__).parent.parent / "deploy" / "offload.sh"
+
+
+def offload_day_of(name: str) -> str | None:
+    text = OFFLOAD_SH.read_text(encoding="utf-8")
+    start = text.index("day_of() {")
+    func = text[start:text.index("\n}", start) + 2]
+    proc = subprocess.run(
+        ["bash", "-c", func + '\nday_of "$1"', "day_of", name],
+        capture_output=True, text=True, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+@pytest.mark.parametrize("venue", sorted({leg.venue for leg in fp.LEGS}))
+def test_every_data_file_name_is_recognised_and_dated_by_offload(tmp_path, venue):
+    # Блокер панели #88: ряд, ради невосполнимости которого поллер написан,
+    # обязан УЕЗЖАТЬ с хоста. offload.sh (единственный путь доставки; его же
+    # оборачивает offload-daily.sh) признаёт имена функцией day_of; всё
+    # нераспознанное он молча оставляет лежать вечно («unrecognised names: N,
+    # left alone») — не доезжает до оператора И не удаляется с хоста, при
+    # зелёном пульсе и молчащем TG. Прежнее имя <venue>-YYYYMMDD.jsonl.gz не
+    # проходило: day_of требует подчёркивание перед датой и .gz СРАЗУ после.
+    # Сегодняшний файл офлоад не трогает сам (day >= UTC-сегодня хоста), так
+    # что распознаваемость не грозит файлу, в который ещё дописывают.
+    host = fp.RealHost(tmp_path / "data", tmp_path / "pulse")
+    host.append_jsonl(venue, "20260820", '{"x":1}')
+    (written,) = (tmp_path / "data").iterdir()
+    assert offload_day_of(written.name) == "20260820"
+
+
 def test_real_host_appends_gzip_jsonl_per_venue_day(tmp_path):
     host = fp.RealHost(tmp_path / "data", tmp_path / "pulse")
     host.append_jsonl("aster", "20260820", '{"x":1}')
     host.append_jsonl("aster", "20260820", '{"x":2}')
-    p = tmp_path / "data" / "aster-20260820.jsonl.gz"
+    p = tmp_path / "data" / "funding_aster_20260820.gz"
     assert p.exists()
     with gzip.open(p, "rt", encoding="utf-8") as fh:
         assert fh.read() == '{"x":1}\n{"x":2}\n'

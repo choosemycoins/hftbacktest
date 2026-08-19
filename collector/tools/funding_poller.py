@@ -14,8 +14,9 @@ Binance сюда НЕ входит намеренно: его premiumIndex уж�
 Контракт записи — контракт коллектора: сырые ответы площадки по ВСЕМ её
 символам, без сведения и интерпретации на этапе захвата. Парсинг минимальный —
 счётчик символов для лога/пульса и пол правдоподобия (усечённый ответ,
-прочитанный как мир, оставил бы дыру в ряде молча). Формат: jsonl.gz на
-площадку на сутки UTC, строка:
+прочитанный как мир, оставил бы дыру в ряде молча). Формат: файл
+`funding_<venue>_<YYYYMMDD>.gz` на площадку на сутки UTC (имя — контракт
+offload.sh, см. data_file_name; содержимое — jsonl.gz), строка:
 
     {"t_local_ns": ..., "venue": ..., "endpoint": ..., "payload": <сырой ответ>}
 
@@ -256,6 +257,23 @@ def advance(state: State, outcomes: dict[str, LegOutcome],
 # ==============================================================================
 
 
+def data_file_name(venue: str, day: str) -> str:
+    """Имя суточного файла площадки: `funding_<venue>_<YYYYMMDD>.gz`.
+
+    Форма — контракт с `deploy/offload.sh` (`day_of`): подчёркивание перед
+    датой и `.gz` СРАЗУ после неё. Только распознанное имя уезжает с хоста и
+    удаляется после сверки; нераспознанное офлоад молча оставляет лежать вечно
+    («unrecognised names: N, left alone») — панель #88, blocker: прежнее
+    `<venue>-YYYYMMDD.jsonl.gz` не проходило, и ряд копился на хосте, никуда
+    не доезжая, при зелёном пульсе. Сегодняшний файл офлоад не трогает сам
+    (day >= UTC-сегодня хоста). Внутри — jsonl.gz (см. докстринг модуля);
+    `.jsonl` в имени day_of не признаёт, поэтому формат живёт в документации,
+    а не в суффиксе. Пин — test_every_data_file_name_is_recognised_and_dated…,
+    он гоняет НАСТОЯЩУЮ day_of из offload.sh.
+    """
+    return f"funding_{venue}_{day}.gz"
+
+
 class Host(Protocol):
     """Шов между решениями и миром. В тестах — записывающая подделка."""
 
@@ -336,9 +354,10 @@ class RealHost:
 
     def append_jsonl(self, venue: str, day: str, line: str) -> None:
         """gzip-append: каждый тик — свой gzip-член, zcat читает подряд.
-        Тот же приём, что у positions-поллера."""
+        Тот же приём, что у positions-поллера. Имя файла — контракт офлоада
+        (data_file_name)."""
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        with gzip.open(self.out_dir / f"{venue}-{day}.jsonl.gz", "at",
+        with gzip.open(self.out_dir / data_file_name(venue, day), "at",
                        encoding="utf-8") as fh:
             fh.write(line + "\n")
 
@@ -401,7 +420,7 @@ class DryRunHost:
         print(f"--- DRY RUN, записал бы {path}:\n{text}", flush=True)
 
     def append_jsonl(self, venue: str, day: str, line: str) -> None:
-        print(f"--- DRY RUN, дописал бы {venue}-{day}.jsonl.gz: "
+        print(f"--- DRY RUN, дописал бы {data_file_name(venue, day)}: "
               f"{len(line)} байт, {line[:120]}…", flush=True)
 
     def append_pulse(self, line: str) -> None:
