@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import http.client
 import json
+import time
 import zlib
 from pathlib import Path
 
@@ -183,7 +184,7 @@ def test_a_good_tick_writes_one_line_per_leg_into_per_venue_day_files():
     host = FakeHost()
     fp.tick(host, hostname="tokyo")
     assert len(host.jsonl) == 5
-    # 2026-08-20 05:46:40 UTC — день из now_ns, не из площадки
+    # 2026-08-20 04:26:40 UTC — день из now_ns, не из площадки
     assert {(v, d) for v, d, _ in host.jsonl} == {
         ("hyperliquid", "20260820"), ("lighter", "20260820"),
         ("aster", "20260820"), ("paradex", "20260820"),
@@ -397,8 +398,74 @@ def test_state_roundtrip():
 
 
 # ==============================================================================
+# Сутки файла — UTC, а не хостовые
+# ==============================================================================
+
+
+@pytest.fixture
+def tokyo_tz():
+    """Часовой пояс процесса — токийский: там, где стоит хост сбора, локальные
+    сутки уже наступили, а UTC-е ещё нет. Без этого пин вакуумен на UTC-машине."""
+    if not hasattr(time, "tzset"):  # pragma: no cover — не Unix
+        pytest.skip("tzset только на Unix")
+    import os
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Tokyo"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+# 2026-08-20 23:59:30 UTC — в Токио это уже 21-е.
+NEAR_UTC_MIDNIGHT_NS = 1_787_270_370_000_000_000
+
+
+def test_the_file_day_is_the_utc_day_not_the_hosts(tokyo_tz):
+    # Ряд режется по UTC-суткам: иначе один и тот же час лежал бы в разных
+    # файлах у хостов в разных поясах, а потребитель (#40) склеивает их вслепую.
+    host = FakeHost(now_ns=NEAR_UTC_MIDNIGHT_NS)
+    fp.tick(host, hostname="tokyo")
+    assert {d for _, d, _ in host.jsonl} == {"20260820"}
+
+
+def test_the_pulse_file_day_is_the_utc_day_too(tokyo_tz, tmp_path):
+    host = fp.RealHost(tmp_path / "data", tmp_path / "pulse",
+                       _now_ns=lambda: NEAR_UTC_MIDNIGHT_NS)
+    host.append_pulse('{"t":1}')
+    assert [p.name for p in (tmp_path / "pulse").glob("pulse-*.gz")] == \
+        ["pulse-20260820.gz"]
+
+
+# ==============================================================================
 # Исполняющий слой
 # ==============================================================================
+
+
+def test_alert_env_is_read_the_way_alert_sh_writes_it(tmp_path):
+    # Тот же файл, что у alert.sh/heartbeat.sh: строки с `export`, кавычки,
+    # комментарии. Прочитанный неверно токен — это молчащий TG при живом алерте.
+    path = tmp_path / "alert.env"
+    path.write_text(
+        "# алертинг коллектора\n"
+        "\n"
+        'export TG_BOT_TOKEN="123:abc"\n'
+        "TG_CHAT_ID='-1001'\n"
+        "мусор без знака равенства\n",
+        encoding="utf-8")
+    assert fp.read_alert_env(str(path)) == ("123:abc", "-1001")
+
+
+def test_missing_or_empty_alert_env_reads_as_not_configured(tmp_path):
+    assert fp.read_alert_env(str(tmp_path / "нет-такого")) == (None, None)
+    path = tmp_path / "alert.env"
+    path.write_text("TG_BOT_TOKEN=\nTG_CHAT_ID=\n", encoding="utf-8")
+    assert fp.read_alert_env(str(path)) == (None, None)
 
 
 def test_dry_run_host_reads_but_never_writes(capsys):
