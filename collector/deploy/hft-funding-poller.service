@@ -30,7 +30,8 @@ StandardOutput=append:/home/ubuntu/funding-data/poller.log
 StandardError=append:/home/ubuntu/funding-data/poller.log
 
 # Хост 2 vCPU, его работа — не отставать по записи маркетдаты. Поллер уступает
-# всем: 5 HTTP-запросов (~285 КБ на проводе суммарно) раз в 5 минут.
+# всем: 5 HTTP-запросов раз в 5 минут (~396 КБ на проводе: HL 71+63 и lighter 52
+# приходят identity, aster 19 и paradex 191 — gzip; перемерено 2026-08-20).
 Nice=19
 IOSchedulingClass=idle
 
