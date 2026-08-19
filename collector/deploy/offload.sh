@@ -298,7 +298,13 @@ for instance in "${INSTANCES[@]}"; do
     # script's whole promise is that nothing is deleted on the strength of a
     # timestamp.
     echo "  copying…"
+    # Удалённая сторона — под ionice idle + nice 19: сборщик на том же хосте
+    # важнее вывоза. Измерено 2026-08-19: все четыре инцидента коллектора за
+    # неделю (два queue_overflow, сталл bybit-d, оверфлоу 17.08 01:06) пришлись
+    # на окна, когда на коробке работал тяжёлый читатель — этот rsync или гейт.
+    # Гейт уже Nice=19/idle; этот был единственным невежливым соседом.
     if ! rsync -a --checksum --partial --human-readable \
+        --rsync-path="ionice -c3 nice -n19 rsync" \
         --files-from="${all_list}" "${HOST}:${remote_dir}/" "${local_dir}/"; then
         echo "  ERROR: rsync failed; nothing will be removed on the host." >&2
         FAILURES=$((FAILURES + 1))
