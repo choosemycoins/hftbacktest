@@ -37,7 +37,25 @@
 
 set -euo pipefail
 
-DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# --- самокопия: защита от правки под работающим процессом ----------------------
+# bash читает скрипт по мере исполнения. Эти два скрипта живут в git-рабочем
+# дереве и выполняются ЧАСАМИ — правка файла (или git checkout) под живым
+# процессом кормит его мусором со сдвинутых байтовых смещений. Измерено
+# 2026-08-19: коммит bde181d лёг в offload.sh во время прогона, и процесс,
+# дойдя до сдвинутого участка, умер с «синтаксическая ошибка, строка 398» —
+# ПОСЛЕ всей работы (каждая площадка verified, удаления только верифицированных),
+# потеряв лишь финальный отчёт. Снимок в tmp делает исполняемые байты
+# неизменяемыми на весь прогон; репозиторий можно править когда угодно.
+if [[ -z "${OFFLOAD_SNAPSHOT_DIR:-}" ]]; then
+    _snap="$(mktemp -d "${TMPDIR:-/tmp}/offload-snapshot.XXXXXX")"
+    _src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cp "${_src}/offload-daily.sh" "${_src}/offload.sh" "${_snap}/"
+    cp "${_src}/archive-rotate.sh" "${_snap}/" 2>/dev/null || true
+    OFFLOAD_SNAPSHOT_DIR="${_snap}" exec bash "${_snap}/offload-daily.sh" "$@"
+fi
+trap 'rm -rf "${OFFLOAD_SNAPSHOT_DIR}"' EXIT
+
+DEPLOY_DIR="${OFFLOAD_SNAPSHOT_DIR}"
 HFT_HOST="${HFT_HOST:-hft-collector-tokyo}"
 HFT_TARGET="${HFT_TARGET:-${HOME}/hft-data}"
 TG_ENV="${HFT_TG_ENV:-${HOME}/.config/hftbacktest-connector/telegram-alert.env}"
