@@ -72,10 +72,24 @@ Nice=19
 IOSchedulingClass=idle
 
 # Generous, because Nice=19 means "whenever the collector is idle" and a quiet
-# hour is not guaranteed. A gate that genuinely needs more than an hour on a
-# day's recording is itself a finding — the day is far larger than the measured
-# 3-5 GB, or the host is being throttled.
-TimeoutStartSec=3600
+# hour is not guaranteed.
+#
+# 3600 was sized for the 5-6 instances of the time, and the `all` set walks them
+# in glob (alphabetical) order — so when the budget runs out, it is ALWAYS the
+# same tail that loses its report, and it loses it silently: the unit says
+# "timed out", never which instances were never reached. Measured 2026-08-21 on
+# the Tokyo host: 10 instances, ~13 GB of recording, killed at the 10th —
+# hyperliquid and lighter (the two alphabetically last, and the two this fork
+# actually trades against) had no gate report for 20260820 at all, while every
+# binance* instance had one. The host was not the constraint (idle ~60%,
+# steal ~1.5%); the deadline was.
+#
+# A gate that needs more than TWO hours is still a finding — that is either a
+# day far larger than the measured 3-5 GB per instance, or a throttled host.
+# If a host ever needs a different budget, override it per host rather than
+# raising it here:
+#   systemctl edit hft-collector-gate@all.service   # [Service] TimeoutStartSec=...
+TimeoutStartSec=7200
 
 # It writes gate/<day>.{txt,json} into each instance's data directory and
 # nothing else. If COLLECTOR_DATA_DIR points outside the tree, add it here the
