@@ -13,6 +13,9 @@
 #   bin/gate-run.sh                 daily quality gate, run by the timer below
 #   bin/alert.sh                    OnFailure hook; ExecStart of the alert unit
 #   bin/rollback.sh                 so a rollback needs nothing but /opt
+#   bin/heartbeat.sh                dead man over every instance and poller
+#   bin/day0_poller.py              day-zero listing poller
+#   bin/funding_poller.py           cross-venue funding poller
 #   etc/hft-collector@.service
 #   etc/hft-collector-gate@.service
 #   etc/hft-collector-gate@.timer
@@ -112,6 +115,29 @@ install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/to
 # that has nothing but /opt — the operator should never need the source repo
 # to recover. install.sh is deliberately NOT shipped: installing a release
 # requires the tarball, which arrives with its own copy.
+# The dead man and the two pollers. Staged here for one reason: until 2026-08-22
+# they were not, and all three had been copied into the live release directory
+# BY HAND. `install.sh` builds a fresh release directory and flips `current` at
+# it, so the next ordinary release would have removed all three at once —
+# silently, because their units keep pointing at `current/bin/...` and simply
+# start failing. The heartbeat is the worst of the three to lose that way: it is
+# the thing that would have told us the others were gone.
+#
+# Their units are staged too. A unit whose ExecStart points inside the swapped
+# tree has to travel with the tree, or a release can leave the file and the unit
+# describing different things.
+install -m 755 "${REPO_ROOT}/collector/tools/day0_poller.py"    "${BUILD_DIR}/bin/day0_poller.py"
+install -m 755 "${REPO_ROOT}/collector/tools/funding_poller.py" "${BUILD_DIR}/bin/funding_poller.py"
+install -m 755 "${DEPLOY_DIR}/heartbeat.sh"                     "${BUILD_DIR}/bin/heartbeat.sh"
+install -m 644 "${DEPLOY_DIR}/hft-heartbeat.service"            "${BUILD_DIR}/etc/hft-heartbeat.service"
+install -m 644 "${DEPLOY_DIR}/hft-heartbeat.timer"              "${BUILD_DIR}/etc/hft-heartbeat.timer"
+install -m 644 "${DEPLOY_DIR}/hft-day0-poller.service"          "${BUILD_DIR}/etc/hft-day0-poller.service"
+install -m 644 "${DEPLOY_DIR}/hft-day0-poller.timer"            "${BUILD_DIR}/etc/hft-day0-poller.timer"
+install -m 644 "${DEPLOY_DIR}/hft-funding-poller.service"       "${BUILD_DIR}/etc/hft-funding-poller.service"
+install -m 644 "${DEPLOY_DIR}/hft-funding-poller.timer"         "${BUILD_DIR}/etc/hft-funding-poller.timer"
+install -m 644 "${DEPLOY_DIR}/binancefuturesum-day0.env.example" \
+               "${BUILD_DIR}/etc/binancefuturesum-day0.env.example"
+
 install -m 755 "${DEPLOY_DIR}/rollback.sh"                "${BUILD_DIR}/bin/rollback.sh"
 
 # `--version` is the binary's own account of its provenance; recording it

@@ -1,0 +1,16 @@
+[Unit]
+Description=Heartbeat: свежесть записей коллекторов и поллеров -> Telegram
+After=network-online.target
+
+[Service]
+Type=oneshot
+# СИСТЕМНЫЙ юнит от root: alert.env лежит root:600, и пользовательский юнит его не
+# прочитает. Каталоги поллеров передаются явно — у root свой $HOME.
+Environment=POLLER_HOME=/home/ubuntu
+ExecStart=/opt/hft-collector/current/bin/heartbeat.sh
+# Сторож не имеет права стать нагрузкой на хосте, чья работа — не отставать.
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

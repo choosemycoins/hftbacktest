@@ -10,6 +10,8 @@
 #   current -> releases/<tag>/     symlink, swapped atomically
 #   releases/<tag>/
 #     bin/{collector,collector-run.sh,rollback.sh,gate-run.sh,alert.sh}
+#     bin/{heartbeat.sh,day0_poller.py,funding_poller.py} and the units that
+#     execute them — all optional, all installed but never enabled here
 #     etc/{hft-collector@.service,hft-collector-gate@.service,
 #          hft-collector-gate@.timer,hft-collector-alert@.service,
 #          instance.env.example,alert.env.example}
@@ -187,6 +189,36 @@ if [[ "${HAS_GATE}" -eq 0 ]]; then
     echo "      tools/quality_report.py). Nothing is removed; an enabled timer"
     echo "      keeps running whatever the previous release installed."
 fi
+# The dead man and the two pollers, on the same optional terms as the gate: a
+# tarball built before 2026-08-22 does not carry them, and such a release must
+# still install — its units keep executing whatever the previous release left in
+# `current/bin`. Each component is checked on its own so the message names the
+# one that is missing rather than the group.
+#
+# Format: <name>|<file> <file> ... — one line each. No associative arrays, to
+# keep this script readable on any bash a host happens to have.
+TIMED_COMPONENTS="
+heartbeat|bin/heartbeat.sh etc/hft-heartbeat.service etc/hft-heartbeat.timer
+day0-poller|bin/day0_poller.py etc/hft-day0-poller.service etc/hft-day0-poller.timer
+funding-poller|bin/funding_poller.py etc/hft-funding-poller.service etc/hft-funding-poller.timer
+"
+PRESENT_COMPONENTS=""
+while IFS='|' read -r name files; do
+    [[ -z "${name}" ]] && continue
+    have=1
+    for f in ${files}; do
+        [[ -f "${TMP}/${f}" ]] || have=0
+    done
+    if [[ "${have}" -eq 1 ]]; then
+        PRESENT_COMPONENTS="${PRESENT_COMPONENTS}${name}|${files}
+"
+    else
+        echo "NOTE: this tarball carries no ${name}. Nothing is removed; an"
+        echo "      enabled timer keeps running whatever the previous release"
+        echo "      installed under current/bin."
+    fi
+done <<<"${TIMED_COMPONENTS}"
+
 # The alert hook, on the same optional terms. Loud rather than silent when it
 # is absent: every unit shipped here carries OnFailure=hft-collector-alert@%n
 # unconditionally, so a release without it leaves those units naming a hook
@@ -326,6 +358,10 @@ trap - EXIT
 if [[ -f "${NEW_RELEASE}/etc/instance.env.example" ]]; then
     install -m 644 "${NEW_RELEASE}/etc/instance.env.example" "${ETC_DIR}/instance.env.example"
 fi
+if [[ -f "${NEW_RELEASE}/etc/binancefuturesum-day0.env.example" ]]; then
+    install -m 644 "${NEW_RELEASE}/etc/binancefuturesum-day0.env.example" \
+                   "${ETC_DIR}/binancefuturesum-day0.env.example"
+fi
 if [[ -f "${NEW_RELEASE}/etc/alert.env.example" ]]; then
     install -m 644 "${NEW_RELEASE}/etc/alert.env.example" "${ETC_DIR}/alert.env.example"
 fi
@@ -347,6 +383,29 @@ if [[ "${HAS_GATE}" -eq 1 ]]; then
         fi
     done
 fi
+
+# The dead man's and the pollers' units, on the gate's terms exactly: installed,
+# never enabled here. Enabling is the operator's, and the DEPLOY notes beside
+# this script say when.
+#
+# Refreshing them matters more than it looks: their ExecStart points INSIDE the
+# swapped tree, so a unit left describing the previous release's flags while the
+# tree underneath it changed is a poller that runs with the wrong arguments and
+# says nothing about it.
+while IFS='|' read -r name files; do
+    [[ -z "${name}" ]] && continue
+    for f in ${files}; do
+        case "${f}" in
+            etc/*)
+                unit="${f#etc/}"
+                if ! cmp -s "${NEW_RELEASE}/${f}" "/etc/systemd/system/${unit}" 2>/dev/null; then
+                    echo "==> Updating /etc/systemd/system/${unit}"
+                    install -m 644 "${NEW_RELEASE}/${f}" "/etc/systemd/system/${unit}"
+                fi
+                ;;
+        esac
+    done
+done <<<"${PRESENT_COMPONENTS}"
 
 # The alert unit, likewise. This one is not "enabled" at all — it is an
 # OnFailure target, activated by the units that name it — so installing the
