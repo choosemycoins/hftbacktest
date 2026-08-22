@@ -176,6 +176,56 @@ for name in "${INSTANCES[@]}"; do
     esac
 done
 
+# --- каталоги поллеров -------------------------------------------------------
+# Их не видит цикл выше: он перечисляет инстансы по etc/*.env, а у поллера .env
+# нет. До 2026-08-22 это значило, что funding, params и positions не проверялись
+# НИЧЕМ — ни разу за всё время их существования.
+#
+# Проверяет их отдельный инструмент, а не профиль внутри quality_report.py, и это
+# осознанно: тот построен вокруг записей биржевых стримов (сайдкар _meta с
+# session_start, набор стримов на символ, цепочки последовательности), а у
+# поллера нет ничего из перечисленного — это снимки REST по таймеру. Общая
+# абстракция поверх двух непохожих вещей стоила бы дороже двух инструментов.
+#
+# Каденция объявляется здесь, потому что она свойство ТАЙМЕРА, а не данных:
+# ровно её и проверяем — молчащий таймер params стоил 23 часов ряда 12.08.
+POLLER_DIRS="funding:300 params:3600 positions:3600"
+POLLER_SCRIPT="${COLLECTOR_HOME}/tools/poller_report.py"
+if [[ -f "${POLLER_SCRIPT}" ]]; then
+    for spec in ${POLLER_DIRS}; do
+        pname="${spec%%:*}"
+        cadence="${spec##*:}"
+        pdir="${DATA_ROOT}/${pname}"
+        [[ -d "${pdir}" ]] || continue
+        pout="${pdir}/gate"
+        mkdir -p "${pout}" 2>/dev/null || { worst=2; continue; }
+        ptxt="${pout}/${DAY}.txt"; pjson="${pout}/${DAY}.json"
+        prc=0
+        "${PYTHON}" "${POLLER_SCRIPT}" "${pdir}" --cadence-s "${cadence}" \
+            --day "${DAY}" --json "${pjson}.partial" > "${ptxt}.partial" 2>&1 || prc=$?
+        mv -f "${ptxt}.partial" "${ptxt}"
+        [[ -f "${pjson}.partial" ]] && mv -f "${pjson}.partial" "${pjson}"
+        checked=$((checked + 1))
+        case "${prc}" in
+            0) echo "gate-run[${pname}]: ok -> ${ptxt}" ;;
+            1)
+                echo "gate-run[${pname}]: RED -> ${ptxt}" >&2
+                grep -E '^\s*\[(red|yellow)' "${ptxt}" | head -20 \
+                    | sed "s/^/gate-run[${pname}]:   /" >&2 || true
+                red+=("${pname}")
+                [[ "${worst}" -lt 1 ]] && worst=1
+                ;;
+            *)
+                echo "gate-run[${pname}]: the check could not run (exit ${prc})" >&2
+                tail -5 "${ptxt}" | sed "s/^/gate-run[${pname}]:   /" >&2 || true
+                worst=2
+                ;;
+        esac
+    done
+else
+    echo "gate-run: no ${POLLER_SCRIPT}; poller directories not checked" >&2
+fi
+
 echo "gate-run: checked ${checked} instance(s) for ${DAY}"
 if [[ "${#red[@]}" -gt 0 ]]; then
     echo "gate-run: RED: ${red[*]}" >&2

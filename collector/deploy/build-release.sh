@@ -112,6 +112,7 @@ install -m 644 "${DEPLOY_DIR}/alert.env.example"          "${BUILD_DIR}/etc/aler
 # Shipping them would put a dependency on the recording host that nothing there
 # can satisfy.
 install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/tools/quality_report.py"
+install -m 644 "${REPO_ROOT}/collector/tools/poller_report.py"  "${BUILD_DIR}/tools/poller_report.py"
 
 # Ship rollback.sh inside the release so a rollback is possible from a host
 # that has nothing but /opt — the operator should never need the source repo
