@@ -201,6 +201,7 @@ TIMED_COMPONENTS="
 heartbeat|bin/heartbeat.sh etc/hft-heartbeat.service etc/hft-heartbeat.timer
 day0-poller|bin/day0_poller.py etc/hft-day0-poller.service etc/hft-day0-poller.timer
 funding-poller|bin/funding_poller.py etc/hft-funding-poller.service etc/hft-funding-poller.timer
+params-poller|bin/params_poller.py etc/hft-params-poller.service etc/hft-params-poller.timer
 "
 PRESENT_COMPONENTS=""
 while IFS='|' read -r name files; do

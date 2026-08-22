@@ -16,6 +16,7 @@
 #   bin/heartbeat.sh                dead man over every instance and poller
 #   bin/day0_poller.py              day-zero listing poller
 #   bin/funding_poller.py           cross-venue funding poller
+#   bin/params_poller.py            venue administered-parameter poller
 #   etc/hft-collector@.service
 #   etc/hft-collector-gate@.service
 #   etc/hft-collector-gate@.timer
@@ -128,6 +129,7 @@ install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/to
 # describing different things.
 install -m 755 "${REPO_ROOT}/collector/tools/day0_poller.py"    "${BUILD_DIR}/bin/day0_poller.py"
 install -m 755 "${REPO_ROOT}/collector/tools/funding_poller.py" "${BUILD_DIR}/bin/funding_poller.py"
+install -m 755 "${REPO_ROOT}/collector/tools/params_poller.py"  "${BUILD_DIR}/bin/params_poller.py"
 install -m 755 "${DEPLOY_DIR}/heartbeat.sh"                     "${BUILD_DIR}/bin/heartbeat.sh"
 install -m 644 "${DEPLOY_DIR}/hft-heartbeat.service"            "${BUILD_DIR}/etc/hft-heartbeat.service"
 install -m 644 "${DEPLOY_DIR}/hft-heartbeat.timer"              "${BUILD_DIR}/etc/hft-heartbeat.timer"
@@ -135,6 +137,8 @@ install -m 644 "${DEPLOY_DIR}/hft-day0-poller.service"          "${BUILD_DIR}/et
 install -m 644 "${DEPLOY_DIR}/hft-day0-poller.timer"            "${BUILD_DIR}/etc/hft-day0-poller.timer"
 install -m 644 "${DEPLOY_DIR}/hft-funding-poller.service"       "${BUILD_DIR}/etc/hft-funding-poller.service"
 install -m 644 "${DEPLOY_DIR}/hft-funding-poller.timer"         "${BUILD_DIR}/etc/hft-funding-poller.timer"
+install -m 644 "${DEPLOY_DIR}/hft-params-poller.service"         "${BUILD_DIR}/etc/hft-params-poller.service"
+install -m 644 "${DEPLOY_DIR}/hft-params-poller.timer"           "${BUILD_DIR}/etc/hft-params-poller.timer"
 install -m 644 "${DEPLOY_DIR}/binancefuturesum-day0.env.example" \
                "${BUILD_DIR}/etc/binancefuturesum-day0.env.example"
 
