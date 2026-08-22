@@ -21,6 +21,7 @@
 //!   skipped here, it is the addressing.
 
 mod http;
+mod subscription;
 
 #[cfg(test)]
 mod fixtures;
@@ -89,10 +90,20 @@ pub const CHANNELS: [&str; 4] = ["order_book", "ticker", "trade", "market_stats"
 
 /// The venue's client-message budget, per minute.
 ///
-/// Exceeding it is not answered with an error frame — the connection is
-/// throttled, which from this side is a socket that goes quiet. That is the
-/// one failure this collector is least able to tell from a quiet market, so
-/// the budget is treated as a hard constraint rather than a guideline.
+/// ⚠️ **Corrected 2026-08-22 by measurement; the previous sentence here was
+/// wrong.** It said exceeding the budget "is not answered with an error frame —
+/// the connection is throttled, which from this side is a socket that goes
+/// quiet". The recording says otherwise: every refused client frame comes back
+/// as `{"error":{"code":30009,"message":"Too Many Websocket Messages!"}}`, one
+/// per frame — 41 of them on 2026-08-12 and 53 on 2026-08-18, in bursts of
+/// eight 246ms apart, which is this collector's own subscribe chunking
+/// reflected back. The venue is loud about it; the collector simply filed the
+/// frames in the sidecar and read none of them. See `subscription.rs`.
+///
+/// The other half of that measurement is that the per-minute figure does not
+/// describe the constraint: a full 92-frame set is well inside 200, and was
+/// refused anyway after exactly 38 accepted frames at +1.01s. Treat 200/min as
+/// a ceiling that is necessary and not sufficient.
 ///
 /// **Provenance, and the one thing about it that is not established.** The
 /// figure is the venue's published limit, alongside 500 subscriptions per

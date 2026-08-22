@@ -84,6 +84,18 @@ pub const ERROR_UNKNOWN_CHANNEL: &str = r#"{"error":{"code":30005,"message":"Inv
 pub const ERROR_ALREADY_SUBSCRIBED: &str =
     r#"{"error":{"code":30003,"message":"Already Subscribed to : order_book:0"}}"#;
 
+/// What the venue says to a subscribe it refuses for rate: one of these per
+/// refused frame, and it names no channel at all.
+///
+/// Byte for byte from our own recording — `_meta_lighter_20260812.jsonl` and
+/// `_meta_lighter_20260818.jsonl`, 41 and 53 of them respectively, in bursts of
+/// eight 246ms apart, beginning 1.01s after `connected` in both. This is the
+/// frame that proves the venue is not silent about a dropped subscription, and
+/// the reason a rate-limited connection must never be reconnected: the fresh
+/// connection re-sends the whole set into the same limiter.
+pub const ERROR_TOO_MANY_MESSAGES: &str =
+    r#"{"error":{"code":30009,"message":"Too Many Websocket Messages!"}}"#;
+
 /// The ack for `{"type":"unsubscribe","channel":"order_book/0"}` — the first
 /// half of the repair the venue does honour.
 ///
