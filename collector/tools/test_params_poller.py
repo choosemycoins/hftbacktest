@@ -151,3 +151,46 @@ def test_a_change_inside_a_reordered_catalog_is_still_caught(tmp_path, one_sourc
     poll_once(tmp_path, fetch=lambda _u: seq.pop(0))
     poll_once(tmp_path, fetch=lambda _u: seq.pop(0))
     assert [r["kind"] for r in read_records(tmp_path)] == ["snapshot", "snapshot"]
+
+
+# --- контракт с offload.sh -------------------------------------------------
+# Тот же приём, что в test_funding_poller.py: вырезаем НАСТОЯЩУЮ day_of из
+# offload.sh и гоняем её. Два совпадающих литерала в двух файлах доказывали бы
+# только то, что они совпадают.
+import subprocess
+
+OFFLOAD_SH = Path(__file__).parent.parent / "deploy" / "offload.sh"
+
+
+def offload_day_of(name: str) -> str | None:
+    text = OFFLOAD_SH.read_text(encoding="utf-8")
+    start = text.index("day_of() {")
+    func = text[start : text.index("\n}\n", start) + 3]
+    r = subprocess.run(
+        ["bash", "-c", func + '\nday_of "$1"', "day_of", name],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+@pytest.mark.parametrize("venue,source", [("aster", "exchangeInfo"),
+                                          ("bybit", "risk-limit"),
+                                          ("hyperliquid", "meta")])
+def test_every_data_file_is_recognised_and_dated_by_offload(tmp_path, monkeypatch,
+                                                            venue, source):
+    """Ряд параметров обязан УЕЗЖАТЬ с хоста, а не копиться на нём вечно.
+
+    В отличие от остальных поллеров этот пишет в ПОДКАТАЛОГ площадки, то есть
+    offload.sh видит имя вида `aster/params_aster_exchangeInfo_20260822.gz`.
+    Замерено 2026-08-22: прежняя day_of якорилась на `^` и такое имя не
+    признавала — файл попадал в «unrecognised names, left alone», то есть НЕ
+    доезжал до архива и НЕ удалялся с хоста, при зелёном пульсе и молчащем TG.
+    Ровно тот же класс, что блокер панели #88 у funding-поллера.
+    """
+    monkeypatch.setattr("params_poller.SOURCES", {venue: [(source, "https://example.invalid/x")]})
+    poll_once(tmp_path, fetch=lambda _u: {"a": 1})
+    (written,) = tmp_path.rglob("params_*.gz")
+    rel = written.relative_to(tmp_path).as_posix()
+    assert "/" in rel, "имя, которое увидит offload.sh, несёт подкаталог площадки"
+    day_in_name = written.stem.rsplit("_", 1)[1]
+    assert offload_day_of(rel) == day_in_name
