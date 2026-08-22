@@ -90,6 +90,27 @@ pub fn subscribe(url: &str, attempt: u64, subscriptions: Value) -> Value {
     )
 }
 
+/// Subscriptions the venue never acknowledged on a connection it kept open.
+///
+/// The record exists because this failure has no other trace. A venue that
+/// serves thirteen markets of twenty-three and silently drops the rest leaves
+/// a healthy socket, a healthy process, and files that simply stop for the ten
+/// — measured on Lighter twice in seven days (2026-08-12, 5.19h; 2026-08-18,
+/// 1.48h), and healed both times only by the next reconnect. `outstanding`
+/// names them in response spelling so the sidecar says which markets were lost
+/// and for how long, and `action` says what the collector did about it.
+pub fn subscriptions_unacked(outstanding: &[String], waited_ms: u64, action: &str) -> Value {
+    record(
+        "subscriptions_unacked",
+        serde_json::json!({
+            "outstanding": outstanding,
+            "count": outstanding.len(),
+            "waited_ms": waited_ms,
+            "action": action,
+        }),
+    )
+}
+
 /// The socket came up. A `subscribe` with no `connected` after it is a dial
 /// that failed; the pair is what separates the two.
 pub fn connected(url: &str) -> Value {

@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashSet, VecDeque},
     io,
     io::ErrorKind,
     time::{Duration, Instant},
@@ -152,6 +153,131 @@ fn repair_frames(market_id: i64) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// How long after the last subscribe frame every subscription must be acked.
+///
+/// **This is the bound that closes the hole this venue is measured to have.**
+/// A subscribe the venue does not serve is answered with nothing at all: no
+/// error, no close, and — critically — no gap in the *other* markets, so
+/// [`IDLE_TIMEOUT`] never fires and the connection looks perfectly healthy
+/// while a subset of the roster records nothing. Measured on mainnet twice in
+/// seven days: 2026-08-12, ten markets of twenty-three silent for 5.185h after
+/// the 00:40:48Z reconnect; 2026-08-18, thirteen of twenty-three for 1.485h.
+/// Both healed only when the socket happened to drop for some other reason.
+/// The recording proves the mechanism: at the 12.08 reconnect `aero` was
+/// acknowledged and `hype` was not, and `hype`'s next acknowledgement is
+/// timestamped at the exact second its five-hour hole ends.
+///
+/// 60s against a measured ack latency of 267ms is a margin of 225×, and it is
+/// wide for a second reason: it is also what keeps a resend inside the venue's
+/// message budget. A full set is [`SUBSCRIBE_BUDGET_PER_MIN`] frames, so a
+/// resend may not follow the set it repeats inside the same minute
+/// (`a_resend_cannot_exceed_the_subscribe_budget`).
+pub const SUBSCRIBE_ACK_GRACE: Duration = Duration::from_secs(60);
+
+/// How many connections in a row may be abandoned for an incomplete set.
+///
+/// Dropping the connection is the cure for a venue that lost part of the
+/// batch, and the recording says it works. It is the wrong cure for a market
+/// that can never be subscribed at all — a market id the catalog offered and
+/// the venue then retired, say — because there the ledger is never complete
+/// and the collector would reconnect for ever, losing every market's stream
+/// every two minutes to repair one that cannot be repaired.
+///
+/// So the drop is spent, not free: after this many consecutive abandons the
+/// connection is kept and the loss is reported instead. Recording twenty-two
+/// markets of twenty-three with a loud alarm beats recording none of them
+/// quietly, and §3 of AGENTS.md calls that degraded venue mode rather than
+/// failure.
+pub const MAX_UNACKED_ABANDONS: u32 = 3;
+
+/// The response spelling of a request channel: `order_book/0` -> `order_book:0`.
+///
+/// The two spellings differ in one separator and the venue is strict about
+/// which belongs where — see [`subscription_frames`]. The mapping lives here
+/// only, so "what was asked for" and "what is waited for" cannot drift apart.
+fn response_spelling(request: &str) -> String {
+    request.replacen('/', ":", 1)
+}
+
+/// Every channel this connection must see acknowledged, in response spelling.
+///
+/// Derived from the subscribe frames rather than from the specs, so the ledger
+/// is by construction exactly the set that went out on the wire.
+fn expected_acks(frames: &[serde_json::Value]) -> HashSet<String> {
+    frames
+        .iter()
+        .filter_map(|frame| frame.get("channel").and_then(|c| c.as_str()))
+        .map(response_spelling)
+        .collect()
+}
+
+/// The channel a subscribe acknowledgement names, or `None` for anything else.
+///
+/// The venue acknowledges every one of [`CHANNELS`](super::CHANNELS) the same
+/// way — `"type":"subscribed/<channel>"` carrying the payload — and says
+/// nothing at all about a subscribe it drops, which is why the ack is the only
+/// evidence there is.
+///
+/// Two frames must not be mistaken for one: `update/order_book` is the data,
+/// and `{"error":{"code":30003,…}}` is the refusal of a *duplicate* subscribe,
+/// which carries neither `type` nor `channel`. The `type` and the `channel`
+/// are cross-checked against each other so a frame that merely mentions the
+/// word cannot mark a subscription live.
+///
+/// The cheap `contains` first is not decoration: this runs on the read path of
+/// a feed that peaks in the thousands of frames a second. The caller only asks
+/// while the ledger is incomplete, so in the steady state the whole function
+/// is never entered at all.
+fn acked_channel(text: &str) -> Option<String> {
+    if !text.contains("\"subscribed/") {
+        return None;
+    }
+    let frame: serde_json::Value = serde_json::from_str(text).ok()?;
+    let kind = frame.get("type")?.as_str()?.strip_prefix("subscribed/")?;
+    let channel = frame.get("channel")?.as_str()?;
+    let (named, _) = channel.split_once(':')?;
+    (named == kind).then(|| channel.to_string())
+}
+
+/// What to do about subscriptions the venue has not acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckVerdict {
+    /// Nothing outstanding, or the grace has not run out yet.
+    Wait,
+    /// Ask again for the ones that are missing.
+    Resend,
+    /// The venue will not serve this set here; drop the connection.
+    Abandon,
+    /// Abandoning has stopped working. Keep recording what there is, and say so.
+    Degraded,
+}
+
+/// The decision, split out so it can be pinned without a socket.
+///
+/// Order matters and is fail-closed in the direction that costs data least:
+/// nothing happens while frames are still going out (a set that is half sent
+/// is not a set the venue has ignored), a missing ack is asked for once before
+/// the connection is written off, and writing it off is bounded by
+/// [`MAX_UNACKED_ABANDONS`].
+fn ack_verdict(
+    outstanding: usize,
+    still_sending: bool,
+    since_last_send: Duration,
+    resends_spent: u32,
+    abandons_spent: u32,
+) -> AckVerdict {
+    if outstanding == 0 || still_sending || since_last_send < SUBSCRIBE_ACK_GRACE {
+        return AckVerdict::Wait;
+    }
+    if resends_spent == 0 {
+        AckVerdict::Resend
+    } else if abandons_spent < MAX_UNACKED_ABANDONS {
+        AckVerdict::Abandon
+    } else {
+        AckVerdict::Degraded
+    }
+}
+
 /// How long the paced subscribe takes for `total` frames.
 ///
 /// Arithmetic rather than a measurement, so the budget test can fail on it.
@@ -220,6 +346,7 @@ async fn connect(
     ws_tx: &Tx<Frame>,
     resub_rx: &mut UnboundedReceiver<i64>,
     connected_at: &mut Option<Instant>,
+    abandons_spent: &mut u32,
 ) -> Result<StreamEnd, anyhow::Error> {
     let request = url.into_client_request()?;
     let (ws_stream, _) = timeout(CONNECT_TIMEOUT, connect_async(request))
@@ -239,7 +366,13 @@ async fn connect(
     // reader: the resubscribe channel is borrowed from the caller (it outlives
     // each connection and is re-read on the next one), and a spawned task
     // would need it by value.
-    let mut pending = subscriptions.into_iter().peekable();
+    // The ledger of what must come back. Built before the frames are consumed,
+    // from the frames themselves, so it is exactly what goes on the wire.
+    let mut awaiting = expected_acks(&subscriptions);
+    let catalogue = subscriptions.clone();
+    let mut pending: VecDeque<serde_json::Value> = subscriptions.into();
+    let mut last_send = Instant::now();
+    let mut resends_spent: u32 = 0;
     let mut pacer = interval(SUBSCRIBE_CHUNK_DELAY);
     let mut ping = interval(PING_INTERVAL);
     ping.tick().await; // the first tick is immediate; nothing to keep alive yet
@@ -264,6 +397,22 @@ async fn connect(
                 Some(Ok(Message::Text(text))) => {
                     let recv_time = Utc::now();
                     last_frame = Instant::now();
+                    // Guarded, not unconditional: once the ledger is complete
+                    // this costs one integer comparison per frame, which is
+                    // what a feed of thousands of frames a second can afford.
+                    if !awaiting.is_empty()
+                        && let Some(channel) = acked_channel(&text)
+                    {
+                        awaiting.remove(&channel);
+                        if awaiting.is_empty() {
+                            info!(
+                                subscriptions = catalogue.len(),
+                                took_ms = connected_at
+                                    .map_or(0, |at| at.elapsed().as_millis() as u64),
+                                "every subscription is acknowledged"
+                            );
+                        }
+                    }
                     // A refused hand-off is terminal, whether the parser has
                     // gone or has simply stopped draining: `send` has already
                     // raised the fatal signal, and reading on would drop frames
@@ -306,10 +455,13 @@ async fn connect(
                 None => break,
             },
 
-            _ = pacer.tick(), if pending.peek().is_some() => {
-                for subscription in pending.by_ref().take(SUBSCRIBE_CHUNK) {
+            _ = pacer.tick(), if !pending.is_empty() => {
+                for subscription in pending.drain(..SUBSCRIBE_CHUNK.min(pending.len()))
+                    .collect::<Vec<_>>()
+                {
                     write.send(Message::Text(subscription.to_string().into())).await?;
                 }
+                last_send = Instant::now();
             }
 
             market = resub_rx.recv(), if resub_open => match market {
@@ -337,6 +489,82 @@ async fn connect(
             }
 
             _ = idle.tick() => {
+                // Checked before the silence check, because the failure it
+                // catches is invisible to that one: the markets the venue DID
+                // serve keep `last_frame` fresh for ever.
+                if !awaiting.is_empty() {
+                    let mut outstanding: Vec<String> = awaiting.iter().cloned().collect();
+                    outstanding.sort();
+                    let waited = last_send.elapsed();
+                    let verdict = ack_verdict(
+                        outstanding.len(),
+                        !pending.is_empty(),
+                        waited,
+                        resends_spent,
+                        *abandons_spent,
+                    );
+                    let waited_ms = waited.as_millis() as u64;
+                    match verdict {
+                        AckVerdict::Wait => {}
+                        AckVerdict::Resend => {
+                            warn!(
+                                outstanding = outstanding.len(),
+                                markets = ?outstanding,
+                                waited_ms,
+                                "the venue acknowledged only part of the subscribe set; asking again"
+                            );
+                            meta::emit(
+                                ws_tx,
+                                meta::subscriptions_unacked(&outstanding, waited_ms, "resend"),
+                            );
+                            pending.extend(catalogue.iter().filter(|frame| {
+                                frame
+                                    .get("channel")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(|c| awaiting.contains(&response_spelling(c)))
+                            }).cloned());
+                            resends_spent += 1;
+                            last_send = Instant::now();
+                        }
+                        AckVerdict::Abandon => {
+                            error!(
+                                outstanding = outstanding.len(),
+                                markets = ?outstanding,
+                                waited_ms,
+                                abandons_spent = *abandons_spent,
+                                "the venue will not serve part of the subscribe set here; \
+                                 dropping the connection so the next one starts clean"
+                            );
+                            meta::emit(
+                                ws_tx,
+                                meta::subscriptions_unacked(&outstanding, waited_ms, "abandon"),
+                            );
+                            *abandons_spent += 1;
+                            return Err(Error::from(io::Error::new(
+                                ErrorKind::TimedOut,
+                                format!(
+                                    "{} of {} subscriptions were never acknowledged",
+                                    outstanding.len(),
+                                    catalogue.len()
+                                ),
+                            )));
+                        }
+                        AckVerdict::Degraded => {
+                            error!(
+                                outstanding = outstanding.len(),
+                                markets = ?outstanding,
+                                waited_ms,
+                                "these subscriptions have not been served across \
+                                 {MAX_UNACKED_ABANDONS} connections; recording the rest"
+                            );
+                            meta::emit(
+                                ws_tx,
+                                meta::subscriptions_unacked(&outstanding, waited_ms, "degraded"),
+                            );
+                        }
+                    }
+                }
+
                 let silent_for = last_frame.elapsed();
                 if silent_for > IDLE_TIMEOUT {
                     // Not an error the socket reported — that is the point. A
@@ -366,6 +594,10 @@ pub async fn keep_connection(
 ) {
     let mut error_count: u32 = 0;
     let mut attempt: u64 = 0;
+    // Carried across connections on purpose: it is what stops a market the
+    // venue will never serve from costing every other market a reconnect
+    // every two minutes for ever. See `MAX_UNACKED_ABANDONS`.
+    let mut abandons_spent: u32 = 0;
     loop {
         let frames = subscription_frames(&subscriptions, &markets);
         info!(
@@ -401,6 +633,7 @@ pub async fn keep_connection(
             &ws_tx,
             &mut resub_rx,
             &mut connected_at,
+            &mut abandons_spent,
         )
         .await
         {
@@ -444,6 +677,204 @@ pub async fn keep_connection(
 mod tests {
     use super::*;
     use crate::lighter::{CHANNELS, MAX_MARKETS, MarketInfo, REPAIR_COOLDOWN, SubscriptionSpec};
+
+    /// The one frame that says a subscription is live, told apart from every
+    /// frame that merely looks like it.
+    ///
+    /// Real wire fixtures, because this venue spells the request `order_book/0`
+    /// and the response `order_book:0`, and a check written against the wrong
+    /// one marks nothing and drops every connection.
+    #[test]
+    fn an_acknowledgement_names_the_channel_it_confirms() {
+        use crate::lighter::fixtures::*;
+
+        assert_eq!(
+            acked_channel(ORDER_BOOK_SNAPSHOT_ETH).as_deref(),
+            Some("order_book:0"),
+            "the snapshot IS the acknowledgement"
+        );
+        // Everything else on that socket, none of which confirms anything.
+        for (name, frame) in [
+            ("the data that follows it", ORDER_BOOK_AFTER_SNAPSHOT_ETH),
+            ("a refused duplicate subscribe", ERROR_ALREADY_SUBSCRIBED),
+            ("the unsubscribe ack", UNSUBSCRIBED_ETH),
+            ("a pong", PONG),
+            ("the session handshake", CONNECTED),
+            ("a channel we do not subscribe to", MARKET_STATS_ALL),
+            ("an unknown market", ERROR_UNKNOWN_MARKET),
+        ] {
+            assert_eq!(
+                acked_channel(frame),
+                None,
+                "{name} is not an acknowledgement"
+            );
+        }
+    }
+
+    /// A frame that says `subscribed/x` about channel `y` confirms neither.
+    ///
+    /// Cross-checking the two fields is what stops a malformed or hostile frame
+    /// from marking a market live that the venue never served.
+    #[test]
+    fn an_acknowledgement_whose_type_and_channel_disagree_confirms_nothing() {
+        assert_eq!(
+            acked_channel(r#"{"channel":"ticker:7","type":"subscribed/order_book"}"#),
+            None
+        );
+        assert_eq!(
+            acked_channel(r#"{"channel":"order_book","type":"subscribed/order_book"}"#),
+            None,
+            "a channel with no market id names no market"
+        );
+    }
+
+    /// The cheap `contains` must not be what makes the check correct.
+    ///
+    /// Measured on the 2026-08-12 recording: every frame carrying the literal
+    /// `subscribed/` is an acknowledgement, 12 of 12 — so this frame is
+    /// synthetic, and says so. It is here because the alternative is a function
+    /// whose correctness rests on a fast path that was put there for speed:
+    /// drop the guard for performance one day and `update/order_book` begins
+    /// marking subscriptions live, silently, which is the exact class of
+    /// failure this ledger exists to end.
+    #[test]
+    fn only_the_subscribed_prefix_confirms_not_a_frame_that_merely_carries_it() {
+        assert_eq!(
+            acked_channel(
+                r#"{"channel":"order_book:0","type":"update/order_book","echo":"subscribed/order_book"}"#
+            ),
+            None
+        );
+    }
+
+    /// The ledger waits for exactly the set that went out, market for market.
+    #[test]
+    fn the_ledger_waits_for_exactly_what_was_asked_for() {
+        let markets = markets(&[("HYPE", 24), ("AERO", 42)]);
+        let frames = subscription_frames(&specs(), &markets);
+        let expected = expected_acks(&frames);
+
+        assert_eq!(expected.len(), frames.len());
+        for market in &markets {
+            for channel in CHANNELS {
+                assert!(
+                    expected.contains(&format!("{channel}:{}", market.market_id)),
+                    "{channel} of {} is not waited for",
+                    market.symbol
+                );
+            }
+        }
+    }
+
+    /// The request spelling and the acknowledged spelling are the same channel.
+    ///
+    /// Pinned against the wire fixture rather than against another constant, so
+    /// the two halves cannot agree with each other and both be wrong.
+    #[test]
+    fn a_request_and_its_acknowledgement_are_one_channel_spelled_two_ways() {
+        let asked = SubscriptionSpec::plain("order_book").topic(0);
+        assert_eq!(asked, "order_book/0");
+        assert_eq!(
+            response_spelling(&asked),
+            acked_channel(crate::lighter::fixtures::ORDER_BOOK_SNAPSHOT_ETH).unwrap()
+        );
+    }
+
+    /// The regression itself: the market the venue silently dropped is the one
+    /// the ledger still holds.
+    ///
+    /// Shaped on the measured incident of 2026-08-12 — the reconnect at
+    /// 00:40:48Z acknowledged AERO and never acknowledged HYPE, and HYPE's file
+    /// has literally zero records in UTC hours 01 through 04 while AERO's has
+    /// twenty-four non-empty hours. Before this ledger existed nothing on the
+    /// connection could tell the two apart.
+    #[test]
+    fn the_market_the_venue_dropped_is_the_one_left_outstanding() {
+        let markets = markets(&[("HYPE", 24), ("AERO", 42)]);
+        let frames = subscription_frames(&specs(), &markets);
+        let mut awaiting = expected_acks(&frames);
+
+        // Only AERO comes back. The acknowledgement is built in the shape the
+        // wire fixture is pinned to by `an_acknowledgement_names_the_channel`.
+        for channel in CHANNELS {
+            let ack = format!(r#"{{"channel":"{channel}:42","type":"subscribed/{channel}"}}"#);
+            awaiting.remove(&acked_channel(&ack).expect("a well-formed acknowledgement"));
+        }
+
+        let mut outstanding: Vec<String> = awaiting.into_iter().collect();
+        outstanding.sort();
+        assert_eq!(
+            outstanding,
+            vec!["market_stats:24", "order_book:24", "ticker:24", "trade:24"],
+            "every channel of the dropped market, and nothing of the served one"
+        );
+    }
+
+    /// A missing acknowledgement is asked for once, then the connection goes.
+    #[test]
+    fn an_unacknowledged_subscription_is_asked_once_before_the_connection_is_dropped() {
+        let late = SUBSCRIBE_ACK_GRACE + Duration::from_secs(1);
+        assert_eq!(ack_verdict(4, false, late, 0, 0), AckVerdict::Resend);
+        assert_eq!(ack_verdict(4, false, late, 1, 0), AckVerdict::Abandon);
+    }
+
+    /// Dropping the connection is spent, not free.
+    ///
+    /// A market that can never be subscribed would otherwise cost every OTHER
+    /// market a reconnect every two minutes for ever — worse than the hole it
+    /// is trying to close.
+    #[test]
+    fn abandoning_is_bounded_so_one_dead_market_cannot_cost_every_other_one() {
+        let late = SUBSCRIBE_ACK_GRACE + Duration::from_secs(1);
+        for spent in 0..MAX_UNACKED_ABANDONS {
+            assert_eq!(ack_verdict(4, false, late, 1, spent), AckVerdict::Abandon);
+        }
+        assert_eq!(
+            ack_verdict(4, false, late, 1, MAX_UNACKED_ABANDONS),
+            AckVerdict::Degraded,
+            "after the budget the loss is reported, not repaired"
+        );
+    }
+
+    /// Half a set is not an ignored set.
+    #[test]
+    fn nothing_is_asked_again_while_the_set_is_still_going_out() {
+        let late = SUBSCRIBE_ACK_GRACE * 10;
+        assert_eq!(ack_verdict(40, true, late, 0, 0), AckVerdict::Wait);
+    }
+
+    /// A complete ledger never speaks, and the grace is not spent early.
+    #[test]
+    fn a_complete_ledger_never_asks_again_and_the_grace_is_not_spent_early() {
+        let late = SUBSCRIBE_ACK_GRACE + Duration::from_secs(1);
+        assert_eq!(ack_verdict(0, false, late, 0, 0), AckVerdict::Wait);
+        assert_eq!(
+            ack_verdict(
+                4,
+                false,
+                SUBSCRIBE_ACK_GRACE - Duration::from_millis(1),
+                0,
+                0
+            ),
+            AckVerdict::Wait
+        );
+    }
+
+    /// The resend cannot put the connection over the venue's message budget.
+    ///
+    /// A resend is at worst the whole set again, and the whole set is the whole
+    /// per-minute subscribe budget — so the two may not share a minute. That is
+    /// the arithmetic reason the grace is a full minute rather than the 267ms
+    /// the acknowledgement actually takes.
+    #[test]
+    fn a_resend_cannot_exceed_the_subscribe_budget() {
+        let full_set = MAX_MARKETS * CHANNELS.len();
+        assert!(full_set <= SUBSCRIBE_BUDGET_PER_MIN);
+        assert!(
+            SUBSCRIBE_ACK_GRACE >= Duration::from_secs(60),
+            "a resend inside the same minute as the set it repeats would be throttled"
+        );
+    }
 
     fn markets(names: &[(&str, i64)]) -> Vec<MarketInfo> {
         names

@@ -54,11 +54,39 @@ RequiresMountsFor=/opt/hft-collector/data
 # outage exits in ~1s, restarts every ~6s and reaches the limit in a minute,
 # which is why the loop is easy to miss when testing.
 #
-# At 3600s the arithmetic works out for both: ~50 minutes of silence (10
-# restarts at ~305s) or ~1 minute of a refused network. Lowering
-# --stall-timeout-min shortens the first proportionally.
-StartLimitBurst=10
-StartLimitIntervalSec=3600
+# ⚠️ That last clause was the bug, and it cost the only recording this project
+# has ever lost outright. On 2026-08-09 Lighter answered /api/v1/orderBooks
+# with 503 for about two minutes. The collector refuses to start without a
+# catalog — correctly, it is fail-closed — so it exited in under a second,
+# eleven times in 118 seconds, which burned StartLimitBurst=10 and left the
+# unit `failed`. The next systemd line for it is `Started` 43.6 hours later,
+# by hand. Twenty-three markets, ~880 MB, unrecoverable: Lighter serves no
+# historical replay of its stream, so those frames exist nowhere.
+#
+# The reasoning above was sound for the slow exit and simply did not cover the
+# fast one. A transient venue outage — the single most likely thing to happen
+# to a market-data collector — must not be able to reach a terminal state at
+# all, so the limiter is off and the restart is backed off instead:
+#
+#   * RestartSec/RestartSteps/RestartMaxDelaySec grow the delay 5s -> 300s over
+#     ten restarts (~18 minutes for those ten, against ~1 minute before), so a
+#     crash-looping build cannot spin the CPU or fill the journal, which is the
+#     one thing StartLimitBurst was actually protecting.
+#   * StartLimitIntervalSec=0 removes the terminal state. A venue that is down
+#     for a day is retried for a day; there is nothing a human could do to it
+#     that the retry does not already do.
+#
+# What that gives up is the alarm: with no `failed` state, OnFailure= above
+# never fires for a crash loop. That is deliberate, and only defensible because
+# the alarm has moved somewhere strictly better — `heartbeat.sh` (timer at :00
+# and :30) enumerates every instance in etc/*.env and reports one with no .gz
+# newer than COLLECTOR_STALE_MIN=10 minutes. It watches the OUTCOME, files on
+# disk, rather than the process state, so it also catches the case this unit
+# never could: a collector that is running, connected and recording nothing.
+# Removing that timer without replacing this alarm re-opens the 43-hour hole.
+#
+# RestartSteps and RestartMaxDelaySec need systemd >= 254 (host: 259).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -86,13 +114,17 @@ ExecStart=/opt/hft-collector/current/bin/collector-run.sh
 
 # A collector that dies mid-day leaves a gap in the recording, so restart
 # eagerly. `always` rather than `on-failure` because a clean exit still means
-# recording has stopped. The burst limit (in [Unit] above) stops a
-# crash-looping build from spinning the CPU and filling the journal.
+# recording has stopped. The backoff ladder (5s -> 300s over ten restarts) is
+# what stops a crash-looping build from spinning the CPU and filling the
+# journal — see the note in [Unit] above for why it, rather than a start-rate
+# limit, is the thing doing that job now.
 #
 # `systemctl stop` is unaffected by Restart=always — systemd does not restart
 # a unit it stopped itself — so the SIGTERM path stays clean.
 Restart=always
 RestartSec=5s
+RestartSteps=10
+RestartMaxDelaySec=300s
 
 # SIGTERM is what makes the gzip stream valid. The collector handles it
 # explicitly (see shutdown_signal in collector/src/main.rs), flushes every
