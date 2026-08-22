@@ -121,7 +121,7 @@ done
 # пропущенный листинг невосполним. Отсутствующий каталог = STALE nodir, как у всех:
 # «не задеплоен» не равно «здоров».
 for p in "params:${DATA_ROOT}/params:${POLLER_STALE_MIN}" \
-         "positions:${POLLER_HOME}/positions-data:${POLLER_STALE_MIN}" \
+         "positions:${DATA_ROOT}/positions:${POLLER_STALE_MIN}" \
          "day0:${POLLER_HOME}/day0-data:${DAY0_STALE_MIN}" \
          "funding:${POLLER_HOME}/funding-data:${FUNDING_STALE_MIN}"; do
     IFS=: read -r p_name p_dir p_limit <<<"${p}"

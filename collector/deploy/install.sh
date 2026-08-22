@@ -202,6 +202,7 @@ heartbeat|bin/heartbeat.sh etc/hft-heartbeat.service etc/hft-heartbeat.timer
 day0-poller|bin/day0_poller.py etc/hft-day0-poller.service etc/hft-day0-poller.timer
 funding-poller|bin/funding_poller.py etc/hft-funding-poller.service etc/hft-funding-poller.timer
 params-poller|bin/params_poller.py etc/hft-params-poller.service etc/hft-params-poller.timer
+positions-poller|bin/positions_poller.py etc/hft-positions-poller.service etc/hft-positions-poller.timer
 "
 PRESENT_COMPONENTS=""
 while IFS='|' read -r name files; do
@@ -358,6 +359,10 @@ trap - EXIT
 # and this script never touches them.
 if [[ -f "${NEW_RELEASE}/etc/instance.env.example" ]]; then
     install -m 644 "${NEW_RELEASE}/etc/instance.env.example" "${ETC_DIR}/instance.env.example"
+fi
+if [[ -f "${NEW_RELEASE}/etc/operators_addrs.json.example" ]]; then
+    install -m 644 "${NEW_RELEASE}/etc/operators_addrs.json.example" \
+                   "${ETC_DIR}/operators_addrs.json.example"
 fi
 if [[ -f "${NEW_RELEASE}/etc/binancefuturesum-day0.env.example" ]]; then
     install -m 644 "${NEW_RELEASE}/etc/binancefuturesum-day0.env.example" \

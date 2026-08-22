@@ -1,0 +1,49 @@
+[Unit]
+# Почасовая позиция любого адреса Hyperliquid: в записях `userFunding` поле
+# `delta.szi` — знаковый размер позиции на момент начисления. Фактически
+# per-address hourly Commitments of Traders, чего на традиционных рынках нет.
+# Окно `userFunding` ограничено, история укатывается — каждый неснятый час
+# потерян навсегда, и это единственная причина, по которой поллер срочный.
+Description=Поллер позиций операторов Hyperliquid (почасовой szi по адресам) — ряд, которого не ведёт никто
+Documentation=file:/opt/hft-collector/current/bin/positions_poller.py
+
+# Wants=, а не только After=: без него юнит не подтягивает цель, и догоняющий
+# запуск на буте уходит в сеть, которой ещё нет. У прежней, ручной редакции
+# было только After=.
+After=network-online.target
+Wants=network-online.target
+
+# Транзиентный отказ площадки не должен превращаться в мёртвый юнит.
+StartLimitIntervalSec=0
+
+# Провал должен быть слышен: у прежней редакции OnFailure не было вовсе.
+OnFailure=hft-collector-alert@%n.service
+
+# Откат на релиз, который поллера ещё не знал, — тихий пропуск, а не шторм.
+ConditionPathExists=/opt/hft-collector/current/bin/positions_poller.py
+
+[Service]
+Type=oneshot
+
+# Выход — на том данных, и это главная правка. Прежняя редакция писала в
+# /home/ubuntu/positions-data, то есть на КОРНЕВОЙ диск (6.7 ГБ, свободно 3.4),
+# мимо вывоза: замерено 2026-08-22 — 188 МБ ряда позиций существовали ровно в
+# одном экземпляре и не были вывезены ни разу.
+#
+# Список адресов — операторский конфиг, поэтому он в etc/ рядом с *.env, а не
+# в свопаемом дереве релиза: релиз его не перезаписывает. Порождается
+# collector/tools/build_operator_watchlist.py; пример едет в релизе как
+# etc/operators_addrs.json.example.
+#
+# Журнал остаётся в /home/ubuntu/positions-data — ровно как у funding- и
+# params-поллеров: сторож смотрит на ДАННЫЕ, а не на лог.
+ExecStart=/usr/bin/python3 /opt/hft-collector/current/bin/positions_poller.py /opt/hft-collector/data/positions /opt/hft-collector/etc/operators_addrs.json --once
+StandardOutput=append:/home/ubuntu/positions-data/poller.log
+StandardError=append:/home/ubuntu/positions-data/poller.log
+
+# Две вКПУ, и единственная работа этой коробки — не отставать от ленты.
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
