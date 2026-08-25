@@ -105,6 +105,16 @@ STALL_TIMEOUT_MIN = 1080
 LIVENESS_TIMEOUT_S = 64800
 
 # --- словарь площадки --------------------------------------------------------
+# Полоса «неминуемого» pending: onboard не дальше упреждения таймера в будущем и не
+# старше часа в прошлом. Такой символ берётся в env немедленно — ради окна 0–5 мин
+# (+13.16 бп), которое флип-захват со следующего тика (≤10 мин) уже не обещает.
+# Всё, что старше часа, — класс GAIBUSDT (272 суток pending): подписка кадров не даёт,
+# а держит дневной гейт качества красным неограниченно долго (замерено 24-25.08).
+# Час — это и потолок жизни pending в state (watch И armed): перенесённый запуск
+# деградирует на полку тем же правилом на следующем тике. Из самого env-файла символ
+# уходит следующей волной (медиана ~2.1 суток) — инвариант «env только волной».
+WATCH_GRACE_MS = 3600 * 1000
+
 STATUS_TRADING = "TRADING"
 STATUS_PENDING = "PENDING_TRADING"
 # Живыми наблюдались ровно три статуса; документация знает больше (PRE_DELIVERING,
@@ -117,7 +127,7 @@ TRADIFI_TYPE = "TRADIFI_PERPETUAL"
 # --- фазы записи состояния ---------------------------------------------------
 PHASE_REJECTED = "rejected"      # объявленная отбраковка; терминальна
 PHASE_SEEDED = "seeded"          # мир как он есть; никаких действий никогда
-PHASE_WATCH = "watch"            # PENDING, таймер поставить некуда — берём сейчас
+PHASE_WATCH = "watch"            # PENDING в неминуемой полосе (≤ WATCH_GRACE_MS) — берём сейчас
 PHASE_ARMED = "armed"            # PENDING с датой в будущем — таймер на onboard−2мин
 PHASE_CAPTURING = "capturing"    # торгуется и моложе окна — пишем
 PHASE_SHELVED = "shelved"        # watch, не начавший торговать за окно; флип всё ещё ловим
@@ -288,13 +298,18 @@ def load_state(text: str | None) -> State:
     """Битое или отсутствующее состояние читается как «ничего не знаем».
 
     Прецедент positions-поллера. Потеря состояния реальна без единого бага: state.json
-    переписывается каждые 10 минут без fsync (жёсткий ребут даёт нулевую длину или
-    мусор), а read_file глушит OSError. Плата за re-bootstrap мала НЕ сама по себе, а
-    благодаря спасению по env в `_classify_new`: env-файл — второй, независимый носитель
-    факта «мы это ловим», и символ из него не понижается в seeded, даже когда его
-    onboardDate старше окна (класс GAIBUSDT: якорь — наблюдённый флип — утрачен вместе
-    с состоянием). Поэтому env пересобирается из тех же символов, совпадает по байтам —
-    ни записи, ни рестарта; продублируется максимум один алерт.
+    исторически писался без fsync (жёсткий ребут давал нулевую длину или мусор; с
+    2026-08-25 запись fsync-ится — см. `write_atomic`), а read_file глушит OSError.
+    Плата за re-bootstrap мала НЕ сама по себе, а благодаря спасению по env в
+    `_classify_new`: env-файл — второй, независимый носитель факта «мы это ловим», и
+    символ из него не понижается в seeded, даже когда его onboardDate старше окна
+    (якорь — наблюдённый флип — утрачен вместе с состоянием). Поэтому env
+    пересобирается из тех же символов, совпадает по байтам — ни записи, ни рестарта;
+    продублируется максимум один алерт.
+    ⚠️ Для shelved-pending (с 2026-08-25) второго носителя НЕТ: такой символ в env не
+    попадает по построению, факт «ждём флип» живёт только здесь — потому и fsync.
+    Остаточное слепое пятно: state потерян И флип случился в том же окне простоя —
+    TRADING старше 14 суток вне env прочитается как балласт (seeded_stale).
     """
     if not text:
         return State()
@@ -405,6 +420,7 @@ def _new_counters() -> dict[str, int]:
         "universe": 0, "malformed_entry": 0, "rejected_quarterly": 0,
         "seeded_stale": 0, "seeded_unknown_status": 0,
         "wave": 0, "armed": 0, "watch": 0, "capturing": 0,
+        "shelved_pending": 0, "watch_demoted": 0,
         "superseded": 0, "rotated": 0, "shelved": 0, "in_env": 0,
         "env_rescued": 0,
     }
@@ -426,12 +442,33 @@ def plan_tick(
     """
     known = {k: replace(e) for k, e in state.known.items()}
     counters = _new_counters()
-    server_ms = snapshot.get("serverTime")
-    server_ms = int(server_ms) if isinstance(server_ms, int) else None
-
     wave: list[str] = []      # ключи, ставшие в этом тике watch/armed/capturing
     flips: list[str] = []     # из них — наблюдённые PENDING→TRADING (R-FLIP)
     cancel: list[str] = []
+    # Деградация pending, чей onboard стух за пределы неминуемой полосы: перенесённый
+    # или так и не состоявшийся запуск (класс GAIBUSDT) не должен держать env
+    # неограниченно — ни через watch, ни через armed (штатная дверь: непрерывно
+    # работающий поллер видит листинг ДО даты, значит застрявший pending живёт именно
+    # в armed). У armed снимается и таймер: он либо уже выстрелил в пустоту, либо
+    # выстрелит туда же. Это же правило мигрирует состояние, записанное до 2026-08-25,
+    # когда watch не имел потолка жизни. Побочно оно ограничивает часом и окно R-QUIET
+    # (задержанный запуск с давно отработавшим таймером теперь идёт через
+    # shelved→R-FLIP с якорем и рестартом по наблюдению). Вывод из самого env —
+    # следующей волной, как любой вывод; флип продолжает ловиться из shelved (R-FLIP).
+    for e in known.values():
+        if (e.phase in (PHASE_WATCH, PHASE_ARMED)
+                and e.status_last_seen == STATUS_PENDING
+                and e.onboard_ms <= now_ms - WATCH_GRACE_MS):
+            if e.timer_unit:
+                cancel.append(e.timer_unit)
+            e.phase = PHASE_SHELVED
+            e.in_env = False
+            e.timer_unit = None
+            e.phase_changed_local_ms = now_ms
+            counters["watch_demoted"] += 1
+    server_ms = snapshot.get("serverTime")
+    server_ms = int(server_ms) if isinstance(server_ms, int) else None
+
 
     # env — второй, НЕЗАВИСИМЫЙ носитель факта «мы это ловим». Нужен, потому что
     # state.json переписывается каждые 10 минут без fsync и после жёсткого ребута
@@ -539,7 +576,8 @@ def plan_tick(
     arm = _arm_timers(known, now_ms)
     restart_now = _restart_owed(known)
 
-    alerts.append(_wave_alert(hostname, known, wave, flips, rotated + shelved, now_ms, server_ms))
+    dropped = sorted(set(rotated) | (env_carried - set(symbols)))
+    alerts.append(_wave_alert(hostname, known, wave, flips, dropped, now_ms, server_ms))
     return (
         Plan(cancel_timers=cancel, env_write=env_write, arm_timers=arm, restart_now=restart_now,
              alerts=alerts, counters=counters, pulse=_pulse(now_ms, server_ms, known, counters)),
@@ -556,12 +594,19 @@ def _classify_new(*, symbol, onboard_ms, status, contract_type, quote, utype, tr
         phase, anchor = PHASE_SEEDED, None
         counters["seeded_unknown_status"] += 1
     elif status == STATUS_PENDING:
-        # Дата в будущем и дальше упреждения — ставим таймер; иначе брать надо сейчас,
-        # потому что таймер в прошлое поставить некуда (класс GAIBUSDT).
+        # Дата в будущем и дальше упреждения — ставим таймер. Иначе (класс GAIBUSDT:
+        # дата на 272 суток в прошлом) — на полку: подписка до старта торгов кадров
+        # не даёт (урок day0-start), а pending в env держит дневной гейт качества
+        # красным неограниченно долго (замерено 24-25.08 на GAIBUSDT). Старт ловит
+        # R-FLIP со следующего тика — ≤10 минут, которых недостоверная дата всё
+        # равно не обещала точнее.
         if onboard_ms - TIMER_LEAD_S * 1000 > now_ms:
             phase, anchor = PHASE_ARMED, onboard_ms
-        else:
+        elif onboard_ms > now_ms - WATCH_GRACE_MS:
             phase, anchor = PHASE_WATCH, None
+        else:
+            phase, anchor = PHASE_SHELVED, None
+            counters["shelved_pending"] += 1
     elif now_ms - onboard_ms > CAPTURE_MAX_AGE_DAYS * DAY_MS:
         if in_env_now:
             # СПАСЕНИЕ ПО ENV: символ старше окна по своей дате, но он уже стоит в
@@ -686,10 +731,6 @@ def _rotate(known: dict[str, Entry], wave: list[str], now_ms: int,
         elif e.phase == PHASE_CAPTURING and e.anchor_ms is not None and now_ms - e.anchor_ms > window:
             e.phase, e.in_env = PHASE_ROTATED, False
             rotated.append(e.symbol)
-        elif e.phase == PHASE_WATCH and now_ms - e.first_seen_local_ms > window:
-            # Не «ротирован»: он ещё ни дня не торговал, и его флип продолжает ловиться.
-            e.phase, e.in_env = PHASE_SHELVED, False
-            shelved.append(e.symbol)
         else:
             continue
         e.phase_changed_local_ms = now_ms
@@ -707,7 +748,7 @@ def _wave_alert(hostname: str, known: dict[str, Entry], wave: list[str], flips: 
         if e.phase == PHASE_ARMED:
             action = f"таймер на {on_calendar_utc(e.onboard_ms - TIMER_LEAD_S * 1000)}"
         elif e.phase == PHASE_WATCH:
-            action = "watch: дата в прошлом, подхвачен сейчас"
+            action = "неминуемый старт, подхвачен сейчас"
         elif key in flips:
             action = "начал торговать, переподписка сейчас"
         else:
@@ -869,8 +910,22 @@ class RealHost:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.parent / (p.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            # Для shelved-pending state.json — ЕДИНСТВЕННЫЙ носитель факта «ждём флип»
+            # (в env такой символ не попадает по построению), поэтому запись обязана
+            # переживать жёсткий ребут, а не только смерть процесса.
+            os.fsync(f.fileno())
         os.replace(tmp, p)  # недописанный env — это юнит, который не стартует
+        try:
+            dirfd = os.open(p.parent, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        except OSError:
+            pass  # долговечность rename — best effort; сам файл уже fsync-нут
 
     def systemctl(self, *args: str) -> int:
         assert_allowed_systemctl(args)
@@ -1063,7 +1118,8 @@ def tick(host: Host, *, hostname: str = "") -> str:
         f"вселенная={c.get('universe', 0)} known={len(new_state.known)} "
         f"волна={c.get('wave', 0)} armed={c.get('armed', 0)} watch={c.get('watch', 0)} "
         f"capturing={c.get('capturing', 0)} ротировано={c.get('rotated', 0)} "
-        f"полка={c.get('shelved', 0)} в_env={c.get('in_env', 0)} "
+        f"демотировано={c.get('watch_demoted', 0)} полка_pending={c.get('shelved_pending', 0)} "
+        f"в_env={c.get('in_env', 0)} "
         f"отбраковка(кварт/статус/старые/битые)={c.get('rejected_quarterly', 0)}/"
         f"{c.get('seeded_unknown_status', 0)}/{c.get('seeded_stale', 0)}/"
         f"{c.get('malformed_entry', 0)}"

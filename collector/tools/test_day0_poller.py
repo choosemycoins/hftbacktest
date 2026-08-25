@@ -68,6 +68,7 @@ from day0_poller import (
     read_alert_env,
     tick,
     timer_unit_name,
+    WATCH_GRACE_MS,
 )
 
 DAY_MS = 86_400_000
@@ -285,27 +286,58 @@ def test_a_new_pending_symbol_with_a_future_onboard_date_is_armed_with_a_timer()
     assert new.known[entry_key("SOONUSDT", onboard)].phase == PHASE_ARMED
 
 
-def test_a_new_pending_symbol_with_a_past_onboard_date_is_watched_env_now_no_timer():
-    """Класс GAIBUSDT — живой на момент разведки: PENDING_TRADING с датой на 272 суток
-    в прошлом. Таймер в прошлое поставить нельзя, значит символ берётся немедленно."""
+def test_a_new_pending_symbol_with_a_past_onboard_date_is_shelved_not_captured():
+    """Класс GAIBUSDT: PENDING_TRADING с датой на 272 суток в прошлом. Подписка до
+    старта торгов кадров не даёт (урок day0-start), а такой символ держит дневной
+    гейт качества красным неограниченно долго (замерено 24-25.08: GAIBUSDT). Поэтому
+    он идёт сразу на полку: не в env, без таймера, без волны — а его старт ловит
+    R-FLIP со следующего тика (≤10 мин)."""
     onboard = NOW - 272 * DAY_MS
     plan, new = plan_tick(doc(sym("GAIBUSDT", onboard, status="PENDING_TRADING")), State(), NOW)
 
     assert plan.arm_timers == []
-    assert env_symbols(plan.env_write[1]) == ["GAIBUSDT"]
-    assert plan.restart_now is True
+    assert plan.env_write is None
+    assert plan.restart_now is False
+    assert plan.alerts == []
     e = new.known[entry_key("GAIBUSDT", onboard)]
-    assert e.phase == PHASE_WATCH
-    # Часы ротации у watch идут от НАБЛЮДЕНИЯ: его onboardDate измеренно недостоверен.
+    assert e.phase == PHASE_SHELVED and e.in_env is False
     assert e.anchor_ms is None and e.first_seen_local_ms == NOW
+    assert plan.counters["shelved_pending"] == 1
+
+
+def test_the_imminent_band_boundary_splits_watch_from_shelf():
+    """Полоса неминуемости — час: pending с onboard получасовой давности ещё watch
+    (запуск мог чуть съехать), с двухчасовой — уже полка (класс GAIBUSDT)."""
+    near = NOW - 30 * 60_000
+    plan, new = plan_tick(doc(sym("NEARUSDT", near, status="PENDING_TRADING")), State(), NOW)
+    assert new.known[entry_key("NEARUSDT", near)].phase == PHASE_WATCH
+    assert env_symbols(plan.env_write[1]) == ["NEARUSDT"]
+
+    far = NOW - 2 * 3600 * 1000
+    plan2, new2 = plan_tick(doc(sym("FARUSDT", far, status="PENDING_TRADING")), State(), NOW)
+    assert new2.known[entry_key("FARUSDT", far)].phase == PHASE_SHELVED
+    assert plan2.env_write is None
+
+
+def test_a_pending_symbol_never_enters_the_env_between_discovery_and_its_flip():
+    """Два тика подряд: обнаружение pending молчит, флип в TRADING захватывает."""
+    onboard = NOW - 272 * DAY_MS
+    plan1, st1 = plan_tick(doc(sym("GAIBUSDT", onboard, status="PENDING_TRADING")), State(), NOW)
+    assert plan1.env_write is None and plan1.restart_now is False
+
+    plan2, st2 = plan_tick(doc(sym("GAIBUSDT", onboard)), st1, NOW + 600_000, env_now=None)
+    assert env_symbols(plan2.env_write[1]) == ["GAIBUSDT"]
+    assert plan2.restart_now is True
+    e = st2.known[entry_key("GAIBUSDT", onboard)]
+    assert e.phase == PHASE_CAPTURING and e.anchor_ms == NOW + 600_000
 
 
 def test_a_watched_symbol_flipping_to_trading_restarts_immediately():
     """R-FLIP. Урок day0-start: после начала торгов нужна свежая подписка, а таймера у
     watch-символа нет — значит рестарт делает сам флип. Env при этом НЕ меняется
     (символ уже в списке), и именно поэтому рестарт не имеет права зависеть от записи."""
-    onboard = NOW - 272 * DAY_MS
-    before = state_of(entry("GAIBUSDT", onboard, PHASE_WATCH, first_seen_local_ms=NOW - DAY_MS,
+    onboard = NOW - 30 * 60_000  # внутри неминуемой полосы: watch жив, не демотирован
+    before = state_of(entry("GAIBUSDT", onboard, PHASE_WATCH, first_seen_local_ms=NOW - 35 * 60_000,
                             status="PENDING_TRADING"))
     content = env_text(["GAIBUSDT"])
 
@@ -626,25 +658,31 @@ def test_rotation_ages_from_the_anchor_by_local_clock_boundary_exclusive():
         assert ("EDGEUSDT" in env_symbols(plan.env_write[1])) == (expected == PHASE_CAPTURING)
 
 
-def test_a_stale_onboard_date_never_rotates_a_symbol_before_it_traded():
-    """У watch onboardDate измеренно недостоверен (272 суток в прошлом у живого
-    PENDING). Ротация по нему выкинула бы символ ровно перед его листингом."""
+def test_a_stale_watch_entry_is_demoted_to_shelved_and_leaves_the_env_on_a_wave():
+    """Watch, чей onboard стух за пределы часа (перенесённый запуск, легаси-состояние
+    до 2026-08-25 — класс GAIBUSDT), деградирует на полку; волна выписывает его."""
     onboard = NOW - 272 * DAY_MS
     young = state_of(entry("GAIBUSDT", onboard, PHASE_WATCH, first_seen_local_ms=NOW - DAY_MS,
                            status="PENDING_TRADING"))
     plan, after = plan_tick(doc(sym("GAIBUSDT", onboard, status="PENDING_TRADING"),
-                                sym("NEWUSDT", NOW - 600_000)), young, NOW)
-    assert after.known[entry_key("GAIBUSDT", onboard)].phase == PHASE_WATCH
-    assert "GAIBUSDT" in env_symbols(plan.env_write[1])
+                                sym("NEWUSDT", NOW - 600_000)), young, NOW,
+                            env_now=env_text(["GAIBUSDT"]))
+    assert after.known[entry_key("GAIBUSDT", onboard)].phase == PHASE_SHELVED
+    assert "GAIBUSDT" not in env_symbols(plan.env_write[1])
+    assert plan.counters["watch_demoted"] == 1
 
-    # А вот 14 суток БЕЗ ТОРГОВ от первого наблюдения — уже полка, не ротация:
-    # флип из shelved продолжает ловиться (см. отдельный пин).
-    old = state_of(entry("GAIBUSDT", onboard, PHASE_WATCH,
-                         first_seen_local_ms=NOW - ROT_MS - 1, status="PENDING_TRADING"))
-    plan2, after2 = plan_tick(doc(sym("GAIBUSDT", onboard, status="PENDING_TRADING"),
-                                  sym("NEWUSDT", NOW - 600_000)), old, NOW)
-    assert after2.known[entry_key("GAIBUSDT", onboard)].phase == PHASE_SHELVED
-    assert env_symbols(plan2.env_write[1]) == ["NEWUSDT"]
+
+def test_a_watch_demotion_alone_does_not_touch_the_env_between_waves():
+    """Инвариант «между волнами env не трогается» переживает деградацию watch: сам по
+    себе перевод watch→shelved не даёт ни записи env, ни рестарта — вывод случится
+    следующей волной, как и любой другой вывод."""
+    onboard = NOW - 272 * DAY_MS
+    young = state_of(entry("GAIBUSDT", onboard, PHASE_WATCH, first_seen_local_ms=NOW - DAY_MS,
+                           status="PENDING_TRADING"))
+    plan, after = plan_tick(doc(sym("GAIBUSDT", onboard, status="PENDING_TRADING")), young, NOW,
+                            env_now=env_text(["GAIBUSDT"]))
+    assert plan.env_write is None and plan.restart_now is False
+    assert after.known[entry_key("GAIBUSDT", onboard)].phase == PHASE_SHELVED
 
 
 def test_a_dead_status_marks_the_symbol_for_rotation_regardless_of_age():
@@ -1292,3 +1330,85 @@ def test_the_wave_alert_records_local_and_server_time():
     assert day0_poller.iso_ms(server) in text
     assert "87." in text  # лаг назван числом, а не оставлен читателю
     assert json.loads(plan.pulse)["server_lag_s"] == pytest.approx(SERVER_LAG_MS / 1000)
+
+
+def test_the_grace_constant_is_one_hour():
+    """Час — измеренная граница «неминуемости»; сдвиг — отдельное решение, не дрейф."""
+    assert WATCH_GRACE_MS == 3600 * 1000
+
+
+def test_the_band_boundary_is_exact_on_both_sides_of_the_hour():
+    """Классификация и деградация держат одну и ту же границу с точностью до минуты."""
+    inside = NOW - WATCH_GRACE_MS + 60_000
+    _, st = plan_tick(doc(sym("INUSDT", inside, status="PENDING_TRADING")), State(), NOW)
+    assert st.known[entry_key("INUSDT", inside)].phase == PHASE_WATCH
+
+    at = NOW - WATCH_GRACE_MS
+    _, st2 = plan_tick(doc(sym("ATUSDT", at, status="PENDING_TRADING")), State(), NOW)
+    assert st2.known[entry_key("ATUSDT", at)].phase == PHASE_SHELVED
+
+    # пролог деградации: живой watch внутри полосы переживает тик С ВОЛНОЙ и остаётся в env
+    young = state_of(entry("INUSDT", inside, PHASE_WATCH, first_seen_local_ms=NOW - 60_000,
+                           status="PENDING_TRADING"))
+    plan, st3 = plan_tick(doc(sym("INUSDT", inside, status="PENDING_TRADING"),
+                              sym("NEWUSDT", NOW - 600_000)), young, NOW)
+    assert st3.known[entry_key("INUSDT", inside)].phase == PHASE_WATCH
+    assert "INUSDT" in env_symbols(plan.env_write[1])
+
+    stale = state_of(entry("ATUSDT", at, PHASE_WATCH, first_seen_local_ms=NOW - DAY_MS,
+                           status="PENDING_TRADING"))
+    _, st4 = plan_tick(doc(sym("ATUSDT", at, status="PENDING_TRADING")), stale, NOW)
+    assert st4.known[entry_key("ATUSDT", at)].phase == PHASE_SHELVED
+
+
+def test_an_armed_symbol_stuck_in_pending_past_the_band_is_demoted_and_its_timer_cancelled():
+    """Штатная дверь того же красного: листинг объявлен заранее (armed), перенесён и
+    завис в PENDING. Часовая полоса выводит его из env и снимает таймер."""
+    onboard = NOW - 2 * 3600 * 1000
+    unit = timer_unit_name("LATEUSDT", onboard)
+    before = state_of(entry("LATEUSDT", onboard, PHASE_ARMED, anchor_ms=onboard,
+                            timer_unit=unit, status="PENDING_TRADING"))
+    plan, after = plan_tick(doc(sym("LATEUSDT", onboard, status="PENDING_TRADING")), before, NOW,
+                            env_now=env_text(["LATEUSDT"]))
+    e = after.known[entry_key("LATEUSDT", onboard)]
+    assert e.phase == PHASE_SHELVED and e.in_env is False and e.timer_unit is None
+    assert plan.cancel_timers == [unit]
+    assert plan.env_write is None  # env — только волной
+
+    # а armed внутри полосы (запуск слегка съехал) живёт: его подберёт флип или R-QUIET
+    near = NOW - 30 * 60_000
+    unit2 = timer_unit_name("NEARUSDT", near)
+    before2 = state_of(entry("NEARUSDT", near, PHASE_ARMED, anchor_ms=near,
+                             timer_unit=unit2, status="PENDING_TRADING"))
+    plan2, after2 = plan_tick(doc(sym("NEARUSDT", near, status="PENDING_TRADING")), before2, NOW)
+    assert after2.known[entry_key("NEARUSDT", near)].phase == PHASE_ARMED
+    assert plan2.cancel_timers == []
+
+
+def test_the_wave_alert_tells_the_truth_about_watch_and_armed():
+    """Оператору называется реальное действие: у watch таймера НЕТ (подхвачен сейчас),
+    у armed — таймер и его время."""
+    near = NOW - 10 * 60_000
+    soon = NOW + 2 * 3600 * 1000
+    plan, _ = plan_tick(doc(sym("NEARUSDT", near, status="PENDING_TRADING"),
+                            sym("SOONUSDT", soon, status="PENDING_TRADING")), State(), NOW)
+    alert = "\n".join(plan.alerts)
+    near_line = [l for l in alert.splitlines() if "NEARUSDT" in l][0]
+    soon_line = [l for l in alert.splitlines() if "SOONUSDT" in l][0]
+    assert "неминуемый старт, подхвачен сейчас" in near_line  # не «уже торгуется» из else
+    assert "таймер" not in near_line
+    assert "таймер на" in soon_line
+
+
+def test_a_symbol_leaving_the_env_file_is_named_in_the_wave_alert():
+    """Состав COLLECTOR_SYMBOLS не меняется молча: демотированный легаси-watch, которого
+    волна выписывает из env-файла, называется в строке «выведено»."""
+    onboard = NOW - 272 * DAY_MS
+    legacy = state_of(entry("GAIBUSDT", onboard, PHASE_WATCH, first_seen_local_ms=NOW - DAY_MS,
+                            status="PENDING_TRADING"))
+    plan, _ = plan_tick(doc(sym("GAIBUSDT", onboard, status="PENDING_TRADING"),
+                            sym("NEWUSDT", NOW - 600_000)), legacy, NOW,
+                        env_now=env_text(["GAIBUSDT"]))
+    assert "GAIBUSDT" not in env_symbols(plan.env_write[1])
+    alert = "\n".join(plan.alerts)
+    assert "выведено" in alert and "GAIBUSDT" in alert
