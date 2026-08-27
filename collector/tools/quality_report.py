@@ -1001,7 +1001,29 @@ MAX_GAP_NS = {
     (HYPERLIQUID, "activeAssetCtx"): 10 * SEC_NS,
     (BINANCE, "bookTicker"): 30 * SEC_NS,
     (BINANCE, "depthUpdate"): 30 * SEC_NS,
-    (BINANCE, "trade"): 120 * SEC_NS,
+    # `trade` has NO entry, for the same reason Paradex's `trades` has none, and
+    # now on this venue's own measurement rather than by analogy. A print is an
+    # event; a thin symbol simply does not print for minutes at a time, and no
+    # number separates that from a stream that died.
+    #
+    #   * 23 Binance USDC perpetuals, 10.5h of 2026-08-27: 166 holes past the
+    #     120s this line used to hold, worst 417.8s, spread over 11 of the 23.
+    #     A full day of the same set is ~380 findings nobody can act on.
+    #   * DATAIPUSDC, the thinnest symbol of that set, went 823 of 1440 minutes
+    #     of 2026-08-26 with no print at all (public 1m klines, `count`), in
+    #     runs of up to 18 minutes. A limit that does not flag an 18-minute
+    #     drought is not a limit; one that does flags a healthy market daily.
+    #
+    # A `LIVENESS_REFERENCE` would not save it either: the suppression ceiling
+    # is 10x the limit, i.e. 1200s, and the worst legal drought measured is
+    # 1080s — a 10% margin is not a check, it is a coin toss. What still catches
+    # a dead tape is the stream set: no print at all for a whole day is
+    # `missing_optional` (`missing_required` under `book-v1`).
+    #
+    # What is NOT caught, and is the price of this line: a tape that dies
+    # halfway through a day while the socket lives. Nothing here can see that
+    # for an event-driven feed, and a limit tuned to pretend otherwise buries
+    # the finding among hundreds of quiet-market ones.
     (BINANCE, "markPriceUpdate"): 10 * SEC_NS,
     (BINANCE, "premiumIndex"): 100 * SEC_NS,
     (BYBIT, "orderbook"): 30 * SEC_NS,
@@ -1099,10 +1121,33 @@ MAX_GAP_NS = {
 #: finer than `slow` (5.4s), so it is preferred where it was recorded; `slow` is
 #: the fallback for a legal `--hl-l2-modes slow` run.
 #:
-#: Binance's `bookTicker` is event-driven too, but it is not listed: its 30s
-#: limit is a flat guess (no cadence for that venue has ever been measured here),
-#: `@depth@0ms` is optional and may be absent, and no false positive has been
-#: observed. Adding a reference before the measurement would be inventing one.
+#: Binance's `bookTicker` is event-driven too, and it IS listed now — the
+#: measurement the earlier note said was missing has been made. It used to read
+#: "no false positive has been observed; adding a reference before the
+#: measurement would be inventing one", which was true when the recorded
+#: symbols were majors. It stopped being true the moment thin symbols were
+#: recorded:
+#:
+#:   * five thin USD-M symbols, full day 2026-08-24 (`binancefuturesum-c`):
+#:     59 `bookTicker` holes past 30s (0, 1, 14, 19, 25 per symbol), worst
+#:     75.3s — and `depthUpdate` ran with **zero** holes past its own 30s limit
+#:     on all five, witnessing 59 of the 59;
+#:   * 23 Binance USDC perpetuals, 10.5h of 2026-08-27: 141 holes, worst 77.9s,
+#:     i.e. ~320 findings a day on one instance.
+#:
+#: `@depth@0ms` is the reference for the reason Lighter's `order_book` is: it is
+#: the densest thing on the same socket (2.6M vs 1.25M frames over those five
+#: symbol-days) and it is a diff feed, so it moves on any change anywhere in the
+#: book while the touch can sit still. Every hole measured is far inside the
+#: 300s suppression ceiling (10x its own limit), so a genuine socket outage —
+#: which takes depth with it — still flags.
+#:
+#: It stays a single-name tuple deliberately. `trade` would be the obvious
+#: second, and it is exactly the wrong one: the tape is the sparsest channel
+#: here, quiet for minutes on a thin symbol, so it can witness nothing that
+#: depth cannot. `depthUpdate` is `optional` under `mode-a-v1`, so a recording
+#: without it simply has no witness and keeps its warnings — `liveness_witness`
+#: fails closed on an absent reference.
 #:
 #: The 1/s index feeds would make fine references — they are periodic, they are
 #: on the same socket, and `markPriceUpdate` is the first steady channel Binance
@@ -1140,6 +1185,7 @@ MAX_GAP_NS = {
 #: only because it is the plain API book: `book_interactive` carries the
 #: RPI-inclusive quotes and is the more market-dependent of the two.
 LIVENESS_REFERENCE = {
+    (BINANCE, "bookTicker"): ("depthUpdate",),
     (HYPERLIQUID, "bbo"): ("l2Book_fast", "l2Book_slow"),
     (LIGHTER, "ticker"): ("order_book", "market_stats"),
     (PARADEX, "bbo"): ("book_snapshot", "book_interactive"),
@@ -1206,8 +1252,24 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
     Profile `mode-a-v1` is the contract of "Режим A" in the design document:
     Hyperliquid is the traded venue and Binance USD-M is the signal, whose only
     load-bearing stream is `@bookTicker`.
+
+    Profile `book-v1` is `mode-a-v1` with one difference, and it exists because
+    an instance can be recorded FOR the book. Under mode A a Binance recording
+    that lost `@depth@0ms` is yellow — the dataset it feeds reads the touch and
+    nothing else. For an instance whose whole reason to exist is that the venue
+    publishes no book anywhere else (Binance USD-M `bookTicker` archives stop in
+    2024-04 and no perpetual listed after that has one at all), the same loss is
+    total: the recording can never become what it was made for, and a yellow
+    the nightly gate does not escalate is how that would be found out a month
+    later. So under `book-v1` the Binance families require the whole order flow
+    — touch, tape and diffs.
+
+    It changes nothing for any other venue: whatever a run carries besides the
+    Binance directory is judged exactly as mode A judges it. The profile is
+    per-instance (`gate-run.sh` reads `GATE_PROFILE` from the instance's own env
+    file), so declaring it for one directory does not re-grade the others.
     """
-    if profile != "mode-a-v1":
+    if profile not in ("mode-a-v1", "book-v1"):
         raise ValueError(f"unknown profile {profile!r}")
 
     exchange = canonical_exchange(exchange)
@@ -1275,6 +1337,15 @@ def expected_streams(profile: str, exchange: str, config: dict) -> Expected:
         informational = ("markPriceUpdate",)
         if exchange == "binancefuturesum":
             informational = ("markPriceUpdate", "premiumIndex")
+        if profile == "book-v1":
+            # See the docstring: for a recording made for the book, losing the
+            # book is not a warning about a nice-to-have, it is the recording
+            # failing at the one thing it was for. The tape rides with it —
+            # a book with no prints against it cannot be marked out, which is
+            # the only reason to want the book.
+            return Expected(
+                ("bookTicker", "trade", "depthUpdate"), (), None, informational
+            )
         return Expected(("bookTicker",), ("trade", "depthUpdate"), None, informational)
 
     if exchange == "bybit":
@@ -2247,6 +2318,34 @@ def session_records_for_day(records, day: str) -> list:
     return out
 
 
+def depth_repairs_refused(records, day: str) -> dict:
+    """`{symbol: [reason, ...]}` for the repairs this day could not make.
+
+    Binance USD-M publishes the book as diffs whose continuity the collector
+    checks frame by frame; a break is repaired by refetching the whole book over
+    REST, and a refused refetch leaves every later diff applying to a book that
+    is missing a batch. Nothing in the recording shows that. The frames on
+    either side arrive on time and well formed, `_track_sequence` below counts
+    the break itself — and counts it identically whether or not it was repaired.
+
+    So the collector says so in the sidecar (`meta::depth_repair_failed`), and
+    this is what reads it. Filtered to the day the way nothing else in the
+    sidecar is, because unlike `session_start` this record describes a moment
+    rather than a configuration: an undated one (a line written without the
+    `<ts> ` prefix) is kept, since dropping it would hide the finding entirely.
+    """
+    start_ns, end_ns = day_bounds_ns(day)
+    out = {}
+    for ts, rec in records:
+        if rec.get("_collector") != "depth_repair_failed":
+            continue
+        if ts is not None and not (start_ns <= ts < end_ns):
+            continue
+        symbol = str(rec.get("symbol", "")).lower() or "unknown"
+        out.setdefault(symbol, []).append(str(rec.get("reason", "unknown")))
+    return out
+
+
 def merge_session_config(records) -> Optional[dict]:
     """One recording configuration for the day, from every `session_start`.
 
@@ -2712,6 +2811,27 @@ def check_day(
     clock = clock_summary(meta_records, day)
     if clock is not None and clock["unsynced_samples"]:
         issues.append(issue(YELLOW, "clock_unsynced", clock_detail(clock)))
+
+    # Yellow, not red, and per symbol: one refused repair damages one book from
+    # that moment on, which is a warning about part of a day rather than a day
+    # that cannot be used. It is listed before the per-symbol findings because
+    # it qualifies them — a `sequence_gap` on a symbol named here is a break
+    # that stayed broken.
+    refused = depth_repairs_refused(meta_records, day)
+    for symbol, reasons in sorted(refused.items()):
+        counted = ", ".join(
+            f"{reasons.count(r)}x {r}" for r in sorted(set(reasons))
+        )
+        issues.append(
+            issue(
+                YELLOW,
+                "depth_repair_failed",
+                f"{symbol}: {len(reasons)} depth snapshot(s) could not be "
+                f"fetched after a break in the incremental feed ({counted}); "
+                f"every diff after each one applies to a book that is missing "
+                f"updates, and the frames themselves look perfectly healthy",
+            )
+        )
 
     expected = None
     if config is None:
@@ -3237,7 +3357,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         default="mode-a-v1",
-        help="Dataset profile deciding which streams are required (default: mode-a-v1).",
+        choices=("mode-a-v1", "book-v1"),
+        help="Dataset profile deciding which streams are required (default: "
+        "mode-a-v1). `book-v1` additionally requires the Binance book and tape, "
+        "for an instance recorded because the venue publishes no book elsewhere.",
     )
     return parser
 

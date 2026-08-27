@@ -862,6 +862,214 @@ def test_a_quiet_lighter_ticker_over_a_live_book_is_not_reported(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Binance: a quiet touch, a quiet tape, the book required, a refused repair
+# --------------------------------------------------------------------------
+
+
+def um_day(tmp_path, recs, name, symbol="BTCUSDT", day=DAY, meta=()):
+    """One USD-M symbol-day, written as the collector writes it."""
+    d = tmp_path / name
+    d.mkdir()
+    write_gz(d / f"{symbol.lower()}_{day}.gz", sorted(recs, key=lambda pair: pair[0]))
+    write_meta(
+        d,
+        "binancefuturesum",
+        day,
+        [(ns(0), session_start("binancefuturesum", [symbol]))] + list(meta),
+    )
+    return d
+
+
+def um_book_and_tape(touch_ts, depth_ts, trade_ts, symbol="BTCUSDT"):
+    """Frames at the given second offsets, chained so the book is continuous."""
+    recs = [(ns(t), um_book_ticker(symbol, ns(t), u=100 + i)) for i, t in enumerate(touch_ts)]
+    recs += [
+        (ns(t), um_depth(symbol, ns(t), u=1000 + i * 10, pu=1000 + (i - 1) * 10))
+        for i, t in enumerate(depth_ts)
+    ]
+    recs += [(ns(t), um_trade(symbol, ns(t))) for t in trade_ts]
+    return recs
+
+
+def test_a_quiet_binance_touch_over_a_live_book_is_not_reported(tmp_path):
+    """`@bookTicker` fires when the touch changes and at no other time.
+
+    Measured on our own recordings: five thin USD-M symbols over the full day
+    2026-08-24 held 59 `bookTicker` holes past the 30s limit (worst 75.3s) while
+    `@depth@0ms` ran with zero holes of its own across every one of them, and 23
+    USDC perpetuals over 10.5h of 2026-08-27 held 141 more. That is ~320
+    findings a day on one instance for a top of book that simply stopped moving,
+    which is a gate nobody reads.
+    """
+    recs = um_book_and_tape(
+        touch_ts=[0, 1, 41, 59],  # a 40s hole, well past the 30s limit
+        depth_ts=list(range(0, 60, 2)),  # the book runs across it
+        trade_ts=[0, 30, 59],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(um_day(tmp_path, recs, "um-quiet-touch"), out=out)
+
+    assert code == 0
+    assert "cadence_gap" not in checks_of(report, "binancefuturesum"), issues_of(
+        report, "binancefuturesum"
+    )
+
+
+def test_a_touch_hole_with_the_book_silent_too_is_still_reported(tmp_path):
+    """The other half, and the reason the reference is not just a looser limit.
+
+    A hole in the touch WITH the book silent across it is a hole in the
+    recording — the socket, not the market. Suppression must not reach it.
+    """
+    recs = um_book_and_tape(
+        touch_ts=[0, 1, 41, 59],
+        depth_ts=[0, 1, 41, 59],  # the book stopped too: this is an outage
+        trade_ts=[0, 30, 59],
+    )
+    out = tmp_path / "r.json"
+    code, report = run(um_day(tmp_path, recs, "um-dead-socket"), out=out)
+
+    gaps = [i for i in issues_of(report, "binancefuturesum") if i["check"] == "cadence_gap"]
+    assert gaps, issues_of(report, "binancefuturesum")
+    assert any("bookTicker" in i["detail"] for i in gaps), gaps
+
+
+def test_a_thin_binance_tape_is_not_a_cadence_finding(tmp_path):
+    """A print is an event, and a thin symbol does not print for minutes.
+
+    DATAIPUSDC — the thinnest symbol of the USDC set — spent 823 of the 1440
+    minutes of 2026-08-26 without a single print (public 1m klines, `count`), in
+    runs of up to 18 minutes. There is no number that separates that from a tape
+    that died, so `(BINANCE, "trade")` carries no limit at all, exactly as
+    `(PARADEX, "trades")` does not.
+    """
+    recs = um_book_and_tape(
+        touch_ts=list(range(0, 900, 5)),
+        depth_ts=list(range(0, 900, 5)),
+        trade_ts=[0, 880],  # a 14-minute drought, with the socket plainly alive
+    )
+    out = tmp_path / "r.json"
+    code, report = run(um_day(tmp_path, recs, "um-thin-tape"), out=out)
+
+    assert code == 0
+    assert "cadence_gap" not in checks_of(report, "binancefuturesum"), issues_of(
+        report, "binancefuturesum"
+    )
+
+
+def test_book_v1_makes_the_binance_book_and_tape_required(tmp_path):
+    """An instance recorded FOR the book cannot lose the book to a warning.
+
+    Binance publishes no USD-M `bookTicker` archive after 2024-04 and none at
+    all for a perpetual listed later, so for such an instance `@depth@0ms` is
+    not a nice-to-have beside the touch — it is the entire reason the recording
+    exists. Under mode A the same absence is yellow, and `gate-run.sh` escalates
+    on red only.
+    """
+    d = um_dir(tmp_path, streams=("bookTicker",), name="um-touch-only")
+    out = tmp_path / "r.json"
+
+    code, report = run(d, out=out)
+    assert code == 0, "mode A reads the touch alone; this is a warning there"
+    assert report["venues"]["binancefuturesum"]["days"][DAY]["verdict"] == "yellow"
+
+    code, report = run(d, out=out, extra=("--profile", "book-v1"))
+    assert code == 1
+    reds = [i for i in issues_of(report, "binancefuturesum") if i["severity"] == "red"]
+    assert any(
+        i["check"] == "missing_required"
+        and "depthUpdate" in i["detail"]
+        and "trade" in i["detail"]
+        for i in reds
+    ), reds
+
+    sym = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
+    assert sym["missing_optional"] == [], "nothing is optional here any more"
+
+
+def test_book_v1_leaves_a_complete_binance_day_green(tmp_path):
+    """And it must not turn an ordinary healthy recording red."""
+    out = tmp_path / "r.json"
+    code, report = run(um_dir(tmp_path, name="um-complete"), out=out, extra=("--profile", "book-v1"))
+    assert code == 0
+    assert "missing_required" not in checks_of(report, "binancefuturesum")
+
+
+def test_a_refused_depth_repair_is_reported(tmp_path):
+    """A break that stayed broken must not read like one that was repaired.
+
+    The collector repairs a `pu` break by refetching the whole book over REST.
+    When the venue refuses — a rate limit is the ordinary case, shared as it is
+    with every other instance on the host — every later diff applies to a book
+    that is missing updates, and the frames on either side are impeccable. The
+    only account of it is the sidecar record, so the report has to read it.
+    """
+    recs = um_book_and_tape(
+        touch_ts=[0, 10, 20],
+        depth_ts=[0, 10, 20],
+        trade_ts=[0, 10, 20],
+    )
+    refused = [
+        (
+            ns(11),
+            {
+                "_collector": "depth_repair_failed",
+                "symbol": "BTCUSDT",
+                "reason": "rate_limited",
+                "error": "",
+            },
+        ),
+        (
+            ns(12),
+            {
+                "_collector": "depth_repair_failed",
+                "symbol": "BTCUSDT",
+                "reason": "fetch_failed",
+                "error": "HTTP status client error (429 Too Many Requests)",
+            },
+        ),
+    ]
+    out = tmp_path / "r.json"
+    code, report = run(um_day(tmp_path, recs, "um-refused", meta=refused), out=out)
+
+    found = [
+        i for i in issues_of(report, "binancefuturesum") if i["check"] == "depth_repair_failed"
+    ]
+    assert len(found) == 1, issues_of(report, "binancefuturesum")
+    assert found[0]["severity"] == "yellow"
+    assert "btcusdt" in found[0]["detail"]
+    assert "1x rate_limited" in found[0]["detail"]
+    assert "1x fetch_failed" in found[0]["detail"]
+
+    # A day whose repairs all worked says nothing: the snapshots are in the
+    # symbol files, and a record per successful repair is a sidecar nobody
+    # finishes reading.
+    code, report = run(um_day(tmp_path, recs, "um-repaired"), out=out)
+    assert "depth_repair_failed" not in checks_of(report, "binancefuturesum")
+
+
+def test_a_refused_repair_from_another_day_is_not_this_days_finding(tmp_path):
+    """The sidecar is read whole (one `session_start` per process, not per day),
+    so a record that describes a moment has to be filtered to the day itself."""
+    recs = um_book_and_tape(touch_ts=[0, 10], depth_ts=[0, 10], trade_ts=[0, 10])
+    yesterday = [
+        (
+            ns(0) - 86_400 * 10**9,
+            {
+                "_collector": "depth_repair_failed",
+                "symbol": "BTCUSDT",
+                "reason": "rate_limited",
+                "error": "",
+            },
+        )
+    ]
+    out = tmp_path / "r.json"
+    code, report = run(um_day(tmp_path, recs, "um-yesterday", meta=yesterday), out=out)
+
+    assert "depth_repair_failed" not in checks_of(report, "binancefuturesum")
+
+
+# --------------------------------------------------------------------------
 # Extended: URL-based channels, RFQ sibling files
 # --------------------------------------------------------------------------
 
@@ -4686,7 +4894,13 @@ def test_the_topology_the_registry_declares_is_the_one_the_backend_has(exchange)
     # the second is the direction that matters, because an unclaimed producer is
     # a real race the model has no tolerance for and would call corruption.
     if "depthSnapshot" in topology.producers:
-        assert "tokio::spawn(async move {" in mod and "fetch_depth_snapshot(" in mod, (
+        # Shape-agnostic on purpose: what the interleave model depends on is
+        # that the snapshot is fetched on a task of its own — a second producer
+        # into the writer hop — not on which spelling of `tokio::spawn` a
+        # backend uses. USD-M spawns a named `repair_depth` future (so the
+        # error policy can be tested without the venue), COIN-M an inline
+        # `async move` block; both are detached, which is the claim.
+        assert "tokio::spawn(" in mod and "fetch_depth_snapshot(" in mod, (
             f"{topology.backend} claims the detached REST depth-snapshot "
             f"fetcher but no longer spawns one"
         )

@@ -6,9 +6,10 @@
 //! it is indistinguishable from a quiet market. These records are the
 //! collector's own account of the session, and every backend writes the same
 //! five of them through the constructors here so that one parser reads all five
-//! venues. [`poller_degraded`], [`probe_failed`] and [`sequence_gap`] are the
-//! exceptions: each is written by the one backend whose venue makes it
-//! possible. All three are constructed here regardless, because the point of
+//! venues. [`poller_degraded`], [`probe_failed`], [`sequence_gap`] and
+//! [`depth_repair_failed`] are the exceptions: each is written by the one
+//! backend whose venue makes it possible. All four are constructed here
+//! regardless, because the point of
 //! this module is that the sidecar has one vocabulary — a record spelled
 //! locally inside one backend is one the offline report does not know to look
 //! for.
@@ -282,6 +283,34 @@ pub fn sequence_gap(
             "expected_begin_nonce": expected_begin_nonce,
             "begin_nonce": begin_nonce,
             "count": count,
+        }),
+    )
+}
+
+/// A break in an incremental depth feed that could NOT be repaired.
+///
+/// Binance USD-M publishes the book as diffs whose continuity is checked frame
+/// by frame (`pu` against the previous `u`); a break is repaired by refetching
+/// the whole book over REST. The repair is the only thing that makes the feed
+/// recoverable, and it is the one part of the loop the venue can refuse — a
+/// rate limit, a 5xx, a timeout — while the diffs keep arriving perfectly on
+/// time. Offline that failure is invisible: the frames are all there, the hole
+/// is inside their numbers, and a report reading the recording alone cannot
+/// tell a break that was repaired from one that was not.
+///
+/// So the collector says so here, once per failed attempt. A break that WAS
+/// repaired needs no record: the snapshot itself is in the symbol's file.
+///
+/// `reason` is the class — `rate_limited` when this process's own throttle
+/// refused to spend the request, `fetch_failed` when the venue did — and
+/// `error` carries the detail, empty for the former, which has none.
+pub fn depth_repair_failed(symbol: &str, reason: &str, error: &str) -> Value {
+    record(
+        "depth_repair_failed",
+        serde_json::json!({
+            "symbol": symbol,
+            "reason": reason,
+            "error": error,
         }),
     )
 }

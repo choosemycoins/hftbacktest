@@ -225,12 +225,24 @@ stamp taken anywhere but at receive would show. The REST depth snapshot is the
 milder version of the same thing: it skips the socket hop but shares the writer
 hop, so one queue still describes the pair and it keeps a bound either way.
 
-The Python converter (`hftbacktest.data.utils.binancefutures`) skips these lines
-the same way it already skips the REST depth snapshots: at its default
-`combined_stream=True`, which is the correct setting for these files, a line
-with no `data` envelope is passed over without an event type being read out of
-it. Turning them into rows is not implemented — `opt='m'` converts a
-`markPriceUpdate` frame, i.e. COIN-M's.
+The Python converter (`hftbacktest.data.utils.binancefutures`) skips these
+lines: at its default `combined_stream=True`, which is the correct setting for
+these files, a line with no `data` envelope and no `bids`/`asks` is passed over
+without an event type being read out of it. Turning them into rows is not
+implemented — `opt='m'` converts a `markPriceUpdate` frame, i.e. COIN-M's.
+
+⚠️ **This was untrue until 2026-08-27, and in the worst way.** The paragraph
+said the poller's lines were "passed over the same way the REST depth snapshots
+are", and the code did the opposite: a line with no `data` envelope and no
+`code` fell into the snapshot branch and reached for `message['T']`, which a
+`premiumIndex` element does not have. `KeyError: 'T'` on the first one, no
+partial output — and there are ~121 per symbol per day, so **every USD-M
+recording made since the poller landed (2026-07-28) was unconvertible**, on
+every instance. Note the asymmetry the old wording hid: the depth snapshots are
+not passed over at all, they are converted (that is what `DEPTH_SNAPSHOT_EVENT`
+rows in a converted file are), and they are the reason the branch exists. What
+the converter now keys on is `bids`/`asks` — a book is recognised by carrying a
+book, not by not being a shape somebody listed.
 
 ### Hyperliquid symbol names
 
@@ -811,8 +823,8 @@ data = binancefutures.convert('btcusd_perp_20260728.gz', opt='m')
 
 **That is COIN-M only.** USD-M's index and funding data no longer arrives as
 `markPriceUpdate` at all — it is the REST poller's `premiumIndex` elements, a
-bare object with no `data` envelope, which `convert` passes over exactly as it
-passes over the REST depth snapshots. Nothing is lost and nothing breaks;
+bare object with no `data` envelope, which `convert` passes over (since
+2026-08-27; before that date it died on them — see above). Nothing is lost;
 `opt='m'` simply finds no rows in a USD-M file. Reading the poller's lines
 directly is a `zcat`-and-`json.loads` away:
 

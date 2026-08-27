@@ -98,12 +98,21 @@ struct PremiumIndexSymbol {
     symbol: String,
 }
 
+/// Files one frame, and says when the book behind it has to be refetched.
+///
+/// `on_gap` is a parameter, not a `tokio::spawn` inlined below, for one reason:
+/// the continuity rule it guards is the whole of what makes this feed
+/// recoverable, and with the spawn inside there was no seam to observe it
+/// through. Deleting the `pu != prev_u` half of the condition left the crate's
+/// 234 tests green — measured 2026-08-27 — i.e. the single line that turns an
+/// incremental book into a repairable one could be removed by a refactor
+/// without one red light anywhere. Production passes [`spawn_depth_repair`].
 fn handle(
     prev_u_map: &mut HashMap<String, i64>,
     writer_tx: &Tx<Record>,
     recv_time: DateTime<Utc>,
     data: Utf8Bytes,
-    throttler: &Throttler,
+    on_gap: &mut dyn FnMut(&str),
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(data.as_str())?;
     // The collector's own lifecycle records travel this hop alongside the
@@ -136,47 +145,101 @@ fn handle(
                 .ok_or(ConnectorError::FormatError)?
                 .as_i64()
                 .ok_or(ConnectorError::FormatError)?;
+            // The venue's own continuity rule for USD-M futures: this frame
+            // continues the book only if its `pu` is the previous frame's `u`.
+            // (Spot's is `U == prev_u + 1`, and it is NOT interchangeable —
+            // measured 2026-08-27 on a live 28-symbol USDC stream, `U` failed
+            // that test on ~100% of frames, so reading the spot rule here
+            // would refetch the whole book on every single frame.) No previous
+            // `u` at all is the same case: at the start of a process, and
+            // after a reconnect, the book has to be seeded before the diffs
+            // mean anything.
             let prev_u = prev_u_map.get(symbol);
             if prev_u.is_none() || pu != *prev_u.unwrap() {
                 warn!(%symbol, "missing depth feed has been detected.");
-                let symbol_ = symbol.to_string();
-                let writer_tx_ = writer_tx.clone();
-                let mut throttler_ = throttler.clone();
-                tokio::spawn(async move {
-                    match throttler_.execute(fetch_depth_snapshot(&symbol_)).await {
-                        Some(Ok(data)) => {
-                            let recv_time = Utc::now();
-                            // Detached: there is no caller to return an error
-                            // to, so discarding this result would be the one
-                            // silent drop the bound cannot catch. `send` has
-                            // already raised the fatal signal by the time this
-                            // logs — that signal is the whole error path a
-                            // spawned task has.
-                            if let Err(error) = writer_tx_.send((recv_time, symbol_, data)) {
-                                error!(?error, "couldn't hand the depth snapshot to the writer");
-                            }
-                        }
-                        Some(Err(error)) => {
-                            error!(
-                                symbol = symbol_,
-                                ?error,
-                                "couldn't fetch the depth snapshot."
-                            );
-                        }
-                        None => {
-                            warn!(
-                                symbol = symbol_,
-                                "Fetching the depth snapshot is rate-limited."
-                            )
-                        }
-                    }
-                });
+                on_gap(symbol);
             }
             *prev_u_map.entry(symbol.to_string()).or_insert(0) = u;
         }
         writer_tx.send((recv_time, symbol.to_string(), data.to_string()))?;
     }
     Ok(())
+}
+
+/// Refetches one symbol's whole book over REST, and files a sidecar record when
+/// it could not be had.
+///
+/// Detached, because the frame stream must keep draining while the request is
+/// in flight — a repair that blocked the parser would turn one break into a
+/// backlog. That is also why every outcome is reported inside rather than
+/// returned: a spawned task has no caller.
+fn spawn_depth_repair(symbol: &str, writer_tx: &Tx<Record>, throttler: &Throttler) {
+    tokio::spawn(repair_depth(
+        symbol.to_string(),
+        writer_tx.clone(),
+        throttler.clone(),
+        |symbol| async move {
+            fetch_depth_snapshot(&symbol)
+                .await
+                .map_err(anyhow::Error::from)
+        },
+    ));
+}
+
+/// One repair attempt and its account of itself.
+///
+/// The failure record is the point. A refused repair leaves the book wrong from
+/// that moment until some later break happens to be repaired successfully, and
+/// the frames on either side of it are impeccable — on time, well formed, no
+/// hole in `local_ts` for a cadence check to find. Without a record there is
+/// nothing offline to read. The one outcome that writes none is success, which
+/// needs none: the snapshot lands in the symbol's own file, which IS the record.
+///
+/// `fetch` is a parameter for the same reason it is one on
+/// [`poll_premium_index`]: the error policy is the thing worth pinning, and
+/// pinning it must not require the venue.
+async fn repair_depth<F, Fut>(
+    symbol: String,
+    writer_tx: Tx<Record>,
+    mut throttler: Throttler,
+    fetch: F,
+) where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<String, anyhow::Error>>,
+{
+    let failure = match throttler.execute(fetch(symbol.clone())).await {
+        Some(Ok(data)) => {
+            let recv_time = Utc::now();
+            // Detached: there is no caller to return an error to, so discarding
+            // this result would be the one silent drop the bound cannot catch.
+            // `send` has already raised the fatal signal by the time this logs —
+            // that signal is the whole error path a spawned task has.
+            if let Err(error) = writer_tx.send((recv_time, symbol.clone(), data)) {
+                error!(?error, "couldn't hand the depth snapshot to the writer");
+            }
+            None
+        }
+        Some(Err(error)) => {
+            error!(symbol, ?error, "couldn't fetch the depth snapshot.");
+            Some(("fetch_failed", format!("{error:#}")))
+        }
+        None => {
+            warn!(symbol, "Fetching the depth snapshot is rate-limited.");
+            Some(("rate_limited", String::new()))
+        }
+    };
+    if let Some((reason, detail)) = failure
+        && let Err(error) = writer_tx.send((
+            Utc::now(),
+            META_STREAM.to_string(),
+            meta::depth_repair_failed(&symbol, reason, &detail).to_string(),
+        ))
+    {
+        error!(
+            ?error,
+            "couldn't hand the depth-repair record to the writer"
+        );
+    }
 }
 
 /// Files every element of a `premiumIndex` response that this instance records.
@@ -393,7 +456,8 @@ pub async fn run_collection(
         writer_tx,
         |ws_tx| keep_connection(streams, symbols, ws_tx),
         move |writer_tx, recv_time, data| {
-            handle(&mut prev_u_map, writer_tx, recv_time, data, &throttler)
+            let mut on_gap = |symbol: &str| spawn_depth_repair(symbol, writer_tx, &throttler);
+            handle(&mut prev_u_map, writer_tx, recv_time, data, &mut on_gap)
         },
     );
     let poll = poll_premium_index(recorded, poller_tx, || async {
@@ -417,7 +481,28 @@ mod tests {
     use crate::queue::{self, WRITER_HOP};
 
     fn depth_update(u: i64, pu: i64) -> String {
-        format!(r#"{{"data":{{"e":"depthUpdate","s":"BTCUSDT","u":{u},"pu":{pu}}}}}"#)
+        depth_update_for("BTCUSDT", u, pu)
+    }
+
+    fn depth_update_for(symbol: &str, u: i64, pu: i64) -> String {
+        format!(r#"{{"data":{{"e":"depthUpdate","s":"{symbol}","u":{u},"pu":{pu}}}}}"#)
+    }
+
+    /// A gap sink that records the symbols a repair was asked for, in order.
+    ///
+    /// `RefCell` rather than a plain `Vec` because `handle` takes the sink by
+    /// `&mut` for the length of one call, and every assertion here is about
+    /// what several calls did between them.
+    fn recording_gap_sink() -> (
+        impl FnMut(&str),
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    ) {
+        let repairs = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = {
+            let repairs = repairs.clone();
+            move |symbol: &str| repairs.borrow_mut().push(symbol.to_string())
+        };
+        (sink, repairs)
     }
 
     /// Three elements of a `GET /fapi/v1/premiumIndex` response, each captured
@@ -843,17 +928,21 @@ mod tests {
     fn mark_price_frames_are_filed_under_their_symbol_and_leave_gap_detection_alone() {
         let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 4);
         let mut prev_u_map = HashMap::from([("BTCUSDT".to_string(), 100)]);
-        let throttler = Throttler::new(100);
         let now = Utc::now();
+        let (mut on_gap, repairs) = recording_gap_sink();
 
         handle(
             &mut prev_u_map,
             &tx,
             now,
             mark_price_update().as_str().into(),
-            &throttler,
+            &mut on_gap,
         )
         .expect("a mark-price frame is ordinary market data, not a parse failure");
+        assert!(
+            repairs.borrow().is_empty(),
+            "a non-depth frame must not ask for a book"
+        );
 
         let (_, stream, payload) = rx.try_recv().expect("the frame must be written");
         assert_eq!(
@@ -881,15 +970,15 @@ mod tests {
         // Primed so both frames continue the sequence: a gap would spawn the
         // REST snapshot fetch, which is not what this test is about.
         let mut prev_u_map = HashMap::from([("BTCUSDT".to_string(), 1)]);
-        let throttler = Throttler::new(100);
         let now = Utc::now();
+        let (mut on_gap, _repairs) = recording_gap_sink();
 
         handle(
             &mut prev_u_map,
             &tx,
             now,
             depth_update(2, 1).as_str().into(),
-            &throttler,
+            &mut on_gap,
         )
         .expect("the first frame fits");
 
@@ -898,7 +987,7 @@ mod tests {
             &tx,
             now,
             depth_update(3, 2).as_str().into(),
-            &throttler,
+            &mut on_gap,
         )
         .expect_err("a frame that could not be handed over must not be reported as written");
         assert!(matches!(error, ConnectorError::Queue(_)), "{error}");
@@ -914,16 +1003,16 @@ mod tests {
     fn lifecycle_records_are_filed_under_meta_and_market_data_still_is_not() {
         let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 4);
         let mut prev_u_map = HashMap::new();
-        let throttler = Throttler::new(100);
         let now = Utc::now();
         let lifecycle = meta::disconnected("Connection reset without closing handshake", 1194);
+        let (mut on_gap, _repairs) = recording_gap_sink();
 
         handle(
             &mut prev_u_map,
             &tx,
             now,
             lifecycle.to_string().as_str().into(),
-            &throttler,
+            &mut on_gap,
         )
         .unwrap();
         handle(
@@ -931,7 +1020,7 @@ mod tests {
             &tx,
             now,
             r#"{"data":{"e":"trade","s":"BTCUSDT"}}"#.into(),
-            &throttler,
+            &mut on_gap,
         )
         .unwrap();
 
@@ -945,6 +1034,233 @@ mod tests {
             rx.try_recv().expect("market data must still be written").1,
             "BTCUSDT",
             "the symbol routing below the tag check is untouched"
+        );
+    }
+    /// **The rule that makes this feed recoverable at all.**
+    ///
+    /// Binance publishes the USD-M book as diffs, and a diff is only meaningful
+    /// on top of the book the previous one left behind. The venue states the
+    /// link in the frame: `pu` is the previous frame's `u`. When that link
+    /// holds there is nothing to do; when it breaks, frames were lost and the
+    /// book in hand is wrong for ever after unless it is refetched.
+    ///
+    /// Nothing else in the recording shows this. The frames keep arriving on
+    /// time, with no hole in `local_ts` for a cadence check to find and no
+    /// error anywhere — only the numbers inside consecutive frames say a batch
+    /// is missing. Until this test existed, deleting the `pu != prev_u` half of
+    /// the condition left all 234 tests of the crate green (measured
+    /// 2026-08-27).
+    #[test]
+    fn a_break_in_the_depth_chain_asks_for_a_fresh_book_and_an_unbroken_one_does_not() {
+        let (tx, _rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 16);
+        let mut prev_u_map = HashMap::new();
+        let now = Utc::now();
+        let (mut on_gap, repairs) = recording_gap_sink();
+
+        // Cold start: nothing is known about this book yet, so it has to be
+        // seeded. This is the same branch a reconnect takes.
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            depth_update(2, 1).as_str().into(),
+            &mut on_gap,
+        )
+        .unwrap();
+        assert_eq!(
+            repairs.borrow().as_slice(),
+            ["BTCUSDT"],
+            "the first frame of a symbol has no book under it"
+        );
+
+        // Continuous: pu == the previous u. Nothing to repair.
+        for (u, pu) in [(3, 2), (7, 3), (9, 7)] {
+            handle(
+                &mut prev_u_map,
+                &tx,
+                now,
+                depth_update(u, pu).as_str().into(),
+                &mut on_gap,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            repairs.borrow().len(),
+            1,
+            "an unbroken chain must not spend a REST request: {:?}",
+            repairs.borrow()
+        );
+
+        // Broken: the venue's link does not hold, so frames between 9 and this
+        // one are gone and the book has to be refetched.
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            depth_update(20, 15).as_str().into(),
+            &mut on_gap,
+        )
+        .unwrap();
+        assert_eq!(
+            repairs.borrow().as_slice(),
+            ["BTCUSDT", "BTCUSDT"],
+            "a break in the chain must ask for a fresh book"
+        );
+
+        // And the state moves on with the frame that broke it, so the next
+        // continuous frame is continuous again rather than a second break.
+        handle(
+            &mut prev_u_map,
+            &tx,
+            now,
+            depth_update(21, 20).as_str().into(),
+            &mut on_gap,
+        )
+        .unwrap();
+        assert_eq!(
+            repairs.borrow().len(),
+            2,
+            "one break is one repair, not a repair per frame after it"
+        );
+    }
+
+    /// The chain is per symbol, and an instance carries dozens of them on one
+    /// socket. Tracked globally, every symbol would look broken every time
+    /// another one's frame arrived — a REST refetch per frame, against a
+    /// venue rate limit shared with every other instance on the host.
+    #[test]
+    fn each_symbols_chain_is_its_own() {
+        let (tx, _rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 16);
+        let mut prev_u_map = HashMap::new();
+        let now = Utc::now();
+        let (mut on_gap, repairs) = recording_gap_sink();
+
+        for frame in [
+            depth_update_for("BTCUSDC", 2, 1),
+            depth_update_for("ZECUSDC", 500, 499),
+            depth_update_for("BTCUSDC", 3, 2),
+            depth_update_for("ZECUSDC", 501, 500),
+        ] {
+            handle(
+                &mut prev_u_map,
+                &tx,
+                now,
+                frame.as_str().into(),
+                &mut on_gap,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            repairs.borrow().as_slice(),
+            ["BTCUSDC", "ZECUSDC"],
+            "one seeding repair each, and neither symbol breaks the other's chain"
+        );
+    }
+
+    /// A repair the venue refused has to leave a mark, because nothing else
+    /// does.
+    ///
+    /// The frames on either side of an unrepaired break are perfect: on time,
+    /// well formed, no hole in `local_ts`. The damage is that every diff after
+    /// it applies to a book that is missing a batch of updates — and the only
+    /// way an offline reader could ever know is if the collector says so.
+    #[tokio::test]
+    async fn a_repair_the_venue_refuses_is_reported_in_the_sidecar() {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 16);
+
+        repair_depth("ZECUSDC".to_string(), tx, Throttler::new(100), |_| async {
+            Err(anyhow!("HTTP status client error (429 Too Many Requests)"))
+        })
+        .await;
+
+        let records = meta_records(&mut rx);
+        assert_eq!(
+            records.len(),
+            1,
+            "one refused repair, one record: {records:?}"
+        );
+        assert_eq!(records[0]["_collector"], "depth_repair_failed");
+        assert_eq!(
+            records[0]["symbol"], "ZECUSDC",
+            "the record has to name the book that is now wrong"
+        );
+        assert_eq!(records[0]["reason"], "fetch_failed");
+        assert!(
+            records[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("429 Too Many Requests"),
+            "and carry what the venue said: {records:?}"
+        );
+    }
+
+    /// A repair this process refused itself is the same loss and gets the same
+    /// record. The throttle exists because the venue's rate limit is shared
+    /// with every other instance on the host, so this branch is not exotic —
+    /// it is what a reconnect storm looks like from inside.
+    #[tokio::test]
+    async fn a_repair_the_throttle_refuses_is_reported_too() {
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 16);
+        let throttler = Throttler::new(0);
+        let fetched = Arc::new(AtomicUsize::new(0));
+
+        // Two attempts against a budget of zero. Whether the first one is spent
+        // or refused is the throttle's business (its bound is inclusive of one
+        // request); what this pins is that a refusal is never silent.
+        for _ in 0..2 {
+            let fetched = fetched.clone();
+            repair_depth(
+                "ZECUSDC".to_string(),
+                tx.clone(),
+                throttler.clone(),
+                move |_| async move {
+                    fetched.fetch_add(1, Ordering::Relaxed);
+                    Ok(r#"{"lastUpdateId":1,"bids":[],"asks":[]}"#.to_string())
+                },
+            )
+            .await;
+        }
+
+        assert!(
+            fetched.load(Ordering::Relaxed) < 2,
+            "a zero budget must refuse at least one of the two attempts"
+        );
+        let records = meta_records(&mut rx);
+        assert!(
+            records
+                .iter()
+                .any(|r| r["_collector"] == "depth_repair_failed" && r["reason"] == "rate_limited"),
+            "a repair the collector declined to spend must reach the sidecar: {records:?}"
+        );
+    }
+
+    /// The other half: a repair that worked writes the book into the symbol's
+    /// own file and says nothing in the sidecar. A record per successful repair
+    /// would be a `_meta` nobody finishes reading, and the snapshot line is the
+    /// evidence anyway.
+    #[tokio::test]
+    async fn a_repair_that_worked_writes_the_book_and_nothing_else() {
+        const BOOK: &str = r#"{"lastUpdateId":77,"E":1,"T":1,"bids":[["1.0","2.0"]],"asks":[]}"#;
+        let (tx, mut rx, _fatal) = queue::test_bounded::<Record>(WRITER_HOP, 16);
+
+        repair_depth(
+            "ZECUSDC".to_string(),
+            tx,
+            Throttler::new(100),
+            |symbol| async move {
+                assert_eq!(symbol, "ZECUSDC", "the fetch is for the broken symbol");
+                Ok(BOOK.to_string())
+            },
+        )
+        .await;
+
+        let (_, stream, payload) = rx.try_recv().expect("the snapshot must be written");
+        assert_eq!(stream, "ZECUSDC");
+        assert_eq!(payload, BOOK, "the venue's bytes, unaltered");
+        assert!(
+            rx.try_recv().is_err(),
+            "a successful repair writes no sidecar record"
         );
     }
 }

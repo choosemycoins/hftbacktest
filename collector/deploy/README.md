@@ -67,7 +67,7 @@ journalctl -u 'hft-collector@*' -f
 | Переменная | Обязательна | Значение |
 |---|---|---|
 | `COLLECTOR_EXCHANGE` | да | `hyperliquid` \| `binancefutures`/`binancefuturesum` \| `binancefuturescm` \| `binance`/`binancespot` \| `bybit` \| `lighter` |
-| `COLLECTOR_SYMBOLS` | да | символы через пробел, В НОТАЦИИ БИРЖИ: HL — `BTC`, `xyz:GOLD` (dex-префикс — часть имени); Binance/Bybit — `BTCUSDT`. Каждый символ проверяется на бирже при старте, неизвестный = отказ запуска |
+| `COLLECTOR_SYMBOLS` | да | символы через пробел, В НОТАЦИИ БИРЖИ: HL — `BTC`, `xyz:GOLD` (dex-префикс — часть имени); Binance/Bybit — `BTCUSDT`. Проверка символов на бирже при старте есть только у HL/Paradex/Extended/Lighter; **у Binance и Bybit её нет** — опечатка принимается, акается и молча не отдаёт ничего (замерено 2026-08-27). Ловят её, по порядку: отсутствие файла символа, `COLLECTOR_LIVENESS_TIMEOUT_S` (WARN + запись в `_meta`), `COLLECTOR_STALL_TIMEOUT_MIN` (если молчат все — фатал), и утренний гейт (`missing_required` = RED). Сверяйте первый `ls` каталога данных со списком |
 | `RUST_LOG` | нет (`info`) | verbosity; `debug` очень шумный на тиках |
 | `COLLECTOR_DATA_DIR` | нет | дефолт `/opt/hft-collector/data/<instance>` — правильный: две записи в одну директорию запрещены и пресекаются замком. Если выносите за `/opt/hft-collector/data` — расширьте `ReadWritePaths` юнита drop-in'ом |
 | `COLLECTOR_MIN_FREE_GB` | нет (5) | порог свободного места; пробитие = фатальный выход (и алерт). `0` — выключить |
@@ -76,6 +76,7 @@ journalctl -u 'hft-collector@*' -f
 | `COLLECTOR_BYBIT_DEPTHS` | только bybit (`1,50`) | глубины стакана. НЕ добавляйте `500`: биржа отвергает его для мажоров, а один отвергнутый топик валит всю пачку подписки |
 | `COLLECTOR_HL_L2_MODES` | только HL (`slow,fast`) | какие каденции `l2Book` писать. Дефолт пишет обе — датасет `bbo+fast` (live-parity) требует `fast` |
 | `COLLECTOR_NO_SYMBOL_CHECK` | нет (0) | пропустить стартовую валидацию символов. Для `lighter` игнорируется — там каталог и есть адресация |
+| `GATE_PROFILE` | нет (`mode-a-v1`) | профиль ночного гейта ДЛЯ ЭТОГО инстанса (`gate-run.sh` читает переменную из его же env, не исполняя файл). `book-v1` — для инстанса, который пишут РАДИ КНИГИ: у семейств Binance тогда обязательны все три потока (`bookTicker`, `trade`, `depthUpdate`), и потеря стакана даёт RED, а не жёлтый, который таймер не эскалирует. Коллектор эту переменную не читает вовсе |
 
 ## Справочник: `alert.env` (root:600, единый на хост)
 

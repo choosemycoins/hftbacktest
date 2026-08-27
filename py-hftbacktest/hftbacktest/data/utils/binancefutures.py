@@ -215,6 +215,33 @@ def convert(
             else:
                 if 'code' in message:
                     print(message['code'], message['msg'])
+                elif 'bids' not in message or 'asks' not in message:
+                    # Not every line without a `data` envelope is a REST depth
+                    # snapshot, and treating it as one is fatal rather than
+                    # wrong: `KeyError: 'T'` on the first line of the day, no
+                    # partial output, no diagnosis in the traceback.
+                    #
+                    # The collector writes at least one such line by design.
+                    # `binancefuturesum` polls `GET /fapi/v1/premiumIndex` every
+                    # 10s and files each element under its symbol, verbatim and
+                    # bare, exactly as this snapshot is filed:
+                    #
+                    #   {"symbol":"BTCUSDC","markPrice":"...","indexPrice":"...",
+                    #    "lastFundingRate":"...","nextFundingTime":...,"time":...}
+                    #
+                    # It has no `data`, no `code` and no `T` — 121 of them in a
+                    # day per symbol, in every USD-M recording made since
+                    # 2026-07-28. Basis data is not order flow and no backtest
+                    # reads it, so it is skipped here rather than converted; the
+                    # raw recording keeps it.
+                    #
+                    # Identifying a snapshot by `bids`/`asks` rather than by
+                    # excluding known strangers is deliberate: a line the
+                    # converter has never seen must not be read as a book. The
+                    # `T` this branch used to reach for is not even a good
+                    # marker — `premiumIndex` carries no `T`, but plenty of
+                    # other REST answers do.
+                    continue
                 else:
                     # snapshot
                     # event_time = msg['E']

@@ -89,7 +89,17 @@ pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
         .collect())
 }
 
+/// Where a depth snapshot comes from, without the query string.
+const DEPTH_SNAPSHOT_URL: &str = "https://fapi.binance.com/fapi/v1/depth";
+
 pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error> {
+    fetch_depth_snapshot_from(DEPTH_SNAPSHOT_URL, symbol).await
+}
+
+/// The snapshot fetch itself, with the endpoint as a parameter so the error
+/// policy below can be tested against a socket this process owns rather than
+/// against the venue.
+async fn fetch_depth_snapshot_from(url: &str, symbol: &str) -> Result<String, reqwest::Error> {
     // A depth snapshot is fetched to repair a gap in the incremental feed and
     // is worthless once stale; failing fast also frees the throttler slot.
     const DEPTH_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,14 +107,90 @@ pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error
     reqwest::Client::builder()
         .timeout(DEPTH_SNAPSHOT_TIMEOUT)
         .build()?
-        .get(format!(
-            "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=1000"
-        ))
+        .get(format!("{url}?symbol={symbol}&limit=1000"))
         .header("Accept", "application/json")
         .send()
         .await?
+        // The body of a refusal is JSON too, and it is the caller's *repair*:
+        // without this it travels the success path and is written into the
+        // symbol's file as if it were a book. `{"code":-1003,"msg":"Way too
+        // many requests"}` is what a rate limit answers with (the shape is
+        // measured: `{"code":-1121,"msg":"Invalid symbol."}` came back with
+        // HTTP 400 from a deliberately misspelled symbol, 2026-08-27), and an
+        // edge under load answers with HTML. Either way the recording would
+        // hold a line that is neither a frame nor a snapshot, the gap that
+        // prompted the fetch would stay unrepaired, and nothing anywhere would
+        // say so. `fetch_premium_index` beside this has always checked; this
+        // one never did.
+        .error_for_status()?
         .text()
         .await
+}
+
+#[cfg(test)]
+mod depth_snapshot_tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::fetch_depth_snapshot_from;
+
+    /// A one-shot HTTP server on loopback: answers the first request with
+    /// `status` and `body`, then goes away. Enough to pin an error policy, and
+    /// it needs neither a new dependency nor the venue.
+    async fn serve_once(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/fapi/v1/depth")
+    }
+
+    /// A refused snapshot must not come back as a snapshot.
+    ///
+    /// This is the repair path for a break in the incremental depth feed, and
+    /// the caller writes whatever it gets into the symbol's file. A rate limit
+    /// answers 429 with a JSON body, so without a status check the recording
+    /// acquires a line that reads as a book, the book stays broken, and the
+    /// only account of it is nowhere.
+    #[tokio::test]
+    async fn a_rate_limited_snapshot_is_an_error_not_a_body() {
+        let url = serve_once("429 Too Many Requests", r#"{"code":-1003,"msg":"Way too many requests; current limit is 2400 request weight per 1 MINUTE."}"#).await;
+
+        let error = fetch_depth_snapshot_from(&url, "BTCUSDC")
+            .await
+            .expect_err("a 429 body is not a depth snapshot");
+
+        assert!(
+            error.status().map(|s| s.as_u16()) == Some(429),
+            "the refusal must arrive as the venue's own status: {error}"
+        );
+    }
+
+    /// The other half: the guard must not eat the thing it guards. A 200 comes
+    /// back as the venue's bytes, unaltered.
+    #[tokio::test]
+    async fn a_served_snapshot_comes_back_verbatim() {
+        const BOOK: &str =
+            r#"{"lastUpdateId":1,"E":1,"T":1,"bids":[["1.0","2.0"]],"asks":[["1.1","3.0"]]}"#;
+        let url = serve_once("200 OK", BOOK).await;
+
+        let body = fetch_depth_snapshot_from(&url, "BTCUSDC")
+            .await
+            .expect("a served snapshot is not an error");
+
+        assert_eq!(body, BOOK);
+    }
 }
 
 /// Fetches the venue's premium-index snapshot for **every** symbol at once.

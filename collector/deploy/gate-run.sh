@@ -103,6 +103,26 @@ data_dir_of() {
     printf '%s\n' "${dir:-${DATA_ROOT}/${name}}"
 }
 
+# The dataset profile ONE instance is judged against, read the same way and for
+# the same reason: never by sourcing an operator-authored file.
+#
+# Per instance rather than per host because "which streams are load-bearing" is
+# a property of why that recording exists, not of the box it runs on. A signal
+# instance under `mode-a-v1` may lose `@depth@0ms` to a warning; an instance
+# recorded FOR the book — Binance publishes no USD-M bookTicker archive after
+# 2024-04, and none at all for anything listed later — must go red for the same
+# loss, or the one thing it exists for disappears behind a yellow the timer does
+# not escalate. GATE_PROFILE in the environment still sets the default for
+# instances that name none.
+profile_of() {
+    local name="$1" env_file="${ETC_DIR}/$1.env" profile=""
+    if [[ -r "${env_file}" ]]; then
+        profile="$(sed -n 's/^[[:space:]]*GATE_PROFILE=//p' "${env_file}" \
+                   | tail -n1 | tr -d "\"'" | tr -d '[:space:]')"
+    fi
+    printf '%s\n' "${profile:-${PROFILE}}"
+}
+
 INSTANCES=()
 if [[ "${SET}" == "all" ]]; then
     shopt -s nullglob
@@ -128,6 +148,7 @@ red=()
 checked=0
 for name in "${INSTANCES[@]}"; do
     dir="$(data_dir_of "${name}")"
+    profile="$(profile_of "${name}")"
     if [[ ! -d "${dir}" ]]; then
         echo "gate-run[${name}]: ${dir} is not a directory" >&2
         worst=2
@@ -150,7 +171,7 @@ for name in "${INSTANCES[@]}"; do
 
     rc=0
     "${PYTHON}" "${REPORT_SCRIPT}" \
-        --dir "${dir}" --day "${DAY}" --profile "${PROFILE}" \
+        --dir "${dir}" --day "${DAY}" --profile "${profile}" \
         --json "${tmp_json}" > "${tmp_txt}" 2>&1 || rc=$?
 
     mv -f "${tmp_txt}" "${txt}"
@@ -158,7 +179,7 @@ for name in "${INSTANCES[@]}"; do
     checked=$((checked + 1))
 
     case "${rc}" in
-        0) echo "gate-run[${name}]: ok -> ${txt}" ;;
+        0) echo "gate-run[${name}]: ok (profile ${profile}) -> ${txt}" ;;
         1)
             echo "gate-run[${name}]: RED -> ${txt}" >&2
             # The findings themselves, in the journal: an operator reading a
