@@ -147,13 +147,19 @@ fn handle(
                 .ok_or(ConnectorError::FormatError)?;
             // The venue's own continuity rule for USD-M futures: this frame
             // continues the book only if its `pu` is the previous frame's `u`.
-            // (Spot's is `U == prev_u + 1`, and it is NOT interchangeable —
-            // measured 2026-08-27 on a live 28-symbol USDC stream, `U` failed
-            // that test on ~100% of frames, so reading the spot rule here
-            // would refetch the whole book on every single frame.) No previous
-            // `u` at all is the same case: at the start of a process, and
-            // after a reconnect, the book has to be seeded before the diffs
-            // mean anything.
+            //
+            // Spot's rule is `U == prev_u + 1`, and the two are NOT
+            // interchangeable. Measured on this collector's own recording
+            // (2026-08-27 11:46-12:42 UTC, 112 251 depth frames over ZECUSDC,
+            // ENAUSDC and DATAIPUSDC): `pu == prev_u` held on 100.00% of them,
+            // `U == prev_u + 1` on 0.00-0.02%. Reading the spot rule here would
+            // refetch the whole book on essentially every frame — at weight 20
+            // a request, against a 2400/min IP budget shared with every other
+            // instance on the host.
+            //
+            // No previous `u` at all is the same case: at the start of a
+            // process, and after a reconnect, the book has to be seeded before
+            // the diffs mean anything.
             let prev_u = prev_u_map.get(symbol);
             if prev_u.is_none() || pu != *prev_u.unwrap() {
                 warn!(%symbol, "missing depth feed has been detected.");
