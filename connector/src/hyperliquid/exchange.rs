@@ -123,12 +123,41 @@ pub struct CancelByCloidWire {
     pub cloid: String,
 }
 
-/// `{"type":"cancelByCloid","cancels":[…]}`.
+/// Never serialised as `false`: see [`CancelByCloidAction::fast`].
+fn is_not_fast(fast: &bool) -> bool {
+    !*fast
+}
+
+/// `{"type":"cancelByCloid","cancels":[…],"f":true}`.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CancelByCloidAction {
     #[serde(rename = "type")]
     pub action_type: &'static str,
     pub cancels: Vec<CancelByCloidWire>,
+    /// The venue's `f` ("fast") flag.
+    ///
+    /// **Omitted entirely when false, never serialised as `false`.** The venue's own
+    /// documentation is explicit: "`f` must be skipped if false, i.e. actions hashed with
+    /// `f: false` will be rejected." `skip_serializing_if` makes the illegal shape
+    /// unrepresentable rather than leaving it to each call site to remember.
+    ///
+    /// **Why we send it.** Measured on this account: a cancel's venue stamp lands ~290 ms
+    /// after a placement's, twice — the HYPE campaign (n=11407, 2026-08-07..09: place
+    /// req->exch p50 196.6 ms, cancel 496.6) and a fresh ONDO probe (n=48, 2026-08-27:
+    /// 202.0 / 489.3). Two unimodal distributions of equal width offset by a constant, so
+    /// an extra fixed stage, not noise. The docs say `f` currently has no effect beyond
+    /// rejecting trigger orders, *and* that "in a future network upgrade, cancel actions
+    /// will be prioritized in the mempool if and only if `fast = true`" — and a trader
+    /// reported measuring ~400 ms saved by sending it. Whether that upgrade has shipped is
+    /// exactly what the A/B against the baseline above answers.
+    ///
+    /// **Why only here, and not on [`CancelAction`].** `f: true` is rejected outright when
+    /// the cancel refers to a trigger order. `cancelByCloid` can only ever name orders this
+    /// process minted, and this backend mints no trigger orders. The sweep cancels by `oid`
+    /// from the *venue's* open-order list, which may hold anything a human placed — there a
+    /// rejected sweep is far worse than a slow one, so it stays on the plain path.
+    #[serde(rename = "f", skip_serializing_if = "is_not_fast")]
+    pub fast: bool,
 }
 
 impl CancelByCloidAction {
@@ -136,6 +165,7 @@ impl CancelByCloidAction {
         Self {
             action_type: "cancelByCloid",
             cancels,
+            fast: true,
         }
     }
 }
@@ -477,10 +507,17 @@ mod tests {
 
         // `cancelByCloid` uses the long field names. Reusing the order action's `a`/`c`
         // here signs perfectly well and recovers to nobody.
-        let cancel = CancelByCloidAction::new(vec![CancelByCloidWire {
+        //
+        // Built in the SLOW form on purpose: these bytes came from the official SDK, which
+        // does not send `f`, so pinning them against the fast form would be pinning our own
+        // output against itself. The fast form has its own tests
+        // (`a_cloid_cancel_asks_for_the_fast_path_and_says_so_on_the_wire` and
+        // `the_fast_flag_changes_the_signed_bytes`); this one stays the independent anchor.
+        let mut cancel = CancelByCloidAction::new(vec![CancelByCloidWire {
             asset: 3,
             cloid: "0xa1b2000000000000000000000000dead".into(),
         }]);
+        cancel.fast = false;
         assert_eq!(
             hex(&rmp_serde::to_vec_named(&cancel).unwrap()),
             cancel_by_cloid
@@ -497,10 +534,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let action = CancelByCloidAction::new(vec![CancelByCloidWire {
+        // Slow form: the signature below was computed against the SDK's field set. See the
+        // note in `msgpack_bytes_match_the_official_sdk`.
+        let mut action = CancelByCloidAction::new(vec![CancelByCloidWire {
             asset: 3,
             cloid: "0xa1b2000000000000000000000000dead".into(),
         }]);
+        action.fast = false;
         let msgpack = rmp_serde::to_vec_named(&action).unwrap();
         let nonce = NonceSource::new().next_from(1_700_000_000_001);
         let signature = signer.sign_action(&msgpack, nonce).unwrap();
@@ -719,6 +759,63 @@ mod tests {
         assert_eq!(body["type"], "cancel");
         assert_eq!(body["cancels"][0]["a"], 3);
         assert_eq!(body["cancels"][0]["o"], 57118842019u64);
+    }
+
+    /// The `f` flag on the wire, in both directions.
+    ///
+    /// Two separate contracts, and the second is the one that bites: the venue rejects an
+    /// action hashed with `f: false`, so "off" must mean *absent*, not present-and-false.
+    /// A plain `bool` field without `skip_serializing_if` would sign perfectly and be
+    /// refused by the venue with a message about the signature, not about the flag.
+    #[test]
+    fn a_cloid_cancel_asks_for_the_fast_path_and_says_so_on_the_wire() {
+        let action = CancelByCloidAction::new(vec![CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1f000000000000000000000000000ff".to_string(),
+        }]);
+        assert!(action.fast, "the constructor must opt into the fast path");
+
+        let body = serde_json::to_value(&action).unwrap();
+        assert_eq!(body["type"], "cancelByCloid");
+        assert_eq!(body["f"], true);
+        assert_eq!(body["cancels"][0]["asset"], 3);
+    }
+
+    #[test]
+    fn a_slow_cloid_cancel_omits_the_flag_rather_than_sending_false() {
+        let mut action = CancelByCloidAction::new(vec![CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1f000000000000000000000000000ff".to_string(),
+        }]);
+        action.fast = false;
+
+        let body = serde_json::to_value(&action).unwrap();
+        assert!(
+            body.get("f").is_none(),
+            "`f: false` must not reach the wire; the venue rejects actions hashed with it"
+        );
+    }
+
+    /// The flag is inside the signature, not beside it.
+    ///
+    /// If it were dropped from the hashed bytes the venue would verify a different action
+    /// than the one it executes — the failure mode this module's opening warning is about.
+    #[test]
+    fn the_fast_flag_changes_the_signed_bytes() {
+        let fast = CancelByCloidAction::new(vec![CancelByCloidWire {
+            asset: 3,
+            cloid: "0xa1f000000000000000000000000000ff".to_string(),
+        }]);
+        let mut slow = fast.clone();
+        slow.fast = false;
+
+        let fast_bytes = rmp_serde::to_vec_named(&fast).unwrap();
+        let slow_bytes = rmp_serde::to_vec_named(&slow).unwrap();
+        assert_ne!(hex(&fast_bytes), hex(&slow_bytes));
+        assert!(
+            fast_bytes.len() > slow_bytes.len(),
+            "the fast form carries one extra map entry"
+        );
     }
 
     /// An `ok` whose per-item shape this backend has never seen is **not** counted as a
