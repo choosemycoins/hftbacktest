@@ -61,6 +61,9 @@ impl UserDataStream {
 
     fn process_message(&self, stream: EventStream) -> Result<(), BinanceFuturesError> {
         match stream {
+            // Public-feed variants never reach the user socket; naming it keeps the match
+            // exhaustive without a catch-all that would swallow a future account event.
+            EventStream::BookTicker(_) => {}
             EventStream::DepthUpdate(_) | EventStream::Trade(_) => unreachable!(),
             EventStream::ListenKeyExpired(_) => {
                 return Err(BinanceFuturesError::ListenKeyExpired);

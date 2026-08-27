@@ -24,6 +24,7 @@ use crate::{
     binancefutures::{
         BinanceFuturesError,
         SharedSymbolSet,
+        StreamConfig,
         msg::{
             rest,
             stream,
@@ -35,18 +36,31 @@ use crate::{
     utils::{SubscriptionTracker, generate_rand_string, parse_depth, parse_px_qty_tup},
 };
 
-/// The subscribe frame for one symbol: its trade and diff-depth streams.
+/// The subscribe frame for one symbol, built from the configured stream set.
 ///
 /// The symbol goes across exactly as given — `Connector::register` lowercases it, and the
 /// venue's stream names are lowercase. Split out from the socket so the wire shape can be
 /// asserted without one.
-pub fn subscription_frame(symbol: &str, id: &str) -> String {
+///
+/// Order is `@trade`, `@depth@0ms`, `@bookTicker` — stable so a frame is diffable across
+/// versions, not because the venue cares.
+pub fn subscription_frame(symbol: &str, id: &str, streams: &StreamConfig) -> String {
+    let mut params: Vec<String> = Vec::with_capacity(3);
+    if streams.trades {
+        params.push(format!("\"{symbol}@trade\""));
+    }
+    if streams.depth {
+        params.push(format!("\"{symbol}@depth@0ms\""));
+    }
+    if streams.book_ticker {
+        params.push(format!("\"{symbol}@bookTicker\""));
+    }
+    let params = params.join(",\n        ");
     format!(
         r#"{{
     "method": "SUBSCRIBE",
     "params": [
-        "{symbol}@trade",
-        "{symbol}@depth@0ms"
+        {params}
     ],
     "id": "{id}"
 }}"#
@@ -62,6 +76,16 @@ pub struct MarketDataStream {
     symbol_rx: Receiver<String>,
     pending_depth_messages: HashMap<String, Vec<stream::Depth>>,
     prev_u: HashMap<String, i64>,
+    streams: StreamConfig,
+    /// Per symbol, the (bid, ask) prices this stream last wrote from a bookTicker frame.
+    ///
+    /// `bookTicker` reports the touch and nothing else, so a level that stops being the
+    /// touch is indistinguishable from one that was cancelled. Publishing the new touch
+    /// without retracting the old one leaves the previous price in the bot's book for ever,
+    /// and a bid that has fallen would still read as the best bid — the book would quote a
+    /// price the venue abandoned. Holding exactly one written price a side, and deleting it
+    /// when it moves, keeps the mirror a true BBO and bounds the state at two entries.
+    bbo_written: HashMap<String, (Option<f64>, Option<f64>)>,
     rest_tx: UnboundedSender<(String, rest::Depth)>,
     rest_rx: UnboundedReceiver<(String, rest::Depth)>,
 }
@@ -72,6 +96,7 @@ impl MarketDataStream {
         ev_tx: UnboundedSender<PublishEvent>,
         symbols: SharedSymbolSet,
         symbol_rx: Receiver<String>,
+        streams: StreamConfig,
     ) -> Self {
         let (rest_tx, rest_rx) = unbounded_channel::<(String, rest::Depth)>();
         Self {
@@ -81,6 +106,8 @@ impl MarketDataStream {
             symbol_rx,
             pending_depth_messages: Default::default(),
             prev_u: Default::default(),
+            streams,
+            bbo_written: Default::default(),
             rest_tx,
             rest_rx,
         }
@@ -112,7 +139,9 @@ impl MarketDataStream {
         for symbol in &pending {
             let id = generate_rand_string(16);
             write
-                .send(Message::Text(subscription_frame(symbol, &id).into()))
+                .send(Message::Text(
+                    subscription_frame(symbol, &id, &self.streams).into(),
+                ))
                 .await?;
         }
         // Marked only once every frame is on the wire: a write that failed drops the
@@ -156,6 +185,30 @@ impl MarketDataStream {
                 debug!(?result, "Subscription request response is received.");
             }
         }
+    }
+
+    /// One depth-event write for the touch mirror.
+    ///
+    /// Deliberately an ordinary `LOCAL_*_DEPTH_EVENT` (kind 1) and **not** a BBO event
+    /// (kind 5): `LiveBot::process_event` applies only kinds 1 and 2 and drops kind 5
+    /// without a word (AGENTS §4.1). A leader published as kind 5 leaves the bot's book
+    /// empty for ever, and the only symptom is a signal quietly computing on nothing.
+    fn publish_bbo_level(&self, symbol: &str, ev: u64, exch_ts: i64, px: f64, qty: f64) {
+        self.ev_tx
+            .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                symbol: symbol.to_string(),
+                event: Event {
+                    ev,
+                    exch_ts,
+                    local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                    order_id: 0,
+                    px,
+                    qty,
+                    ival: 0,
+                    fval: 0.0,
+                },
+            }))
+            .unwrap();
     }
 
     fn process_message(&mut self, stream: EventStream) {
@@ -244,6 +297,57 @@ impl MarketDataStream {
                         error!(?error, "Couldn't parse DepthUpdate stream.");
                     }
                 }
+            }
+            EventStream::BookTicker(data) => {
+                let parsed = data
+                    .bid_price
+                    .parse::<f64>()
+                    .and_then(|bp| data.bid_qty.parse::<f64>().map(|bq| (bp, bq)))
+                    .and_then(|(bp, bq)| data.ask_price.parse::<f64>().map(|ap| (bp, bq, ap)))
+                    .and_then(|(bp, bq, ap)| {
+                        data.ask_qty.parse::<f64>().map(|aq| (bp, bq, ap, aq))
+                    });
+                let (bid_px, bid_qty, ask_px, ask_qty) = match parsed {
+                    Ok(v) => v,
+                    Err(error) => {
+                        error!(?error, "Couldn't parse BookTicker stream.");
+                        return;
+                    }
+                };
+                let exch_ts = data.transaction_time * 1_000_000;
+                let (prev_bid, prev_ask) = self
+                    .bbo_written
+                    .get(&data.symbol)
+                    .copied()
+                    .unwrap_or((None, None));
+
+                self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
+                // Retract before writing: a fallen bid whose old level survives would still
+                // be the highest price in the book, i.e. the bot's best bid.
+                if let Some(px) = prev_bid.filter(|px| *px != bid_px) {
+                    self.publish_bbo_level(&data.symbol, LOCAL_BID_DEPTH_EVENT, exch_ts, px, 0.0);
+                }
+                if let Some(px) = prev_ask.filter(|px| *px != ask_px) {
+                    self.publish_bbo_level(&data.symbol, LOCAL_ASK_DEPTH_EVENT, exch_ts, px, 0.0);
+                }
+                self.publish_bbo_level(
+                    &data.symbol,
+                    LOCAL_BID_DEPTH_EVENT,
+                    exch_ts,
+                    bid_px,
+                    bid_qty,
+                );
+                self.publish_bbo_level(
+                    &data.symbol,
+                    LOCAL_ASK_DEPTH_EVENT,
+                    exch_ts,
+                    ask_px,
+                    ask_qty,
+                );
+                self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+
+                self.bbo_written
+                    .insert(data.symbol, (Some(bid_px), Some(ask_px)));
             }
             EventStream::Trade(data) => match parse_px_qty_tup(data.price, data.qty) {
                 Ok((px, qty)) => {
@@ -457,7 +561,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use hftbacktest::types::{ErrorKind, LiveEvent};
+    use hftbacktest::types::{ErrorKind, LOCAL_ASK_DEPTH_EVENT, LOCAL_BID_DEPTH_EVENT, LiveEvent};
     use tokio::sync::{
         broadcast,
         mpsc::{UnboundedReceiver, unbounded_channel},
@@ -467,7 +571,9 @@ mod tests {
         binancefutures::{
             BinanceFuturesError,
             SharedSymbolSet,
+            StreamConfig,
             market_data_stream::{MarketDataStream, subscription_frame},
+            msg::stream::EventStream,
             rest::BinanceFuturesClient,
         },
         connector::PublishEvent,
@@ -484,6 +590,105 @@ mod tests {
 
     /// A stream whose shared symbol set already holds `registered` and whose broadcast
     /// receiver holds nothing — exactly the state a reconnect finds.
+    /// The subscribe frame is built from the switches, not from a constant.
+    #[test]
+    fn the_subscribe_frame_carries_exactly_the_configured_streams() {
+        let default_frame: serde_json::Value = serde_json::from_str(&subscription_frame(
+            "btcusdt",
+            "id1",
+            &StreamConfig::default(),
+        ))
+        .unwrap();
+        let params = default_frame["params"].as_array().unwrap();
+        assert_eq!(
+            params.len(),
+            2,
+            "the historical pair, unchanged: {params:?}"
+        );
+        assert_eq!(params[0], "btcusdt@trade");
+        assert_eq!(params[1], "btcusdt@depth@0ms");
+
+        // A leader: the touch alone, 25 ms fresher than a depth diff, and no book to keep.
+        let leader = StreamConfig {
+            depth: false,
+            trades: false,
+            book_ticker: true,
+        };
+        let frame: serde_json::Value =
+            serde_json::from_str(&subscription_frame("ethusdt", "id2", &leader)).unwrap();
+        let params = frame["params"].as_array().unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], "ethusdt@bookTicker");
+    }
+
+    /// Two writers on one touch level, and no writer at all, are both refused up front.
+    #[test]
+    fn the_stream_config_refuses_the_shapes_that_corrupt_or_starve_a_book() {
+        assert!(StreamConfig::default().validate().is_ok());
+
+        let both = StreamConfig {
+            depth: true,
+            trades: false,
+            book_ticker: true,
+        };
+        assert!(
+            both.validate().is_err(),
+            "depth + book_ticker write the same level at different cadences"
+        );
+
+        let nothing = StreamConfig {
+            depth: false,
+            trades: false,
+            book_ticker: false,
+        };
+        assert!(
+            nothing.validate().is_err(),
+            "a connector with no feed at all"
+        );
+    }
+
+    /// **The trap this handler exists for.** `bookTicker` reports the touch and nothing
+    /// else, so a level that stops being the touch looks exactly like one that was never
+    /// cancelled. Publish the new bid without retracting the old and a bid that has *fallen*
+    /// still sits in the book as the highest price — the bot would quote against a price the
+    /// venue abandoned, with nothing in any log to say so.
+    #[tokio::test]
+    async fn a_moved_touch_retracts_the_price_it_left_behind() {
+        let (mut stream, _symbols, _symbol_tx, mut ev_rx) = stream(&["btcusdt"]);
+
+        let frame = |bid: &str, ask: &str| {
+            serde_json::from_str::<EventStream>(&format!(
+                r#"{{"e":"bookTicker","u":1,"E":1700000000000,"T":1700000000000,
+                     "s":"BTCUSDT","b":"{bid}","B":"3.0","a":"{ask}","A":"4.0"}}"#
+            ))
+            .unwrap()
+        };
+
+        stream.process_message(frame("100.0", "101.0"));
+        stream.process_message(frame("99.0", "101.0"));
+
+        let mut writes: Vec<(u64, f64, f64)> = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Feed { event, .. }) = ev {
+                writes.push((event.ev, event.px, event.qty));
+            }
+        }
+
+        assert!(
+            writes.contains(&(LOCAL_BID_DEPTH_EVENT, 100.0, 0.0)),
+            "the abandoned bid at 100 must be retracted: {writes:?}"
+        );
+        assert!(
+            writes.contains(&(LOCAL_BID_DEPTH_EVENT, 99.0, 3.0)),
+            "the new bid must be written: {writes:?}"
+        );
+        // The ask never moved, so nothing about it is retracted.
+        assert!(
+            !writes.contains(&(LOCAL_ASK_DEPTH_EVENT, 101.0, 0.0)),
+            "a standing ask must not be retracted: {writes:?}"
+        );
+    }
+
     fn stream(registered: &[&str]) -> Fixture {
         stream_with_capacity(registered, 16)
     }
@@ -503,6 +708,7 @@ mod tests {
                 ev_tx,
                 symbols.clone(),
                 symbol_rx,
+                StreamConfig::default(),
             ),
             symbols,
             symbol_tx,
@@ -695,8 +901,12 @@ mod tests {
     /// stream the venue has.
     #[test]
     fn the_frame_carries_the_symbol_verbatim() {
-        let frame: serde_json::Value =
-            serde_json::from_str(&subscription_frame("btcusdt", "abc123")).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&subscription_frame(
+            "btcusdt",
+            "abc123",
+            &StreamConfig::default(),
+        ))
+        .unwrap();
 
         assert_eq!(frame["id"], "abc123");
         assert_eq!(frame["params"][0], "btcusdt@trade");

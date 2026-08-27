@@ -45,6 +45,33 @@ pub enum EventStream {
     AccountUpdate(AccountUpdate),
     #[serde(rename = "listenKeyExpired")]
     ListenKeyExpired(ListenKeyStream),
+    #[serde(rename = "bookTicker")]
+    BookTicker(BookTicker),
+}
+
+/// `<symbol>@bookTicker` — the touch and nothing else.
+///
+/// Why a connector would want it instead of `@depth@0ms`: measured on our own recording
+/// 2026-08-26, a depth diff reaches us **26.6 ms** after the match it reports, a bookTicker
+/// frame **1.6 ms**. Binance batches diffs before publishing; the touch it pushes at once.
+/// For a leader feed — where the only thing read is the mid — those 25 ms are free.
+#[derive(Deserialize, Debug)]
+pub struct BookTicker {
+    #[serde(rename = "T")]
+    pub transaction_time: i64,
+    #[serde(rename = "E")]
+    pub event_time: i64,
+    #[serde(rename = "s")]
+    #[serde(deserialize_with = "to_lowercase")]
+    pub symbol: String,
+    #[serde(rename = "b")]
+    pub bid_price: String,
+    #[serde(rename = "B")]
+    pub bid_qty: String,
+    #[serde(rename = "a")]
+    pub ask_price: String,
+    #[serde(rename = "A")]
+    pub ask_qty: String,
 }
 
 #[derive(Deserialize, Debug)]

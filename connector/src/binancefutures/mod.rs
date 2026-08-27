@@ -55,6 +55,11 @@ pub enum BinanceFuturesError {
     Tunstenite(#[from] tungstenite::Error),
     #[error("Config: {0:?}")]
     Config(#[from] toml::de::Error),
+    /// A config that parses but asks for something incoherent. Refused at build time: the
+    /// alternative is a connector that starts, subscribes to a set that cannot work, and
+    /// looks healthy while the bot waits for a feed.
+    #[error("InvalidConfig: {0}")]
+    InvalidConfig(String),
 }
 
 impl From<BinanceFuturesError> for Value {
@@ -62,6 +67,7 @@ impl From<BinanceFuturesError> for Value {
         match value {
             BinanceFuturesError::InstrumentNotFound => Value::String(value.to_string()),
             BinanceFuturesError::InvalidRequest => Value::String(value.to_string()),
+            BinanceFuturesError::InvalidConfig(_) => Value::String(value.to_string()),
             BinanceFuturesError::ReqError(error) => {
                 let mut map = HashMap::new();
                 if let Some(code) = error.status() {
@@ -97,6 +103,75 @@ pub struct Config {
     api_key: String,
     #[serde(default)]
     secret: String,
+    /// Which public streams to subscribe. Defaults reproduce the historical set exactly
+    /// (`@trade` + `@depth@0ms`), so an existing config keeps its behaviour byte for byte.
+    #[serde(default)]
+    streams: StreamConfig,
+}
+
+/// The public streams this connector may open, one switch each.
+///
+/// A **leader** connector — one whose only job is to carry another venue's price to the bot
+/// — wants `book_ticker` alone: the touch, 25 ms fresher than a depth diff (see
+/// [`msg::stream::BookTicker`]), and no book to maintain. A **trading** connector wants the
+/// historical pair.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StreamConfig {
+    /// `<symbol>@depth@0ms` — the incremental book, every level.
+    #[serde(default = "yes")]
+    pub depth: bool,
+    /// `<symbol>@trade`.
+    #[serde(default = "yes")]
+    pub trades: bool,
+    /// `<symbol>@bookTicker` — touch only, published as ordinary depth events.
+    #[serde(default)]
+    pub book_ticker: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            depth: true,
+            trades: true,
+            book_ticker: false,
+        }
+    }
+}
+
+impl StreamConfig {
+    /// Refuses the combinations that would corrupt a book silently.
+    ///
+    /// `depth` and `book_ticker` together put **two writers with different cadences on the
+    /// same touch level**: a bookTicker frame that overtakes a newer depth diff rewrites the
+    /// touch with a stale size, and nothing in the pipeline can tell that happened. The two
+    /// are alternatives, not a pair — a leader takes the touch, a trading connector takes
+    /// the book.
+    ///
+    /// Everything off is refused for the obvious reason: the socket would connect, subscribe
+    /// to nothing, and the bot would wait for a feed that is never coming — the exact
+    /// failure §4.2 exists to prevent.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.depth && self.book_ticker {
+            return Err(
+                "streams.depth and streams.book_ticker are alternatives, not a pair: both \
+                 write the touch level, at different cadences, and the loser is silent. \
+                 Pick depth for a trading connector, book_ticker for a leader."
+                    .to_string(),
+            );
+        }
+        if !self.depth && !self.trades && !self.book_ticker {
+            return Err(
+                "every public stream is disabled; this connector would subscribe to \
+                        nothing and the bot would wait for a feed that never arrives"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
@@ -115,6 +190,7 @@ impl BinanceFutures {
         let base_url = self.config.stream_url.clone();
         let client = self.client.clone();
         let symbol_tx = self.symbol_tx.clone();
+        let streams = self.config.streams.clone();
         // The registered symbols, so every reconnect re-derives its subscriptions from them
         // rather than from a fresh broadcast receiver that has seen nothing. `AGENTS.md` §4.2.
         let symbols = self.symbols.clone();
@@ -140,6 +216,7 @@ impl BinanceFutures {
                         ev_tx.clone(),
                         symbols.clone(),
                         symbol_tx.subscribe(),
+                        streams.clone(),
                     );
                     debug!("Connecting to the market data stream...");
                     stream.connect(&base_url).await?;
@@ -199,6 +276,10 @@ impl ConnectorBuilder for BinanceFutures {
 
     fn build_from(config: &str) -> Result<Self, Self::Error> {
         let config: Config = toml::from_str(config)?;
+        config
+            .streams
+            .validate()
+            .map_err(BinanceFuturesError::InvalidConfig)?;
 
         let order_manager = Arc::new(Mutex::new(OrderManager::new(&config.order_prefix)));
         let client = BinanceFuturesClient::new(&config.api_url, &config.api_key, &config.secret);
