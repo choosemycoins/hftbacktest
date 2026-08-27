@@ -1,0 +1,38 @@
+[Unit]
+# Watches what Binance charges US as a maker, hourly, and keeps the answers.
+#
+# ⚠ THIS UNIT RUNS ON THE OPERATOR'S MACHINE, NOT ON THE COLLECTION HOST.
+# It needs a signed API key, and the recording host deliberately holds no venue
+# credentials at all — every poller there hits public endpoints only. Putting
+# this on it would introduce the first secret onto a box whose whole job is to
+# be boring.
+#
+# Why it exists: the Binance USD-M USDC perpetuals have charged a maker
+# commission of exactly 0 since 2024-04-03, "until further notice", and since
+# 2026-02 Binance edits the fee page IN PLACE — no announcement feed, no
+# changelog, no date. Watching announcements is not a weaker signal, it is no
+# signal. The rate is also per account, so nothing public would show a change
+# that applied to us. This signed endpoint is the only instrument there is.
+#
+# Credentials: ~/.config/eventshort/binanceusdm.toml (mode 600, never in git),
+# read by the script and never logged. Reading permission is enough.
+Description=Binance maker-commission watch (USDC promo is either alive or it is not)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The Telegram credentials the alert uses. Absent, the poll still writes its
+# series and still exits non-zero on a change — the two paths are independent
+# on purpose.
+EnvironmentFile=-%h/.config/hftbacktest-connector/telegram-alert.env
+# BTCUSDC is the promotion, ZECUSDC and PNUTUSDC are the thin/wide symbols the
+# collection is actually about, and BTCUSDT:2 is the CONTROL: it separates "the
+# promotion ended" from "our whole fee tier moved", and a poll that silently
+# started answering nonsense would show up there first.
+ExecStart=/usr/bin/env python3 %h/RustroverProjects/hftbacktest/collector/tools/commission_watch.py \
+    --symbols BTCUSDC ZECUSDC PNUTUSDC BTCUSDT:2 \
+    --out /home/storage/hft-data/commission
+# A change is a finding, not a crash: exit 1 must reach the journal and any
+# OnFailure= hook, and it must not be retried into a rate limit.
+SuccessExitStatus=0

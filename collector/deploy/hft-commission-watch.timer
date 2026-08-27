@@ -1,0 +1,17 @@
+[Unit]
+Description=Hourly Binance maker-commission watch
+# See the service for why this lives on the operator's machine.
+
+[Timer]
+# Hourly, on the hour, with a spread so it does not land on every other timer's
+# minute. Four signed requests at weight 20 is 80/hour — nothing against the
+# 2400/min IP budget, and an hour is far finer than the thing being watched:
+# a fee change is a permanent state, and learning of it within the hour is the
+# difference between "we knew" and "we found out from a backtest".
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -23,6 +23,7 @@
 #   etc/hft-collector-gate@.timer
 #   etc/hft-collector-alert@.service
 #   etc/instance.env.example
+#   etc/binancefuturesum-usdc.env.example
 #   etc/alert.env.example
 #   tools/quality_report.py         the gate's only dependency; stdlib-only
 #   README.md
@@ -147,6 +148,12 @@ install -m 644 "${DEPLOY_DIR}/hft-positions-poller.timer"        "${BUILD_DIR}/e
 install -m 644 "${DEPLOY_DIR}/operators_addrs.json.example"      "${BUILD_DIR}/etc/operators_addrs.json.example"
 install -m 644 "${DEPLOY_DIR}/binancefuturesum-day0.env.example" \
                "${BUILD_DIR}/etc/binancefuturesum-day0.env.example"
+# The USDC book instance. Travels for the same reason the day-0 one does: the
+# file is not configuration, it is the ARGUMENT for a symbol list — which rule
+# selected those symbols, on what instrument, and which one exception is named.
+# Kept beside the data it explains, on the host that records it.
+install -m 644 "${DEPLOY_DIR}/binancefuturesum-usdc.env.example" \
+               "${BUILD_DIR}/etc/binancefuturesum-usdc.env.example"
 
 install -m 755 "${DEPLOY_DIR}/rollback.sh"                "${BUILD_DIR}/bin/rollback.sh"
 
