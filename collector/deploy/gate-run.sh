@@ -198,7 +198,17 @@ if [[ -f "${POLLER_SCRIPT}" ]]; then
         pdir="${DATA_ROOT}/${pname}"
         [[ -d "${pdir}" ]] || continue
         pout="${pdir}/gate"
-        mkdir -p "${pout}" 2>/dev/null || { worst=2; continue; }
+        # Отказ mkdir здесь раньше уходил в /dev/null: сервис выходил с кодом 2,
+        # не напечатав ни слова, и тревога становилась неотличимой от настоящего
+        # RED. Инстансы двадцатью строками выше диагностируют этот же случай —
+        # поллеры должны делать то же самое.
+        if ! mkdir -p "${pout}" 2>/dev/null; then
+            echo "gate-run[${pname}]: cannot create ${pout}" >&2
+            echo "  Under ProtectSystem=strict the unit may write only to ReadWritePaths;" >&2
+            echo "  и каталог должен принадлежать пользователю юнита (ls -ld ${pdir})." >&2
+            worst=2
+            continue
+        fi
         ptxt="${pout}/${DAY}.txt"; pjson="${pout}/${DAY}.json"
         prc=0
         "${PYTHON}" "${POLLER_SCRIPT}" "${pdir}" --cadence-s "${cadence}" \
