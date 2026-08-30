@@ -57,6 +57,25 @@ ETC_DIR="${COLLECTOR_ETC_DIR:-/opt/hft-collector/etc}"
 DATA_ROOT="${COLLECTOR_DATA_ROOT:-/opt/hft-collector/data}"
 REPORT_SCRIPT="${COLLECTOR_HOME}/tools/quality_report.py"
 PYTHON="${GATE_PYTHON:-python3}"
+# Находки в журнал. КРАСНЫЕ ПЕЧАТАЮТСЯ ВСЕ И ВСЕГДА; режется только хвост
+# жёлтых, и то с явной пометкой, сколько отброшено.
+#
+# Было: grep красных И жёлтых одним выражением, потом head -20. Двадцати жёлтых
+# достаточно, чтобы красная находка не попала в вывод вовсе — так и случилось:
+# единственный missing_required по VINE утонул под жёлтыми, оператор увидел
+# «RED» без причины и пошёл искать её вручную. Гейт, который не называет
+# причину своего отказа, стоит ровно столько же, сколько отсутствующий гейт.
+emit_findings() {
+    local txt="$1" name="$2" yellows dropped
+    grep -E '^\s*\[red' "${txt}" | sed "s/^/gate-run[${name}]:   /" >&2 || true
+    yellows="$(grep -cE '^\s*\[yellow' "${txt}" 2>/dev/null || echo 0)"
+    grep -E '^\s*\[yellow' "${txt}" | head -20 | sed "s/^/gate-run[${name}]:   /" >&2 || true
+    dropped=$(( yellows > 20 ? yellows - 20 : 0 ))
+    if (( dropped > 0 )); then
+        echo "gate-run[${name}]:   ... и ещё ${dropped} жёлтых, полный отчёт: ${txt}" >&2
+    fi
+}
+
 PROFILE="${GATE_PROFILE:-mode-a-v1}"
 SET="${1:-${COLLECTOR_GATE_SET:-all}}"
 
@@ -185,7 +204,7 @@ for name in "${INSTANCES[@]}"; do
             # The findings themselves, in the journal: an operator reading a
             # failure notification should not have to ssh in to learn what it
             # was. The full report stays on disk beside the data.
-            grep -E '^\s*\[(red|yellow)' "${txt}" | head -20 | sed "s/^/gate-run[${name}]:   /" >&2 || true
+            emit_findings "${txt}" "${name}"
             red+=("${name}")
             [[ "${worst}" -lt 1 ]] && worst=1
             ;;
@@ -241,8 +260,7 @@ if [[ -f "${POLLER_SCRIPT}" ]]; then
             0) echo "gate-run[${pname}]: ok -> ${ptxt}" ;;
             1)
                 echo "gate-run[${pname}]: RED -> ${ptxt}" >&2
-                grep -E '^\s*\[(red|yellow)' "${ptxt}" | head -20 \
-                    | sed "s/^/gate-run[${pname}]:   /" >&2 || true
+                emit_findings "${ptxt}" "${pname}"
                 red+=("${pname}")
                 [[ "${worst}" -lt 1 ]] && worst=1
                 ;;
