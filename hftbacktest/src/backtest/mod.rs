@@ -142,6 +142,7 @@ pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     last_trades_cap: usize,
     queue_model: Option<QM>,
     depth_builder: Option<Box<dyn Fn() -> MD>>,
+    initial_position: f64,
 }
 
 impl<LM, AT, QM, MD, FM> L2AssetBuilder<LM, AT, QM, MD, FM>
@@ -165,6 +166,7 @@ where
             last_trades_cap: 0,
             queue_model: None,
             depth_builder: None,
+            initial_position: 0.0,
         }
     }
 
@@ -231,6 +233,20 @@ where
         }
     }
 
+    /// Sets the initial position of the local (strategy-facing) state, the one read through
+    /// [`Bot::position`] and [`Bot::state_values`]. Use it to replay a period that a live
+    /// account entered while already carrying inventory.
+    ///
+    /// This seeds only the position: the balance and the other state values start at zero as
+    /// before, and the exchange processor's own state is untouched. The default value is
+    /// `0.0`, which leaves the behavior exactly as it was without this setter.
+    pub fn initial_position(self, initial_position: f64) -> Self {
+        Self {
+            initial_position,
+            ..self
+        }
+    }
+
     /// Sets a queue model.
     pub fn queue_model(self, queue_model: QM) -> Self {
         Self {
@@ -286,12 +302,11 @@ where
 
         let (order_e2l, order_l2e) = order_bus(order_latency);
 
-        let local = Local::new(
-            create_depth(),
-            State::new(asset_type, fee_model),
-            self.last_trades_cap,
-            order_l2e,
-        );
+        // Seeds only the local (strategy-facing) state: the exchange processor below keeps its
+        // own `State`, which starts flat as before.
+        let mut local_state = State::new(asset_type, fee_model);
+        local_state.state_values.position = self.initial_position;
+        let local = Local::new(create_depth(), local_state, self.last_trades_cap, order_l2e);
 
         let queue_model = self
             .queue_model
@@ -1401,6 +1416,88 @@ mod test {
         let bt = backtest(ExchangeKind::NoPartialFillExchange, &feed(&[]))?;
         assert!(bt.snapshot_ready(0));
         assert!(bt.position_observed(0));
+        Ok(())
+    }
+
+    /// Same as [`backtest`], but seeds the initial position of the local state.
+    fn backtest_with_initial_position(
+        exch_kind: ExchangeKind,
+        events: &[Event],
+        initial_position: f64,
+    ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
+        Ok(Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(Data::from_data(events))])
+                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(exch_kind)
+                    .initial_position(initial_position)
+                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT_SIZE))
+                    .build()?,
+            )
+            .build()?)
+    }
+
+    /// A live account enters a period already carrying inventory; a replay must be able to
+    /// start from that state, and the strategy must see it before the first `elapse`.
+    #[test]
+    fn the_initial_position_seed_is_visible_before_the_first_elapse() -> Result<(), Box<dyn Error>>
+    {
+        let bt =
+            backtest_with_initial_position(ExchangeKind::NoPartialFillExchange, &feed(&[]), -0.07)?;
+        assert_eq!(bt.state_values(0).position, -0.07);
+        assert_eq!(bt.position(0), -0.07);
+        // The seed is a position, not a trade: nothing else is pre-filled.
+        let values = bt.state_values(0);
+        assert_eq!(values.balance, 0.0);
+        assert_eq!(values.fee, 0.0);
+        assert_eq!(values.num_trades, 0);
+        assert_eq!(values.trading_volume, 0.0);
+        assert_eq!(values.trading_value, 0.0);
+        Ok(())
+    }
+
+    /// Backward compatibility: without the setter the backtest starts flat, exactly as before.
+    #[test]
+    fn without_the_knob_the_backtest_starts_flat() -> Result<(), Box<dyn Error>> {
+        let bt = backtest(ExchangeKind::NoPartialFillExchange, &feed(&[]))?;
+        assert_eq!(bt.state_values(0).position, 0.0);
+        assert_eq!(bt.position(0), 0.0);
+        Ok(())
+    }
+
+    /// The seed is an accounting offset on the local (strategy-facing) state only. The exchange
+    /// processor keeps its own `StateValues`, which matching never reads and which stays
+    /// unseeded, so the fill stream must be identical to an unseeded run and every local state
+    /// value except the position must match it exactly.
+    #[test]
+    fn the_seed_offsets_the_position_without_touching_the_fill_accounting()
+    -> Result<(), Box<dyn Error>> {
+        let feed = feed(&[(SEC, 8.0)]);
+        let mut flat = backtest(ExchangeKind::PartialFillExchange, &feed)?;
+        let mut seeded =
+            backtest_with_initial_position(ExchangeKind::PartialFillExchange, &feed, -0.07)?;
+        for bt in [&mut flat, &mut seeded] {
+            submit_resting_sell(bt)?;
+            bt.elapse(SEC)?;
+        }
+        // Both runs executed the same single partial fill of 3 behind the queue of 5.
+        assert_sold(&flat, 3.0, 1);
+        let f = flat.state_values(0);
+        let s = seeded.state_values(0);
+        assert_eq!(
+            s.position,
+            f.position - 0.07,
+            "fills accumulate on top of the seed"
+        );
+        assert_eq!(s.num_trades, f.num_trades);
+        assert_eq!(s.balance, f.balance);
+        assert_eq!(s.fee, f.fee);
+        assert_eq!(s.trading_volume, f.trading_volume);
+        assert_eq!(s.trading_value, f.trading_value);
         Ok(())
     }
 
