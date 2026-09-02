@@ -152,16 +152,22 @@ where
                     // q_ahead is negative since is_filled is true and its value represents the
                     // executable quantity of this order after execution in the queue ahead of this
                     // order.
-                    // An execution that takes the whole remaining quantity completes the order,
-                    // including when it takes exactly that quantity: the order must be retired
-                    // here, or it rests on already filled and the next trade at its price
-                    // reaches it.
-                    let exec_qty = if filled_qty >= order.leaves_qty {
-                        self.filled_orders.push(order.order_id);
-                        order.leaves_qty
-                    } else {
-                        filled_qty
-                    };
+                    // The order completes exactly when the quantity left after this execution
+                    // no longer amounts to a positive number of lots — the same lot rule by
+                    // which `fill` assigns `Status::Filled`. Comparing `filled_qty` to
+                    // `leaves_qty` directly is a different rule: with a fractional lot size the
+                    // two can disagree by one ULP, leaving a `Status::Filled` order resting in
+                    // the book, and the next trade at its price aborts the entire backtest with
+                    // `InvalidOrderStatus`. A completed order must be retired here, or it rests
+                    // on already filled.
+                    let exec_qty =
+                        if ((order.leaves_qty - filled_qty) / self.depth.lot_size()).round() > 0f64
+                        {
+                            filled_qty
+                        } else {
+                            self.filled_orders.push(order.order_id);
+                            order.leaves_qty
+                        };
                     return self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty);
                 }
             }
@@ -196,16 +202,22 @@ where
                     // q_ahead is negative since is_filled is true and its value represents the
                     // executable quantity of this order after execution in the queue ahead of this
                     // order.
-                    // An execution that takes the whole remaining quantity completes the order,
-                    // including when it takes exactly that quantity: the order must be retired
-                    // here, or it rests on already filled and the next trade at its price
-                    // reaches it.
-                    let exec_qty = if filled_qty >= order.leaves_qty {
-                        self.filled_orders.push(order.order_id);
-                        order.leaves_qty
-                    } else {
-                        filled_qty
-                    };
+                    // The order completes exactly when the quantity left after this execution
+                    // no longer amounts to a positive number of lots — the same lot rule by
+                    // which `fill` assigns `Status::Filled`. Comparing `filled_qty` to
+                    // `leaves_qty` directly is a different rule: with a fractional lot size the
+                    // two can disagree by one ULP, leaving a `Status::Filled` order resting in
+                    // the book, and the next trade at its price aborts the entire backtest with
+                    // `InvalidOrderStatus`. A completed order must be retired here, or it rests
+                    // on already filled.
+                    let exec_qty =
+                        if ((order.leaves_qty - filled_qty) / self.depth.lot_size()).round() > 0f64
+                        {
+                            filled_qty
+                        } else {
+                            self.filled_orders.push(order.order_id);
+                            order.leaves_qty
+                        };
                     return self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty);
                 }
             }

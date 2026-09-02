@@ -1607,6 +1607,75 @@ mod test {
         Ok(())
     }
 
+    /// The exhaustion check in `check_if_buy_filled`/`check_if_sell_filled` and the status rule
+    /// in `fill` must be one rule. The check used to compare `filled_qty >= leaves_qty` as exact
+    /// f64s, while `fill` retires an order once its remainder no longer rounds to a positive
+    /// number of lots. With a fractional lot size the two rules can disagree by one ULP: the
+    /// execution is deemed partial, yet `fill` marks the order [`Status::Filled`], so it never
+    /// reaches `filled_orders` and rests on in the book. The next trade at its price then reaches
+    /// it and aborts the entire backtest with
+    /// [`BacktestError`](crate::backtest::BacktestError::InvalidOrderStatus).
+    ///
+    /// Here 0.45 at a lot size of 0.01 fills as 15 lots, then 30 lots: in f64, `15.0 * 0.01` is
+    /// one ULP above 0.15, so after the first execution `leaves_qty` is one ULP above
+    /// `30.0 * 0.01`, and the second execution leaves 5.55e-17 resting.
+    #[test]
+    fn a_partial_execution_whose_remainder_is_less_than_one_lot_completes_the_order()
+    -> Result<(), Box<dyn Error>> {
+        const LOT: f64 = 0.01;
+        const QTY: f64 = 0.45;
+        let feed = feed(&[
+            (SEC, QUEUE_AHEAD_QTY + 0.15),
+            (2 * SEC, 0.30),
+            (3 * SEC, 0.10),
+        ]);
+        let mut bt = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(Data::from_data(&feed))])
+                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
+                    .queue_model(RiskAdverseQueueModel::new())
+                    .exchange(ExchangeKind::PartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT))
+                    .build()?,
+            )
+            .build()?;
+        bt.elapse(0)?;
+        bt.submit_sell_order(
+            0,
+            ORDER_ID,
+            ASK_PRICE,
+            QTY,
+            TimeInForce::GTX,
+            OrdType::Limit,
+            true,
+        )?;
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::PartiallyFilled);
+        // The scenario only exercises the gap if the remainder sits strictly above 30 lots.
+        assert!(order.leaves_qty > 30.0 * LOT);
+
+        // The second trade executes the remainder up to one ULP; what is left no longer amounts
+        // to a lot, so the order is complete.
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+
+        // The completed order is gone from the exchange, so the next trade at its price passes
+        // it by instead of reaching a [`Status::Filled`] order left resting in the book.
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.leaves_qty, 0.0);
+        assert!((bt.state_values(0).position + QTY).abs() < 1e-9);
+
+        Ok(())
+    }
+
     /// Amending the price makes the exchange re-rest the order, and it must re-rest the
     /// amended quantity. `Local::modify` sets the order's `qty`, but the quantity that
     /// actually trades is its `leaves_qty`.
