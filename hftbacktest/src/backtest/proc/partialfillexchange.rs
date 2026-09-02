@@ -125,6 +125,18 @@ where
         }
     }
 
+    /// The lot rule: does `qty` still amount to a positive number of lots?
+    ///
+    /// This is the one rule by which `fill` assigns [`Status::Filled`] and by which
+    /// `check_if_buy_filled`/`check_if_sell_filled` decide that an execution completes the
+    /// order. It exists exactly once on purpose: the two checks and `fill` used to carry
+    /// diverging copies of the exhaustion rule, which left completed orders resting in the
+    /// book (see the checks below). The FOK feasibility comparisons deliberately do not use
+    /// it: comparing the rounded lot counts of two quantities is a different rule.
+    fn amounts_to_a_lot(&self, qty: f64) -> bool {
+        (qty / self.depth.lot_size()).round() > 0f64
+    }
+
     fn check_if_sell_filled(
         &mut self,
         order: &mut Order,
@@ -154,20 +166,21 @@ where
                     // order.
                     // The order completes exactly when the quantity left after this execution
                     // no longer amounts to a positive number of lots — the same lot rule by
-                    // which `fill` assigns `Status::Filled`. Comparing `filled_qty` to
-                    // `leaves_qty` directly is a different rule: with a fractional lot size the
-                    // two can disagree by one ULP, leaving a `Status::Filled` order resting in
-                    // the book, and the next trade at its price aborts the entire backtest with
-                    // `InvalidOrderStatus`. A completed order must be retired here, or it rests
-                    // on already filled.
-                    let exec_qty =
-                        if ((order.leaves_qty - filled_qty) / self.depth.lot_size()).round() > 0f64
-                        {
-                            filled_qty
-                        } else {
-                            self.filled_orders.push(order.order_id);
-                            order.leaves_qty
-                        };
+                    // which `fill` assigns `Status::Filled`, shared via `amounts_to_a_lot`.
+                    // Comparing `filled_qty` to `leaves_qty` directly is a different rule: any
+                    // remainder below half a lot (one ULP is merely its smallest case) counts
+                    // as partial here while `fill` marks the order `Status::Filled`, leaving it
+                    // resting in the book, and the next trade at its price aborts the entire
+                    // backtest with `InvalidOrderStatus`. A completed order must be retired
+                    // here, or it rests on already filled. The completing execution takes the
+                    // whole `leaves_qty` — up to half a lot beyond what the tape offered — and
+                    // position and fee are computed on it.
+                    let exec_qty = if self.amounts_to_a_lot(order.leaves_qty - filled_qty) {
+                        filled_qty
+                    } else {
+                        self.filled_orders.push(order.order_id);
+                        order.leaves_qty
+                    };
                     return self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty);
                 }
             }
@@ -204,20 +217,21 @@ where
                     // order.
                     // The order completes exactly when the quantity left after this execution
                     // no longer amounts to a positive number of lots — the same lot rule by
-                    // which `fill` assigns `Status::Filled`. Comparing `filled_qty` to
-                    // `leaves_qty` directly is a different rule: with a fractional lot size the
-                    // two can disagree by one ULP, leaving a `Status::Filled` order resting in
-                    // the book, and the next trade at its price aborts the entire backtest with
-                    // `InvalidOrderStatus`. A completed order must be retired here, or it rests
-                    // on already filled.
-                    let exec_qty =
-                        if ((order.leaves_qty - filled_qty) / self.depth.lot_size()).round() > 0f64
-                        {
-                            filled_qty
-                        } else {
-                            self.filled_orders.push(order.order_id);
-                            order.leaves_qty
-                        };
+                    // which `fill` assigns `Status::Filled`, shared via `amounts_to_a_lot`.
+                    // Comparing `filled_qty` to `leaves_qty` directly is a different rule: any
+                    // remainder below half a lot (one ULP is merely its smallest case) counts
+                    // as partial here while `fill` marks the order `Status::Filled`, leaving it
+                    // resting in the book, and the next trade at its price aborts the entire
+                    // backtest with `InvalidOrderStatus`. A completed order must be retired
+                    // here, or it rests on already filled. The completing execution takes the
+                    // whole `leaves_qty` — up to half a lot beyond what the tape offered — and
+                    // position and fee are computed on it.
+                    let exec_qty = if self.amounts_to_a_lot(order.leaves_qty - filled_qty) {
+                        filled_qty
+                    } else {
+                        self.filled_orders.push(order.order_id);
+                        order.leaves_qty
+                    };
                     return self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty);
                 }
             }
@@ -249,7 +263,7 @@ where
 
         order.exec_qty = exec_qty;
         order.leaves_qty -= exec_qty;
-        if (order.leaves_qty / self.depth.lot_size()).round() > 0f64 {
+        if self.amounts_to_a_lot(order.leaves_qty) {
             order.status = Status::PartiallyFilled;
         } else {
             order.status = Status::Filled;

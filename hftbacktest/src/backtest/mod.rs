@@ -1184,11 +1184,13 @@ mod test {
             EXCH_BID_DEPTH_EVENT,
             EXCH_BUY_TRADE_EVENT,
             EXCH_EVENT,
+            EXCH_SELL_TRADE_EVENT,
             LOCAL_ASK_DEPTH_EVENT,
             LOCAL_BID_ADD_ORDER_EVENT,
             LOCAL_BID_DEPTH_EVENT,
             LOCAL_BUY_TRADE_EVENT,
             LOCAL_EVENT,
+            LOCAL_SELL_TRADE_EVENT,
             OrdType,
             OrderId,
             Status,
@@ -1289,6 +1291,10 @@ mod test {
     const SEC: i64 = 1_000_000_000;
     const MAKER_FEE: f64 = 0.0002;
 
+    /// A fractional lot size for the exhaustion-rule pins: with the group's default integer
+    /// [`LOT_SIZE`] a remainder below half a lot can never arise.
+    const FRACTIONAL_LOT: f64 = 0.01;
+
     fn feed_event(ev: u64, ts: i64, px: f64, qty: f64) -> Event {
         Event {
             ev,
@@ -1329,12 +1335,42 @@ mod test {
         events
     }
 
+    /// The initial book followed by sell trades at [`BID_PRICE`], given as `(timestamp,
+    /// quantity)`. The mirror of [`feed`]: the queue ahead rests on the bid side, so a resting
+    /// buy order exercises `check_if_buy_filled` — [`feed`] only ever reaches its sell twin.
+    fn feed_sell(trades: &[(i64, f64)]) -> Vec<Event> {
+        let mut events = vec![
+            feed_event(
+                LOCAL_BID_DEPTH_EVENT | EXCH_BID_DEPTH_EVENT,
+                0,
+                BID_PRICE,
+                QUEUE_AHEAD_QTY,
+            ),
+            feed_event(
+                LOCAL_ASK_DEPTH_EVENT | EXCH_ASK_DEPTH_EVENT,
+                0,
+                ASK_PRICE,
+                10.0,
+            ),
+        ];
+        events.extend(trades.iter().map(|&(ts, qty)| {
+            feed_event(
+                LOCAL_SELL_TRADE_EVENT | EXCH_SELL_TRADE_EVENT,
+                ts,
+                BID_PRICE,
+                qty,
+            )
+        }));
+        events
+    }
+
     /// A single asset using [`RiskAdverseQueueModel`], whose queue position advances only by trades
     /// at the order's own price. That makes each trade's executable quantity exactly
     /// `traded qty - queue ahead`, so partial executions are deterministic.
-    fn backtest(
+    fn backtest_with_lot(
         exch_kind: ExchangeKind,
         events: &[Event],
+        lot_size: f64,
     ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
         Ok(Backtest::builder()
             .add_asset(
@@ -1345,10 +1381,17 @@ mod test {
                     .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
                     .queue_model(RiskAdverseQueueModel::new())
                     .exchange(exch_kind)
-                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT_SIZE))
+                    .depth(move || HashMapMarketDepth::new(TICK_SIZE, lot_size))
                     .build()?,
             )
             .build()?)
+    }
+
+    fn backtest(
+        exch_kind: ExchangeKind,
+        events: &[Event],
+    ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
+        backtest_with_lot(exch_kind, events, LOT_SIZE)
     }
 
     /// Rests the sell order behind [`QUEUE_AHEAD_QTY`] and waits for the exchange acknowledgement.
@@ -1610,38 +1653,25 @@ mod test {
     /// The exhaustion check in `check_if_buy_filled`/`check_if_sell_filled` and the status rule
     /// in `fill` must be one rule. The check used to compare `filled_qty >= leaves_qty` as exact
     /// f64s, while `fill` retires an order once its remainder no longer rounds to a positive
-    /// number of lots. With a fractional lot size the two rules can disagree by one ULP: the
-    /// execution is deemed partial, yet `fill` marks the order [`Status::Filled`], so it never
-    /// reaches `filled_orders` and rests on in the book. The next trade at its price then reaches
-    /// it and aborts the entire backtest with
+    /// number of lots. The two rules disagree on any remainder below half a lot — one ULP is
+    /// merely its smallest case: the execution is deemed partial, yet `fill` marks the order
+    /// [`Status::Filled`], so it never reaches `filled_orders` and rests on in the book. The
+    /// next trade at its price then reaches it and aborts the entire backtest with
     /// [`BacktestError`](crate::backtest::BacktestError::InvalidOrderStatus).
     ///
     /// Here 0.45 at a lot size of 0.01 fills as 15 lots, then 30 lots: in f64, `15.0 * 0.01` is
     /// one ULP above 0.15, so after the first execution `leaves_qty` is one ULP above
     /// `30.0 * 0.01`, and the second execution leaves 5.55e-17 resting.
     #[test]
-    fn a_partial_execution_whose_remainder_is_less_than_one_lot_completes_the_order()
+    fn a_partial_execution_whose_remainder_no_longer_amounts_to_a_lot_completes_the_order()
     -> Result<(), Box<dyn Error>> {
-        const LOT: f64 = 0.01;
         const QTY: f64 = 0.45;
         let feed = feed(&[
             (SEC, QUEUE_AHEAD_QTY + 0.15),
             (2 * SEC, 0.30),
             (3 * SEC, 0.10),
         ]);
-        let mut bt = Backtest::builder()
-            .add_asset(
-                L2AssetBuilder::default()
-                    .data(vec![DataSource::Data(Data::from_data(&feed))])
-                    .latency_model(ConstantLatency::new(LATENCY, LATENCY))
-                    .asset_type(LinearAsset::new(1.0))
-                    .fee_model(TradingValueFeeModel::new(CommonFees::new(MAKER_FEE, 0.0)))
-                    .queue_model(RiskAdverseQueueModel::new())
-                    .exchange(ExchangeKind::PartialFillExchange)
-                    .depth(|| HashMapMarketDepth::new(TICK_SIZE, LOT))
-                    .build()?,
-            )
-            .build()?;
+        let mut bt = backtest_with_lot(ExchangeKind::PartialFillExchange, &feed, FRACTIONAL_LOT)?;
         bt.elapse(0)?;
         bt.submit_sell_order(
             0,
@@ -1657,7 +1687,7 @@ mod test {
         let order = bt.orders(0).get(&ORDER_ID).unwrap();
         assert_eq!(order.status, Status::PartiallyFilled);
         // The scenario only exercises the gap if the remainder sits strictly above 30 lots.
-        assert!(order.leaves_qty > 30.0 * LOT);
+        assert!(order.leaves_qty > 30.0 * FRACTIONAL_LOT);
 
         // The second trade executes the remainder up to one ULP; what is left no longer amounts
         // to a lot, so the order is complete.
@@ -1672,6 +1702,96 @@ mod test {
         assert_eq!(order.status, Status::Filled);
         assert_eq!(order.leaves_qty, 0.0);
         assert!((bt.state_values(0).position + QTY).abs() < 1e-9);
+
+        Ok(())
+    }
+
+    /// The buy twin of
+    /// [`a_partial_execution_whose_remainder_no_longer_amounts_to_a_lot_completes_the_order`]:
+    /// the same arithmetic, mirrored — the order rests on the bid behind [`QUEUE_AHEAD_QTY`] and
+    /// sell trades consume it. `check_if_buy_filled` carries a textually identical copy of the
+    /// exhaustion rule, but every other pin in this group trades the sell side only, so without
+    /// this twin a regression confined to the buy copy passes the whole suite (measured: it
+    /// did).
+    #[test]
+    fn a_partial_buy_execution_whose_remainder_no_longer_amounts_to_a_lot_completes_the_order()
+    -> Result<(), Box<dyn Error>> {
+        const QTY: f64 = 0.45;
+        let feed = feed_sell(&[
+            (SEC, QUEUE_AHEAD_QTY + 0.15),
+            (2 * SEC, 0.30),
+            (3 * SEC, 0.10),
+        ]);
+        let mut bt = backtest_with_lot(ExchangeKind::PartialFillExchange, &feed, FRACTIONAL_LOT)?;
+        bt.elapse(0)?;
+        bt.submit_buy_order(
+            0,
+            ORDER_ID,
+            BID_PRICE,
+            QTY,
+            TimeInForce::GTX,
+            OrdType::Limit,
+            true,
+        )?;
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::PartiallyFilled);
+        // The scenario only exercises the gap if the remainder sits strictly above 30 lots.
+        assert!(order.leaves_qty > 30.0 * FRACTIONAL_LOT);
+
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+
+        // The completed order is gone from the exchange, so the next trade at its price passes
+        // it by instead of reaching a [`Status::Filled`] order left resting in the book.
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.leaves_qty, 0.0);
+        assert!((bt.state_values(0).position - QTY).abs() < 1e-9);
+
+        Ok(())
+    }
+
+    /// Pins which rounding the exhaustion rule uses: `round`, the same as `fill` — not `floor`.
+    /// A remainder of 0.6 lots is "less than one lot", yet it still rounds to a lot, so the
+    /// first execution must leave the order [`Status::PartiallyFilled`]; it completes only on
+    /// the second execution. Under `floor` (or `trunc`) the first execution would already
+    /// retire it, completing 0.456 in one execution against a trade that offered 0.45.
+    #[test]
+    fn a_remainder_that_still_rounds_to_a_lot_keeps_the_order_partially_filled()
+    -> Result<(), Box<dyn Error>> {
+        const QTY: f64 = 0.456;
+        let feed = feed(&[(SEC, QUEUE_AHEAD_QTY + 0.45), (2 * SEC, 0.10)]);
+        let mut bt = backtest_with_lot(ExchangeKind::PartialFillExchange, &feed, FRACTIONAL_LOT)?;
+        bt.elapse(0)?;
+        bt.submit_sell_order(
+            0,
+            ORDER_ID,
+            ASK_PRICE,
+            QTY,
+            TimeInForce::GTX,
+            OrdType::Limit,
+            true,
+        )?;
+
+        // 0.45 executes; the remaining 0.6 lots still round to a lot, so the order rests on.
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::PartiallyFilled);
+        assert!((order.exec_qty - 0.45).abs() < 1e-9);
+        assert!((order.leaves_qty - 0.006).abs() < 1e-9);
+
+        // The second execution takes the remainder: two executions, not one.
+        bt.elapse(SEC)?;
+        let order = bt.orders(0).get(&ORDER_ID).unwrap();
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.leaves_qty, 0.0);
+        let values = bt.state_values(0);
+        assert_eq!(values.num_trades, 2);
+        assert!((values.position + QTY).abs() < 1e-9);
 
         Ok(())
     }
