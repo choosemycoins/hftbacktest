@@ -79,14 +79,18 @@ use tracing::error;
 ///
 /// # The arithmetic
 ///
-/// Budget: **absorb half a second of tape at the measured peak**
-/// (`burst::PEAK_MSG_PER_S`). 16 384 ÷ 20 000 = **0.82s**, and it is the
-/// smallest power of two that clears 500 ms (8192 gives 0.41s). The budget is
-/// expressed as a multiple of the depth that failed rather than as a
-/// measurement of the excursion, because there is no measurement of the
-/// excursion: both processes died 204 ms into it, so 204 ms is a lower bound and
-/// the only figure available. 2.5× the number known to be too small is the
-/// smallest honest step.
+/// Budget: **absorb two seconds of tape at the measured peak**
+/// (`burst::PEAK_MSG_PER_S`). 65 536 ÷ 20 000 = **3.28s**, and it is the
+/// smallest power of two that clears 2000 ms (32 768 gives 1.64s). The budget
+/// moved from 500 ms on 2026-09-04 by the same rule that set it — at least
+/// double the figure known to be insufficient — after 16 384 (0.82s) failed
+/// **eight times in thirty days**: three at 12:30:0x UTC exactly (08:30 ET,
+/// the US macro prints of 08-07, 08-12 and 09-04), a cluster on the 08-19
+/// regime break, two Asia-session bursts, and almost always on the
+/// heaviest-flow instances. Still a multiple rather than a measurement:
+/// nothing counts frames per second yet, so every overflow is a lower bound
+/// (the 09-04 pair died within 600 ms of each other, flushing backlogs of
+/// 19 435 and 23 668 records on the way out).
 ///
 /// Two things about that arithmetic, because it is what a later reader will
 /// trust and both cut in opposite directions:
@@ -95,8 +99,8 @@ use tracing::error;
 ///   throughput.** `burst::fill_time_ms` models a consumer that has stopped
 ///   dead, which is not the fault being sized for — an out-run parser is still
 ///   draining, so the hop fills at (arrival − parser throughput) and the real
-///   duration absorbed is 16 384 ÷ (peak − parser) rather than 16 384 ÷ peak.
-///   0.82s is therefore a *floor*. The 204 ms that failed is computed exactly
+///   duration absorbed is 65 536 ÷ (peak − parser) rather than 65 536 ÷ peak.
+///   3.28s is therefore a *floor*. The 819 ms that failed is computed exactly
 ///   the same way and is a floor for the same reason, so what the two figures
 ///   actually decide between them is the ratio, 4×, and the ratio is the honest
 ///   part. Sizing off the excess would need the parser's throughput measured,
@@ -104,25 +108,24 @@ use tracing::error;
 /// * **The rate is the 2026-07-26 burst's**, reused because the 2026-07-29
 ///   excursion's own rate was never captured — see `burst::PEAK_MSG_PER_S`. If
 ///   that excursion was faster than 20 000 msg/s, and it broke a hop the
-///   earlier one did not, then 16 384 buys proportionally less: at 32 000 msg/s
-///   it is 512 ms and the budget is met with nothing to spare. That is the
-///   thinnest part of this argument and the measurement worth taking next.
+///   earlier one did not, then 65 536 buys proportionally less: at 32 000 msg/s
+///   it is 2.0s and the budget is met with nothing to spare. That is the
+///   thinnest part of this argument and the measurement worth taking next —
+///   ten overflows later it is still untaken.
 ///
 /// # What the depth costs, and the bound it runs into
 ///
 /// Not RAM, but the figure depends on the venue and this constant governs all
-/// of them. At 300–600 B a UM frame a full hop is **~10 MB**, against the
+/// of them. At 300–600 B a UM frame a full hop is **~40 MB**, against the
 /// writer hop's ~20 MB of ordinary frames (see below). A Bybit instance
-/// carrying 1–2 KB `orderbook.200` deltas is **~33 MB**, and a Lighter one
-/// **~18 MB** (11.8 MB of ordinary frames plus the ~5.9 MB of subscribe
-/// snapshots that cross this hop, unlike Binance's REST snapshots which are
-/// handed straight to the writer). Both hops full on the worst of those is
-/// ~98 MB for one instance, so the four that share the 2 GB recording host sit
-/// under 400 MB even if every one of them is Bybit and every one of them is
-/// wedged at once — and each of those states is itself terminal. Raising this
-/// hop fourfold moved that ceiling by at most ~25 MB per instance and the
-/// resting footprint by nothing, since tokio's bounded channels do not
-/// preallocate.
+/// carrying 1–2 KB `orderbook.200` deltas is **~131 MB**, and a Lighter one
+/// **~71 MB** (ordinary frames plus the subscribe snapshots that cross this
+/// hop, unlike Binance's REST snapshots which are handed straight to the
+/// writer). Both hops full on the worst of those is ~151 MB for one instance;
+/// the 2026-09 fleet of eleven (two Bybit, seven UM, Lighter, Hyperliquid)
+/// wedged at once — each such state itself terminal — sits near ~900 MB, and
+/// the resting footprint moves by nothing, since tokio's bounded channels do
+/// not preallocate. The measured peak of the biggest instance is 444 MB.
 ///
 /// What it costs is the speed of a diagnosis. A backlog **here** does not mean
 /// data is waiting to be written — it means the stage that decides where data
@@ -132,23 +135,23 @@ use tracing::error;
 /// watchdog, and whichever fires first is what the operator gets. The overflow
 /// names the hop and files `queue_overflow` in the sidecar for Phase 2's gap
 /// attribution; the watchdog can say no more than "nothing for five minutes".
-/// At the measured background rate 16 384 reports in ~82s where 4096 reported in
-/// ~20s — still comfortably first, and `main.rs`'s
+/// At the measured background rate 65 536 reports in ~328s where 16 384
+/// reported in ~82s — still first against the raised default, and `main.rs`'s
 /// `the_socket_hop_reports_a_starved_parser_before_the_stall_watchdog_does`
 /// is where that ordering is pinned, with the margin it needs to survive a
 /// market thinner than the one that was measured. That test caps this hop near
-/// 30 000 messages and the budget above floors it at 10 000; 16 384 is the only
+/// 90 000 messages and the budget above floors it at 40 000; 65 536 is the only
 /// power of two in the window.
 ///
-/// That ordering is against the **shipped** `--stall-timeout-min` of 5, and the
-/// flag is deployable (`COLLECTOR_STALL_TIMEOUT_MIN`). Raising this hop raised
-/// the floor under it: 82s to fill at the measured background rate and 164s at
-/// half of it means the watchdog has to be **3 minutes or more** for the hop to
-/// still report first, where 4096 left that safe anywhere down to 1. Lowering
-/// the flag past 3 does not break the recording, but it inverts which of the
-/// two guards speaks — the operator gets "nothing for two minutes" instead of
-/// the hop that broke. Noted on the flag itself in `main.rs`.
-pub const WS_QUEUE_CAPACITY: usize = 16384;
+/// That ordering is against the **shipped** `--stall-timeout-min` of 15, and
+/// the flag is deployable (`COLLECTOR_STALL_TIMEOUT_MIN`). Raising this hop
+/// raised the floor under it again: 328s to fill at the measured background
+/// rate and 656s at half of it means the watchdog has to be **12 minutes or
+/// more** for the hop to still report first, where 16 384 left that safe down
+/// to 3. Lowering the flag past 12 does not break the recording, but it
+/// inverts which of the two guards speaks — the operator gets "silence"
+/// instead of the hop that broke. Noted on the flag itself in `main.rs`.
+pub const WS_QUEUE_CAPACITY: usize = 65536;
 
 /// Capacity of the parser → writer hand-off, **in messages**.
 ///
@@ -285,10 +288,20 @@ pub mod burst {
     /// What the same four symbols run at outside a burst: ~50 msg/s each.
     pub const BACKGROUND_MSG_PER_S: usize = 200;
 
-    /// The socket-hop depth that overflowed on **2026-07-29 at 03:30:02 UTC**,
-    /// kept as the number the replacement has to beat.
+    /// The socket-hop depth that overflowed **eight times between 2026-08-07
+    /// and 2026-09-04**, kept as the number the replacement has to beat.
     ///
-    /// The second measured burst, and the first one this hop failed. Both
+    /// The third sizing generation. 4096 fell first, on **2026-07-29 at
+    /// 03:30:02 UTC** (204 ms at the borrowed peak); its replacement 16 384
+    /// (819 ms) then fell three times at 12:30:0x UTC exactly — the 08:30 ET
+    /// US macro prints of 08-07, 08-12 and 09-04 — plus a cluster on the
+    /// 08-19 regime break and two Asia-session bursts, almost always on the
+    /// heaviest instances (BTC/ETH/SOL, the US-stock perps at their own data
+    /// times, XAU/TSLA/NVDA). The 09-04 pair died within 600 ms of each other,
+    /// flushed backlogs of 19 435 and 23 668 records, and resynced depth
+    /// cleanly on restart. No excursion has had its rate captured yet.
+    ///
+    /// The 2026-07-29 fall, for the record it set. Both
     /// `binancefuturesum` instances — separate processes, separate sockets,
     /// separate connections to the venue — filled `websocket->parser` within
     /// 100 ms of each other and exited on `full => fatal`, each leaving a ~6s
@@ -319,7 +332,7 @@ pub mod burst {
     /// its depth), and both backlogs were drained to disk on the way out. That
     /// is the second time it has been measured and the first time it has been
     /// measured *not* failing.
-    pub const OVERFLOWED_WS_CAPACITY: usize = 4096;
+    pub const OVERFLOWED_WS_CAPACITY: usize = 16384;
 
     /// How long a hop of `capacity` survives a consumer that has stopped
     /// draining, at `rate` messages per second.
@@ -618,11 +631,13 @@ mod tests {
     /// neither can be closed without a measurement this incident did not leave.
     #[test]
     fn the_socket_hop_outlasts_the_excursion_that_overflowed_it() {
-        // Two and a half times the depth that demonstrably failed. Not a
-        // measurement of the excursion — nothing measured it, both processes
-        // died at 205 ms — but the smallest budget that is not simply a repeat
-        // of the number already known to be too small.
-        const REQUIRED_MS: usize = 500;
+        // At least twice the depth that demonstrably failed — the same rule the
+        // 500 ms budget was set by when 4096 (204 ms) failed in 2026-07-29.
+        // 16 384 (819 ms at the borrowed peak) then failed eight times in the
+        // thirty days to 2026-09-04, three of them at 12:30:0x UTC exactly
+        // (08:30 ET macro prints), so the budget moves the same way: >= 2x the
+        // 819 ms known to be insufficient.
+        const REQUIRED_MS: usize = 2000;
 
         let known_insufficient =
             burst::fill_time_ms(burst::OVERFLOWED_WS_CAPACITY, burst::PEAK_MSG_PER_S);

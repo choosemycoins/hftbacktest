@@ -102,19 +102,20 @@ struct Args {
     /// a frame that is parsed into no stream. None of those raise an error, and
     /// the process looks healthy while it records an empty day.
     ///
-    /// The default of 5 minutes is a PROPOSAL, not a measurement (open decision
-    /// 2 of docs/design-multi-venue-collection.md). For scale, the slowest
+    /// The default of 15 minutes is sized by the guard race below — it was 5
+    /// until the 2026-09-04 socket-hop resize (open decision 2 of
+    /// docs/design-multi-venue-collection.md). For scale, the slowest
     /// legitimate feed is Hyperliquid's plain `l2Book` at ~5.4s, so the margin
     /// is roughly fifty-fold — raise it if you record something slower, and
     /// lower it once a real quiet-period gap has been measured.
     ///
-    /// **Do not lower it below 3.** This is the slower of two guards on
-    /// purpose: a starved parser fills the socket hop in ~82s at the measured
-    /// background rate (~164s if the market is half as busy), and that overflow
+    /// **Do not lower it below 12.** This is the slower of two guards on
+    /// purpose: a starved parser fills the socket hop in ~328s at the measured
+    /// background rate (~656s if the market is half as busy), and that overflow
     /// is the only report that NAMES the fault — this one can say no more than
-    /// "silence". Below 3 minutes the watchdog wins the race and the diagnosis
-    /// is lost. The margin used to run down to 1; raising the socket hop to
-    /// 16 384 on 2026-07-29 raised the floor with it. See
+    /// "silence". Below 12 minutes the watchdog wins the race and the diagnosis
+    /// is lost. The margin used to run down to 1; 16 384 on 2026-07-29 raised
+    /// the floor to 3, and 65 536 on 2026-09-04 to 12. See
     /// `queue::WS_QUEUE_CAPACITY` and
     /// `the_socket_hop_reports_a_starved_parser_before_the_stall_watchdog_does`,
     /// which pins the ordering against the default here.
@@ -123,7 +124,7 @@ struct Args {
     /// still arrive, not one Hyperliquid cadence out of three. Sidecar records
     /// do not count as data. One symbol of ten that stopped is
     /// `--liveness-timeout-s`, which warns rather than stopping.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 15)]
     stall_timeout_min: u64,
 
     /// Warn when one symbol has recorded nothing for this many seconds. `0`
@@ -1069,11 +1070,11 @@ mod tests {
     /// a thinner instance or a venue between listings all make it smaller —
     /// which makes the hop slower to fill and the race closer. So the
     /// requirement is that the overflow still lands first **at half the measured
-    /// background rate**. At 16 384 that is 164s against 300s; a
-    /// `WRITER_QUEUE_CAPACITY`-sized hop (32 768) would be 328s and lose. The
-    /// cap that follows is ~30 000 messages, the floor from
+    /// background rate**. At 65 536 against the 15-minute default that is 656s
+    /// against 900s; double the hop and 1312s would lose. The cap that follows
+    /// is ~90 000 messages, the floor from
     /// `the_socket_hop_outlasts_the_excursion_that_overflowed_it` in `queue.rs`
-    /// is 10 000, and 16 384 is the only power of two in between.
+    /// is 40 000, and 65 536 is the only power of two in between.
     ///
     /// The writer hop is deliberately not held to the same rule. Every dequeue
     /// pets the watchdog, so a writer that is slow rather than stopped keeps it
