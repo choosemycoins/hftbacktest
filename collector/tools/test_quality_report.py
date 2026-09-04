@@ -2426,7 +2426,7 @@ def test_a_cross_stream_inversion_beyond_the_bound_is_red(tmp_path):
     a full socket hop reorders two producers by that much."""
     d = tmp_path / "um-interleave-wide"
     d.mkdir()
-    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(2_000 * MS))
+    write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(5_000 * MS))
     write_meta(d, "binancefuturesum", DAY,
                [(ns(0), session_start("binancefuturesum", ["BTCUSDT"]))])
 
@@ -2436,14 +2436,14 @@ def test_a_cross_stream_inversion_beyond_the_bound_is_red(tmp_path):
     assert "interleave_excess" in checks_of(report, "binancefuturesum", severity="red")
     symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
     assert symbol["interleave_inversion"] is None
-    assert symbol["interleave_excess"]["max_delta_ns"] == 2_000 * MS
+    assert symbol["interleave_excess"]["max_delta_ns"] == 5_000 * MS
 
 
 @pytest.mark.parametrize(
     "delta_ns,expected_code,expected_check",
     [
-        (1_000 * MS, 0, "interleave_inversion"),
-        (1_000 * MS + 1, 1, "interleave_excess"),
+        (4_000 * MS, 0, "interleave_inversion"),
+        (4_000 * MS + 1, 1, "interleave_excess"),
     ],
 )
 def test_the_interleave_bound_is_pinned_to_the_nanosecond(
@@ -2451,10 +2451,10 @@ def test_the_interleave_bound_is_pinned_to_the_nanosecond(
 ):
     """Widening the tolerance must break a test, not pass silently.
 
-    It widened once, on 2026-07-29, and only because the socket hop it is
-    derived from did — see `CROSS_STREAM_TOLERANCE_NS`.
+    It has widened twice — 2026-07-29 and 2026-09-04 — and only because the
+    socket hop it is derived from did; see `CROSS_STREAM_TOLERANCE_NS`.
     """
-    assert qr.CROSS_STREAM_TOLERANCE_NS == 1_000 * MS
+    assert qr.CROSS_STREAM_TOLERANCE_NS == 4_000 * MS
     d = tmp_path / f"um-bound-{delta_ns}"
     d.mkdir()
     write_gz(d / f"btcusdt_{DAY}.gz", um_interleaved(delta_ns))
@@ -2624,7 +2624,7 @@ def test_an_extended_cross_stream_inversion_past_the_bound_is_still_red(tmp_path
     `CROSS_STREAM_TOLERANCE_NS` that stops being a scheduler slice and becomes
     the same two hypotheses every other venue's red carries.
     """
-    delta_ns = 1_200 * MS
+    delta_ns = 4_800 * MS
     assert delta_ns > qr.CROSS_STREAM_TOLERANCE_NS
     d = extended_inverted(tmp_path, "ext-over-bound", "orderbook", "mark", delta_ns)
     code, report = run(d, out=tmp_path / "r.json")
@@ -2925,17 +2925,17 @@ def test_a_whole_file_out_of_order_is_red_not_a_tolerated_interleave(tmp_path):
     base = ns(0, nanos=500_000_000)
     recs = [(base, um_book_ticker("BTCUSDT", base))]
     for i in range(1, 6):
-        # Each snapshot is stamped at least two seconds after the bookTicker
+        # Each snapshot is stamped at least five seconds after the bookTicker
         # written next to it: far beyond any hand-off skew, and beyond the
         # tolerance with the whole socket hop to spare. The offsets are
-        # `(i + 1) * SEC` and not `i * SEC` for that last reason — at one
-        # second the SMALLEST of the five inversions is 999ms, which slipped
-        # under the bound the moment it followed the socket hop up to 1s on
-        # 2026-07-29 and turned this into a four-violation file. The fixture
-        # has to keep saying "every pair here is out of order" whatever the
-        # bound is; pinning the count to whatever survives it would be reading
-        # the answer off the implementation.
-        at = base + (i + 1) * SEC
+        # `(i + 4) * SEC` because the bound has followed the socket hop twice
+        # (1s on 2026-07-29, 4s on 2026-09-04): at `(i + 1)` the smallest of
+        # the five inversions is ~2s and would now slip under it, turning this
+        # into a four-violation file. The fixture has to keep saying "every
+        # pair here is out of order" whatever the bound is; pinning the count
+        # to whatever survives it would be reading the answer off the
+        # implementation.
+        at = base + (i + 4) * SEC
         recs.append((at, um_depth_snapshot("BTCUSDT", at, 1000 + i)))
         recs.append((base + i * MS, um_book_ticker("BTCUSDT", base + i * MS)))
     write_gz(d / f"btcusdt_{DAY}.gz", recs)
@@ -2946,7 +2946,7 @@ def test_a_whole_file_out_of_order_is_red_not_a_tolerated_interleave(tmp_path):
     assert code == 1
     symbol = report["venues"]["binancefuturesum"]["days"][DAY]["symbols"]["btcusdt"]
     assert symbol["interleave_excess"]["violations"] == 5
-    assert symbol["interleave_excess"]["max_delta_ns"] == 6 * SEC - 5 * MS
+    assert symbol["interleave_excess"]["max_delta_ns"] == 9 * SEC - 5 * MS
     assert symbol["interleave_inversion"] is None, (
         "every pair in this file is beyond the bound; a tolerated one left over "
         "means the fixture has drifted back under it"

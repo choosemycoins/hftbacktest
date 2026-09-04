@@ -474,11 +474,13 @@ def crosses_a_hand_off_of_its_own(stream) -> bool:
 #: That is exactly what happened on 2026-07-29: the socket hop overflowed on
 #: both `binancefuturesum` instances at once and went from 4096 to 16384, which
 #: quadrupled the honest overtake below and forced the tolerance up with it.
-WS_QUEUE_CAPACITY = 16384
+#: And again on 2026-09-04, after eight overflows in thirty days (three at
+#: 12:30 UTC exactly — the US macro prints): 16384 -> 65536, tolerance 1s -> 4s.
+WS_QUEUE_CAPACITY = 65536
 PEAK_MSG_PER_S = 20_000
 
 #: The longest a WS frame can sit behind the REST snapshot that skips it: the
-#: whole socket hop, drained at the measured peak. 16384 / 20 000 = 819.2ms.
+#: whole socket hop, drained at the measured peak. 65536 / 20 000 = 3.28s.
 SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 
 #: How far the *write* order of two different streams may disagree with their
@@ -529,7 +531,7 @@ SOCKET_HOP_NS = WS_QUEUE_CAPACITY * SEC_NS // PEAK_MSG_PER_S
 #: In the other direction, where the poll is itself the late row, the pair does
 #: keep a ceiling — its own, `POLLER_HOP_CEILING_NS`, which is this same figure
 #: and deliberately not this same constant.
-CROSS_STREAM_TOLERANCE_NS = 1_000 * 1_000_000
+CROSS_STREAM_TOLERANCE_NS = 4_000 * 1_000_000
 
 #: How far a `premiumIndex` row may be written **behind** a frame stamped later
 #: before the report stops calling it an interleave.
