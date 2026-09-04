@@ -1274,7 +1274,7 @@ different reasons they are bounded differently:
 
 | Hop | Capacity | Consumer | What a full queue means |
 |---|---|---|---|
-| socket reader → parser | 16 384 | JSON parse, no syscalls | the parser is not keeping up with the tape |
+| socket reader → parser | 65 536 | JSON parse, no syscalls | the parser is not keeping up with the tape |
 | parser → writer | 32 768 | gzip + `write(2)` | the writer stalled or stopped |
 
 If either fills, the collector stops: `{"_collector":"queue_overflow", …}` goes
@@ -1362,31 +1362,34 @@ reasoning.
 
 One cost the depth does carry: `drain_backlog` empties the **writer** hop on
 the way out and nothing drains this one, so whatever is sitting here when the
-process stops is lost. That went from ~4096 unparsed frames to ~16 384 — about
-0.6s more of the ~6s hole a restart leaves anyway, which is why it did not
-change the choice.
+process stops is lost. That has grown with the hop: ~4096, then ~16 384, now
+~65 536 unparsed frames — ~3.3s of tape at the measured peak, against the ~6s
+hole a restart leaves anyway, which is why it still did not change the choice.
 
 It cannot simply keep growing. This hop's overflow is the only *specific*
 diagnosis the process has for a parser that cannot keep up, and it races the
 stall watchdog — a parser that has stopped dequeuing produces no writes either,
 so whichever fires first is what the operator gets, and the watchdog can only
-say "nothing for five minutes". 16 384 reports in ~82s at the background rate,
-or ~164s if the market is half as busy as when it was measured; a hop as deep as
-the writer's would lose that race outright. Both bounds are pinned by tests
-(`queue.rs` and `main.rs`), and 16 384 is the only power of two between them.
-The same arithmetic puts a **floor under `--stall-timeout-min` of 3 minutes** —
-it was 1 while the hop was 4096. Set it lower and the watchdog wins the race,
-so the operator gets "silence" instead of the hop that broke.
+say "nothing for fifteen minutes". 65 536 reports in ~328s at the background
+rate, or ~656s if the market is half as busy as when it was measured; double it
+and the race is lost outright. Both bounds are pinned by tests (`queue.rs` and
+`main.rs`), and 65 536 is the only power of two between them. The same
+arithmetic puts a **floor under `--stall-timeout-min` of 12 minutes** (656s is
+just under 11; the twelfth is margin) — the floor was 1 at 4096 and 3 at
+16 384, and the shipped default moved to 15 with the 2026-09-04 resize. Set it
+lower and the watchdog wins the race, so the operator gets "silence" instead of
+the hop that broke.
 One consequence reaches the offline gate: the deeper hop widens the largest
-honest cross-stream overtake to 819 ms, so `quality_report.py`'s interleave
-tolerance moved from 250 ms to 1s with it. That tolerance covers the pair this
-hop actually separates — a REST depth snapshot against a WebSocket frame. A
+honest cross-stream overtake to 3.28s, so `quality_report.py`'s interleave
+tolerance has followed the capacity each time it moved: 250 ms at 4096, 1s at
+16 384, 4s at 65 536. That tolerance covers the pair this hop actually
+separates — a REST depth snapshot against a WebSocket frame. A
 WebSocket frame written behind a `premiumIndex` poll waited in this hop and the
 writer's alike, so nothing over these capacities bounds it and the gate grades
 it without one. The other way round — a poll written behind a frame stamped
-later — keeps a ceiling of the same 1s, but a constant of its own
-(`POLLER_HOP_CEILING_NS`), read off what the poller's hand-off has actually been
-seen doing: raising this capacity again must not widen that one.
+later — keeps its own 1s ceiling (`POLLER_HOP_CEILING_NS`), read off what the
+poller's hand-off has actually been seen doing: raising this capacity again
+must not widen that one, and the 2026-09-04 raise did not.
 
 One case escapes all of it. If a write blocks for ever in the kernel — a hung
 mount, a device that stops answering — the main loop never gets back to notice

@@ -109,7 +109,8 @@ struct Args {
     /// is roughly fifty-fold — raise it if you record something slower, and
     /// lower it once a real quiet-period gap has been measured.
     ///
-    /// **Do not lower it below 12.** This is the slower of two guards on
+    /// **Do not lower it below 12** (656s is just under 11 minutes; the
+    /// twelfth is margin). This is the slower of two guards on
     /// purpose: a starved parser fills the socket hop in ~328s at the measured
     /// background rate (~656s if the market is half as busy), and that overflow
     /// is the only report that NAMES the fault — this one can say no more than
@@ -1049,13 +1050,13 @@ mod tests {
     /// A starved parser produces no dequeues, so `watchdog.record_write` is
     /// never reached and the watchdog becomes the only other thing that would
     /// ever report the fault. It can say no more than "nothing has been
-    /// recorded for five minutes"; the overflow names the hop and files
+    /// recorded for fifteen minutes"; the overflow names the hop and files
     /// `queue_overflow` in the sidecar, which is what Phase 2's gap attribution
     /// reads. The specific diagnosis has to arrive first.
     ///
     /// Bounded from both sides, or the rule has no teeth: merely beating the
-    /// five-minute watchdog is still satisfied at ~60 000 messages, four times
-    /// the shipped depth. What the upper bound is stated as changed when the hop
+    /// fifteen-minute watchdog is still satisfied at ~180 000 messages, nearly
+    /// three times the shipped depth. What the upper bound is stated as changed when the hop
     /// was raised to 16 384 on 2026-07-29 (see `queue::burst`), and the old
     /// version is worth recording because it was the tighter of the two: **a
     /// diagnosis inside a minute** at the measured background rate, which capped
