@@ -1412,3 +1412,121 @@ def test_a_symbol_leaving_the_env_file_is_named_in_the_wave_alert():
     assert "GAIBUSDT" not in env_symbols(plan.env_write[1])
     alert = "\n".join(plan.alerts)
     assert "выведено" in alert and "GAIBUSDT" in alert
+
+
+# --- ротация без волны ----------------------------------------------------------
+# До 09.09.2026 отжившие символы выводились из env только внутри волны нового
+# листинга: между волнами env не трогался вовсе. На живом хосте это дало пять имён
+# возрастом 15.2 суток, пишущихся в ожидании волны. Ротация без волны обязана
+# (1) ждать сутки запаса сверх окна — чтобы обычная волна успела сделать это бесплатно,
+# (2) не рвать запись символу моложе двух суток и не мешать неминуемому старту,
+# (3) никогда не опустошать env, (4) быть видимой — алерт, как у волны, —
+# (5) не повторяться на следующем тике.
+
+from day0_poller import ROTATION_SLACK_DAYS, ROTATION_QUIET_MIN_AGE_DAYS
+
+SLACK_MS = ROTATION_SLACK_DAYS * DAY_MS
+QUIET_MS = ROTATION_QUIET_MIN_AGE_DAYS * DAY_MS
+
+
+def _quiet_world(*entries):
+    """Мир без новых листингов: ровно те же символы, что уже известны."""
+    return doc(*(sym(e.symbol, e.onboard_ms) for e in entries))
+
+
+def test_a_symbol_past_the_window_plus_slack_is_rotated_without_a_wave():
+    old = NOW - ROT_MS - SLACK_MS - 1
+    young = NOW - 5 * DAY_MS
+    e_old = entry("OLDUSDT", old, PHASE_CAPTURING, anchor_ms=old)
+    e_young = entry("YOUNGUSDT", young, PHASE_CAPTURING, anchor_ms=young)
+    before = state_of(e_old, e_young)
+    plan, after = plan_tick(_quiet_world(e_old, e_young), before, NOW,
+                            env_now=env_text(["OLDUSDT", "YOUNGUSDT"]), hostname="h")
+    assert plan.env_write is not None
+    assert env_symbols(plan.env_write[1]) == ["YOUNGUSDT"]
+    assert plan.restart_now is True
+    assert after.known[entry_key("OLDUSDT", old)].phase == PHASE_ROTATED
+    assert after.known[entry_key("OLDUSDT", old)].in_env is False
+    assert plan.counters["rotated"] == 1
+    assert any("без волны" in a and "OLDUSDT" in a for a in plan.alerts), plan.alerts
+
+
+def test_rotation_without_a_wave_waits_one_day_of_slack_past_the_window():
+    """Внутри запаса выводить должна волна, бесплатно; сама по себе ротация — нет."""
+    old = NOW - ROT_MS - SLACK_MS + 3_600_000
+    young = NOW - 5 * DAY_MS
+    e_old = entry("OLDUSDT", old, PHASE_CAPTURING, anchor_ms=old)
+    e_young = entry("YOUNGUSDT", young, PHASE_CAPTURING, anchor_ms=young)
+    plan, after = plan_tick(_quiet_world(e_old, e_young), state_of(e_old, e_young), NOW,
+                            env_now=env_text(["OLDUSDT", "YOUNGUSDT"]))
+    assert plan.env_write is None
+    assert plan.restart_now is False
+    assert after.known[entry_key("OLDUSDT", old)].phase == PHASE_CAPTURING
+
+
+def test_rotation_without_a_wave_never_cuts_a_symbol_younger_than_the_quiet_age():
+    """Рестарт рвёт запись всем живым; первые сутки-двое — самое дорогое окно."""
+    old = NOW - ROT_MS - SLACK_MS - 1
+    baby = NOW - QUIET_MS + 60_000
+    e_old = entry("OLDUSDT", old, PHASE_CAPTURING, anchor_ms=old)
+    e_baby = entry("BABYUSDT", baby, PHASE_CAPTURING, anchor_ms=baby)
+    plan, after = plan_tick(_quiet_world(e_old, e_baby), state_of(e_old, e_baby), NOW,
+                            env_now=env_text(["OLDUSDT", "BABYUSDT"]))
+    assert plan.env_write is None
+    assert plan.restart_now is False
+    assert after.known[entry_key("OLDUSDT", old)].phase == PHASE_CAPTURING
+
+
+def test_rotation_without_a_wave_is_blocked_by_an_imminent_start():
+    old = NOW - ROT_MS - SLACK_MS - 1
+    young = NOW - 5 * DAY_MS
+    e_old = entry("OLDUSDT", old, PHASE_CAPTURING, anchor_ms=old)
+    e_young = entry("YOUNGUSDT", young, PHASE_CAPTURING, anchor_ms=young)
+    e_watch = entry("SOONUSDT", NOW + 600_000, PHASE_WATCH, status="PENDING_TRADING")
+    world = doc(sym("OLDUSDT", old), sym("YOUNGUSDT", young),
+                sym("SOONUSDT", NOW + 600_000, status="PENDING_TRADING"))
+    plan, after = plan_tick(world, state_of(e_old, e_young, e_watch), NOW,
+                            env_now=env_text(["OLDUSDT", "YOUNGUSDT", "SOONUSDT"]))
+    assert plan.env_write is None
+    assert after.known[entry_key("OLDUSDT", old)].phase == PHASE_CAPTURING
+
+
+def test_rotation_without_a_wave_never_empties_the_env():
+    old = NOW - ROT_MS - SLACK_MS - 1
+    e_old = entry("OLDUSDT", old, PHASE_CAPTURING, anchor_ms=old)
+    plan, after = plan_tick(_quiet_world(e_old), state_of(e_old), NOW,
+                            env_now=env_text(["OLDUSDT"]))
+    assert plan.env_write is None
+    assert plan.restart_now is False
+    assert after.known[entry_key("OLDUSDT", old)].phase == PHASE_CAPTURING
+    assert not plan.alerts
+
+
+def test_rotation_without_a_wave_is_idempotent_on_the_next_tick():
+    old = NOW - ROT_MS - SLACK_MS - 1
+    young = NOW - 5 * DAY_MS
+    e_old = entry("OLDUSDT", old, PHASE_CAPTURING, anchor_ms=old)
+    e_young = entry("YOUNGUSDT", young, PHASE_CAPTURING, anchor_ms=young)
+    plan1, after1 = plan_tick(_quiet_world(e_old, e_young), state_of(e_old, e_young), NOW,
+                              env_now=env_text(["OLDUSDT", "YOUNGUSDT"]))
+    assert plan1.env_write is not None
+    plan2, after2 = plan_tick(_quiet_world(e_old, e_young), after1, NOW + 600_000,
+                              env_now=plan1.env_write[1])
+    assert plan2.env_write is None
+    assert plan2.restart_now is False
+    assert not any("без волны" in a for a in plan2.alerts)
+    assert after2.known[entry_key("OLDUSDT", old)].phase == PHASE_ROTATED
+
+
+def test_a_dead_symbol_is_rotated_without_a_wave_under_the_same_guard():
+    old = NOW - 3 * DAY_MS
+    young = NOW - 5 * DAY_MS
+    e_dead = entry("DEADUSDT", old, PHASE_CAPTURING, anchor_ms=old, dead=True, status="SETTLING")
+    e_young = entry("YOUNGUSDT", young, PHASE_CAPTURING, anchor_ms=young)
+    world = doc(sym("DEADUSDT", old, status="SETTLING"), sym("YOUNGUSDT", young))
+    plan, after = plan_tick(world, state_of(e_dead, e_young), NOW,
+                            env_now=env_text(["DEADUSDT", "YOUNGUSDT"]), hostname="h")
+    assert plan.env_write is not None
+    assert env_symbols(plan.env_write[1]) == ["YOUNGUSDT"]
+    assert after.known[entry_key("DEADUSDT", old)].phase == PHASE_ROTATED
+    assert any("без волны" in a and "DEADUSDT" in a for a in plan.alerts)

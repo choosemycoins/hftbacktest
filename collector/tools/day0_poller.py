@@ -82,6 +82,14 @@ UNIVERSE_FLOOR = 100
 DAY_MS = 86_400_000
 # Затухание края завершено за 10–12 суток по измеренной λ; хвост до 14 ещё измерим.
 ROTATION_DAYS = 14
+# Ротация БЕЗ волны (с 09.09.2026). До того отжившие выводились только внутри волны
+# листинга, и между волнами env не трогался; на живом хосте пять имён простояли 15.2
+# суток в ожидании волны. Запас в сутки сверх окна — чтобы обычная волна успела
+# вывести их бесплатно; порог тишины в двое суток — чтобы рестарт не рвал запись
+# символу в самом дорогом окне (затухание края измерено: 10–12 суток, но первые часы
+# несут 4–5× суточного вала — project_day0-listings.md).
+ROTATION_SLACK_DAYS = 1
+ROTATION_QUIET_MIN_AGE_DAYS = 2
 # Символ захватоспособен ⇔ он не был бы немедленно ротирован. ОДНА константа вместо
 # двух убирает класс рассинхронов «захватили и тут же выкинули».
 CAPTURE_MAX_AGE_DAYS = ROTATION_DAYS
@@ -542,11 +550,12 @@ def plan_tick(
             f"{state.consecutive_failures} провалов подряд"
         )
 
-    if not wave:
-        # Между волнами env не трогается вообще: ротация «сама по себе» была бы
-        # невидимой мутацией конфига живого инстанса. Но НЕЗАКРЫТЫЙ долг по эффектам
-        # (рестарт не состоялся, таймер не встал) добирается и здесь — иначе провал
-        # ждал бы следующей волны, то есть ~2.1 суток.
+    standalone = not wave and _rotation_due(known, now_ms)
+    if not wave and not standalone:
+        # Между волнами env не трогается — кроме ротации, которая созрела по своим
+        # правилам (`_rotation_due`) и потому НЕ невидима: у неё свой алерт. Но
+        # НЕЗАКРЫТЫЙ долг по эффектам (рестарт не состоялся, таймер не встал)
+        # добирается и здесь — иначе провал ждал бы следующей волны, то есть ~2.1 суток.
         counters["in_env"] = sum(1 for e in known.values() if e.in_env)
         return (
             Plan(cancel_timers=cancel, arm_timers=_arm_timers(known, now_ms),
@@ -574,10 +583,14 @@ def plan_tick(
 
     env_write = None if env_now == content else (ENV_PATH, content)
     arm = _arm_timers(known, now_ms)
-    restart_now = _restart_owed(known)
+    # Ротация без волны обязана дойти до инстанса: подписки снимаются только рестартом.
+    restart_now = _restart_owed(known) or (standalone and env_write is not None)
 
     dropped = sorted(set(rotated) | (env_carried - set(symbols)))
-    alerts.append(_wave_alert(hostname, known, wave, flips, dropped, now_ms, server_ms))
+    if standalone:
+        alerts.append(_rotation_alert(hostname, dropped, symbols))
+    else:
+        alerts.append(_wave_alert(hostname, known, wave, flips, dropped, now_ms, server_ms))
     return (
         Plan(cancel_timers=cancel, env_write=env_write, arm_timers=arm, restart_now=restart_now,
              alerts=alerts, counters=counters, pulse=_pulse(now_ms, server_ms, known, counters)),
@@ -737,6 +750,45 @@ def _rotate(known: dict[str, Entry], wave: list[str], now_ms: int,
     counters["rotated"] = len(rotated)
     counters["shelved"] = len(shelved)
     return rotated, shelved
+
+
+def _rotation_due(known: dict[str, Entry], now_ms: int) -> bool:
+    """Созрела ли ротация без волны. Все четыре условия — про цену рестарта, а не про
+    сам вывод: вывести можно всегда, рвать запись живым — только когда это дёшево.
+
+    1. Есть кого выводить: dead, либо capturing старше окна на ROTATION_SLACK_DAYS.
+       Внутри запаса выводит волна — бесплатно, вместе со своим рестартом.
+    2. Нет неминуемого старта (watch в env): его рестарт назначен на другое.
+    3. Самый молодой capturing в env старше ROTATION_QUIET_MIN_AGE_DAYS.
+    4. После вывода в env кто-то останется (пустой env — отказ `env_text`, и тот
+       путь оставлял бы состояние нетронутым с алертом каждые 10 минут).
+    """
+    window = ROTATION_DAYS * DAY_MS
+    slack = ROTATION_SLACK_DAYS * DAY_MS
+    quiet = ROTATION_QUIET_MIN_AGE_DAYS * DAY_MS
+    in_env = [e for e in known.values() if e.in_env]
+    due = [
+        e for e in in_env
+        if e.dead or (e.phase == PHASE_CAPTURING and e.anchor_ms is not None
+                      and now_ms - e.anchor_ms > window + slack)
+    ]
+    if not due:
+        return False
+    if any(e.phase == PHASE_WATCH for e in in_env):
+        return False
+    ages = [now_ms - e.anchor_ms for e in in_env
+            if e.phase == PHASE_CAPTURING and e.anchor_ms is not None and not e.dead]
+    if ages and min(ages) < quiet:
+        return False
+    due_keys = {id(e) for e in due}
+    survivors = [e for e in in_env if id(e) not in due_keys]
+    return bool(survivors)
+
+
+def _rotation_alert(hostname: str, dropped: list[str], remaining: list[str]) -> str:
+    """Ротация без волны — правка конфига живого инстанса, и она обязана быть видимой."""
+    return (f"♻️ {hostname}: ротация day-0 без волны — выведены {len(dropped)}: "
+            f"{', '.join(dropped)}; остаются {len(remaining)}; инстанс перезапущен")
 
 
 def _wave_alert(hostname: str, known: dict[str, Entry], wave: list[str], flips: list[str],
