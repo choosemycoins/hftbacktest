@@ -255,6 +255,72 @@ def cmd_fetch_model(args, cfg) -> int:
     return 0
 
 
+GOLDEN = Path(__file__).resolve().parent.parent / "eval" / "golden.jsonl"
+
+
+def cmd_eval(args, cfg) -> int:
+    """Golden eval. Plain: the chosen modes on the whole index (semantic and
+    hybrid use the active model). --compare-models A,B: both models on the
+    same sub-corpus (expected sources + stratified distractors), embedding
+    the sub-corpus first, then the §6.3 decision."""
+    import glob
+    from . import evaluate as E
+    from . import store
+    from .embed import embed_pass, load_embedder
+    from .search import Index
+    from .semantic import Engine, engine_for
+    from .update import WriterLock
+    db = _db(args, cfg)
+    golden = E.load_golden(Path(args.golden).expanduser())
+    modes = [m for m in args.modes.split(",") if m]
+    bad = [m for m in modes if m not in E.MODES]
+    if bad:
+        print(f"kb: unknown mode(s) {bad}; use {','.join(E.MODES)}", file=sys.stderr)
+        return 2
+    idx = Index(db)
+    stamp = store.now_iso().replace(":", "")
+    if not args.compare_models:
+        engine = engine_for(idx, cfg, threads=args.threads) \
+            if any(m in ("semantic", "hybrid") for m in modes) else None
+        rep = E.evaluate(idx, golden, modes, engine=engine)
+        print(E.table(rep, f"kb eval — whole index ({db})"))
+        p = E.save(db, f"eval-{stamp}.json", rep)
+        print(f"report: {p}")
+        return 0
+    keys = args.compare_models.split(",")
+    sub = E.subcorpus(idx.conn(), golden, args.distractors, seed=args.seed)
+    print(f"sub-corpus: {len(sub)} chunks (expected sources + {args.distractors} distractors, "
+          f"seed {args.seed})", flush=True)
+    reports = {}
+    for key in keys:
+        emb = load_embedder(key, cfg.hf_home, threads=args.threads, device=args.device)
+        with WriterLock(db.parent, 600):
+            conn = store.open_rw(db)
+            try:
+                st = embed_pass(conn, db, emb, restrict=set(int(r) for r in sub), log=_log)
+            finally:
+                conn.close()
+        print(f"  {key}: embedded {st['embedded']} sub-corpus chunks in {st['seconds']} s", flush=True)
+        engine = Engine(idx, key, emb.dim, embedder=emb)
+        rep = E.evaluate(idx, golden, modes, engine=engine, restrict=sub)
+        rep["embed_seconds"] = st["seconds"]
+        reports[key] = rep
+        print(E.table(rep, f"kb eval — {key}, sub-corpus of {len(sub)}"), flush=True)
+    out = {"subcorpus": len(sub), "seed": args.seed, "distractors": args.distractors,
+           "reports": reports}
+    if set(keys) == {"e5b", "m3"}:
+        benches = sorted(glob.glob(str(db.parent / "eval" / "bench-m3-*.json")))
+        delta = json.loads(Path(benches[-1]).read_text())["daily_delta_minutes"] if benches else None
+        out["decision"] = E.decide(reports["e5b"], reports["m3"], delta)
+        d = out["decision"]
+        print(f"decision (DESIGN §6.3): {d['choice']} — net m3−e5b on hybrid strict@10 = "
+              f"{d['net_m3_minus_e5b']} (m3 wins {len(d['m3_wins'])}, e5b wins {len(d['e5b_wins'])}); "
+              f"m3 daily delta {d['m3_daily_delta_minutes']} min (≤ 60: {d['speed_ok']})")
+    p = E.save(db, f"compare-{'-'.join(keys)}-{stamp}.json", out)
+    print(f"report: {p}")
+    return 0
+
+
 def cmd_bench(args, cfg) -> int:
     from .bench import bench_embed
     print(json.dumps(bench_embed(cfg, _db(args, cfg), args.model, args.n, args.threads,
@@ -325,6 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--model", required=True)
     f.add_argument("--revision", help="commit sha (default: the repo's current one, then pinned)")
 
+    ev = sub.add_parser("eval", help="golden-set recall per mode; --compare-models for §6.3")
+    ev.add_argument("--golden", default=str(GOLDEN))
+    ev.add_argument("--modes", default="fts_raw_or,fts,semantic,hybrid")
+    ev.add_argument("--compare-models", help="e.g. e5b,m3: both on one sub-corpus")
+    ev.add_argument("--distractors", type=int, default=10000)
+    ev.add_argument("--seed", type=int, default=20261007)
+    ev.add_argument("--threads", type=int, default=16)
+    ev.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+
     bn = sub.add_parser("bench-embed", help="embedding speed on a stratified sample of real chunks")
     bn.add_argument("--model", required=True)
     bn.add_argument("--n", type=int, default=2000)
@@ -338,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {"search": cmd_search, "read": cmd_read, "build": cmd_build, "update": cmd_update,
             "stats": cmd_stats, "embed": cmd_embed, "gc": cmd_gc, "fetch-model": cmd_fetch_model,
-            "bench-embed": cmd_bench}
+            "bench-embed": cmd_bench, "eval": cmd_eval}
 
 
 def _embed_args(p) -> None:
