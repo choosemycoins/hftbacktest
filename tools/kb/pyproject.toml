@@ -1,0 +1,42 @@
+[project]
+name = "kb"
+version = "2.0.0"
+description = "Local knowledge base: chunked FTS5 with Russian stemming, local embeddings, hybrid search, stdio MCP. Pointers, not answers."
+requires-python = ">=3.12"
+dependencies = [
+  "snowballstemmer>=2.2",
+  "numpy>=1.26",
+  "mcp>=1.12",
+  "torch>=2.6",
+  "transformers>=4.46",
+  "tokenizers>=0.20",
+  "safetensors>=0.4",
+  "huggingface_hub>=0.26",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["kb"]
+
+# torch comes ONLY from the CPU wheel index: the default (CUDA) wheel drags in
+# gigabytes of NVIDIA libraries. The index is explicit, so nothing else
+# resolves from it.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["model: needs a real downloaded embedding model (skipped by default)"]
+addopts = "-m 'not model'"

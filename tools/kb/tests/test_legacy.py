@@ -1,4 +1,5 @@
-"""Tests for kbindex — extractors, FTS round-trip, build safety.
+"""Tests for the v1 kbindex code, moved verbatim into kb.legacy (+ kb.extract,
+kb.redact, kb.secure) — extractors, FTS round-trip, build safety.
 
 Everything runs on synthetic fixtures in tmp_path; no test touches the real
 ~/.claude, the real repos, or the real database.
@@ -13,9 +14,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import kbindex  # noqa: E402
+import kb.legacy as kbindex  # noqa: E402
 
 
 # --------------------------------------------------------------------------
