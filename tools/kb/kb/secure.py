@@ -20,9 +20,10 @@ DIR_MODE = 0o700
 # nothing else — authorises re-chmodding that directory on later builds.
 DIR_MARKER = ".kbindex-dir"
 DIR_MARKER_TEXT = (
-    "This directory is managed by tools/kbindex.py: it is kept 0700 because\n"
-    "kb.db holds secrets pasted into session transcripts. Delete this marker\n"
-    "to stop kbindex from touching the directory mode.\n"
+    "This directory is managed by kb (tools/kb, formerly tools/kbindex.py): it\n"
+    "is kept 0700 because kb.db and the embedding matrices hold secrets pasted\n"
+    "into session transcripts and chats. Delete this marker to stop kb from\n"
+    "touching the directory mode.\n"
 )
 
 

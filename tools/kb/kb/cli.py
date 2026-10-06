@@ -38,7 +38,8 @@ LIMITATIONS worth knowing before you trust an empty result
 NETWORK
   Only `kb fetch-model` touches the network (one-time model download).
 
-EXIT CODES  0 ok · 2 bad query/usage · 3 incomplete run (missing root, guard).
+EXIT CODES  0 ok · 2 bad query/usage · 3 incomplete run (missing root, guard,
+            parse failure) · 75 deferred (memory pressure, lock held while waiting).
 """
 
 from __future__ import annotations
@@ -119,24 +120,50 @@ def cmd_read(args, cfg) -> int:
     return 0
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _summary(st: dict) -> None:
+    for kind, c in sorted(st.get("kinds", {}).items()):
+        print(f"  {kind:<11} " + " ".join(f"{k}={v}" for k, v in sorted(c.items())), flush=True)
+    if "db_bytes" in st:
+        print(f"  db={st['db_bytes'] / 1e6:.1f} MB elapsed={st.get('elapsed')}s")
+        where = "in a 0700 dir kb owns" if st.get("dir_managed") else \
+            "in a directory kb did not lock down (see warning above)"
+        print(f"  db is 0600 {where}: it holds pasted secrets — never commit or copy it off "
+              "this machine")
+    for m in st.get("missing_roots", []):
+        print(f"  INCOMPLETE: missing root: {m}", file=sys.stderr)
+    for s in st.get("refused", []):
+        print(f"  INCOMPLETE: mass delete refused for {s} (--allow-mass-delete)", file=sys.stderr)
+    if st.get("failed"):
+        print(f"  INCOMPLETE: {st['failed']} unit(s) failed to parse (see warnings)", file=sys.stderr)
+    if st.get("reason"):
+        print(f"  {st['reason']}", file=sys.stderr)
+
+
 def cmd_build(args, cfg) -> int:
     from .update import build_full
     if not args.full:
         print("kb build needs --full (use `kb update` for an incremental run)", file=sys.stderr)
         return 2
     db = _db(args, cfg)
-    print(f"kb build --full -> {db}")
-    st = build_full(cfg, db, log=print)
-    for kind, c in sorted(st["kinds"].items()):
-        print(f"  {kind:<11} " + " ".join(f"{k}={v}" for k, v in sorted(c.items())))
-    print(f"  db={st['db_bytes'] / 1e6:.1f} MB elapsed={st['elapsed']}s")
-    where = "in a 0700 dir kb owns" if st["dir_managed"] else \
-        "in a directory kb did not lock down (see warning above)"
-    print(f"  db is 0600 {where}: it holds pasted secrets — never commit or copy it off this machine")
-    if st["missing_roots"]:
-        print(f"  INCOMPLETE: {len(st['missing_roots'])} source root(s) missing", file=sys.stderr)
-        return 3
-    return 0
+    print(f"kb build --full -> {db}", flush=True)
+    st = build_full(cfg, db, log=_log, lock_timeout=args.lock_timeout)
+    _summary(st)
+    return st["exit"]
+
+
+def cmd_update(args, cfg) -> int:
+    from .update import update
+    db = _db(args, cfg)
+    print(f"kb update -> {db}", flush=True)
+    st = update(cfg, db, allow_mass_delete=args.allow_mass_delete, lock_timeout=args.lock_timeout,
+                min_free_gb=args.min_free_gb, max_psi=args.max_psi,
+                psi_wait_minutes=args.psi_wait_minutes, log=_log)
+    _summary(st)
+    return st["exit"]
 
 
 def cmd_stats(args, cfg) -> int:
@@ -174,13 +201,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("build", help="full rebuild into a temp file, then atomic rename")
     b.add_argument("--full", action="store_true")
+    b.add_argument("--lock-timeout", type=float, default=600)
+
+    u = sub.add_parser("update", help="incremental update (what changed since the last run)")
+    u.add_argument("--allow-mass-delete", action="store_true",
+                   help="accept losing > max(50, 20%%) of a source's units in one run")
+    u.add_argument("--lock-timeout", type=float, default=600,
+                   help="seconds to wait for another writer; 0 = exit 0 at once (timer)")
+    u.add_argument("--min-free-gb", type=float, default=5.0)
+    u.add_argument("--max-psi", type=float, default=None,
+                   help="defer while memory PSI some avg10 of user@.service is above this")
+    u.add_argument("--psi-wait-minutes", type=float, default=60)
 
     st = sub.add_parser("stats", help="what is indexed, what is missing")
     st.add_argument("--check", action="store_true", help="FTS integrity check")
     return p
 
 
-COMMANDS = {"search": cmd_search, "read": cmd_read, "build": cmd_build, "stats": cmd_stats}
+COMMANDS = {"search": cmd_search, "read": cmd_read, "build": cmd_build, "update": cmd_update,
+            "stats": cmd_stats}
 
 
 def main(argv=None) -> int:

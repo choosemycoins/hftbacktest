@@ -46,7 +46,8 @@ def test_build_is_atomic_old_db_survives_a_failure(built, monkeypatch):
     with pytest.raises(RuntimeError):
         update.build_full(cfg, db, warn=lambda m: None)
     assert db.read_bytes() == before
-    leftovers = [p.name for p in db.parent.iterdir() if p.name not in (db.name, ".kbindex-dir")]
+    leftovers = [p.name for p in db.parent.iterdir()
+                 if p.name not in (db.name, ".kbindex-dir", "kb.lock")]
     assert leftovers == []
 
 
