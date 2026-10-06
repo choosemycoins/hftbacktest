@@ -1,0 +1,11 @@
+# 05:20: after mirror-sdb1 (03:30), before hft-offload-daily (09:15) and topic-scan (09:16)
+[Unit]
+Description=kb nightly update
+
+[Timer]
+OnCalendar=*-*-* 05:20
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

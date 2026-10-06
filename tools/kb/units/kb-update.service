@@ -1,0 +1,30 @@
+# kb: nightly incremental index update (DESIGN.md §11.3). Installed by the lead:
+#   cp tools/kb/units/kb-update.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now kb-update.timer
+[Unit]
+Description=kb: incremental index update (local, offline)
+
+[Service]
+Type=oneshot
+Slice=hft-compute.slice
+# same limits as ~/bin/hft-run: hard ceiling, no swap, and NO MemoryHigh —
+# throttling at memory.high itself raises the PSI that systemd-oomd acts on
+MemoryMax=24G
+MemorySwapMax=0
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+# offline by construction: in a user unit (systemd 249) PrivateNetwork=yes is
+# silently ignored unless PrivateUsers=yes is set too (measured 07.10)
+PrivateUsers=yes
+PrivateNetwork=yes
+Environment=HF_HOME=/home/storage/hft-scratch/hf-cache
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=TOKENIZERS_PARALLELISM=false
+ExecStart=/home/storage/hft-scratch/kb-venv/bin/kb update --lock-timeout 0 --min-free-gb 5 --max-psi 20 --psi-wait-minutes 60
+TimeoutStartSec=5h
+# Optional hardening, only after a trial run of the unit:
+# ReadOnlyPaths=%h
+# ReadWritePaths=%h/.local/share/kbindex
