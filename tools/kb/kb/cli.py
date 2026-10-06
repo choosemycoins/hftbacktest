@@ -88,10 +88,12 @@ def _print_hits(resp: dict, query: str) -> str:
 def cmd_search(args, cfg) -> int:
     from .redact import redact_obj
     from .search import Index, QueryError, search
+    from .semantic import engine_for
     idx = Index(_db(args, cfg))
     try:
+        engine = engine_for(idx, cfg, threads=args.threads) if idx.path.exists() else None
         resp = search(idx, args.query, mode=args.mode, kind=args.kind, project=args.project,
-                      since=args.since, limit=args.limit)
+                      since=args.since, limit=args.limit, engine=engine)
     except QueryError as exc:
         print(f"kb: {exc}", file=sys.stderr)
         return 2
@@ -160,15 +162,104 @@ def cmd_build(args, cfg) -> int:
     return st["exit"]
 
 
+def _embed_after(cfg, db, args):
+    """The embedding pass, run under the writer lock of `kb update`."""
+    def after(conn):
+        from .embed import embed_pass, load_embedder
+        from .models import ModelError
+        key = getattr(args, "model", None) or cfg.model_active
+        if not key:
+            return {"skipped": "no [models] active in the config"}
+        try:
+            emb = load_embedder(key, cfg.hf_home, threads=args.threads, device=args.device,
+                                full_verify=True)
+        except ModelError as exc:
+            print(f"kb: embeddings skipped: {exc}", file=sys.stderr, flush=True)
+            return {"skipped": str(exc)}
+        st = embed_pass(conn, db, emb, budget_minutes=args.budget_minutes,
+                        max_chunks=args.max_chunks, log=_log)
+        print(f"  embeddings {st['model']}: +{st['embedded']} in {st['seconds']} s, "
+              f"remaining {st['remaining']}", flush=True)
+        return st
+    return after
+
+
 def cmd_update(args, cfg) -> int:
     from .update import update
     db = _db(args, cfg)
     print(f"kb update -> {db}", flush=True)
     st = update(cfg, db, allow_mass_delete=args.allow_mass_delete, lock_timeout=args.lock_timeout,
                 min_free_gb=args.min_free_gb, max_psi=args.max_psi,
-                psi_wait_minutes=args.psi_wait_minutes, log=_log)
+                psi_wait_minutes=args.psi_wait_minutes, log=_log,
+                after=_embed_after(cfg, db, args) if args.embed else None)
     _summary(st)
     return st["exit"]
+
+
+def cmd_embed(args, cfg) -> int:
+    from . import store
+    from .update import Busy, WriterLock
+    db = _db(args, cfg)
+    if not db.exists():
+        print(f"kb: no index at {db} — run: kb build --full", file=sys.stderr)
+        return 2
+    try:
+        with WriterLock(db.parent, args.lock_timeout):
+            conn = store.open_rw(db)
+            try:
+                store.check_schema(conn)
+                st = _embed_after(cfg, db, args)(conn)
+            finally:
+                conn.close()
+    except Busy:
+        print("kb: another writer holds the lock — nothing done", file=sys.stderr)
+        return 0 if args.lock_timeout <= 0 else 75
+    return 3 if "skipped" in st else 0
+
+
+def cmd_gc(args, cfg) -> int:
+    import shutil
+    from . import store
+    from .embed import MatrixStore
+    from .update import WriterLock
+    db = _db(args, cfg)
+    with WriterLock(db.parent, args.lock_timeout):
+        conn = store.open_rw(db)
+        try:
+            models = conn.execute("SELECT model_key, dim FROM emb_model").fetchall()
+            for key, dim in models:
+                ms = MatrixStore(db, key, dim)
+                if args.drop_model == key:
+                    with store.transaction(conn):
+                        conn.execute("DELETE FROM emb_row WHERE model_key=?", (key,))
+                        conn.execute("DELETE FROM emb_model WHERE model_key=?", (key,))
+                    shutil.rmtree(ms.dir, ignore_errors=True)
+                    print(f"  {key}: dropped")
+                    continue
+                orphans = ms.clean_orphans(conn)
+                n = ms.gc(conn, force=True)
+                print(f"  {key}: {n} garbage rows dropped, {len(orphans)} orphan file(s) removed")
+        finally:
+            conn.close()
+    return 0
+
+
+def cmd_fetch_model(args, cfg) -> int:
+    from .fetch import fetch_model
+    from .models import ModelError
+    try:
+        fetch_model(args.model, cfg.hf_home, revision=args.revision, log=_log)
+    except ModelError as exc:
+        print(f"kb: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_bench(args, cfg) -> int:
+    from .bench import bench_embed
+    print(json.dumps(bench_embed(cfg, _db(args, cfg), args.model, args.n, args.threads,
+                                 args.device, log=_log), indent=1))
+    return 0
 
 
 def cmd_stats(args, cfg) -> int:
@@ -192,12 +283,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("search", help="where was this discussed?")
     s.add_argument("query")
-    s.add_argument("--mode", default="fts", choices=["hybrid", "fts", "semantic"])
+    s.add_argument("--mode", default="hybrid", choices=["hybrid", "fts", "semantic"])
     s.add_argument("--kind")
     s.add_argument("--project")
     s.add_argument("--since")
     s.add_argument("--limit", type=int, default=10)
     s.add_argument("--json", action="store_true")
+    s.add_argument("--threads", type=int, default=4, help="CPU threads for the query embedding")
 
     r = sub.add_parser("read", help="a chunk (and neighbours) by kb:<id> or `where`")
     r.add_argument("pointer")
@@ -217,6 +309,27 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--max-psi", type=float, default=None,
                    help="defer while memory PSI some avg10 of user@.service is above this")
     u.add_argument("--psi-wait-minutes", type=float, default=60)
+    u.add_argument("--embed", action="store_true", help="then embed what has no vector yet")
+    _embed_args(u)
+
+    e = sub.add_parser("embed", help="embed chunks that have no vector yet (budgeted)")
+    e.add_argument("--model", help="model key (default: [models] active)")
+    e.add_argument("--lock-timeout", type=float, default=600)
+    _embed_args(e)
+
+    g = sub.add_parser("gc", help="drop embedding garbage (new matrix generation)")
+    g.add_argument("--drop-model", help="delete one model's vectors entirely")
+    g.add_argument("--lock-timeout", type=float, default=600)
+
+    f = sub.add_parser("fetch-model", help="ONE-TIME model download (the only network command)")
+    f.add_argument("--model", required=True)
+    f.add_argument("--revision", help="commit sha (default: the repo's current one, then pinned)")
+
+    bn = sub.add_parser("bench-embed", help="embedding speed on a stratified sample of real chunks")
+    bn.add_argument("--model", required=True)
+    bn.add_argument("--n", type=int, default=2000)
+    bn.add_argument("--threads", type=int, default=16)
+    bn.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
 
     st = sub.add_parser("stats", help="what is indexed, what is missing")
     st.add_argument("--check", action="store_true", help="FTS integrity check")
@@ -224,12 +337,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"search": cmd_search, "read": cmd_read, "build": cmd_build, "update": cmd_update,
-            "stats": cmd_stats}
+            "stats": cmd_stats, "embed": cmd_embed, "gc": cmd_gc, "fetch-model": cmd_fetch_model,
+            "bench-embed": cmd_bench}
+
+
+def _embed_args(p) -> None:
+    p.add_argument("--budget-minutes", type=float, default=None)
+    p.add_argument("--max-chunks", type=int, default=None)
+    p.add_argument("--threads", type=int, default=16)
+    p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
 
 
 def main(argv=None) -> int:
     os.umask(0o077)       # everything kb creates (db, journal, lock, matrices) is 0600/0700
     args = build_parser().parse_args(argv)
+    if args.command != "fetch-model":
+        from .netguard import force_offline_env
+        force_offline_env()   # before anything imports huggingface_hub / transformers
     try:
         cfg = cfgmod.load_config(args.config)
     except cfgmod.ConfigError as exc:

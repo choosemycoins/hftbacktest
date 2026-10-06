@@ -1,0 +1,60 @@
+# Pinned embedding models (written by `kb fetch-model`; do not edit by hand).
+# revision = commit sha of the Hugging Face repo; every file has a sha256 + size;
+# weights are safetensors only (pickles are converted once and deleted).
+
+[model.e5b]
+repo_id = "intfloat/multilingual-e5-base"
+revision = "d128750597153bb5987e10b1c3493a34e5a4502a"
+
+[model.e5b.files."config.json"]
+sha256 = "9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4"
+size = 694
+
+[model.e5b.files."model.safetensors"]
+sha256 = "a18a44fad1d0b46ded15928144138cff1135d5cc8233bdd90be5f18822de09a7"
+size = 1112201288
+
+[model.e5b.files."sentencepiece.bpe.model"]
+sha256 = "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865"
+size = 5069051
+
+[model.e5b.files."special_tokens_map.json"]
+sha256 = "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f"
+size = 280
+
+[model.e5b.files."tokenizer.json"]
+sha256 = "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626"
+size = 17082660
+
+[model.e5b.files."tokenizer_config.json"]
+sha256 = "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15"
+size = 418
+
+[model.m3]
+repo_id = "BAAI/bge-m3"
+revision = "5617a9f61b028005a4858fdac845db406aefb181"
+converted_from = "pytorch_model.bin"
+
+[model.m3.files."config.json"]
+sha256 = "26159e7ad065073448460117eb24b7a4572f6f4e78eadff65dc0a11c052449fa"
+size = 687
+
+[model.m3.files."model.safetensors"]
+sha256 = "993b2248881724788dcab8c644a91dfd63584b6e5604ff2037cb5541e1e38e7e"
+size = 2271064456
+
+[model.m3.files."sentencepiece.bpe.model"]
+sha256 = "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865"
+size = 5069051
+
+[model.m3.files."special_tokens_map.json"]
+sha256 = "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835"
+size = 964
+
+[model.m3.files."tokenizer.json"]
+sha256 = "21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08"
+size = 17098108
+
+[model.m3.files."tokenizer_config.json"]
+sha256 = "a62b2b6784f990259fddef5f16388693a8043be4f69179e6a5257eeb3f9abac4"
+size = 444

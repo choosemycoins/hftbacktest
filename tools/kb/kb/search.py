@@ -341,34 +341,85 @@ def hit_json(h: Hit, match, semantic_only: bool) -> dict:
             "score": round(h.score, 6), "ranks": h.ranks}
 
 
-def search(index: Index, query: str, mode: str = "fts", kind=None, project=None, since=None,
-           limit: int = 10, semantic=None) -> dict:
-    """The answer as one JSON-able dict (the same for CLI --json and MCP)."""
+def _restrict_table(index, conn, restrict) -> str | None:
+    """Eval: rank inside a sub-corpus (a TEMP table works on a read-only handle)."""
+    if restrict is None:
+        return None
+    key = (id(conn), id(restrict), len(restrict))
+    if getattr(index, "_restrict_key", None) != key:
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS kb_restrict(rowid INTEGER PRIMARY KEY)")
+        conn.execute("DELETE FROM kb_restrict")
+        conn.executemany("INSERT INTO kb_restrict VALUES (?)", [(int(r),) for r in restrict])
+        index._restrict_key = key
+    return "kb_restrict"
+
+
+def search(index: Index, query: str, mode: str = "hybrid", kind=None, project=None, since=None,
+           limit: int = 10, engine=None, wait: float = 60.0, restrict=None,
+           fts_query=None) -> dict:
+    """The answer as one JSON-able dict (the same for CLI --json and MCP).
+    `engine` (kb.semantic.Engine) supplies vectors; without it, or while its
+    model is unavailable, semantic/hybrid degrade to fts and say so."""
+    from .semantic import rrf, semantic_text
     t0 = time.monotonic()
     if mode not in ("fts", "semantic", "hybrid"):
         raise QueryError("mode must be hybrid, fts or semantic")
     limit = max(1, min(int(limit), MAX_LIMIT))
     scope = make_scope(kind, project, since)
-    q = parse_query(query)
+    q = fts_query(query) if fts_query else parse_query(query)
     conn = index.conn()
     meta = index.meta()
-    ranked = fts_ranked(conn, q, scope)
-    hits = fetch_hits(conn, ranked)
-    ordered = []
-    for i, rowid in enumerate(ranked, 1):
-        h = hits[rowid]
-        h.ranks = {"fts": i}
-        h.score = 1.0 / i
-        ordered.append(h)
+    table = _restrict_table(index, conn, restrict)
+    degraded = None
+    sem: list[tuple[int, float]] = []
+    want_sem = mode in ("semantic", "hybrid")
+    if want_sem:
+        emb, why = engine.embedder(wait) if engine is not None else (None, "no embedding model configured")
+        if emb is None:
+            degraded = f"semantic unavailable ({why}); fts only"
+            mode_used = "fts"
+        else:
+            qv = emb.embed_query(semantic_text(q))
+            sem = engine.sem.ranked(qv, scope, restrict=restrict)
+            mode_used = mode
+    else:
+        mode_used = "fts"
+    fts = fts_ranked(conn, q, scope, restrict_table=table) if mode_used in ("fts", "hybrid") else []
+    sem_ids = [r for r, _ in sem]
+    hits = fetch_hits(conn, list(dict.fromkeys(fts + sem_ids)))
+    if mode_used == "hybrid":
+        fused = rrf(fts, sem_ids, {r: h.date for r, h in hits.items()})
+        ordered = []
+        for r, score, ranks in fused:
+            h = hits[r]
+            h.score, h.ranks = score, ranks
+            ordered.append(h)
+    elif mode_used == "semantic":
+        ordered = []
+        for i, (r, score) in enumerate(sem, 1):
+            h = hits[r]
+            h.score, h.ranks = score, {"sem": i}
+            ordered.append(h)
+    else:
+        ordered = []
+        for i, r in enumerate(fts, 1):
+            h = hits[r]
+            h.score, h.ranks = 1.0 / i, {"fts": i}
+            ordered.append(h)
     final = dedup_diversify(ordered, limit)
     match = make_matcher(q)
+    if engine is not None:
+        coverage = engine.sem.coverage(scope, restrict)
+    else:
+        coverage = {"embedded": 0, "in_scope": count_scope(conn, scope)}
     return {
         "notice": NOTICE,
         "index": index_info(meta),
-        "query": {"mode": mode, "raw": q.raw, "terms": q.terms + [p + "*" for p in q.prefixes]},
-        "coverage": {"embedded": 0, "in_scope": count_scope(conn, scope)},
-        "degraded": None if mode == "fts" else "semantic search is not available in this build",
-        "results": [hit_json(h, match, False) for h in final],
+        "query": {"mode": mode, "used": mode_used, "raw": q.raw,
+                  "terms": q.terms + [p + "*" for p in q.prefixes]},
+        "coverage": coverage,
+        "degraded": degraded,
+        "results": [hit_json(h, match, "fts" not in h.ranks) for h in final],
         "seconds": round(time.monotonic() - t0, 3),
     }
 
