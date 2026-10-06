@@ -19,10 +19,15 @@ THE DATABASE IS A SECRET, AND SO IS THIS TOOL'S OUTPUT
   output local.
 
 SEARCH
-  natural (default)  words of the query, OR-ed, ranked by BM25.
-  raw:<FTS5 query>   passed to SQLite FTS5 over title+text: "exact phrase",
-                     prefix*, AND/OR/NOT, NEAR(a b, 10). Tokenizer unicode61
-                     (case-folding, diacritics removed; ё is NOT folded).
+  natural (default)  words of the query, minus stop words, STEMMED (Snowball
+                     ru/en, ё = е) and OR-ed over a stemmed shadow column,
+                     ranked by BM25: `терять` finds `терял`, `комиссиях`.
+                     Not every form converges (`отмена`/`отменить`,
+                     `котировать`/`котировки`) — that is what semantic is for.
+  raw:<FTS5 query>   passed to SQLite FTS5 over the RAW title+text: exact
+                     forms, "phrase", prefix*, AND/OR/NOT, NEAR(a b, 10).
+                     Tokenizer unicode61 (case-folding, diacritics removed;
+                     ё is NOT folded in raw mode).
   Filters: --kind (comma list), --project, --since YYYY-MM-DD.
 
 LIMITATIONS worth knowing before you trust an empty result

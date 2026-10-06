@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import sources
+from .stem import STEM_VERSION, stem_text
 
 SCHEMA_VERSION = 2
 SEP = "\x1f"
@@ -56,8 +57,9 @@ CREATE TABLE chunk (
   loc        TEXT NOT NULL,
   file       TEXT,
   title      TEXT NOT NULL DEFAULT '',
-  text       TEXT NOT NULL,
-  text_sha   TEXT NOT NULL,
+  text       TEXT NOT NULL,          -- raw, UNmasked (masking happens on output)
+  stem       TEXT NOT NULL,          -- stems of title + text, in order (kb.stem)
+  text_sha   TEXT NOT NULL,          -- sha256(title ␟ text): the embedding key
   n_chars    INTEGER NOT NULL
 );
 CREATE INDEX chunk_unit  ON chunk(unit_id, ordinal);
@@ -65,19 +67,21 @@ CREATE INDEX chunk_scope ON chunk(kind, project, date);
 CREATE INDEX chunk_sha   ON chunk(text_sha);
 
 CREATE VIRTUAL TABLE chunk_fts USING fts5(
-  title, text,
+  title, text, stem,
   content='chunk', content_rowid='rowid',
   tokenize='unicode61 remove_diacritics 2'
 );
 CREATE TRIGGER chunk_ai AFTER INSERT ON chunk BEGIN
-  INSERT INTO chunk_fts(rowid, title, text) VALUES (new.rowid, new.title, new.text);
+  INSERT INTO chunk_fts(rowid, title, text, stem) VALUES (new.rowid, new.title, new.text, new.stem);
 END;
 CREATE TRIGGER chunk_ad AFTER DELETE ON chunk BEGIN
-  INSERT INTO chunk_fts(chunk_fts, rowid, title, text) VALUES ('delete', old.rowid, old.title, old.text);
+  INSERT INTO chunk_fts(chunk_fts, rowid, title, text, stem)
+    VALUES ('delete', old.rowid, old.title, old.text, old.stem);
 END;
-CREATE TRIGGER chunk_au AFTER UPDATE OF title, text ON chunk BEGIN
-  INSERT INTO chunk_fts(chunk_fts, rowid, title, text) VALUES ('delete', old.rowid, old.title, old.text);
-  INSERT INTO chunk_fts(rowid, title, text) VALUES (new.rowid, new.title, new.text);
+CREATE TRIGGER chunk_au AFTER UPDATE OF title, text, stem ON chunk BEGIN
+  INSERT INTO chunk_fts(chunk_fts, rowid, title, text, stem)
+    VALUES ('delete', old.rowid, old.title, old.text, old.stem);
+  INSERT INTO chunk_fts(rowid, title, text, stem) VALUES (new.rowid, new.title, new.text, new.stem);
 END;
 
 CREATE TABLE emb_model (
@@ -140,7 +144,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     set_meta(conn, schema=str(SCHEMA_VERSION), built_at=now_iso(), emb_version="0",
-             parser_versions=json.dumps(sources.PARSER_VERSIONS, sort_keys=True))
+             parser_versions=json.dumps(sources.PARSER_VERSIONS, sort_keys=True),
+             stem_version=STEM_VERSION)
 
 
 def check_schema(conn: sqlite3.Connection) -> None:
@@ -193,6 +198,7 @@ def _chunk_rows(cand, pieces):
             "chunk_id": cid, "ordinal": ordinal, "anchor": p.anchor, "kind": cand.kind,
             "project": cand.project, "date": p.date or cand.date, "loc": p.loc, "file": p.file,
             "title": p.title, "text": p.text, "text_sha": text_sha(p.title, p.text),
+            "stem": None,                   # computed only for rows that get written
             "n_chars": len(p.text),
         })
     return rows
@@ -231,19 +237,20 @@ def write_unit(conn: sqlite3.Connection, cand, pieces, content_sha: str | None,
             if prev is None:
                 conn.execute(
                     "INSERT INTO chunk(chunk_id, unit_id, ordinal, anchor, kind, project, date, "
-                    "loc, file, title, text, text_sha, n_chars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "loc, file, title, text, stem, text_sha, n_chars) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (r["chunk_id"], unit_id, r["ordinal"], r["anchor"], r["kind"], r["project"],
-                     r["date"], r["loc"], r["file"], r["title"], r["text"], r["text_sha"],
-                     r["n_chars"]))
+                     r["date"], r["loc"], r["file"], r["title"], r["text"],
+                     stem_text(r["title"], r["text"]), r["text_sha"], r["n_chars"]))
                 stats["added"] += 1
             elif any(prev[k] != r[k] for k in _COMPARED):
                 if prev["text_sha"] != r["text_sha"]:
                     conn.execute(
                         "UPDATE chunk SET ordinal=?, anchor=?, kind=?, project=?, date=?, loc=?, "
-                        "file=?, title=?, text=?, text_sha=?, n_chars=? WHERE rowid=?",
+                        "file=?, title=?, text=?, stem=?, text_sha=?, n_chars=? WHERE rowid=?",
                         (r["ordinal"], r["anchor"], r["kind"], r["project"], r["date"], r["loc"],
-                         r["file"], r["title"], r["text"], r["text_sha"], r["n_chars"],
-                         prev["rowid"]))
+                         r["file"], r["title"], r["text"], stem_text(r["title"], r["text"]),
+                         r["text_sha"], r["n_chars"], prev["rowid"]))
                 else:          # metadata only: the FTS row stays as it is
                     conn.execute(
                         "UPDATE chunk SET ordinal=?, anchor=?, kind=?, project=?, date=?, loc=?, "
@@ -268,4 +275,16 @@ def delete_unit(conn: sqlite3.Connection, unit_id: int) -> int:
     with transaction(conn):
         n = conn.execute("DELETE FROM chunk WHERE unit_id = ?", (unit_id,)).rowcount
         conn.execute("DELETE FROM unit WHERE unit_id = ?", (unit_id,))
+    return n
+
+
+def restem(conn: sqlite3.Connection) -> int:
+    """Recompute the stem column (the stemmer changed). Triggers re-index FTS."""
+    n = 0
+    with transaction(conn):
+        rows = conn.execute("SELECT rowid, title, text FROM chunk").fetchall()
+        for rowid, title, text in rows:
+            conn.execute("UPDATE chunk SET stem = ? WHERE rowid = ?", (stem_text(title, text), rowid))
+            n += 1
+        set_meta(conn, stem_version=STEM_VERSION)
     return n

@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import secure, sources, store
 from .config import Config
+from .stem import STEM_VERSION
 
 LOCK_NAME = "kb.lock"
 MASS_DELETE_MIN = 50
@@ -285,7 +286,12 @@ def update(cfg: Config, db_path=None, *, allow_mass_delete=False, lock_timeout=6
                 if fresh:
                     store.init_schema(conn)
                 store.check_schema(conn)
+                restemmed = 0
+                if store.get_meta(conn, "stem_version") != STEM_VERSION:
+                    log(f"  stemmer changed -> re-stemming every chunk ({STEM_VERSION})")
+                    restemmed = store.restem(conn)
                 result = _pass(conn, cfg, allow_mass_delete, log, warn)
+                result["restemmed"] = restemmed
                 result["elapsed"] = _finish(conn, cfg, result, started, "update")
                 if after is not None:
                     result["after"] = after(conn)

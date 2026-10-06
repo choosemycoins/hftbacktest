@@ -12,13 +12,13 @@ import os
 import re
 import sqlite3
 import time
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import store
 from .redact import redact
+from .stem import TOKEN_RE, normalize, stem_word, tokens
 
 NOTICE = ("kb: pointers, verify at source — locations of past discussion, not answers. "
           "Snippets are masked best-effort; keep this output local.")
@@ -30,8 +30,6 @@ PER_KEY = 3
 SNIPPET_TOKENS = 40
 SNIPPET_CHARS = 400
 SEMANTIC_HEAD = 300
-
-TOKEN_RE = re.compile(r"[^\W_]+")
 
 STOPWORDS = frozenset("""
 и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по только ее её мне
@@ -54,14 +52,6 @@ class QueryError(Exception):
     pass
 
 
-def normalize(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
-
-
-def tokens(text: str) -> list[str]:
-    return TOKEN_RE.findall(normalize(text))
-
-
 def fts_quote(term: str) -> str:
     return '"' + term.replace('"', '""') + '"'
 
@@ -71,9 +61,10 @@ class Query:
     text: str
     raw: bool
     body: str
-    terms: list[str] = field(default_factory=list)       # what a snippet highlights
+    terms: list[str] = field(default_factory=list)       # stems (natural) / words (raw)
     prefixes: list[str] = field(default_factory=list)    # raw `foo*` terms
     fts: str = ""                                        # FTS5 MATCH expression
+    stemmed: bool = False                                # terms are stems
 
 
 def parse_query(text: str) -> Query:
@@ -91,13 +82,28 @@ def parse_query(text: str) -> Query:
         terms = [normalize(w) for w in words if not w.endswith("*")]
         prefixes = [normalize(w[:-1]) for w in words if w.endswith("*")]
         return Query(text, True, body, terms, prefixes, "{title text} : (" + body + ")")
+    words = _query_words(text)
+    stems = list(dict.fromkeys(stem_word(w) for w in words))[:MAX_TERMS]
+    return Query(text, False, text, stems, [],
+                 "stem : (" + " OR ".join(fts_quote(t) for t in stems) + ")", stemmed=True)
+
+
+def _query_words(text: str) -> list[str]:
     toks = tokens(text)
     kept = [t for t in toks if t not in STOPWORDS] or toks
-    uniq = list(dict.fromkeys(kept))[:MAX_TERMS]
-    if not uniq:
+    if not kept:
         raise QueryError("query has no searchable words")
-    return Query(text, False, text, uniq, [],
-                 "{title text} : (" + " OR ".join(fts_quote(t) for t in uniq) + ")")
+    return kept
+
+
+def raw_or_query(text: str) -> Query:
+    """Eval baseline `fts_raw_or`: the same words OR-ed over the RAW columns,
+    no stemming — the measure of what stemming adds."""
+    if text.strip().startswith("raw:"):
+        return parse_query(text)
+    words = list(dict.fromkeys(_query_words(text)))[:MAX_TERMS]
+    return Query(text, False, text, words, [],
+                 "{title text} : (" + " OR ".join(fts_quote(t) for t in words) + ")")
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +241,10 @@ def _flat(text: str) -> str:
 def make_matcher(q: Query):
     terms = set(q.terms)
     prefixes = tuple(q.prefixes)
+    if q.stemmed:
+        def match(token: str) -> bool:
+            return stem_word(token) in terms
+        return match
 
     def match(token: str) -> bool:
         t = normalize(token)
