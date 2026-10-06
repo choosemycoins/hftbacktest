@@ -525,10 +525,12 @@ where
                 let instrument = unsafe { self.instruments.get_unchecked_mut(inst_no) };
                 instrument.last_feed_latency = Some((event.exch_ts, event.local_ts));
                 if event.is(LOCAL_BID_DEPTH_EVENT) {
+                    instrument.last_depth_latency = Some((event.exch_ts, event.local_ts));
                     instrument
                         .depth
                         .update_bid_depth(event.px, event.qty, event.exch_ts);
                 } else if event.is(LOCAL_ASK_DEPTH_EVENT) {
+                    instrument.last_depth_latency = Some((event.exch_ts, event.local_ts));
                     instrument
                         .depth
                         .update_ask_depth(event.px, event.qty, event.exch_ts);
@@ -1135,6 +1137,10 @@ where
         self.instruments.get(asset_no).unwrap().last_feed_latency
     }
 
+    fn depth_latency(&self, asset_no: usize) -> Option<(i64, i64)> {
+        self.instruments.get(asset_no).unwrap().last_depth_latency
+    }
+
     fn order_latency(&self, asset_no: usize) -> Option<(i64, i64, i64)> {
         self.instruments.get(asset_no).unwrap().last_order_latency
     }
@@ -1415,6 +1421,24 @@ mod tests {
                 ev: LOCAL_BID_DEPTH_EVENT,
                 exch_ts: 1_700_000_000_000_000_000,
                 local_ts: 1_700_000_000_000_000_001,
+                px,
+                qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            },
+        }
+    }
+
+    /// A trade print. Deliberately carries the SAME `local_ts` shape as `bid` so a test that
+    /// distinguishes the two clocks cannot pass by accident of timestamps.
+    fn trade(symbol: &str, px: f64, qty: f64, local_ts: i64) -> LiveEvent {
+        LiveEvent::Feed {
+            symbol: symbol.into(),
+            event: Event {
+                ev: LOCAL_BUY_TRADE_EVENT,
+                exch_ts: local_ts - 1,
+                local_ts,
                 px,
                 qty,
                 order_id: 0,
@@ -3055,5 +3079,88 @@ mod tests {
             "both unreachable connectors must be named in the log, got {named:?}"
         );
         assert_eq!(bot.channel.attempts, 2, "and both were actually attempted");
+    }
+    /// §4.7/#83. A dead order book must be observable as a dead order book, even while trades
+    /// keep printing.
+    ///
+    /// `feed_latency` is refreshed by EVERY feed frame — the assignment sits above the
+    /// `event.is(..)` dispatch — so a venue that stops publishing depth while trades continue
+    /// leaves it fresh, and any freshness gate built on it reads "healthy" over a frozen book.
+    /// Measured 2026-08-13 on the recorded HL tape: the book went silent for 111.7 s on
+    /// 2026-08-09 and 109.7 s on 08-08 while the guards above it kept reading a stale mid.
+    ///
+    /// `depth_latency` is the same clock restricted to depth frames, which is what a guard that
+    /// prices inventory actually needs.
+    #[test]
+    fn a_trade_does_not_refresh_the_depth_clock() {
+        let script = vec![
+            (0, bid("BTC", 100.0, 5.0)), // depth at t=..001
+            (0, trade("BTC", 100.0, 1.0, 1_700_000_009_000_000_000)), // trade 8 s later
+        ];
+        let mut bot = make_bot(&["BTC"], script);
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+
+        let (_, feed_local) = bot.feed_latency(0).expect("a feed frame arrived");
+        let (_, depth_local) = bot.depth_latency(0).expect("a depth frame arrived");
+
+        assert_eq!(
+            feed_local, 1_700_000_009_000_000_000,
+            "the any-frame clock must follow the trade — that is what it is for"
+        );
+        assert_eq!(
+            depth_local, 1_700_000_000_000_000_001,
+            "the depth clock must stay at the last DEPTH frame; if the trade moved it, a frozen \
+             book is invisible to every guard built on this"
+        );
+    }
+
+    /// The liveness half: without it, `depth_latency` could satisfy the pin above by never
+    /// advancing at all.
+    #[test]
+    fn a_depth_frame_does_refresh_the_depth_clock() {
+        let script = vec![
+            (0, bid("BTC", 100.0, 5.0)),
+            (0, trade("BTC", 100.0, 1.0, 1_700_000_009_000_000_000)),
+            (
+                0,
+                LiveEvent::Feed {
+                    symbol: "BTC".into(),
+                    event: Event {
+                        ev: LOCAL_BID_DEPTH_EVENT,
+                        exch_ts: 1_700_000_019_000_000_000,
+                        local_ts: 1_700_000_019_000_000_001,
+                        px: 101.0,
+                        qty: 5.0,
+                        order_id: 0,
+                        ival: 0,
+                        fval: 0.0,
+                    },
+                },
+            ),
+        ];
+        let mut bot = make_bot(&["BTC"], script);
+        for _ in 0..3 {
+            bot.wait_next_feed(false, 1_000_000_000).unwrap();
+        }
+        assert_eq!(
+            bot.depth_latency(0).unwrap().1,
+            1_700_000_019_000_000_001,
+            "a later depth frame must advance the depth clock"
+        );
+    }
+
+    /// An instrument that has never seen depth reports `None`, not a zero that a subtraction
+    /// would turn into "infinitely stale" or "perfectly fresh" depending on the caller.
+    #[test]
+    fn the_depth_clock_is_none_before_any_depth_frame() {
+        let script = vec![(0, trade("BTC", 100.0, 1.0, 1_700_000_009_000_000_000))];
+        let mut bot = make_bot(&["BTC"], script);
+        bot.wait_next_feed(false, 1_000_000_000).unwrap();
+        assert!(bot.feed_latency(0).is_some(), "the trade did arrive");
+        assert!(
+            bot.depth_latency(0).is_none(),
+            "no depth frame has ever arrived; the guard must see absence, not a stand-in"
+        );
     }
 }

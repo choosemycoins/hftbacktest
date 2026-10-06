@@ -22,6 +22,15 @@ pub struct Instrument<MD> {
     last_trades: Vec<Event>,
     orders: HashMap<OrderId, Order>,
     last_feed_latency: Option<(i64, i64)>,
+    /// Same clock as `last_feed_latency`, but advanced ONLY by depth frames.
+    ///
+    /// They must be separate. `last_feed_latency` is assigned above the `event.is(..)`
+    /// dispatch, so any frame refreshes it — including trades. A venue that stops
+    /// publishing depth while trades keep printing therefore looks alive to it, and a
+    /// guard that prices inventory off a frozen book has no way to notice. Measured on the
+    /// recorded Hyperliquid tape 2026-08-13: the HYPE book went silent for 111.7 s
+    /// (2026-08-09) and 109.7 s (08-08) inside live trading.
+    last_depth_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
     state: StateValues,
     /// Set to `true` after the connector delivers `LiveEvent::SnapshotComplete` for this
@@ -62,6 +71,7 @@ impl<MD> Instrument<MD> {
             last_trades: Vec::with_capacity(last_trades_capacity),
             orders: Default::default(),
             last_feed_latency: None,
+            last_depth_latency: None,
             last_order_latency: None,
             state: Default::default(),
             snapshot_ready: false,

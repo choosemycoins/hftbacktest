@@ -1032,6 +1032,19 @@ where
     /// Returns the last feed's exchange timestamp and local receipt timestamp.
     fn feed_latency(&self, asset_no: usize) -> Option<(i64, i64)>;
 
+    /// Timestamps of the most recent DEPTH frame, as `(exch_ts, local_ts)`.
+    ///
+    /// Deliberately separate from [`feed_latency`](Self::feed_latency), which any frame
+    /// refreshes — trades included. A venue can stop publishing depth while trades keep
+    /// printing, and then `feed_latency` reports a healthy feed over a frozen book;
+    /// measured on the recorded Hyperliquid tape 2026-08-13, the HYPE book was silent for
+    /// 111.7 s (2026-08-09) and 109.7 s (08-08) inside live trading. A guard that prices
+    /// inventory must gate on THIS clock.
+    ///
+    /// `None` until the first depth frame — absence, not a zero a subtraction would turn
+    /// into "infinitely stale" or "perfectly fresh" depending on the caller.
+    fn depth_latency(&self, asset_no: usize) -> Option<(i64, i64)>;
+
     /// Returns the last order's request timestamp, exchange timestamp, and response receipt
     /// timestamp.
     fn order_latency(&self, asset_no: usize) -> Option<(i64, i64, i64)>;

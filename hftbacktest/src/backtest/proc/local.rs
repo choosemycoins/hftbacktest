@@ -45,6 +45,7 @@ where
     state: State<AT, FM>,
     trades: Vec<Event>,
     last_feed_latency: Option<(i64, i64)>,
+    last_depth_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
 }
 
@@ -69,6 +70,7 @@ where
             state,
             trades: Vec::with_capacity(last_trades_cap),
             last_feed_latency: None,
+            last_depth_latency: None,
             last_order_latency: None,
         }
     }
@@ -286,6 +288,10 @@ where
         self.last_feed_latency
     }
 
+    fn depth_latency(&self) -> Option<(i64, i64)> {
+        self.last_depth_latency
+    }
+
     fn order_latency(&self) -> Option<(i64, i64, i64)> {
         self.last_order_latency
     }
@@ -311,8 +317,10 @@ where
         } else if ev.is(LOCAL_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::None, 0.0);
         } else if ev.is(LOCAL_BID_DEPTH_EVENT) || ev.is(LOCAL_BID_DEPTH_SNAPSHOT_EVENT) {
+            self.last_depth_latency = Some((ev.exch_ts, ev.local_ts));
             self.depth.update_bid_depth(ev.px, ev.qty, ev.local_ts);
         } else if ev.is(LOCAL_ASK_DEPTH_EVENT) || ev.is(LOCAL_ASK_DEPTH_SNAPSHOT_EVENT) {
+            self.last_depth_latency = Some((ev.exch_ts, ev.local_ts));
             self.depth.update_ask_depth(ev.px, ev.qty, ev.local_ts);
         }
         // Processes a trade event
@@ -320,7 +328,8 @@ where
             self.trades.push(ev.clone());
         }
 
-        // Stores the current feed latency
+        // Stores the current feed latency. The depth clock is set inside the depth
+        // branches above, deliberately: this one is refreshed by trades too.
         self.last_feed_latency = Some((ev.exch_ts, ev.local_ts));
 
         Ok(())

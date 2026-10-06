@@ -45,6 +45,7 @@ where
     state: State<AT, FM>,
     trades: Vec<Event>,
     last_feed_latency: Option<(i64, i64)>,
+    last_depth_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
 }
 
@@ -69,6 +70,7 @@ where
             state,
             trades: Vec::with_capacity(trade_len),
             last_feed_latency: None,
+            last_depth_latency: None,
             last_order_latency: None,
         }
     }
@@ -214,6 +216,10 @@ where
         self.last_feed_latency
     }
 
+    fn depth_latency(&self) -> Option<(i64, i64)> {
+        self.last_depth_latency
+    }
+
     fn order_latency(&self) -> Option<(i64, i64, i64)> {
         self.last_order_latency
     }
@@ -232,7 +238,20 @@ where
     }
 
     fn process(&mut self, ev: &Event) -> Result<(), BacktestError> {
-        // Processes a depth event
+        // Processes a depth event. Every branch of this chain mutates the book, so the depth
+        // clock is stamped once for the whole chain — see `Bot::depth_latency` for why it must
+        // not share `last_feed_latency`, which trades also refresh.
+        if ev.is(LOCAL_BID_DEPTH_CLEAR_EVENT)
+            || ev.is(LOCAL_ASK_DEPTH_CLEAR_EVENT)
+            || ev.is(LOCAL_DEPTH_CLEAR_EVENT)
+            || ev.is(LOCAL_BID_ADD_ORDER_EVENT)
+            || ev.is(LOCAL_ASK_ADD_ORDER_EVENT)
+            || ev.is(LOCAL_MODIFY_ORDER_EVENT)
+            || ev.is(LOCAL_CANCEL_ORDER_EVENT)
+        {
+            self.last_depth_latency = Some((ev.exch_ts, ev.local_ts));
+        }
+
         if ev.is(LOCAL_BID_DEPTH_CLEAR_EVENT) {
             self.depth.clear_orders(Side::Buy);
         } else if ev.is(LOCAL_ASK_DEPTH_CLEAR_EVENT) {

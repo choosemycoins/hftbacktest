@@ -1146,6 +1146,10 @@ where
         self.local.get(asset_no).unwrap().feed_latency()
     }
 
+    fn depth_latency(&self, asset_no: usize) -> Option<(i64, i64)> {
+        self.local.get(asset_no).unwrap().depth_latency()
+    }
+
     #[inline]
     fn order_latency(&self, asset_no: usize) -> Option<(i64, i64, i64)> {
         self.local.get(asset_no).unwrap().order_latency()

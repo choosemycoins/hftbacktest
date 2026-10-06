@@ -95,6 +95,10 @@ where
     /// Returns the last feed's exchange timestamp and local receipt timestamp.
     fn feed_latency(&self) -> Option<(i64, i64)>;
 
+    /// Same clock as [`feed_latency`](Self::feed_latency) but advanced ONLY by depth
+    /// frames. See `Bot::depth_latency` for why the two must not be one.
+    fn depth_latency(&self) -> Option<(i64, i64)>;
+
     /// Returns the last order's request timestamp, exchange timestamp, and response receipt
     /// timestamp.
     fn order_latency(&self) -> Option<(i64, i64, i64)>;
