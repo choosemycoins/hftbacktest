@@ -41,3 +41,15 @@ def redact(text):
     for pattern, replacement in REDACTIONS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def redact_obj(obj):
+    """Mask every string inside a JSON-like structure (keys included): what
+    leaves through the CLI or MCP is masked line by line, not field by field."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {redact_obj(k): redact_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_obj(v) for v in obj]
+    return obj
