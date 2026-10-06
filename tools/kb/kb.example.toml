@@ -1,0 +1,64 @@
+# kb — example configuration. The real one lives in ~/.config/kb/kb.toml
+# (0600, directory 0700) and is NEVER committed: its chat allowlist names
+# private chats. This file is the built-in default (kb.config.builtin_config
+# mirrors it; a test keeps the two equal) minus any chat.
+
+db = "~/.local/share/kbindex/kb.db"
+
+[models]
+active = "e5b"                       # chosen by the golden eval, DESIGN.md §6.3
+hf_home = "/home/storage/hft-scratch/hf-cache"
+
+[projects.alias]
+# transcript slug -> project, where "last dash-separated component" breaks
+"-home-andrew----------Telegram-Desktop-ChatExport-2026-09-26" = "eacc-review"
+
+[claude]
+root = "~/.claude/projects"
+# Claude Code deletes old sessions; the nightly mirror keeps them. Files that
+# exist only here are indexed too (the live copy always wins).
+retain_from = "/home/andrew/storage_2tb/mirror/.claude/projects"
+
+[[repo]]                             # md docs + /export transcripts + docstrings + commits
+name = "hftbacktest"
+path = "~/RustroverProjects/hftbacktest"
+docstring_dirs = ["collector/tools", "collector", "docs", "."]
+
+[[repo]]
+name = "myhft"
+path = "~/RustroverProjects/myhft"
+docstring_dirs = ["scripts", "docs", "."]
+
+[[repo]]
+name = "eventshort"
+path = "~/RustroverProjects/eventshort"
+docstring_dirs = []
+
+[[repo]]
+name = "jansen"
+path = "~/PycharmProjects/jansen"
+docstring_dirs = ["studies", "."]
+
+[research]
+root = "~/hft-research"
+exclude = ["cryptology10-review/**"]
+git_discover = "~/hft-research/*/.git"
+
+[[course]]
+id = "cryptology10"
+asr = "/home/storage/hft-scratch/cryptology10/transcripts"
+notes = "~/hft-research/cryptology10-review"
+videos = "/home/storage/torrent/[Cryptology School] Cryptology 10 (2023)"
+
+[[course]]
+id = "workshop6"
+asr = "/home/storage/hft-scratch/workshop6/transcripts"
+videos = "/home/storage/torrent/[Cryptology School] Cryptology Work Shop v6.0 (2024)"
+
+[chats]
+exports_root = "~/Загрузки/Telegram Desktop"
+# Only chats listed in `allow` are indexed. Everything else in exports_root is
+# either listed in `ignore` or reported by `kb stats` as "unclassified".
+ignore = []
+allow = []
+# allow = [ { id = "some-chat", exports = ["ChatExport_2026-09-14 (1)"] } ]
