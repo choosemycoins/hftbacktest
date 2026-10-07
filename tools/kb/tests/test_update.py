@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import shutil
+import sqlite3
 import time
 
 import pytest
@@ -435,3 +436,68 @@ def test_build_full_refuses_to_drop_vectors_whose_tables_it_cannot_read(corpus):
     with pytest.raises(store.SchemaError, match="cannot carry the vectors"):
         update.build_full(cfg_of(corpus), corpus["db"], warn=lambda m: None)
     assert corpus["db"].read_bytes() == before
+
+
+# --- one odd unit never sinks the run -----------------------------------------------
+
+FILLER = " ".join(["слово"] * 70)                 # > SMALL: no section merges into another
+LONG_Y = "\n\n".join(f"абзац {i} МЕТКАДЛИННЫЙ{i} " + "текст " * 40 for i in range(9))
+ODD_HEADINGS = (f"# X\n\nМЕТКАПЕРВЫЙ {FILLER}\n\n# X\n\nМЕТКАПОВТОР {FILLER}\n\n"
+                f"# X#2\n\nМЕТКАБУКВАЛЬНЫЙ {FILLER}\n\n"
+                f"# Y\n\n{LONG_Y}\n\n# Y/p2\n\nМЕТКАЧАСТЬ {FILLER}\n")
+
+
+def test_a_heading_equal_to_a_generated_anchor_does_not_sink_the_run(corpus):
+    """«X#2» is what the chunker calls the second «X», «Y/p2» the second part
+    of a long «Y». A heading spelled exactly so raised ValueError (duplicate
+    anchor) out of `kb update` and `kb build --full`: one note took every
+    unit of every source down with it."""
+    (corpus["research"] / "odd-headings.md").write_text(ODD_HEADINGS, encoding="utf-8")
+    st = run(corpus)
+    assert st["exit"] == 0
+    assert st["kinds"]["note"]["anchor_collisions"] == 2
+    for word in ("МЕТКАПЕРВЫЙ", "МЕТКАПОВТОР", "МЕТКАБУКВАЛЬНЫЙ", "МЕТКАДЛИННЫЙ0", "МЕТКАДЛИННЫЙ8",
+                 "МЕТКАЧАСТЬ"):
+        assert fts(corpus["db"], word), word
+    sql = ("SELECT anchor, chunk_id FROM chunk JOIN unit USING(unit_id) "
+           "WHERE rel='odd-headings.md' ORDER BY ordinal")
+    ids = chunks(corpus["db"], sql)
+    assert [a for a, _ in ids] == ["X", "X#2", "X#2#2", "Y", "Y/p2", "Y/p2#2"]
+    st = update.build_full(cfg_of(corpus), corpus["db"], warn=lambda m: None)
+    assert st["exit"] == 0
+    assert chunks(corpus["db"], sql) == ids, "a fresh parse resolves the same way: the same ids"
+
+
+def test_one_unit_that_cannot_be_written_does_not_sink_the_run(corpus):
+    """A transcript line with an escaped lone surrogate (JSON.stringify writes
+    one for a string cut inside an emoji) parses, but no UTF-8 encoder takes
+    it: the UnicodeEncodeError escaped `kb update` / `kb build --full` and
+    stopped every unit after it. Now that unit is counted and named (its
+    path, never its text), everything else is indexed, the run exits 3."""
+    (corpus["slug"] / "cut-emoji.jsonl").write_text(json.dumps({
+        "type": "user", "uuid": "ce1", "timestamp": "2026-08-01T00:00:00Z",
+        "message": {"role": "user", "content": "МЕТКАОБРЕЗКИ эмодзи \ud83d обрезан"}}) + "\n")
+    for go in (lambda warn: run(corpus, warn=warn),
+               lambda warn: update.build_full(cfg_of(corpus), corpus["db"], warn=warn)):
+        warnings = []
+        st = go(warnings.append)
+        assert st["exit"] == 3 and st["failed"] == 1
+        assert st["kinds"]["transcript"]["failed"] == 1
+        assert any("cut-emoji.jsonl" in w for w in warnings), warnings
+        assert not any("МЕТКАОБРЕЗКИ" in w for w in warnings), "paths in the journal, never text"
+        assert fts(corpus["db"], "латентность"), "the next transcript of the same source"
+        assert fts(corpus["db"], "anytime"), "and the sources after it"
+        integrity(corpus["db"])
+
+
+@pytest.mark.parametrize("exc", [sqlite3.OperationalError("database is locked"),
+                                 sqlite3.DatabaseError("database disk image is malformed")])
+def test_a_failing_database_still_stops_the_run(corpus, monkeypatch, exc):
+    """Isolation is for a unit's own data. A busy, full, unreadable or corrupt
+    database fails every unit after it the same way (busy: 5 s each) — the
+    run stops at once, as before, instead of counting thousands of failures."""
+    def broken(*a, **kw):
+        raise exc
+    monkeypatch.setattr(store, "write_unit", broken)
+    with pytest.raises(type(exc)):
+        run(corpus)

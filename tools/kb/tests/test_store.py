@@ -82,10 +82,28 @@ def test_delete_unit_removes_chunks_and_fts_rows(conn):
     assert fts(conn, "уникальное") == []
 
 
-def test_duplicate_anchor_in_one_unit_is_refused(conn):
-    with pytest.raises(ValueError, match="duplicate"):
-        store.write_unit(conn, cand(), [P("a", "x"), P("a", "y")], "s")
-    assert conn.execute("SELECT count(*) FROM unit").fetchone()[0] == 0, "nothing half-written"
+@pytest.mark.parametrize("anchors,want", [
+    # a heading spelled «X#2» after two «X» (the chunker numbers the repeat «X#2»)
+    (["X", "X#2", "X#2"], ["X", "X#2", "X#2#2"]),
+    # a heading spelled «X/p2» after a long «X» (its second part is «X/p2»)
+    (["X", "X/p2", "X/p2"], ["X", "X/p2", "X/p2#2"]),
+    # the first FREE suffix, never one a piece already holds
+    (["a", "a#2", "a"], ["a", "a#2", "a#3"]),
+    (["a", "a", "a#2"], ["a", "a#2", "a#2#2"]),
+])
+def test_a_repeated_anchor_gets_the_first_free_suffix(conn, anchors, want):
+    """A repeated anchor used to raise ValueError, and one note with an odd
+    heading sank the whole update/build. The repeat gets the first free
+    '#<n>' in piece order: unique, and the same unit always gets the same ids."""
+    pieces = [P(a, f"текст {i}") for i, a in enumerate(anchors)]
+    st = store.write_unit(conn, cand(), pieces, "s")
+    rows = conn.execute("SELECT anchor, chunk_id FROM chunk ORDER BY ordinal").fetchall()
+    assert [a for a, _ in rows] == want
+    assert [cid for _, cid in rows] == [store.chunk_id("hft-research", "a.md", a) for a in want]
+    assert st["collisions"] == sum(a != w for a, w in zip(anchors, want))
+    again = store.write_unit(conn, cand(), pieces, "s")
+    assert again["unchanged"] == len(pieces), "a re-parse of the same unit changes nothing"
+    integrity(conn)
 
 
 def test_text_sha_covers_title_and_text(conn):

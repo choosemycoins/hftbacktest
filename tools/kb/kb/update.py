@@ -173,6 +173,15 @@ def _empty_stats():
     return Counter()
 
 
+def _database_failed(exc: Exception) -> bool:
+    """The database itself, not the unit's data: busy/locked, full, I/O,
+    read-only (OperationalError) or corrupt (plain DatabaseError). Every unit
+    after it would fail the same way (busy: after a 5 s wait each), so the
+    run stops, as it always did. Anything else — a value no encoder takes, a
+    constraint — belongs to this unit alone."""
+    return isinstance(exc, sqlite3.OperationalError) or type(exc) is sqlite3.DatabaseError
+
+
 def _process_scan(conn, scan, totals, allow_mass_delete, warn, refused, missing):
     existing = store.units_of(conn, scan.source_id)
     seen = set()
@@ -211,9 +220,18 @@ def _process_scan(conn, scan, totals, allow_mass_delete, warn, refused, missing)
             t["failed"] += 1
             warn(f"{cand.kind}: cannot parse {cand.abs_path}: {type(exc).__name__}")
             continue
-        res = store.write_unit(conn, cand, pieces, sha, pv)
+        try:
+            res = store.write_unit(conn, cand, pieces, sha, pv)   # its own transaction
+        except Exception as exc:          # nor one that cannot be written (rolled back)
+            if _database_failed(exc):
+                raise
+            t["failed"] += 1
+            warn(f"{cand.kind}: cannot write {cand.abs_path}: {type(exc).__name__}")
+            continue
         for k in ("added", "updated", "deleted"):
             t[k] += res[k]
+        if res["collisions"]:
+            t["anchor_collisions"] += res["collisions"]
         t["units_new" if cur is None else "units_changed"] += 1
         t["malformed"] += st.get("malformed", 0)
         t["unparsable"] += st.get("unparsable", 0)

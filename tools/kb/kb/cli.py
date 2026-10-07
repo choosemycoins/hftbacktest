@@ -52,8 +52,9 @@ NETWORK
   or pass --allow-network to a manual update/embed.
 
 EXIT CODES  0 ok · 2 bad query/usage · 3 incomplete run (missing root, guard,
-            parse failure, `--embed` pass skipped: no usable model) · 75 deferred
-            (memory pressure, lock held while waiting).
+            a unit that failed to parse or write — the run goes on without it,
+            `--embed` pass skipped: no usable model) · 75 deferred (memory
+            pressure, lock held while waiting).
 """
 
 from __future__ import annotations
@@ -161,7 +162,8 @@ def _summary(st: dict) -> None:
     for s in st.get("refused", []):
         print(f"  INCOMPLETE: mass delete refused for {s} (--allow-mass-delete)", file=sys.stderr)
     if st.get("failed"):
-        print(f"  INCOMPLETE: {st['failed']} unit(s) failed to parse (see warnings)", file=sys.stderr)
+        print(f"  INCOMPLETE: {st['failed']} unit(s) failed to parse or write (see warnings)",
+              file=sys.stderr)
     if "skipped" in (st.get("after") or {}):
         print("  INCOMPLETE: embeddings skipped (see above); vector coverage does not grow",
               file=sys.stderr)

@@ -239,28 +239,40 @@ def units_of(conn: sqlite3.Connection, source_id: str) -> dict:
 
 
 def _chunk_rows(cand, pieces):
-    """Rows of one unit. `loc` is made unique within the unit here, for every
-    chunker: parts of one cut piece share their source position (a transcript
+    """(rows of one unit, anchors renamed). Anchors and `loc` are made unique
+    within the unit here, for every chunker.
+
+    anchor: a chunker's own numbering can meet the text it numbers — a
+    markdown heading spelled «X#2» after two «X» (the second one is «X#2»),
+    or «X/p2» after a long «X» (its second part). A repeat gets the first
+    free '#<n>' (n = 2, 3, …) in piece order, so the same unit always gets the
+    same ids; it used to raise, and one odd heading sank the whole run.
+
+    loc: parts of one cut piece share their source position (a transcript
     line, a commit sha, a docstring, an ASR window, a chat window, one long
     markdown line), so the k-th chunk with an already seen loc gets '/p<k>' —
     `where` (built from loc) then names exactly one chunk, and kb read of a
     hit's `where` reads that hit."""
-    rows, seen, locs = [], set(), {}
+    rows, seen, locs, renamed = [], set(), {}, 0
     for ordinal, p in enumerate(pieces):
-        cid = chunk_id(cand.source_id, cand.rel, p.anchor)
-        if cid in seen:
-            raise ValueError(f"duplicate anchor {p.anchor!r} in {cand.source_id}:{cand.rel}")
+        anchor, n = p.anchor, 1
+        cid = chunk_id(cand.source_id, cand.rel, anchor)
+        while cid in seen:
+            n += 1
+            anchor = f"{p.anchor}#{n}"
+            cid = chunk_id(cand.source_id, cand.rel, anchor)
+        renamed += n > 1
         seen.add(cid)
         locs[p.loc] = locs.get(p.loc, 0) + 1
         loc = p.loc if locs[p.loc] == 1 else f"{p.loc}/p{locs[p.loc]}"
         rows.append({
-            "chunk_id": cid, "ordinal": ordinal, "anchor": p.anchor, "kind": cand.kind,
+            "chunk_id": cid, "ordinal": ordinal, "anchor": anchor, "kind": cand.kind,
             "project": cand.project, "date": p.date or cand.date, "loc": loc, "file": p.file,
             "title": p.title, "text": p.text, "text_sha": text_sha(p.title, p.text),
             "stem": None,                   # computed only for rows that get written
             "n_chars": len(p.text),
         })
-    return rows
+    return rows, renamed
 
 
 _COMPARED = ("ordinal", "anchor", "kind", "project", "date", "loc", "file", "title", "text_sha")
@@ -269,9 +281,9 @@ _COMPARED = ("ordinal", "anchor", "kind", "project", "date", "loc", "file", "tit
 def write_unit(conn: sqlite3.Connection, cand, pieces, content_sha: str | None,
                parser_ver: int | None = None) -> dict:
     """Make the unit's chunks equal `pieces`: diff by chunk_id. One transaction."""
-    rows = _chunk_rows(cand, pieces)
+    rows, renamed = _chunk_rows(cand, pieces)
     parser_ver = parser_ver if parser_ver is not None else sources.PARSER_VERSIONS[cand.kind]
-    stats = {"added": 0, "updated": 0, "deleted": 0, "unchanged": 0}
+    stats = {"added": 0, "updated": 0, "deleted": 0, "unchanged": 0, "collisions": renamed}
     with transaction(conn):
         conn.execute(
             "INSERT INTO unit(source_id, rel, kind, project, abs_path, signature, content_sha, "
