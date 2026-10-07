@@ -161,12 +161,21 @@ class Hit:
         return where_of(self.abs_path, self.kind, self.loc, self.file)
 
 
+_PART = re.compile(r"/p\d+$")
+
+
+def split_part(loc: str) -> tuple[str, str]:
+    """'L377/p2' -> ('L377', '/p2'); 'L377' -> ('L377', '')."""
+    m = _PART.search(loc)
+    return (loc[:m.start()], m.group()) if m else (loc, "")
+
+
 def where_of(abs_path: str, kind: str, loc: str, file: str | None) -> str:
     if kind == "commit":
         return f"{abs_path}@{loc}"
     if kind == "chat":
-        first = loc.split("..", 1)[0]
-        return f"{abs_path}/{file}#{first}"
+        rng, part = split_part(loc)
+        return f"{abs_path}/{file}#{rng.split('..', 1)[0]}{part}"
     return f"{abs_path}#{loc}"
 
 
@@ -487,14 +496,15 @@ def _resolve(conn, pointer: str) -> int | None:
         row = conn.execute("SELECT rowid FROM chunk WHERE chunk_id = ?", (m.group(1),)).fetchone()
         return row[0] if row else None
     if "@" in p:
-        path, _, sha = p.rpartition("@")
+        path, _, ref = p.rpartition("@")
+        sha, part = split_part(ref)
         if re.fullmatch(r"[0-9a-f]{7,40}", sha):
-            row = conn.execute(
-                "SELECT c.rowid FROM chunk c JOIN unit u USING (unit_id) WHERE c.kind='commit' "
-                "AND u.abs_path = ? AND c.loc LIKE ? ORDER BY c.ordinal LIMIT 1",
-                (path, sha + "%")).fetchone()
-            if row:
-                return row[0]
+            for rowid, loc in conn.execute(
+                    "SELECT c.rowid, c.loc FROM chunk c JOIN unit u USING (unit_id) "
+                    "WHERE c.kind='commit' AND u.abs_path = ? AND c.loc LIKE ? ORDER BY c.ordinal",
+                    (path, sha + "%")):
+                if split_part(loc)[1] == part:
+                    return rowid
     if "#" in p:
         path, _, frag = p.rpartition("#")
         row = conn.execute(
@@ -502,12 +512,14 @@ def _resolve(conn, pointer: str) -> int | None:
             "AND c.kind != 'chat' AND c.loc = ? ORDER BY c.ordinal LIMIT 1", (path, frag)).fetchone()
         if row:
             return row[0]
-        if frag.startswith("message"):
-            for (rowid,) in conn.execute(
-                    "SELECT c.rowid FROM chunk c JOIN unit u USING (unit_id) WHERE c.kind='chat' "
-                    "AND (u.abs_path || '/' || c.file) = ? AND c.loc LIKE ? ORDER BY c.ordinal LIMIT 1",
-                    (path, frag + "..%")):
-                return rowid
+        first, part = split_part(frag)
+        if re.fullmatch(r"message-?\d+", first):
+            for rowid, loc in conn.execute(
+                    "SELECT c.rowid, c.loc FROM chunk c JOIN unit u USING (unit_id) WHERE c.kind='chat' "
+                    "AND (u.abs_path || '/' || c.file) = ? AND c.loc LIKE ? ORDER BY c.ordinal",
+                    (path, first + "..%")):
+                if split_part(loc)[1] == part:
+                    return rowid
     return None
 
 

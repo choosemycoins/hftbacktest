@@ -7,6 +7,8 @@ Every piece carries
           pointer stays valid while its own text changes.
   loc     where it is in the source right now ('L12-40', 'L377',
           'message5..9', 't=12:30-14:00', a sha) — metadata, not identity.
+          Parts of one cut piece can share it; the store makes it unique
+          within the unit ('L377/p2'), so a `where` names one chunk.
   title   context (file › H1 › H2, chat · day, lesson · mm:ss, subject).
   text    as found in the source, never rewritten (masking happens on output).
 

@@ -5,7 +5,8 @@ course transcripts and notes, allowlisted Telegram chats, git commits.
 
 It answers "where was this talked about?", not "what is the answer?". Every
 result is a POINTER — id (kb:<16 hex>), kind, project, date, where (path +
-line range / time / message range / sha) — plus a snippet for orientation.
+line range / time / message range / sha; `/p<k>` = k-th part of a piece cut
+at 1500 characters) — plus a snippet for orientation. `kb read` takes either.
 Open the source and read it before believing anything.
 
 THE DATABASE IS A SECRET, AND SO IS THIS TOOL'S OUTPUT

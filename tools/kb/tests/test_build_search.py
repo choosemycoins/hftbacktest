@@ -270,3 +270,64 @@ def test_word_prefixes_and_plain_raw_queries_still_work(q):
 def test_the_cli_refuses_a_digit_prefix_with_a_clean_error(built, corpus, capsys):
     assert cli.main(["--config", str(corpus["config"]), "search", "raw:0x7a*", "--mode", "fts"]) == 2
     assert "prefix" in capsys.readouterr().err
+
+
+# --- `where` names ONE chunk ----------------------------------------------------------
+# Parts of one split piece used to share a loc (a transcript line, a commit sha,
+# a docstring's lines, an ASR window, a chat window, one long markdown line),
+# and `kb read <where>` silently returned part 1 instead of the hit.
+
+LONG_WORDS = " ".join(f"слово{i}" for i in range(400))       # ~3.9k chars, one line
+
+
+@pytest.fixture()
+def multipart(corpus):
+    """Every kind with a piece longer than CAP, so it is cut into parts."""
+    from conftest import git, html_message, write_html_export
+    slug, repo = corpus["slug"], corpus["repo"]
+    (slug / "long.jsonl").write_text(json.dumps(
+        {"type": "assistant", "uuid": "L1", "timestamp": "2026-08-01T00:00:00Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": LONG_WORDS + " МЕТКАТРАНСКРИПТА"}]}}, ensure_ascii=False) + "\n")
+    (corpus["research"] / "oneline.md").write_text(f"# Одна строка\n\n{LONG_WORDS} МЕТКАЗАМЕТКИ\n")
+    (repo / "collector" / "tools" / "long_doc.py").write_text(
+        f'"""{LONG_WORDS} МЕТКАДОКСТРИНГА"""\n')
+    (repo / "2026-08-13-101010-long-export.txt").write_text(
+        f"❯ вопрос\n\n● {LONG_WORDS} МЕТКАЭКСПОРТА\n", encoding="utf-8")
+    (repo / "c.txt").write_text("c")
+    git(repo, "add", "c.txt")
+    git(repo, "commit", "-q", "-m", "длинный коммит\n\n" + LONG_WORDS + " МЕТКАКОММИТА")
+    asr = corpus["asr"] / "14.Длинный.json"
+    asr.write_text(json.dumps({"file": "14.mp4", "segments": [
+        {"s": 1.0 + i, "e": 1.5 + i, "t": f"фраза{i} " * 8} for i in range(60)] + [
+        {"s": 70.0, "e": 71.0, "t": "МЕТКАКУРСА"}]}, ensure_ascii=False))
+    write_html_export(corpus["tg"] / "ChatExport_2026-09-14 (1)", "Deribit RU", [
+        html_message(300001, "13.07.2018 01:07:13 UTC+02:00", LONG_WORDS + " МЕТКАЧАТА",
+                     sender="Support")], name="messages2.html")
+    cfg = cfgmod.load_config(corpus["config"])
+    update.build_full(cfg, corpus["db"], warn=lambda m: None)
+    return Index(corpus["db"])
+
+
+@pytest.mark.parametrize("word,kind", [
+    ("МЕТКАТРАНСКРИПТА", "transcript"), ("МЕТКАЗАМЕТКИ", "note"), ("МЕТКАДОКСТРИНГА", "doc"),
+    ("МЕТКАЭКСПОРТА", "export"), ("МЕТКАКОММИТА", "commit"), ("МЕТКАКУРСА", "course"),
+    ("МЕТКАЧАТА", "chat"),
+])
+def test_the_where_of_a_later_part_reads_that_part(multipart, word, kind):
+    hit = search.search(multipart, f"raw:{word}", mode="fts", kind=kind)["results"][0]
+    assert search.read_pointer(multipart, hit["id"], context=0)["text"].count(word) == 1
+    by_where = search.read_pointer(multipart, hit["where"], context=0)
+    assert by_where["id"] == hit["id"], (hit["where"], kind)
+    assert word in by_where["text"]
+
+
+def test_every_indexed_chunk_is_named_by_its_own_where(multipart):
+    """The property behind the pins above, over the whole synthetic index."""
+    conn = multipart.conn()
+    rows = conn.execute("SELECT rowid, chunk_id FROM chunk").fetchall()
+    hits = search.fetch_hits(conn, [r for r, _ in rows])
+    wrong = [(h.where, cid) for r, cid in rows if search._resolve(conn, (h := hits[r]).where) != r]
+    assert not wrong, wrong[:5]
+    assert not conn.execute("SELECT unit_id, loc FROM chunk GROUP BY unit_id, loc "
+                            "HAVING count(*) > 1").fetchall()

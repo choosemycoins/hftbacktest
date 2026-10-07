@@ -33,9 +33,10 @@ from .extract import extract_message_text
 # Bump a kind's version when its parser changes what it emits: every unit of
 # that kind is re-read once; ids are anchors and vectors are keyed by text, so
 # nothing is re-embedded unless the text itself changed.
-PARSER_VERSIONS = {"transcript": 1, "memory": 1, "doc": 1, "export": 3, "note": 1,
-                   "course": 1, "chat": 1, "commit": 2}
+PARSER_VERSIONS = {"transcript": 2, "memory": 2, "doc": 2, "export": 4, "note": 2,
+                   "course": 2, "chat": 2, "commit": 3}
 # export 3: tool headers without parentheses and inline ⎿ lines dropped; commit 2: oldest-first ordinals
+# all +1: parts sharing a loc get '/p<k>' (store._chunk_rows) — every unit is re-read once
 KINDS = tuple(PARSER_VERSIONS)
 
 MAX_BYTES = 2 * 1024 * 1024

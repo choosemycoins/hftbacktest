@@ -239,15 +239,23 @@ def units_of(conn: sqlite3.Connection, source_id: str) -> dict:
 
 
 def _chunk_rows(cand, pieces):
-    rows, seen = [], set()
+    """Rows of one unit. `loc` is made unique within the unit here, for every
+    chunker: parts of one cut piece share their source position (a transcript
+    line, a commit sha, a docstring, an ASR window, a chat window, one long
+    markdown line), so the k-th chunk with an already seen loc gets '/p<k>' —
+    `where` (built from loc) then names exactly one chunk, and kb read of a
+    hit's `where` reads that hit."""
+    rows, seen, locs = [], set(), {}
     for ordinal, p in enumerate(pieces):
         cid = chunk_id(cand.source_id, cand.rel, p.anchor)
         if cid in seen:
             raise ValueError(f"duplicate anchor {p.anchor!r} in {cand.source_id}:{cand.rel}")
         seen.add(cid)
+        locs[p.loc] = locs.get(p.loc, 0) + 1
+        loc = p.loc if locs[p.loc] == 1 else f"{p.loc}/p{locs[p.loc]}"
         rows.append({
             "chunk_id": cid, "ordinal": ordinal, "anchor": p.anchor, "kind": cand.kind,
-            "project": cand.project, "date": p.date or cand.date, "loc": p.loc, "file": p.file,
+            "project": cand.project, "date": p.date or cand.date, "loc": loc, "file": p.file,
             "title": p.title, "text": p.text, "text_sha": text_sha(p.title, p.text),
             "stem": None,                   # computed only for rows that get written
             "n_chars": len(p.text),
