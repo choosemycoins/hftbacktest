@@ -65,7 +65,7 @@ kb fetch-model --model e5b ; kb fetch-model --model m3            # сеть, р
 ~/bin/hft-run -m 24G -- kb build --full
 ~/bin/hft-run -m 24G -- kb bench-embed --model e5b --n 2000        # затем m3
 ~/bin/hft-run -m 24G -- kb eval --compare-models e5b,m3 --distractors 10000
-# решение по DESIGN §6.3 → kb.toml [models] active = …
+# решение по DESIGN §6.3 → kb.toml [models] active = …   (07.10: m3 — нетто +5, дельта 19 мин; §6.8)
 cp tools/kb/units/kb-update.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now kb-update.timer
 ```
