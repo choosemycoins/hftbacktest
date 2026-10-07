@@ -49,6 +49,8 @@ def test_execstart_flags_are_known_to_the_cli():
     args = cli.build_parser().parse_args(argv[1:])
     assert args.lock_timeout == 0, "the timer must not queue behind a manual writer"
     assert args.max_psi is not None
+    assert args.embed and args.budget_minutes == 180, "drains the vector backlog in bounded nights"
+    assert args.require_offline and not args.allow_network
 
 
 def test_timer_runs_nightly_and_catches_up():

@@ -23,7 +23,7 @@ Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 Environment=HF_HUB_DISABLE_TELEMETRY=1
 Environment=TOKENIZERS_PARALLELISM=false
-ExecStart=/home/storage/hft-scratch/kb-venv/bin/kb update --lock-timeout 0 --min-free-gb 5 --max-psi 20 --psi-wait-minutes 60
+ExecStart=/home/storage/hft-scratch/kb-venv/bin/kb update --embed --budget-minutes 180 --require-offline --lock-timeout 0 --min-free-gb 5 --max-psi 20 --psi-wait-minutes 60 --threads 16
 TimeoutStartSec=5h
 # Optional hardening, only after a trial run of the unit:
 # ReadOnlyPaths=%h

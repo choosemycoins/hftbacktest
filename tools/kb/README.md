@@ -30,7 +30,8 @@ uv sync --frozen --no-editable --extra test     # torch — только CPU-к�
 
 ```text
 kb update [--embed] [--budget-minutes N] [--max-chunks N] [--allow-mass-delete]
-          [--max-psi P --psi-wait-minutes M] [--min-free-gb G] [--lock-timeout S]
+          [--require-offline | --allow-network] [--max-psi P --psi-wait-minutes M]
+          [--min-free-gb G] [--lock-timeout S]
 kb build --full                 # во временный файл → fsync → атомарная подмена
 kb embed [--model KEY] [--budget-minutes N] [--max-chunks N] [--device cpu|cuda]
 kb search QUERY [--mode hybrid|fts|semantic] [--kind K[,K]] [--project P] [--since DATE] [--limit N] [--json]
@@ -42,6 +43,10 @@ kb fetch-model --model KEY      # единственная сетевая ком
 kb gc [--drop-model KEY]
 kb mcp                          # stdio MCP-сервер
 ```
+
+Команды, загружающие модель (`update --embed`, `embed`, `mcp`), отказываются работать, если
+кроме `lo` виден хоть один сетевой интерфейс: запускать под `unshare -rn` (ночной юнит живёт в
+своём сетевом namespace) или, для ручных update/embed, с `--allow-network`.
 
 Обычный запрос стеммируется (ru/en, ё = е); `raw:` — синтаксис FTS5 по сырому тексту
 (точные формы, `"фраза"`, `префикс*`, `AND/OR/NOT`, `NEAR`). `tools/kbindex.py` — шим:

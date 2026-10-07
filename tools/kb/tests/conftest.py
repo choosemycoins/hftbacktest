@@ -9,6 +9,16 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def offline_netns(tmp_path_factory, monkeypatch):
+    """Tests never depend on the host's network: the offline self-check reads
+    a /proc/net/dev that lists only `lo`."""
+    p = tmp_path_factory.getbasetemp() / "net_dev_lo"
+    if not p.exists():
+        p.write_text("Inter-|   Receive\n face |bytes\n    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n")
+    monkeypatch.setenv("KB_PROC_NET_DEV", str(p))
+
+
 def jline(obj) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
 

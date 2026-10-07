@@ -41,7 +41,12 @@ LIMITATIONS worth knowing before you trust an empty result
     that are neither allowed nor ignored.
 
 NETWORK
-  Only `kb fetch-model` touches the network (one-time model download).
+  Only `kb fetch-model` touches the network (one-time model download). Every
+  other command forces the Hugging Face offline variables before anything
+  imports HF code; the commands that load a model (`update --embed`, `embed`,
+  `mcp`) also refuse to run while any interface but `lo` is visible — run them
+  under `unshare -rn` (the nightly unit runs in a private network namespace),
+  or pass --allow-network to a manual update/embed.
 
 EXIT CODES  0 ok · 2 bad query/usage · 3 incomplete run (missing root, guard,
             parse failure) · 75 deferred (memory pressure, lock held while waiting).
@@ -184,8 +189,28 @@ def _embed_after(cfg, db, args):
     return after
 
 
+def _offline_or_refuse(args, needed: bool) -> int | None:
+    """None if clear; 2 if this run would load a model with a network visible."""
+    from .netguard import NetworkError, require_offline
+    if not (needed or getattr(args, "require_offline", False)):
+        return None
+    if getattr(args, "allow_network", False):
+        print("kb: warning: --allow-network — the offline self-check is skipped "
+              "(HF offline variables are still forced)", file=sys.stderr)
+        return None
+    try:
+        require_offline()
+    except NetworkError as exc:
+        print(f"kb: refusing: {exc} (or pass --allow-network)", file=sys.stderr)
+        return 2
+    return None
+
+
 def cmd_update(args, cfg) -> int:
     from .update import update
+    refused = _offline_or_refuse(args, needed=args.embed)
+    if refused is not None:
+        return refused
     db = _db(args, cfg)
     print(f"kb update -> {db}", flush=True)
     st = update(cfg, db, allow_mass_delete=args.allow_mass_delete, lock_timeout=args.lock_timeout,
@@ -199,6 +224,9 @@ def cmd_update(args, cfg) -> int:
 def cmd_embed(args, cfg) -> int:
     from . import store
     from .update import Busy, WriterLock
+    refused = _offline_or_refuse(args, needed=True)
+    if refused is not None:
+        return refused
     db = _db(args, cfg)
     if not db.exists():
         print(f"kb: no index at {db} — run: kb build --full", file=sys.stderr)
@@ -381,6 +409,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="defer while memory PSI some avg10 of user@.service is above this")
     u.add_argument("--psi-wait-minutes", type=float, default=60)
     u.add_argument("--embed", action="store_true", help="then embed what has no vector yet")
+    u.add_argument("--require-offline", action="store_true",
+                   help="refuse unless only `lo` is visible (always on with --embed)")
     _embed_args(u)
 
     e = sub.add_parser("embed", help="embed chunks that have no vector yet (budgeted)")
@@ -426,6 +456,8 @@ COMMANDS = {"search": cmd_search, "read": cmd_read, "build": cmd_build, "update"
 
 
 def _embed_args(p) -> None:
+    p.add_argument("--allow-network", action="store_true",
+                   help="skip the offline self-check (manual runs outside `unshare -rn`)")
     p.add_argument("--budget-minutes", type=float, default=None)
     p.add_argument("--max-chunks", type=int, default=None)
     p.add_argument("--threads", type=int, default=16)

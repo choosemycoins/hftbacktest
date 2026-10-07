@@ -80,10 +80,10 @@ def test_every_string_out_of_search_and_read_is_masked(served):
     server, _ = served
     raw = call(server, "kb_search", {"query": "ключи API Wallet Binance secret", "mode": "fts"})
     text = raw.content[0].text
-    assert FAKE_KEY not in text and "redacted" in text
+    assert FAKE_KEY not in text and FAKE_BINANCE not in text and "redacted" in text
     hit = json.loads(text)["results"][0]
     read = call(server, "kb_read", {"pointer": hit["id"], "context": 2}).content[0].text
-    assert FAKE_KEY not in read
+    assert FAKE_KEY not in read and FAKE_BINANCE not in read
     assert "redacted" in read
 
 
