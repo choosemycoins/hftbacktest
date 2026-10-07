@@ -98,3 +98,9 @@ def test_stemmer_change_restems_on_update(corpus, monkeypatch):
     c.execute("INSERT INTO chunk_fts(chunk_fts, rank) VALUES('integrity-check', 1)")
     assert store.get_meta(c, "stem_version") == stem.STEM_VERSION
     c.close()
+
+
+def test_raw_or_baseline_keeps_yo_as_typed():
+    """The baseline searches the raw columns, where FTS5 does not fold ё."""
+    q = search.raw_or_query("ушёл в крашлуп")
+    assert "ушёл" in q.terms and "ушел" not in q.terms

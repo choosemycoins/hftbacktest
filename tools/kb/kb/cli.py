@@ -330,7 +330,8 @@ def cmd_eval(args, cfg) -> int:
         with WriterLock(db.parent, 600):
             conn = store.open_rw(db)
             try:
-                st = embed_pass(conn, db, emb, restrict=set(int(r) for r in sub), log=_log)
+                st = embed_pass(conn, db, emb, restrict=set(int(r) for r in sub), log=_log,
+                                set_active=False)
             finally:
                 conn.close()
         print(f"  {key}: embedded {st['embedded']} sub-corpus chunks in {st['seconds']} s", flush=True)

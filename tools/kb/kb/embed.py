@@ -310,7 +310,8 @@ def pending(conn, key: str, restrict: set[int] | None = None) -> list[tuple[str,
 
 
 def embed_pass(conn, db_path: Path, emb, budget_minutes: float | None = None,
-               max_chunks: int | None = None, restrict: set[int] | None = None, log=None) -> dict:
+               max_chunks: int | None = None, restrict: set[int] | None = None, log=None,
+               set_active: bool = True) -> dict:
     log = log or (lambda m: None)
     t0 = time.monotonic()
     ms = MatrixStore(db_path, emb.model_key, emb.dim)
@@ -338,6 +339,7 @@ def embed_pass(conn, db_path: Path, emb, budget_minutes: float | None = None,
         rate = done / max(1e-9, time.monotonic() - t0)
         log(f"  embedded {done}/{total} ({rate:.1f}/s)")
     collected = ms.gc(conn)
-    store.set_meta(conn, active_model=emb.model_key)
+    if set_active:            # an eval sub-corpus pass must not relabel the index
+        store.set_meta(conn, active_model=emb.model_key)
     return {"model": emb.model_key, "embedded": done, "remaining": total - done,
             "garbage_collected": collected, "seconds": round(time.monotonic() - t0, 1)}

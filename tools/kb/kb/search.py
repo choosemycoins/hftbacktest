@@ -101,7 +101,12 @@ def raw_or_query(text: str) -> Query:
     no stemming — the measure of what stemming adds."""
     if text.strip().startswith("raw:"):
         return parse_query(text)
-    words = list(dict.fromkeys(_query_words(text)))[:MAX_TERMS]
+    import unicodedata
+    toks = TOKEN_RE.findall(unicodedata.normalize("NFKC", text).lower())   # ё kept: raw columns keep it
+    kept = [t for t in toks if t not in STOPWORDS and t.replace("ё", "е") not in STOPWORDS] or toks
+    if not kept:
+        raise QueryError("query has no searchable words")
+    words = list(dict.fromkeys(kept))[:MAX_TERMS]
     return Query(text, False, text, words, [],
                  "{title text} : (" + " OR ".join(fts_quote(t) for t in words) + ")")
 
@@ -325,7 +330,7 @@ def index_info(meta: dict) -> dict:
             age = round((datetime.now(timezone.utc) - dt).total_seconds() / 3600, 1)
         except ValueError:
             pass
-    return {"updated_at": updated, "age_hours": age, "model": meta.get("active_model")}
+    return {"updated_at": updated, "age_hours": age, "model": None}
 
 
 def count_scope(conn, scope: Scope) -> int:
@@ -412,9 +417,11 @@ def search(index: Index, query: str, mode: str = "hybrid", kind=None, project=No
         coverage = engine.sem.coverage(scope, restrict)
     else:
         coverage = {"embedded": 0, "in_scope": count_scope(conn, scope)}
+    info = index_info(meta)
+    info["model"] = engine.model_key if engine is not None else None
     return {
         "notice": NOTICE,
-        "index": index_info(meta),
+        "index": info,
         "query": {"mode": mode, "used": mode_used, "raw": q.raw,
                   "terms": q.terms + [p + "*" for p in q.prefixes]},
         "coverage": coverage,
