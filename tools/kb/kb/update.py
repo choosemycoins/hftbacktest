@@ -319,8 +319,7 @@ def update(cfg: Config, db_path=None, *, allow_mass_delete=False, lock_timeout=6
             finally:
                 conn.close()
     except Busy:
-        msg = "another writer holds the lock (kb update/build) — nothing done"
-        print(f"kb: {msg}", file=sys.stderr, flush=True)
+        msg = "another writer holds the lock (kb update/build/embed) — nothing done"
         return {"exit": EXIT_OK if lock_timeout <= 0 else EXIT_DEFERRED, "busy": True,
                 "reason": msg, "kinds": {}}
     for leftover in (Path(f"{db_path}-journal"),):
