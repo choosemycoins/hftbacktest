@@ -1,0 +1,80 @@
+# kb — локальная база знаний
+
+Где это обсуждалось? — транскрипты Claude и `/export`, память, md-доки репо
+(hftbacktest, myhft, eventshort, jansen), `~/hft-research`, курс (ASR + конспекты),
+Telegram по allowlist, коммиты. Ответ — **указатели** (`kb:<16 hex>`, вид, проект, дата,
+путь + строки / время / сообщения / sha) и маскированный сниппет. Открыть источник и
+прочитать — до того, как чему-то верить. Пустой ответ ≠ «не обсуждалось» (см. `coverage`).
+
+**БД и матрицы — секрет**: 0600 в каталоге 0700, не коммитить, не синкать, не копировать с
+машины; производный артефакт. Всё, что выходит наружу (CLI, MCP), маскируется — это сеть,
+не гарантия. Сеть нужна только `kb fetch-model` (разово).
+
+Дизайн и решения — `DESIGN.md` рядом (если он в дереве); конфиг — `~/.config/kb/kb.toml`
+(0600, не в git; образец без чатов — `kb.example.toml`).
+
+## Окружение
+
+```bash
+export UV_CACHE_DIR=/home/storage/hft-scratch/uv-cache
+export UV_PROJECT_ENVIRONMENT=/home/storage/hft-scratch/kb-venv
+cd tools/kb
+uv sync --frozen --no-editable --extra test     # torch — только CPU-колесо (uv.lock)
+/home/storage/hft-scratch/kb-venv/bin/python -m pytest -q    # тесты, офлайн
+```
+
+Установка **не editable**: ночной юнит работает с копией кода в venv и не ломается при
+смене ветки в checkout. После правок кода — повторить `uv sync --frozen --no-editable`.
+
+## Команды
+
+```text
+kb update [--embed] [--budget-minutes N] [--max-chunks N] [--allow-mass-delete]
+          [--max-psi P --psi-wait-minutes M] [--min-free-gb G] [--lock-timeout S]
+kb build --full                 # во временный файл → fsync → атомарная подмена
+kb embed [--model KEY] [--budget-minutes N] [--max-chunks N] [--device cpu|cuda]
+kb search QUERY [--mode hybrid|fts|semantic] [--kind K[,K]] [--project P] [--since DATE] [--limit N] [--json]
+kb read POINTER [--context N] [--json]
+kb stats [--check]
+kb eval [--golden PATH] [--modes fts_raw_or,fts,semantic,hybrid] [--compare-models e5b,m3 --distractors N]
+kb bench-embed --model KEY --n N [--threads T]
+kb fetch-model --model KEY      # единственная сетевая команда
+kb gc [--drop-model KEY]
+kb mcp                          # stdio MCP-сервер
+```
+
+Обычный запрос стеммируется (ru/en, ё = е); `raw:` — синтаксис FTS5 по сырому тексту
+(точные формы, `"фраза"`, `префикс*`, `AND/OR/NOT`, `NEAR`). `tools/kbindex.py` — шим:
+`build` → `kb update`, `search Q` → `kb search "raw:Q" --mode fts`.
+
+Коды выхода: 0 — ок; 2 — запрос/использование; 3 — неполный прогон (корень, гард массового
+удаления, отказ разбора); 75 — отложено (давление памяти, занятый лок при ожидании).
+
+## Первый запуск (лид)
+
+```bash
+kb fetch-model --model e5b ; kb fetch-model --model m3            # сеть, разово
+~/bin/hft-run -m 24G -- kb build --full
+~/bin/hft-run -m 24G -- kb bench-embed --model e5b --n 2000        # затем m3
+~/bin/hft-run -m 24G -- kb eval --compare-models e5b,m3 --distractors 10000
+# решение по DESIGN §6.3 → kb.toml [models] active = …
+cp tools/kb/units/kb-update.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now kb-update.timer
+```
+
+## MCP (регистрирует лид; здесь не выполнено)
+
+```bash
+claude mcp add kb -s user \
+  -e HF_HOME=/home/storage/hft-scratch/hf-cache -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -- /usr/bin/unshare -rn /home/storage/hft-scratch/kb-venv/bin/kb mcp
+```
+
+`unshare -rn` (user + net namespace) отрезает сеть целиком: внутри только `lo`. Сервер сам
+проверяет `/proc/net/dev` и без этого не стартует. Инструменты: `kb_search(query,
+mode=hybrid|fts|semantic, kind, project, since, limit≤50)` и `kb_read(pointer, context 0–5)`;
+`kb_read` резолвит только проиндексированные указатели, ответ ≤ 20 000 символов; каждая
+строка ответа маскируется. fd 1 процесса уведён в stderr: случайный print не ломает
+протокол. Модель грузится в фоне; первый семантический запрос ждёт её до 60 с, дальше —
+fts с полем `degraded`. Память: модель + матрица ≈ 1.5–3 ГБ на каждую сессию Claude,
+поднявшую сервер.

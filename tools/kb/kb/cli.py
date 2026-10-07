@@ -255,6 +255,11 @@ def cmd_fetch_model(args, cfg) -> int:
     return 0
 
 
+def cmd_mcp(args, cfg) -> int:
+    from .mcp_server import serve
+    return serve(cfg, _db(args, cfg), proc_net_dev=args.proc_net_dev, threads=args.threads)
+
+
 GOLDEN = Path(__file__).resolve().parent.parent / "eval" / "golden.jsonl"
 
 
@@ -391,6 +396,10 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--model", required=True)
     f.add_argument("--revision", help="commit sha (default: the repo's current one, then pinned)")
 
+    m = sub.add_parser("mcp", help="stdio MCP server (kb_search, kb_read); run under unshare -rn")
+    m.add_argument("--threads", type=int, default=4)
+    m.add_argument("--proc-net-dev", default=None, help=argparse.SUPPRESS)
+
     ev = sub.add_parser("eval", help="golden-set recall per mode; --compare-models for §6.3")
     ev.add_argument("--golden", default=str(GOLDEN))
     ev.add_argument("--modes", default="fts_raw_or,fts,semantic,hybrid")
@@ -413,7 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {"search": cmd_search, "read": cmd_read, "build": cmd_build, "update": cmd_update,
             "stats": cmd_stats, "embed": cmd_embed, "gc": cmd_gc, "fetch-model": cmd_fetch_model,
-            "bench-embed": cmd_bench, "eval": cmd_eval}
+            "bench-embed": cmd_bench, "eval": cmd_eval, "mcp": cmd_mcp}
 
 
 def _embed_args(p) -> None:
