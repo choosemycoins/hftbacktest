@@ -3,6 +3,15 @@
 #   systemctl --user daemon-reload && systemctl --user enable --now kb-update.timer
 [Unit]
 Description=kb: incremental index update (local, offline)
+# Any non-zero exit pages the operator (Telegram, same hook as the other user
+# units): 3 = incomplete (missing root, mass-delete guard, parse failure,
+# free-space gate, --embed pass skipped), 75 = deferred by memory pressure
+# (the index did not move that night — paged on purpose; SuccessExitStatus=75
+# would make it silent), 1/137/203 = crash / MemoryMax / no venv. The alert
+# carries the unit state and the journal tail: kb logs counts, ids and paths,
+# never chunk text, and masks tracebacks. Result of a run:
+#   journalctl --user -u kb-update -n 50 ; systemctl --user status kb-update
+OnFailure=signal-alert@%n.service
 
 [Service]
 Type=oneshot

@@ -73,6 +73,12 @@ cp tools/kb/units/kb-update.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now kb-update.timer
 ```
 
+Итог ночного прогона: `journalctl --user -u kb-update -n 50`, `systemctl --user status
+kb-update`. Любой ненулевой код (3 — неполный прогон, 75 — отложено по давлению памяти, 1/137/203 —
+падение, MemoryMax, нет venv) уходит алертом через `OnFailure=signal-alert@%n.service` (Telegram:
+состояние юнита и хвост журнала). В журнале только счётчики, id и пути, трейсбеки маскируются.
+Если отложенные ночи станут шумом — `SuccessExitStatus=75` в юните делает их молчаливыми.
+
 ## MCP (регистрирует лид; здесь не выполнено)
 
 ```bash

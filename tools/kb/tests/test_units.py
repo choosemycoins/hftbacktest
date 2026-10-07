@@ -58,3 +58,36 @@ def test_timer_runs_nightly_and_catches_up():
     assert values(timer, "OnCalendar") == ["*-*-* 05:20"]
     assert values(timer, "Persistent") == ["true"]
     assert values(timer, "WantedBy") == ["timers.target"]
+
+
+def test_a_failed_night_pages_the_operator():
+    """Every non-zero exit is a page: 3 (missing root, mass-delete guard, parse
+    failure, free-space gate, a skipped --embed pass), 75 (deferred by memory
+    pressure — the index did not move that night), 1/137/203 (crash, MemoryMax,
+    no venv). Same hook as the other user units of this machine."""
+    svc = UNITS / "kb-update.service"
+    unit = [(k, v) for s, k, v in directives(svc) if s == "Unit"]
+    assert ("OnFailure", "signal-alert@%n.service") in unit
+    assert not values(svc, "SuccessExitStatus"), "no exit code is waved through"
+
+
+def test_a_crash_traceback_is_masked_on_its_way_to_the_journal(tmp_path):
+    """OnFailure ships the journal tail to Telegram; an exception message can
+    carry indexed text (a heading in a ValueError). `kb` installs a masking
+    excepthook in main()."""
+    import os
+    import subprocess
+    import sys
+    key = "0x" + "7a" * 32
+    root = Path(__file__).resolve().parents[1]
+    code = (f"import sys; sys.path.insert(0, {str(root)!r})\n"
+            "import kb.cli\n"
+            "try:\n"
+            "    kb.cli.main(['--help'])\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            f"raise RuntimeError('duplicate anchor # Ключ {key}')\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                       cwd=tmp_path, env=dict(os.environ))
+    assert r.returncode == 1 and "Traceback" in r.stderr and "RuntimeError" in r.stderr
+    assert key not in r.stderr and "redacted" in r.stderr

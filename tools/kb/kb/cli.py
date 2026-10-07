@@ -500,8 +500,19 @@ def _embed_args(p) -> None:
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
 
 
+def _masked_excepthook(etype, value, tb) -> None:
+    """A crash prints its traceback masked: the nightly unit's journal tail
+    goes to Telegram (OnFailure), and an exception message can carry indexed
+    text (a heading, a path, a query)."""
+    import traceback
+    from .redact import redact
+    sys.stderr.write(redact("".join(traceback.format_exception(etype, value, tb))))
+    sys.stderr.flush()
+
+
 def main(argv=None) -> int:
     os.umask(0o077)       # everything kb creates (db, journal, lock, matrices) is 0600/0700
+    sys.excepthook = _masked_excepthook
     args = build_parser().parse_args(argv)
     if args.command != "fetch-model":
         from .netguard import force_offline_env
