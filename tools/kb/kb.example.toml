@@ -6,7 +6,9 @@
 db = "~/.local/share/kbindex/kb.db"
 
 [models]
-active = "e5b"                       # chosen by the golden eval, DESIGN.md §6.3
+# bge-m3 (dense): chosen 07.10 by the rule of DESIGN.md §6.3 — hybrid strict@10
+# m3 7 wins vs e5b 2 (net 5 >= 4), CPU daily delta 19 min <= 60. Measured in §6.7-6.8.
+active = "m3"
 hf_home = "/home/storage/hft-scratch/hf-cache"
 
 [projects.alias]

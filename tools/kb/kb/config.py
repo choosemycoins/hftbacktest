@@ -157,7 +157,7 @@ def parse_config(raw: dict, path: Path | None = None, sha: str = "") -> Config:
 BUILTIN_TOML = """
 db = "~/.local/share/kbindex/kb.db"
 [models]
-active = "e5b"
+active = "m3"
 hf_home = "/home/storage/hft-scratch/hf-cache"
 [projects.alias]
 "-home-andrew----------Telegram-Desktop-ChatExport-2026-09-26" = "eacc-review"
