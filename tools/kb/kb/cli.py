@@ -51,7 +51,8 @@ NETWORK
   or pass --allow-network to a manual update/embed.
 
 EXIT CODES  0 ok · 2 bad query/usage · 3 incomplete run (missing root, guard,
-            parse failure) · 75 deferred (memory pressure, lock held while waiting).
+            parse failure, `--embed` pass skipped: no usable model) · 75 deferred
+            (memory pressure, lock held while waiting).
 """
 
 from __future__ import annotations
@@ -160,6 +161,9 @@ def _summary(st: dict) -> None:
         print(f"  INCOMPLETE: mass delete refused for {s} (--allow-mass-delete)", file=sys.stderr)
     if st.get("failed"):
         print(f"  INCOMPLETE: {st['failed']} unit(s) failed to parse (see warnings)", file=sys.stderr)
+    if "skipped" in (st.get("after") or {}):
+        print("  INCOMPLETE: embeddings skipped (see above); vector coverage does not grow",
+              file=sys.stderr)
     if st.get("reason"):
         print(f"  {st['reason']}", file=sys.stderr)
 
@@ -187,13 +191,13 @@ def _embed_after(cfg, db, args):
         from .embed import embed_pass, load_embedder
         from .models import ModelError
         key = getattr(args, "model", None) or cfg.model_active
-        if not key:
-            return {"skipped": "no [models] active in the config"}
         try:
+            if not key:
+                raise ModelError("no [models] active in the config")
             emb = load_embedder(key, cfg.hf_home, threads=args.threads, device=args.device,
                                 full_verify=True)
         except ModelError as exc:
-            print(f"kb: embeddings skipped: {exc}", file=sys.stderr, flush=True)
+            _err(f"kb: embeddings skipped: {exc}")
             return {"skipped": str(exc)}
         st = embed_pass(conn, db, emb, budget_minutes=args.budget_minutes,
                         max_chunks=args.max_chunks, log=_log)
@@ -232,6 +236,8 @@ def cmd_update(args, cfg) -> int:
                 psi_wait_minutes=args.psi_wait_minutes, log=_log,
                 after=_embed_after(cfg, db, args) if args.embed else None)
     _summary(st)
+    if "skipped" in (st.get("after") or {}) and st["exit"] == 0:
+        return 3                # asked to embed, did not: incomplete, like `kb embed`
     return st["exit"]
 
 

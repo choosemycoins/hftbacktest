@@ -207,3 +207,20 @@ def test_a_small_scope_is_scored_exactly_without_the_prefilter(monkeypatch):
     pos, scores = semantic.top_rows(matrix, rows, q, 100)
     ref, ref_scores = _exact(matrix, rows, q, 100)
     assert np.array_equal(pos, ref) and np.allclose(scores, ref_scores, atol=1e-6)
+
+
+@pytest.mark.parametrize("active", ['"e5b"', '""'])
+def test_update_embed_that_skips_the_embedding_pass_is_incomplete(corpus, capsys, active):
+    """The nightly unit runs `kb update --embed`: a pass skipped for a missing
+    or unverifiable model (or no active model) must not look like success —
+    otherwise the unit is green every night while coverage stops growing.
+    Same verdict as `kb embed` on the same config."""
+    from kb import cli
+    p = corpus["config"]
+    p.write_text(p.read_text().replace('active = "fake"', f"active = {active}"))
+    c = ["--config", str(p)]
+    assert cli.main(c + ["update", "--embed", "--lock-timeout", "0"]) == 3
+    err = capsys.readouterr().err
+    assert "embeddings skipped" in err and "INCOMPLETE" in err
+    assert cli.main(c + ["embed"]) == 3
+    assert cli.main(c + ["update", "--lock-timeout", "0"]) == 0, "without --embed nothing was skipped"
