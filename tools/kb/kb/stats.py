@@ -18,13 +18,33 @@ def stats_report(cfg: Config, db_path: Path, check: bool = False) -> tuple[str, 
     out = [f"kb stats — {db_path}",
            f"  updated {info['updated_at']} ({info['age_hours']} h ago), "
            f"last run {meta.get('update_seconds', '?')} s, schema v{meta.get('schema')}"]
+    model = cfg.model_active
     rows = conn.execute(
-        "SELECT kind, count(DISTINCT unit_id), count(*), sum(n_chars) FROM chunk GROUP BY kind "
-        "ORDER BY kind").fetchall()
-    out.append(f"  {'kind':<11} {'units':>7} {'chunks':>8} {'chars':>12}")
-    for kind, units, chunks, chars in rows:
-        out.append(f"  {kind:<11} {units:>7} {chunks:>8} {chars or 0:>12}")
+        "SELECT c.kind, count(DISTINCT c.unit_id), count(*), sum(c.n_chars), count(r.row) "
+        "FROM chunk c LEFT JOIN emb_row r ON r.model_key = ? AND r.text_sha = c.text_sha "
+        "GROUP BY c.kind ORDER BY c.kind", (model or "",)).fetchall()
+    out.append(f"  {'kind':<11} {'units':>7} {'chunks':>8} {'chars':>12} {'embedded':>9}  ({model or 'no model'})")
+    tot = [0, 0, 0, 0]
+    for kind, units, chunks, chars, emb in rows:
+        out.append(f"  {kind:<11} {units:>7} {chunks:>8} {chars or 0:>12} {emb:>9}  {emb / chunks:5.1%}")
+        tot = [tot[0] + units, tot[1] + chunks, tot[2] + (chars or 0), tot[3] + emb]
+    if rows:
+        out.append(f"  {'total':<11} {tot[0]:>7} {tot[1]:>8} {tot[2]:>12} {tot[3]:>9}  "
+                   f"{tot[3] / max(tot[1], 1):5.1%}")
     rc = 0
+    from .embed import MatrixStore
+    for key, dim in conn.execute("SELECT model_key, dim FROM emb_model ORDER BY model_key"):
+        ms = MatrixStore(db_path, key, dim)
+        junk, total = ms.garbage(conn)
+        path = ms.path(ms.gen(conn))
+        size = path.stat().st_size if path.exists() else 0
+        out.append(f"  vectors {key}: {total} rows, garbage {junk} ({junk / max(total, 1):.0%}), "
+                   f"{size / 1e6:.1f} MB, generation {ms.gen(conn)}")
+        if check:
+            top = conn.execute("SELECT max(row) FROM emb_row WHERE model_key=?", (key,)).fetchone()[0]
+            if top is not None and top >= total:
+                out.append(f"  check: vectors {key}: emb_row points past the matrix ({top} >= {total})")
+                rc = 3
     last = json.loads(meta.get("last_run") or "{}")
     for m in last.get("missing_roots", []):
         out.append(f"  MISSING ROOT (last run): {m}")
@@ -55,6 +75,14 @@ def stats_report(cfg: Config, db_path: Path, check: bool = False) -> tuple[str, 
             out.append("  check: FTS integrity ok")
         except Exception as exc:          # noqa: BLE001 — reported, exit 3
             out.append(f"  check: FTS integrity FAILED: {exc}")
+            rc = 3
+    if check and model and model != "fake":
+        from .models import ModelError, verify
+        try:
+            verify(cfg.hf_home, model, full=True)
+            out.append(f"  check: model {model} files match models.toml (sha256)")
+        except ModelError as exc:
+            out.append(f"  check: model {model}: {exc}")
             rc = 3
     idx.close()
     return "\n".join(out), rc

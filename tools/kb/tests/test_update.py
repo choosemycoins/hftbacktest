@@ -266,3 +266,16 @@ def test_unmounted_mirror_keeps_mirror_only_transcripts(corpus, tmp_path):
     st = run(corpus)
     assert st["exit"] == 3
     assert fts(corpus["db"], "зеркале"), "a transcript kept only by the mirror must survive an unmount"
+
+
+def test_a_new_commit_touches_no_existing_commit_row(corpus):
+    """`git log --all` lists newest first; a new commit must not shift the
+    ordinal (and so rewrite the row) of every older one."""
+    from conftest import git
+    run(corpus)
+    (corpus["repo"] / "n.txt").write_text("n")
+    git(corpus["repo"], "add", "n.txt")
+    git(corpus["repo"], "commit", "-q", "-m", "третий коммит")
+    st = run(corpus)
+    assert st["kinds"]["commit"]["added"] == 1
+    assert st["kinds"]["commit"].get("updated", 0) == 0

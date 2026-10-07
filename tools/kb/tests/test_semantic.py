@@ -137,3 +137,20 @@ def test_cli_embed_without_an_index_is_a_clean_error(corpus, capsys):
     from kb import cli
     assert cli.main(["--config", str(corpus["config"]), "embed"]) == 2
     assert "kb build --full" in capsys.readouterr().err
+
+
+def test_stats_shows_vector_coverage_and_checks_the_matrix(corpus, capsys):
+    from kb import cli
+    c = ["--config", str(corpus["config"])]
+    assert cli.main(c + ["update", "--embed", "--max-chunks", "3", "--lock-timeout", "0"]) == 0
+    capsys.readouterr()
+    assert cli.main(c + ["stats", "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "embedded" in out and "vectors fake:" in out and "FTS integrity ok" in out
+    total = [l for l in out.splitlines() if l.strip().startswith("total")][0]
+    assert total.split()[4] == "3"
+    conn = store.open_rw(corpus["db"])
+    conn.execute("UPDATE emb_row SET row = 999 WHERE rowid = (SELECT min(rowid) FROM emb_row)")
+    conn.close()
+    assert cli.main(c + ["stats", "--check"]) == 3
+    assert "points past the matrix" in capsys.readouterr().out

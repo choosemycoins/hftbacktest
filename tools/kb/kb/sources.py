@@ -30,8 +30,11 @@ from . import chunking as ch
 from .config import Config
 from .extract import extract_message_text
 
+# Bump a kind's version when its parser changes what it emits: every unit of
+# that kind is re-read once; ids are anchors and vectors are keyed by text, so
+# nothing is re-embedded unless the text itself changed.
 PARSER_VERSIONS = {"transcript": 1, "memory": 1, "doc": 1, "export": 1, "note": 1,
-                   "course": 1, "chat": 1, "commit": 1}
+                   "course": 1, "chat": 1, "commit": 2}     # commit 2: oldest-first ordinals
 KINDS = tuple(PARSER_VERSIONS)
 
 MAX_BYTES = 2 * 1024 * 1024
@@ -559,7 +562,8 @@ def git_signature(repo: Path) -> str | None:
 
 
 def parse_git(repo: Path):
-    out = _git(repo, "log", "--all", "--format=" + GIT_FORMAT)
+    # oldest first: a new commit appends, older rows keep their ordinal
+    out = _git(repo, "log", "--all", "--reverse", "--format=" + GIT_FORMAT)
     if out is None:
         raise RuntimeError(f"git log failed in {repo}")
     pieces = []
