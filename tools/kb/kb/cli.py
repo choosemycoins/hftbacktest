@@ -173,6 +173,7 @@ def cmd_build(args, cfg) -> int:
     if not args.full:
         print("kb build needs --full (use `kb update` for an incremental run)", file=sys.stderr)
         return 2
+    from .store import SchemaError
     from .update import Busy
     db = _db(args, cfg)
     print(f"kb build --full -> {db}", flush=True)
@@ -181,6 +182,9 @@ def cmd_build(args, cfg) -> int:
     except Busy:
         print("kb: another writer holds the lock — nothing done", file=sys.stderr)
         return 0 if args.lock_timeout <= 0 else 75
+    except SchemaError as exc:
+        _err(f"kb: build refused: {exc}")
+        return 3
     _summary(st)
     return st["exit"]
 

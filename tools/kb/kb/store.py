@@ -25,6 +25,7 @@ from .stem import STEM_VERSION, stem_text
 
 SCHEMA_VERSION = 2
 SEP = "\x1f"
+BUSY_MS = 5000          # how long any handle waits for another one's lock
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -121,9 +122,9 @@ def text_sha(title: str, text: str) -> str:
 
 
 def open_rw(path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=5.0)
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=BUSY_MS / 1000)
+    conn.execute(f"PRAGMA busy_timeout={BUSY_MS}")
     conn.execute("PRAGMA journal_mode=DELETE")
-    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=FULL")
     # Big units (a chat is one unit) must not spill to the file mid-transaction:
@@ -134,9 +135,9 @@ def open_rw(path) -> sqlite3.Connection:
 
 def open_ro(path) -> sqlite3.Connection:
     uri = Path(os.path.abspath(path)).as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=5.0,
+    conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=BUSY_MS / 1000,
                            check_same_thread=False)
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_MS}")
     return conn
 
 
@@ -148,13 +149,46 @@ def init_schema(conn: sqlite3.Connection) -> None:
              stem_version=STEM_VERSION)
 
 
+def explain(exc: sqlite3.DatabaseError) -> str:
+    """What a database error means for the reader and what to do. Only a file
+    that is not a kb database calls for `kb build --full`: on a merely busy
+    one it would race the writer, and next to a hot journal it used to drop
+    every vector (DESIGN.md §8.5)."""
+    name = getattr(exc, "sqlite_errorname", "") or ""
+    if name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")):
+        return "the index is busy (a writer is committing) — retry in a few seconds"
+    if name == "SQLITE_READONLY_ROLLBACK":
+        return ("an interrupted write left a hot journal next to the index; a reader cannot "
+                "roll it back — run: kb update (it does, and keeps every vector)")
+    return f"not a kb database ({exc}) — run: kb build --full"
+
+
 def check_schema(conn: sqlite3.Connection) -> None:
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
     except sqlite3.DatabaseError as exc:
-        raise SchemaError(f"not a kb database ({exc}) — run: kb build --full") from exc
+        raise SchemaError(explain(exc)) from exc
     if version != SCHEMA_VERSION:
         raise SchemaError(f"schema v{version} (need v{SCHEMA_VERSION}) — run: kb build --full")
+
+
+def recover(path) -> int | None:
+    """Open the live database read-write once: its first read rolls back a hot
+    journal an interrupted writer left (read-only handles cannot, so every
+    reader fails until a writer does). user_version, or None when the file is
+    not a SQLite database at all; any other failure (busy, read-only file)
+    raises SchemaError — a database that could not be read is never taken
+    for one that has nothing in it."""
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=BUSY_MS / 1000)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={BUSY_MS}")
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        if getattr(exc, "sqlite_errorname", "") == "SQLITE_NOTADB":
+            return None
+        raise SchemaError(explain(exc)) from exc
+    finally:
+        conn.close()
 
 
 @contextmanager

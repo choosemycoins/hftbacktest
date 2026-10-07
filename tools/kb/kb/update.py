@@ -25,6 +25,7 @@ import fcntl
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
@@ -333,14 +334,11 @@ def update(cfg: Config, db_path=None, *, allow_mass_delete=False, lock_timeout=6
 
 
 def copy_embeddings(src_db: Path, conn) -> int:
-    """Carry emb_model/emb_row over from the live database (same matrices)."""
-    if not src_db.exists():
-        return 0
-    try:
-        old = store.open_ro(src_db)
-        store.check_schema(old)
-    except Exception:          # v1 or unreadable: nothing to carry
-        return 0
+    """Carry emb_model/emb_row over from the live database (same matrices).
+    Called for a live v2 database whose hot journal, if any, has been rolled
+    back (store.recover): an error here is raised — the build stops and the
+    old file keeps its vectors — never read as "nothing to carry"."""
+    old = store.open_ro(src_db)
     try:
         models = old.execute("SELECT * FROM emb_model").fetchall()
         rows = old.execute("SELECT * FROM emb_row").fetchall()
@@ -367,6 +365,13 @@ def build_full(cfg: Config, db_path=None, log=None, warn=None, lock_timeout=600.
     dir_managed = secure._secure_dir(db_path, warn)
     tmp = db_path.parent / f".{db_path.name}.tmp-{os.getpid()}"
     with WriterLock(db_path.parent, lock_timeout):
+        # first, under the lock: roll back a hot journal of the live file (an
+        # interrupted writer's) — read-only, the old file looked unreadable
+        # (no vectors carried), and the journal outlived os.replace to be
+        # played into the NEW file
+        live = store.recover(db_path) if db_path.exists() else None
+        if db_path.exists() and live is None:
+            warn(f"{db_path} is not a SQLite database: rebuilding, no vectors to carry over")
         for leftover in (tmp, Path(f"{tmp}-journal")):
             if leftover.exists():
                 leftover.unlink()
@@ -377,7 +382,13 @@ def build_full(cfg: Config, db_path=None, log=None, warn=None, lock_timeout=600.
             conn.execute("PRAGMA synchronous=OFF")     # not live until fsync + rename
             store.init_schema(conn)
             result = _pass(conn, cfg, True, log, warn)
-            result["carried_embeddings"] = copy_embeddings(db_path, conn)
+            try:
+                result["carried_embeddings"] = (copy_embeddings(db_path, conn)
+                                                if live == store.SCHEMA_VERSION else 0)
+            except sqlite3.DatabaseError as exc:
+                raise store.SchemaError(
+                    f"cannot carry the vectors over from {db_path} ({store.explain(exc)}); nothing "
+                    "replaced — fix it, or move it away to rebuild without them") from exc
             _finish(conn, cfg, result, started, "full")
             conn.close()
             conn = None

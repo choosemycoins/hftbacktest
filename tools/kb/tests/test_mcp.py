@@ -307,3 +307,14 @@ def test_kb_search_after_an_update_deleted_an_embedded_chunk(corpus):
     update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
     resp = payload(call(server, "kb_search", {"query": "anytime-valid methods are absent"}))
     assert not any("book-notes.md" in r["where"] for r in resp["results"])
+
+
+def test_a_hot_journal_is_reported_with_the_cure_not_the_rebuild(served):
+    """An interrupted `kb update` (SIGKILL, power loss) leaves a hot journal;
+    the advice the agent reads must be the harmless `kb update`."""
+    from conftest import kill_a_writer_mid_transaction
+    server, corpus = served
+    kill_a_writer_mid_transaction(corpus["db"])
+    r = call(server, "kb_search", {"query": "монетизирует латентность"})
+    assert r.is_error
+    assert "kb update" in r.content[0].text and "build --full" not in r.content[0].text

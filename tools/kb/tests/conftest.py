@@ -218,3 +218,22 @@ allow = [{{ id = "deribit-ru", exports = ["ChatExport_2026-09-14 (1)"] }}]
     return {"home": home, "claude": claude, "slug": slug, "repo": repo, "research": research,
             "asr": asr, "tg": tg, "config": config, "sub_repo": sub_repo,
             "db": tmp_path / "share" / "kbindex" / "kb.db", "tmp": tmp_path}
+
+
+def kill_a_writer_mid_transaction(db: Path) -> None:
+    """What a SIGKILL / power loss of `kb update` leaves: a writer killed with
+    its transaction spilled to the file (cache smaller than the change), so a
+    HOT journal stays next to the database."""
+    import signal
+    import sys
+    code = (
+        "import os, signal, sqlite3\n"
+        f"c = sqlite3.connect({str(db)!r}, isolation_level=None)\n"
+        "c.execute('PRAGMA cache_size=5')\n"
+        "c.execute('BEGIN IMMEDIATE')\n"
+        "for i in range(300):\n"
+        "    c.execute('INSERT INTO meta VALUES (?, ?)', (f'pad{i}', 'x' * 4000))\n"
+        "os.kill(os.getpid(), signal.SIGKILL)\n")
+    r = subprocess.run([sys.executable, "-c", code])
+    assert r.returncode == -signal.SIGKILL
+    assert Path(f"{db}-journal").stat().st_size > 0, "precondition: a journal is left"

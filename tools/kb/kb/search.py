@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -356,6 +357,17 @@ class Index:
             self._conn = None
 
 
+@contextmanager
+def _readable(conn):
+    """A read snapshot whose database errors reach the caller as advice (busy
+    -> retry, hot journal -> kb update), never as an internal error."""
+    try:
+        with store.snapshot(conn):
+            yield
+    except sqlite3.DatabaseError as exc:
+        raise QueryError(store.explain(exc)) from exc
+
+
 def index_info(meta: dict) -> dict:
     updated = meta.get("updated_at") or meta.get("built_at")
     age = None
@@ -419,7 +431,7 @@ def search(index: Index, query: str, mode: str = "hybrid", kind=None, project=No
         else:
             qv = emb.embed_query(semantic_text(q))
     mode_used = mode if qv is not None else "fts"
-    with store.snapshot(conn):
+    with _readable(conn):
         # one committed state for everything below: the semantic arrays, the
         # fts list, the rows fetched for both, the coverage, the meta
         meta = dict(conn.execute("SELECT key, value FROM meta"))
@@ -513,7 +525,7 @@ def _stale(conn, unit_id: int, abs_path: str, kind: str):
 def read_pointer(index: Index, pointer: str, context: int = 1) -> dict:
     """Resolve a pointer THROUGH THE INDEX ONLY; never read arbitrary files."""
     conn = index.conn()
-    with store.snapshot(conn):           # the chunk and its neighbours from one state
+    with _readable(conn):                # the chunk and its neighbours from one state
         rowid = _resolve(conn, pointer)
         if rowid is None:
             raise QueryError("not an indexed pointer (use a kb:<id> or a `where` from kb search)")

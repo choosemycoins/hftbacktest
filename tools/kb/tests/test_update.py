@@ -319,3 +319,119 @@ def test_build_and_gc_report_a_held_lock_instead_of_a_traceback(corpus, capsys):
         assert capsys.readouterr().err.count("another writer holds the lock") == 2
     finally:
         os.close(fd)
+
+
+# --- an interrupted writer, a busy database: what readers are told, what --full does ---
+
+def _embedded(corpus):
+    """A database with vectors, as after `kb update --embed` (fake model)."""
+    from kb import embed
+    from kb.embed import FakeEmbedder
+    run(corpus)
+    conn = store.open_rw(corpus["db"])
+    embed.embed_pass(conn, corpus["db"], FakeEmbedder())
+    conn.close()
+    n = emb_rows(corpus["db"])
+    assert n > 0
+    return n
+
+
+def emb_rows(db):
+    return chunks(db, "SELECT count(*) FROM emb_row")[0][0]
+
+
+def test_a_hot_journal_sends_readers_to_kb_update_and_kb_update_heals_it(corpus):
+    from conftest import kill_a_writer_mid_transaction
+    from kb.search import Index, QueryError, search
+    n = _embedded(corpus)
+    long_lived = Index(corpus["db"])
+    assert search(long_lived, "латентность", mode="fts")["results"]
+    kill_a_writer_mid_transaction(corpus["db"])
+    for idx in (Index(corpus["db"]), long_lived):            # a fresh reader and an open one
+        with pytest.raises(QueryError) as e:
+            search(idx, "латентность", mode="fts")
+        assert "kb update" in str(e.value) and "build --full" not in str(e.value), str(e.value)
+    st = run(corpus)
+    assert st["exit"] == 0 and emb_rows(corpus["db"]) == n
+    assert search(long_lived, "латентность", mode="fts")["results"]
+    integrity(corpus["db"])
+
+
+def test_build_full_over_a_hot_journal_keeps_the_vectors_and_a_whole_file(corpus):
+    """--full used to read the old file read-only: the hot journal made it
+    'unreadable' -> 0 vectors carried; os.replace left that journal next to
+    the NEW file, and the next writer played it into it (malformed)."""
+    from conftest import kill_a_writer_mid_transaction
+    n = _embedded(corpus)
+    kill_a_writer_mid_transaction(corpus["db"])
+    st = update.build_full(cfg_of(corpus), corpus["db"], warn=lambda m: None)
+    assert st["carried_embeddings"] == n
+    assert not os.path.exists(f"{corpus['db']}-journal")
+    assert run(corpus)["exit"] == 0 and emb_rows(corpus["db"]) == n
+    integrity(corpus["db"])
+
+
+def test_build_full_never_drops_vectors_it_could_not_read(corpus, monkeypatch):
+    """A v2 database held by an outside writer is not 'nothing to carry': the
+    build stops and the old file (with its vectors) stays as it was."""
+    import sqlite3
+    n = _embedded(corpus)
+    monkeypatch.setattr(store, "BUSY_MS", 200)
+    before = corpus["db"].read_bytes()
+    holder = sqlite3.connect(corpus["db"], isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(store.SchemaError, match="busy"):
+            update.build_full(cfg_of(corpus), corpus["db"], warn=lambda m: None)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert corpus["db"].read_bytes() == before and emb_rows(corpus["db"]) == n
+    assert sorted(p.name for p in corpus["db"].parent.iterdir() if p.name.startswith(".kb.db.tmp")) == []
+
+
+def test_a_busy_index_tells_readers_to_retry_not_to_rebuild(corpus, monkeypatch, capsys):
+    import sqlite3
+    from kb.search import Index, QueryError, search
+    run(corpus)
+    monkeypatch.setattr(store, "BUSY_MS", 200)
+    long_lived = Index(corpus["db"])
+    assert search(long_lived, "латентность", mode="fts")["results"]
+    holder = sqlite3.connect(corpus["db"], isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        for idx in (Index(corpus["db"]), long_lived):
+            with pytest.raises(QueryError) as e:
+                search(idx, "латентность", mode="fts")
+            assert "busy" in str(e.value) and "build --full" not in str(e.value), str(e.value)
+        assert cli.main(["--config", str(corpus["config"]), "search", "латентность", "--mode", "fts"]) == 2
+        assert "busy" in capsys.readouterr().err
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_cli_build_reports_a_refusal_instead_of_a_traceback(corpus, monkeypatch, capsys):
+    import sqlite3
+    _embedded(corpus)
+    monkeypatch.setattr(store, "BUSY_MS", 200)
+    holder = sqlite3.connect(corpus["db"], isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        assert cli.main(["--config", str(corpus["config"]), "build", "--full"]) == 3
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert "busy" in capsys.readouterr().err
+
+
+def test_build_full_refuses_to_drop_vectors_whose_tables_it_cannot_read(corpus):
+    import sqlite3
+    _embedded(corpus)
+    c = sqlite3.connect(corpus["db"], isolation_level=None)     # foreign keys off, as sqlite3 is
+    c.execute("DROP TABLE emb_model")
+    c.close()
+    before = corpus["db"].read_bytes()
+    with pytest.raises(store.SchemaError, match="cannot carry the vectors"):
+        update.build_full(cfg_of(corpus), corpus["db"], warn=lambda m: None)
+    assert corpus["db"].read_bytes() == before
