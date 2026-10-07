@@ -309,7 +309,7 @@ def _export_turns(text: str):
             continue
         if line.startswith("✻"):
             continue
-        if line.lstrip().startswith("⎿"):
+        if "⎿" in line:                    # tool output, also inline ("  Stop Task  ⎿  …")
             state = "skip"
             continue
         if _SUMMARY.search(line):
@@ -318,7 +318,7 @@ def _export_turns(text: str):
             if not line.strip():
                 continue
             indent = len(raw) - len(raw.lstrip(" "))
-            if indent >= 5:
+            if indent >= 3:              # prose sits at 2; tool text continues at 3+ (inline) / 5+
                 continue
             state = cur[0] if cur is not None else None
         if state in ("user", "assistant") and cur is not None:

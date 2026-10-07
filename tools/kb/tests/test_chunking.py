@@ -260,6 +260,15 @@ def test_export_loc_points_at_file_lines():
     assert "памп детектора" in lines_of(EXPORT, first.loc)
 
 
+def test_export_inline_tool_marker_line_is_dropped_with_its_continuation():
+    text = ("● Останавливаю прогон.\n\n  Stop Task  ⎿  Фандинг: SECRETTASKDESC по хвосту\n"
+            "   площадок · stopped\n\n  Дата — вчера.\n")
+    pieces = ch.chunk_export(text, "e.txt")
+    blob = "\n".join(p.text for p in pieces)
+    assert "SECRETTASKDESC" not in blob and "площадок · stopped" not in blob
+    assert "Останавливаю прогон." in blob and "Дата — вчера." in blob
+
+
 def test_export_bare_slash_command_turn_is_dropped():
     pieces = ch.chunk_export("❯ /effort\n  ⎿  Set effort\n\n❯ /goal собрать индекс\n", "e.txt")
     assert [p.text for p in pieces] == ["/goal собрать индекс"]
