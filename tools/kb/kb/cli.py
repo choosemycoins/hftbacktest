@@ -160,9 +160,14 @@ def cmd_build(args, cfg) -> int:
     if not args.full:
         print("kb build needs --full (use `kb update` for an incremental run)", file=sys.stderr)
         return 2
+    from .update import Busy
     db = _db(args, cfg)
     print(f"kb build --full -> {db}", flush=True)
-    st = build_full(cfg, db, log=_log, lock_timeout=args.lock_timeout)
+    try:
+        st = build_full(cfg, db, log=_log, lock_timeout=args.lock_timeout)
+    except Busy:
+        print("kb: another writer holds the lock — nothing done", file=sys.stderr)
+        return 0 if args.lock_timeout <= 0 else 75
     _summary(st)
     return st["exit"]
 
@@ -249,9 +254,18 @@ def cmd_gc(args, cfg) -> int:
     import shutil
     from . import store
     from .embed import MatrixStore
-    from .update import WriterLock
+    from .update import Busy, WriterLock
     db = _db(args, cfg)
-    with WriterLock(db.parent, args.lock_timeout):
+    if not db.exists():
+        print(f"kb: no index at {db}", file=sys.stderr)
+        return 2
+    lock = WriterLock(db.parent, args.lock_timeout)
+    try:
+        lock.__enter__()
+    except Busy:
+        print("kb: another writer holds the lock — nothing done", file=sys.stderr)
+        return 0 if args.lock_timeout <= 0 else 75
+    try:
         conn = store.open_rw(db)
         try:
             models = conn.execute("SELECT model_key, dim FROM emb_model").fetchall()
@@ -269,6 +283,8 @@ def cmd_gc(args, cfg) -> int:
                 print(f"  {key}: {n} garbage rows dropped, {len(orphans)} orphan file(s) removed")
         finally:
             conn.close()
+    finally:
+        lock.__exit__(None, None, None)
     return 0
 
 

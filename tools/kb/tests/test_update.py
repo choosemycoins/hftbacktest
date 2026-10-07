@@ -305,3 +305,17 @@ def test_psi_path_comes_from_the_cgroup_not_the_uid():
     assert str(update.psi_path_from_cgroup(text)) == \
         "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.pressure"
     assert update.psi_path_from_cgroup("0::/system.slice/cron.service\n") is None
+
+
+def test_build_and_gc_report_a_held_lock_instead_of_a_traceback(corpus, capsys):
+    run(corpus)
+    lock = corpus["db"].parent / "kb.lock"
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        c = ["--config", str(corpus["config"])]
+        assert cli.main(c + ["build", "--full", "--lock-timeout", "0"]) == 0
+        assert cli.main(c + ["gc", "--lock-timeout", "0"]) == 0
+        assert capsys.readouterr().err.count("another writer holds the lock") == 2
+    finally:
+        os.close(fd)
