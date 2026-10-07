@@ -187,3 +187,28 @@ def test_reparse_and_full_rebuild_reuse_vectors(corpus):
     assert embed.embed_pass(conn, corpus["db"], FakeEmbedder())["embedded"] == 0, \
         "build --full carries emb_row over: no vector is recomputed"
     conn.close()
+
+
+def test_parser_version_bump_does_not_re_embed(corpus, monkeypatch):
+    from kb import sources
+    cfg = cfgmod.load_config(corpus["config"])
+    update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    conn = store.open_rw(corpus["db"])
+    embed.embed_pass(conn, corpus["db"], FakeEmbedder())
+    conn.close()
+    monkeypatch.setitem(sources.PARSER_VERSIONS, "note", 77)
+    st = update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    assert st["kinds"]["note"]["units_changed"] >= 4
+    conn = store.open_rw(corpus["db"])
+    assert embed.pending(conn, "fake") == [], "same text -> same text_sha -> the old vector"
+    conn.close()
+
+
+def test_cli_budget_exhausted_is_a_clean_exit_with_the_remainder(corpus, capsys):
+    from kb import cli
+    c = ["--config", str(corpus["config"])]
+    assert cli.main(c + ["update", "--lock-timeout", "0"]) == 0
+    capsys.readouterr()
+    assert cli.main(c + ["embed", "--budget-minutes", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "+0 in" in out and "remaining 0" not in out

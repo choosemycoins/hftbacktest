@@ -214,6 +214,7 @@ exports_root = "{tg}"
 ignore = ["ChatExport_2023-11-01"]
 allow = [{{ id = "deribit-ru", exports = ["ChatExport_2026-09-14 (1)"] }}]
 ''', encoding="utf-8")
+    config.chmod(0o600)              # it names private chats
     return {"home": home, "claude": claude, "slug": slug, "repo": repo, "research": research,
             "asr": asr, "tg": tg, "config": config, "sub_repo": sub_repo,
             "db": tmp_path / "share" / "kbindex" / "kb.db", "tmp": tmp_path}

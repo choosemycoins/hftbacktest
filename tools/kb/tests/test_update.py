@@ -279,3 +279,21 @@ def test_a_new_commit_touches_no_existing_commit_row(corpus):
     st = run(corpus)
     assert st["kinds"]["commit"]["added"] == 1
     assert st["kinds"]["commit"].get("updated", 0) == 0
+
+
+def test_stats_reports_refusals_and_an_open_config(corpus, capsys):
+    d = corpus["research"] / "many"
+    d.mkdir()
+    for i in range(120):
+        (d / f"n{i}.md").write_text(f"# Note {i}\n\nтекст заметки номер {i} достаточно длинный\n")
+    run(corpus)
+    for i in range(60):
+        (d / f"n{i}.md").unlink()
+    run(corpus)
+    os.chmod(corpus["config"], 0o644)
+    assert cli.main(["--config", str(corpus["config"]), "stats"]) == 3
+    out = capsys.readouterr().out
+    assert "MASS DELETE REFUSED (last run): hft-research" in out
+    assert "chmod 600" in out
+    os.chmod(corpus["config"], 0o600)
+    assert cli.main(["--config", str(corpus["config"]), "stats"]) == 0

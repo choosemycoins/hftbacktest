@@ -225,3 +225,22 @@ def test_titles_and_paths_are_masked_too_not_only_snippets(corpus):
     server = mcp_server.build_server(Index(corpus["db"]), None)
     text = call(server, "kb_search", {"query": "ротацию ключей агента", "mode": "fts"}).content[0].text
     assert "leak.md" in text and FAKE_KEY not in text
+
+
+def test_sdk_stdio_client_smoke(served, tmp_path):
+    """The SDK's own stdio client against `python -m kb mcp`."""
+    from mcp import Client, StdioServerParameters
+    _, corpus = served
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "kb", "--config", str(corpus["config"]), "mcp"],
+        env=dict(os.environ, KB_PROC_NET_DEV=str(lo_only(tmp_path)), PYTHONPATH=str(KB_ROOT)),
+        cwd=str(tmp_path))
+
+    async def main():
+        async with Client(params) as c:
+            tools = await c.list_tools()
+            r = await c.call_tool("kb_search", {"query": "matching engine", "mode": "fts"})
+            return tools, r
+    tools, r = anyio.run(main)
+    assert {t.name for t in tools.tools} == {"kb_search", "kb_read"}
+    assert not r.is_error and "deribit-ru" in r.content[0].text

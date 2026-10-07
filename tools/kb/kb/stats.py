@@ -11,6 +11,7 @@ from .search import Index, index_info
 
 
 def stats_report(cfg: Config, db_path: Path, check: bool = False) -> tuple[str, int]:
+    rc = 0
     idx = Index(db_path)
     conn = idx.conn()
     meta = idx.meta()
@@ -31,7 +32,6 @@ def stats_report(cfg: Config, db_path: Path, check: bool = False) -> tuple[str, 
     if rows:
         out.append(f"  {'total':<11} {tot[0]:>7} {tot[1]:>8} {tot[2]:>12} {tot[3]:>9}  "
                    f"{tot[3] / max(tot[1], 1):5.1%}")
-    rc = 0
     from .embed import MatrixStore
     for key, dim in conn.execute("SELECT model_key, dim FROM emb_model ORDER BY model_key"):
         ms = MatrixStore(db_path, key, dim)
@@ -48,6 +48,13 @@ def stats_report(cfg: Config, db_path: Path, check: bool = False) -> tuple[str, 
     last = json.loads(meta.get("last_run") or "{}")
     for m in last.get("missing_roots", []):
         out.append(f"  MISSING ROOT (last run): {m}")
+    for src in last.get("refused", []):
+        out.append(f"  MASS DELETE REFUSED (last run): {src} — rerun with --allow-mass-delete if intended")
+    if cfg.path is not None and cfg.path.exists():
+        mode = cfg.path.stat().st_mode & 0o777
+        if mode & 0o077:
+            out.append(f"  WARNING: {cfg.path} is {mode:04o}: it names private chats — chmod 600")
+            rc = 3
     for k, v in sorted(last.get("kinds", {}).items()):
         bad = {x: v[x] for x in ("malformed", "failed", "unparsable") if v.get(x)}
         if bad:
