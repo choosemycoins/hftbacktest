@@ -165,3 +165,34 @@ def test_cli_errors_are_masked_too(corpus, capsys):
     err = capsys.readouterr().err
     assert "bad query" in err, err
     assert FAKE_KEY not in err and BINANCE not in err and "redacted" in err
+
+
+# --- snippets: the whole chunk is masked before any cut ---------------------------
+# A bot token is one secret but several FTS tokens (`:`, `-`, `_` split them);
+# a window cut at a token boundary inside it, or the semantic head cut at
+# character 600, leaves a tail no rule recognises. Synthetic, never-used value.
+
+TG_SECRET = "AAHdq-TcvCH1vGWJxfSe_ofSAs0K5PALDs1"      # the 35-char secret half
+TG_TOKEN = f"1234567890:{TG_SECRET}"
+
+
+def test_precondition_the_whole_bot_token_is_masked():
+    from kb.redact import redact
+    assert len(TG_SECRET) == 35 and TG_SECRET not in redact(f"bot {TG_TOKEN}")
+
+
+def test_a_snippet_window_never_starts_inside_a_secret():
+    from kb.search import make_matcher, parse_query, snippet
+    filler = " ".join(f"w{i}" for i in range(33))
+    text = f"intro {TG_TOKEN} {filler} alert bot alert bot"
+    out = snippet(text, make_matcher(parse_query("alert bot")))
+    assert "[alert]" in out
+    assert TG_SECRET[:12] not in out and TG_SECRET[-12:] not in out, out
+
+
+def test_the_semantic_head_never_cuts_a_secret_in_two():
+    from kb.search import SEMANTIC_HEAD, snippet
+    text = "x" + "\n" * 553 + " " + TG_TOKEN + " tail"
+    assert text[:SEMANTIC_HEAD * 2].endswith(TG_TOKEN[:45]), "precondition: the cut lands inside it"
+    out = snippet(text, None, semantic_only=True)
+    assert TG_SECRET[:12] not in out, out

@@ -259,14 +259,18 @@ def make_matcher(q: Query):
 
 def snippet(text: str, match, semantic_only=False) -> str:
     """One line, <= SNIPPET_CHARS: the SNIPPET_TOKENS-token window with the most
-    matches, matches in [ ]. The window is masked BEFORE marking, so a marker
-    never splits a secret into pieces the masking rules cannot see."""
+    matches, matches in [ ]. The WHOLE chunk is masked before any cut: windows
+    start at token boundaries and `:`/`-`/`_` split tokens, so a window (or
+    the semantic head, cut at a character count) starting or ending inside a
+    secret would leave a piece no rule recognises. Masked before marking too:
+    a marker never splits a secret."""
+    text = redact(text)
     if semantic_only or match is None:
-        head = redact(_flat(text[: SEMANTIC_HEAD * 2]))
+        head = _flat(text[: SEMANTIC_HEAD * 2])
         return head[:SEMANTIC_HEAD] + ("…" if len(head) > SEMANTIC_HEAD or len(text) > SEMANTIC_HEAD * 2 else "")
     toks = [(m.start(), m.end(), match(m.group())) for m in TOKEN_RE.finditer(text)]
     if not toks:
-        return redact(_flat(text))[:SNIPPET_CHARS]
+        return _flat(text)[:SNIPPET_CHARS]
     best, best_i, run = -1, 0, 0
     for i, t in enumerate(toks):
         run += t[2]
@@ -277,7 +281,7 @@ def snippet(text: str, match, semantic_only=False) -> str:
             best, best_i = run, start
     lo = toks[best_i][0]
     hi = toks[min(len(toks), best_i + SNIPPET_TOKENS) - 1][1]
-    window = redact(text[lo:hi])
+    window = text[lo:hi]
     marked = TOKEN_RE.sub(lambda m: f"[{m.group()}]" if match(m.group()) else m.group(), window)
     out = _flat(marked)
     if len(out) > SNIPPET_CHARS:

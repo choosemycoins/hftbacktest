@@ -244,3 +244,19 @@ def test_sdk_stdio_client_smoke(served, tmp_path):
     tools, r = anyio.run(main)
     assert {t.name for t in tools.tools} == {"kb_search", "kb_read"}
     assert not r.is_error and "deribit-ru" in r.content[0].text
+
+
+def test_a_secret_split_by_the_snippet_window_does_not_leak_through_kb_search(corpus):
+    """End to end: the window of an fts hit starts right after the bot id."""
+    secret = "AAHdq-TcvCH1vGWJxfSe_ofSAs0K5PALDs1"
+    filler = " ".join(f"w{i}" for i in range(33))
+    (corpus["slug"] / "tg.jsonl").write_text(json.dumps({
+        "type": "user", "uuid": "tg1", "timestamp": "2026-08-01T00:00:00Z",
+        "message": {"role": "user", "content": f"intro 1234567890:{secret} {filler} alert bot alert bot"}})
+        + "\n")
+    cfg = cfgmod.load_config(corpus["config"])
+    update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    server = mcp_server.build_server(Index(corpus["db"]), None)
+    text = call(server, "kb_search", {"query": "alert bot", "mode": "fts"}).content[0].text
+    assert "tg.jsonl" in text
+    assert secret[:12] not in text and secret[-12:] not in text
