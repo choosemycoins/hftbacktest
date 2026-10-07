@@ -19,12 +19,15 @@ Telegram по allowlist, коммиты. Ответ — **указатели** (
 export UV_CACHE_DIR=/home/storage/hft-scratch/uv-cache
 export UV_PROJECT_ENVIRONMENT=/home/storage/hft-scratch/kb-venv
 cd tools/kb
-uv sync --frozen --no-editable --extra test     # torch — только CPU-колесо (uv.lock)
+uv sync --frozen --no-editable --extra test --reinstall-package kb   # torch — только CPU-колесо (uv.lock)
 /home/storage/hft-scratch/kb-venv/bin/python -m pytest -q    # тесты, офлайн
 ```
 
 Установка **не editable**: ночной юнит работает с копией кода в venv и не ломается при
-смене ветки в checkout. После правок кода — повторить `uv sync --frozen --no-editable`.
+смене ветки в checkout. После правок кода — тот же `uv sync` **с `--reinstall-package kb`**:
+версия пакета не меняется, и без этого флага uv считает его установленным и оставляет в venv
+старую копию (замерено 07.10: `cli.py` и `update.py` в venv отставали от дерева).
+Сверка: `cmp` файлов `kb/*.py` с `…/kb-venv/lib/python3.12/site-packages/kb/`.
 
 ## Команды
 
