@@ -297,3 +297,11 @@ def test_stats_reports_refusals_and_an_open_config(corpus, capsys):
     assert "chmod 600" in out
     os.chmod(corpus["config"], 0o600)
     assert cli.main(["--config", str(corpus["config"]), "stats"]) == 0
+
+
+def test_psi_path_comes_from_the_cgroup_not_the_uid():
+    """Under `unshare -r` getuid() is 0; the cgroup still names user@1000."""
+    text = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kb-update.service\n"
+    assert str(update.psi_path_from_cgroup(text)) == \
+        "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.pressure"
+    assert update.psi_path_from_cgroup("0::/system.slice/cron.service\n") is None

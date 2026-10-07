@@ -103,7 +103,26 @@ class WriterLock:
             self.fd = None
 
 
+def psi_path_from_cgroup(cgroup_text: str) -> Path | None:
+    """memory.pressure of the user manager (user@<uid>.service) this process
+    runs under, from /proc/self/cgroup. Works inside a user namespace
+    (`unshare -r` makes getuid() 0, the cgroup path keeps the real uid)."""
+    for line in cgroup_text.splitlines():
+        path = line.split(":", 2)[-1]
+        parts = path.strip("/").split("/")
+        for i, part in enumerate(parts):
+            if part.startswith("user@") and part.endswith(".service"):
+                return Path("/sys/fs/cgroup", *parts[:i + 1], "memory.pressure")
+    return None
+
+
 def default_psi_path() -> Path:
+    try:
+        found = psi_path_from_cgroup(Path("/proc/self/cgroup").read_text())
+    except OSError:
+        found = None
+    if found is not None:
+        return found
     uid = os.getuid()
     return Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/memory.pressure")
 
