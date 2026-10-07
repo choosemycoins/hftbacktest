@@ -148,6 +148,15 @@ class Engine:
         finally:
             self._ready.set()
 
+    def preload(self):
+        """Load the metadata arrays now: done in the background next to the
+        model import they lose the GIL and the first query waits ~13 s
+        (measured); done first they cost ~1 s of start-up."""
+        try:
+            self.sem._load()
+        except Exception:          # noqa: BLE001 — the first query reports it
+            pass
+
     def start(self):
         """Load the model in a background thread (MCP: right after start-up)."""
         import threading
@@ -182,5 +191,6 @@ def engine_for(index, cfg, threads: int = 4, embedder=None, background=False):
                  loader=None if embedder is not None else
                  (lambda: load_embedder(key, cfg.hf_home, threads=threads)))
     if background:
+        eng.preload()
         eng.start()
     return eng
