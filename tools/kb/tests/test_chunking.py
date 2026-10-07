@@ -260,6 +260,18 @@ def test_export_loc_points_at_file_lines():
     assert "памп детектора" in lines_of(EXPORT, first.loc)
 
 
+@pytest.mark.parametrize("shape", [
+    "● Stop Task  ⎿ \xa0SECRETTASKDESC по хвосту\n   площадок · stopped\n",
+    "● Stop Task\n  ⎿ \xa0SECRETTASKDESC по хвосту\n     площадок · stopped\n",
+])
+def test_export_tool_header_without_parentheses_is_dropped(shape):
+    text = "● Останавливаю прогон.\n\n" + shape + "\n● Дата — вчера.\n"
+    pieces = ch.chunk_export(text, "e.txt")
+    blob = "\n".join(p.text for p in pieces)
+    assert "SECRETTASKDESC" not in blob and "stopped" not in blob and "Stop Task" not in blob
+    assert "Останавливаю прогон." in blob and "Дата — вчера." in blob
+
+
 def test_export_inline_tool_marker_line_is_dropped_with_its_continuation():
     text = ("● Останавливаю прогон.\n\n  Stop Task  ⎿  Фандинг: SECRETTASKDESC по хвосту\n"
             "   площадок · stopped\n\n  Дата — вчера.\n")

@@ -271,6 +271,7 @@ def chunk_docstring(source: str, filename: str) -> list[Piece] | None:
 _TOOL_CALL = re.compile(
     r"^[●⏺] (?:[A-Z][A-Za-z0-9_]*|mcp__[\w-]+|[\w.-]+ - [\w .-]+ \(MCP\))\(")
 _SUMMARY = re.compile(r"\(ctrl\+o to (?:expand|see)")
+_TOOL_NAME = re.compile(r"[A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*){0,3}")   # "Stop Task", "Read"
 _BARE_COMMAND = re.compile(r"^/[\w:.-]+\s*$")
 
 
@@ -281,6 +282,7 @@ def _export_turns(text: str):
     cur = None
     state = None             # 'user' | 'assistant' | 'skip' | None
     banner = False
+    header = None            # last "● Name" line: a tool header if ⎿ follows at once
     for no, raw in enumerate(text.split("\n"), 1):
         line = raw.rstrip()
         if banner:
@@ -296,7 +298,7 @@ def _export_turns(text: str):
             state = "user"
             continue
         if line[:1] in ("●", "⏺"):
-            if _TOOL_CALL.match(line):
+            if _TOOL_CALL.match(line) or "⎿" in line:      # "● Stop Task  ⎿  …"
                 state = "skip"
                 continue
             content = line[1:].strip()
@@ -306,12 +308,18 @@ def _export_turns(text: str):
                 cur = ("assistant", [(no, content)])
                 turns.append(cur)
             state = "assistant"
+            header = (no, content) if _TOOL_NAME.fullmatch(content) else None
             continue
         if line.startswith("✻"):
             continue
         if "⎿" in line:                    # tool output, also inline ("  Stop Task  ⎿  …")
+            if header is not None and cur is not None and cur[1] and cur[1][-1] == header:
+                cur[1].pop()               # "● Stop Task" was a tool header, not prose
+            header = None
             state = "skip"
             continue
+        if line.strip():
+            header = None
         if _SUMMARY.search(line):
             continue
         if state == "skip":
