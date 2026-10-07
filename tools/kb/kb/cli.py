@@ -67,6 +67,13 @@ def _db(args, cfg) -> Path:
     return Path(args.db).expanduser() if args.db else cfg.db
 
 
+def _err(msg: str) -> None:
+    """stderr is an output path too: an error can echo a query (or a path)
+    back, and a key pasted into a query must not come out in clear."""
+    from .redact import redact
+    print(redact(msg), file=sys.stderr, flush=True)
+
+
 def _print_hits(resp: dict, query: str) -> str:
     from .redact import redact
     out = [resp["notice"]]
@@ -100,7 +107,7 @@ def cmd_search(args, cfg) -> int:
         resp = search(idx, args.query, mode=args.mode, kind=args.kind, project=args.project,
                       since=args.since, limit=args.limit, engine=engine)
     except QueryError as exc:
-        print(f"kb: {exc}", file=sys.stderr)
+        _err(f"kb: {exc}")
         return 2
     resp = redact_obj(resp)
     if args.json:
@@ -116,7 +123,7 @@ def cmd_read(args, cfg) -> int:
     try:
         resp = redact_obj(read_pointer(Index(_db(args, cfg)), args.pointer, args.context))
     except QueryError as exc:
-        print(f"kb: {exc}", file=sys.stderr)
+        _err(f"kb: {exc}")
         return 2
     if args.json:
         print(json.dumps(resp, ensure_ascii=False, indent=1))
@@ -206,7 +213,7 @@ def _offline_or_refuse(args, needed: bool) -> int | None:
     try:
         require_offline()
     except NetworkError as exc:
-        print(f"kb: refusing: {exc} (or pass --allow-network)", file=sys.stderr)
+        _err(f"kb: refusing: {exc} (or pass --allow-network)")
         return 2
     return None
 
@@ -294,7 +301,7 @@ def cmd_fetch_model(args, cfg) -> int:
     try:
         fetch_model(args.model, cfg.hf_home, revision=args.revision, log=_log)
     except ModelError as exc:
-        print(f"kb: {exc}", file=sys.stderr)
+        _err(f"kb: {exc}")
         return 2
     return 0
 
@@ -388,7 +395,7 @@ def cmd_stats(args, cfg) -> int:
     try:
         text, rc = stats_report(cfg, _db(args, cfg), check=args.check)
     except QueryError as exc:
-        print(f"kb: {exc}", file=sys.stderr)
+        _err(f"kb: {exc}")
         return 2
     print(text)
     return rc
@@ -494,7 +501,7 @@ def main(argv=None) -> int:
     try:
         cfg = cfgmod.load_config(args.config)
     except cfgmod.ConfigError as exc:
-        print(f"kb: config: {exc}", file=sys.stderr)
+        _err(f"kb: config: {exc}")
         return 2
     return COMMANDS[args.command](args, cfg)
 

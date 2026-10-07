@@ -154,3 +154,14 @@ def test_model_verify_refuses_pickles_and_size_mismatches(tmp_path):
     (d / "model.safetensors").write_bytes(b"xy")
     with pytest.raises(models.ModelError, match="size"):
         models.verify(tmp_path, "e5b", manifest=manifest)
+
+
+def test_cli_errors_are_masked_too(corpus, capsys):
+    """An error echoes the query back (bad raw: syntax): stderr is an output
+    path like any other — a key pasted into a query is masked there too."""
+    assert cli.main(c(corpus) + ["update", "--lock-timeout", "0"]) == 0
+    capsys.readouterr()
+    assert cli.main(c(corpus) + ["search", f'raw:"unbalanced {FAKE_KEY} {BINANCE}', "--mode", "fts"]) == 2
+    err = capsys.readouterr().err
+    assert "bad query" in err, err
+    assert FAKE_KEY not in err and BINANCE not in err and "redacted" in err
