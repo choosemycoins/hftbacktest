@@ -181,6 +181,7 @@ def _process_scan(conn, scan, totals, allow_mass_delete, warn, refused, missing)
         cur = existing.get(cand.rel)
         pv = sources.PARSER_VERSIONS[cand.kind]
         sig = json.dumps(cand.signature)
+        sha = None
         if cur is not None and cur["parser_ver"] == pv and cur["kind"] == cand.kind \
                 and cur["project"] == cand.project:
             if cur["signature"] == sig:
@@ -203,7 +204,8 @@ def _process_scan(conn, scan, totals, allow_mass_delete, warn, refused, missing)
                     continue
         try:
             pieces, st = cand.parse()
-            sha = content_sha(cand.files)
+            if sha is None:
+                sha = content_sha(cand.files)
         except Exception as exc:          # one unreadable unit must not sink the run
             t["failed"] += 1
             warn(f"{cand.kind}: cannot parse {cand.abs_path}: {type(exc).__name__}")
