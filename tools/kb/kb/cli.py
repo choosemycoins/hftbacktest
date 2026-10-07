@@ -27,7 +27,9 @@ SEARCH
   raw:<FTS5 query>   passed to SQLite FTS5 over the RAW title+text: exact
                      forms, "phrase", prefix*, AND/OR/NOT, NEAR(a b, 10).
                      Tokenizer unicode61 (case-folding, diacritics removed;
-                     ё is NOT folded in raw mode).
+                     ё is NOT folded in raw mode). A prefix* follows a word
+                     directly and has no digit (`теря*`, never `0x7a*`):
+                     hit / no-hit over masked text would spell a key out.
   Filters: --kind (comma list), --project, --since YYYY-MM-DD.
 
 LIMITATIONS worth knowing before you trust an empty result

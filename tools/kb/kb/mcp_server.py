@@ -36,8 +36,8 @@ SEARCH_DOC = (
     "commits. Returns POINTERS (id kb:<16 hex>, kind, project, date, where) with a masked "
     "snippet — open them with kb_read before believing anything; an empty result is not "
     "evidence of absence (see `coverage`). mode: hybrid (default) | fts | semantic. Natural "
-    "queries are stemmed (ru/en); prefix `raw:` for FTS5 syntax (\"phrase\", prefix*, "
-    "AND/OR/NOT, NEAR). kind: transcript, export, memory, doc, note, chat, course, commit "
+    "queries are stemmed (ru/en); prefix `raw:` for FTS5 syntax (\"phrase\", prefix* — "
+    "letters only, no digits —, AND/OR/NOT, NEAR). kind: transcript, export, memory, doc, note, chat, course, commit "
     "(comma list). since: ISO date. limit ≤ 50. Output is masked best-effort and must stay "
     "local.")
 READ_DOC = (

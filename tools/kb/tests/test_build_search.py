@@ -243,3 +243,30 @@ def test_help_documents_the_contract():
     for needle in ("pointer", "0600", "0700", "never commit", "mask", "not a guarantee",
                    "fetch-model", "raw:", "not evidence", "allowlist"):
         assert needle in doc, needle
+
+
+# --- raw: prefixes are not an oracle over masked text ------------------------------
+# hit / no-hit of `raw:0x7a*`, `raw:0x7a7*`, … spells a masked key out one
+# character at a time (≤ 16 queries a character). FTS5 also reads `"0x7a"*`,
+# `"0x7a" *` and `0x7a *` (a space!) as prefixes, so the rule is about every
+# `*`, not about the words a regex happens to extract.
+
+@pytest.mark.parametrize("q", [
+    "raw:0x7a*", 'raw:"0x7a"*', 'raw:"0x7a" *', "raw:0x7a *", "raw:ключ + 0x7a*",
+    'raw:"ключ 0x7a"*', "raw:NEAR(ключ 0x7a*)", "raw:{text}: 0x7a*", "raw:hl_0x7a*",
+    "raw:теря *", 'raw:"теря"*',
+])
+def test_raw_prefixes_with_a_digit_or_off_a_word_are_refused(q):
+    with pytest.raises(QueryError, match=r"prefix"):
+        search.parse_query(q)
+
+
+@pytest.mark.parametrize("q", ["raw:теря*", "raw:монетиз*", 'raw:"монетизирует латентность"',
+                               "raw:hl_bn*", "raw:szDecim* AND tick", "raw:l2book"])
+def test_word_prefixes_and_plain_raw_queries_still_work(q):
+    search.parse_query(q)
+
+
+def test_the_cli_refuses_a_digit_prefix_with_a_clean_error(built, corpus, capsys):
+    assert cli.main(["--config", str(corpus["config"]), "search", "raw:0x7a*", "--mode", "fts"]) == 2
+    assert "prefix" in capsys.readouterr().err

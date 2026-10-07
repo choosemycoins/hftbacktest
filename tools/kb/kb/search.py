@@ -77,6 +77,7 @@ def parse_query(text: str) -> Query:
         body = text[4:].strip()
         if not body:
             raise QueryError("empty raw: query")
+        _check_prefixes(body)
         words = [w for w in re.findall(r"[^\W_]+\*?", body)
                  if w.rstrip("*") not in ("AND", "OR", "NOT", "NEAR")]
         terms = [normalize(w) for w in words if not w.endswith("*")]
@@ -86,6 +87,27 @@ def parse_query(text: str) -> Query:
     stems = list(dict.fromkeys(stem_word(w) for w in words))[:MAX_TERMS]
     return Query(text, False, text, stems, [],
                  "stem : (" + " OR ".join(fts_quote(t) for t in stems) + ")", stemmed=True)
+
+
+_LAST_WORD = re.compile(r"[^\W_]+$")
+
+
+def _check_prefixes(body: str) -> None:
+    """A prefix query is an oracle: hit / no-hit of `0x7a*`, `0x7a7*`, … spells
+    a MASKED key out one character at a time. Every `*` (FTS5 also reads
+    `"0x7a"*`, `"0x7a" *` and `0x7a *` as prefixes) must directly follow a
+    word, and that word must have no digit: keys, addresses and tokens carry
+    digits, paradigm prefixes (`теря*`) do not. Same rule for CLI and MCP.
+    Not closed: a masked value made of letters only (`password=…`) can still
+    be spelled out by letter prefixes."""
+    for m in re.finditer(r"\*", body):
+        word = _LAST_WORD.search(body, 0, m.start())
+        if word is None:
+            raise QueryError("raw: a prefix `*` must directly follow a word (`теря*`); "
+                             "`\"…\"*` and `word *` are refused")
+        if any(c.isdigit() for c in word.group()):
+            raise QueryError("raw: a prefix with a digit is refused — hit / no-hit over "
+                             "masked text would spell a key out")
 
 
 def _query_words(text: str) -> list[str]:

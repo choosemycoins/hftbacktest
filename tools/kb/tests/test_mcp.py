@@ -260,3 +260,30 @@ def test_a_secret_split_by_the_snippet_window_does_not_leak_through_kb_search(co
     text = call(server, "kb_search", {"query": "alert bot", "mode": "fts"}).content[0].text
     assert "tg.jsonl" in text
     assert secret[:12] not in text and secret[-12:] not in text
+
+
+def test_prefix_queries_cannot_spell_out_a_masked_key(corpus):
+    """The oracle attack through MCP: extend a known prefix by the hex digit
+    that still hits. Refused at the first step, so nothing is learned."""
+    import secrets
+    key = "0x" + secrets.token_hex(32)
+    (corpus["slug"] / "hl.jsonl").write_text(json.dumps({
+        "type": "user", "uuid": "hl1", "timestamp": "2026-08-01T00:00:00Z",
+        "message": {"role": "user", "content": f"агент HL, приватный ключ {key} не терять"}}) + "\n")
+    cfg = cfgmod.load_config(corpus["config"])
+    update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    server = mcp_server.build_server(Index(corpus["db"]), None)
+    first = call(server, "kb_search", {"query": "приватный ключ", "mode": "fts"}).content[0].text
+    assert key not in first and "redacted" in first          # the mask itself works
+    known = "0x"
+    for _ in range(64):
+        for ch in "0123456789abcdef":
+            r = call(server, "kb_search", {"query": f"raw:{known}{ch}*", "mode": "fts"})
+            if not r.is_error and json.loads(r.content[0].text)["results"]:
+                known += ch
+                break
+        else:
+            break
+    assert known == "0x", f"{len(known) - 2} hex digit(s) learned through hit / no-hit"
+    r = call(server, "kb_search", {"query": f"raw:{key[:6]}*", "mode": "fts"})
+    assert r.is_error and "prefix" in r.content[0].text
