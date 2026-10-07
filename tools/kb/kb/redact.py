@@ -1,6 +1,7 @@
 """Masking of recognisable secrets in text that leaves the database.
 
-Moved verbatim from tools/kbindex.py (v1). A net, not a guarantee.
+Moved from tools/kbindex.py (v1); v2 widened the named-secret rule and added
+its own (DESIGN.md §10.2). A net, not a guarantee.
 """
 
 import re
@@ -13,6 +14,22 @@ import re
 # warning. `[`/`]` around a term are FTS5 match markers, so the patterns
 # tolerate them inside a run.
 _HEXISH = r"[0-9a-fA-F\[\]]"
+# NAME=value, NAME: value, NAME = value, "name": "value". The name only has
+# to CONTAIN a credential word — DB_PASSWORD, BYBIT_API_KEY, apiSecret,
+# x-api-key (`\bpassword\b` missed them all: `_`, `-` and camelCase glue the
+# word to the rest; `tokeniz…` is no token). The value goes whatever its
+# length, a quoted one up to its closing quote (a mnemonic is twelve words)
+# or, unclosed, to the end of the line; the name stays. One line only, and
+# `==` is a comparison, not an assignment. An earlier mask is taken whole and
+# nothing after it: output is masked more than once (snippet, JSON, line).
+# The name is bounded (64 around the word): unbounded, a long run of name
+# characters cost quadratic time (12 000 × "token": 1 s).
+_CREDENTIAL = (r"(?:password|passwd|passphrase|secret|token(?!iz)|api[_-]?key|private[_-]?key|"
+               r"mnemonic|seed[_-]?phrase|credential)")
+_NAMED_SECRET = re.compile(
+    r"(?i)((?<![\w.-])[\w.-]{0,64}?" + _CREDENTIAL + r"[\w.-]{0,64})"   # the name: kept
+    r"([\"']?[^\S\n]*(?::=?|=(?!=))[^\S\n]*)"                 # the separator (NBSP too): kept
+    r"(?:\[redacted[^\]\s]*\]|\"[^\"\n]*\"?|'[^'\n]*'?|[^\s\"',;]+)")   # the value: masked
 REDACTIONS = (
     # 0x-prefixed values: EVM/HL addresses and private keys alike
     (re.compile(rf"\b0x{_HEXISH}{{16,}}"), "[redacted:0x]"),
@@ -26,11 +43,8 @@ REDACTIONS = (
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9\[\]]{20,}"), "[redacted:token]"),
     (re.compile(r"\bxox[abposr]-[A-Za-z0-9\-\[\]]{10,}"), "[redacted:token]"),
     (re.compile(r"\bAKIA[0-9A-Z\[\]]{16}\b"), "[redacted:token]"),
-    # key = value / "key": "value" for credential-shaped names
-    (re.compile(r"(?i)\b(api[_-]?keys?|secrets?|passwords?|passwd|passphrase|"
-                r"tokens?|private[_-]?keys?|mnemonic|seed[_-]?phrase|"
-                r"credentials?)\b(\"?\s*[:=]\s*)\"?'?[^\s\"',;]{6,}"),
-     r"\1\2[redacted]"),
+    # key = value / "key": "value" for credential-shaped names (widened in v2)
+    (_NAMED_SECRET, r"\1\2[redacted]"),
 )
 
 
@@ -39,6 +53,10 @@ REDACTIONS = (
 _PEM = re.compile(r"-----BEGIN[^-\n]*PRIVATE KEY-----[\s\S]*?"
                   r"(?:-----END[^-\n]*PRIVATE KEY-----|\Z)")
 REDACTIONS_V2 = (
+    # scheme://user:password@host — the password goes, the user and the host
+    # stay; the LAST '@' before the host ends it (`p@ss` unencoded happens)
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/?#@]*:)([^\s/?#]+)(@[^\s/?#@]+)"),
+     r"\1[redacted]\3"),
     # Telegram bot token: <bot id>:<35 chars>
     (re.compile(r"(?<![0-9])\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"), "[redacted:tg]"),
     (re.compile(r"\bxai-[A-Za-z0-9]{20,}"), "[redacted:token]"),
