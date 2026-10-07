@@ -304,6 +304,10 @@ def cmd_eval(args, cfg) -> int:
     from .semantic import Engine, engine_for
     from .update import WriterLock
     db = _db(args, cfg)
+    if not Path(args.golden).expanduser().is_file():
+        print(f"kb: golden set {args.golden} not found (it lives in the source tree: "
+              "tools/kb/eval/golden.jsonl; pass --golden)", file=sys.stderr)
+        return 2
     golden = E.load_golden(Path(args.golden).expanduser())
     modes = [m for m in args.modes.split(",") if m]
     bad = [m for m in modes if m not in E.MODES]

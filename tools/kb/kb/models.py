@@ -14,7 +14,10 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-MANIFEST = Path(__file__).resolve().parent.parent / "models.toml"
+# Shipped inside the package so the installed (non-editable) copy finds it;
+# `kb fetch-model` run from the source tree (`python -m kb` in tools/kb)
+# rewrites the copy in the repository, which is then committed.
+MANIFEST = Path(__file__).resolve().parent / "models.toml"
 
 
 @dataclass(frozen=True)

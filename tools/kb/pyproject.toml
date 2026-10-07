@@ -27,6 +27,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["kb"]
 
+[tool.setuptools.package-data]
+kb = ["models.toml"]
+
 # torch comes ONLY from the CPU wheel index: the default (CUDA) wheel drags in
 # gigabytes of NVIDIA libraries. The index is explicit, so nothing else
 # resolves from it.
