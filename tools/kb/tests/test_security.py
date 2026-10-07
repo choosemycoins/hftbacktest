@@ -135,3 +135,22 @@ def test_every_cli_output_path_is_masked(corpus, capsys):
     blob = "\n".join(outs)
     assert BINANCE not in blob and FAKE_KEY not in blob
     assert "redacted" in blob
+
+
+def test_model_verify_refuses_pickles_and_size_mismatches(tmp_path):
+    """The runtime never unpickles: a .bin next to the weights is a refusal."""
+    from kb import models
+    manifest = {"e5b": {"revision": "r", "files": {"model.safetensors": {"size": 1, "sha256": "0"}}}}
+    d = tmp_path / "hub" / "models--intfloat--multilingual-e5-base" / "snapshots" / "r"
+    d.mkdir(parents=True)
+    (d / "model.safetensors").write_bytes(b"x")
+    assert models.verify(tmp_path, "e5b", manifest=manifest) == d
+    with pytest.raises(models.ModelError, match="sha256"):
+        models.verify(tmp_path, "e5b", full=True, manifest=manifest)
+    (d / "pytorch_model.bin").write_bytes(b"pickle")
+    with pytest.raises(models.ModelError, match="pickle"):
+        models.verify(tmp_path, "e5b", manifest=manifest)
+    (d / "pytorch_model.bin").unlink()
+    (d / "model.safetensors").write_bytes(b"xy")
+    with pytest.raises(models.ModelError, match="size"):
+        models.verify(tmp_path, "e5b", manifest=manifest)
