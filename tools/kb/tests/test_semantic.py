@@ -154,3 +154,56 @@ def test_stats_shows_vector_coverage_and_checks_the_matrix(corpus, capsys):
     conn.close()
     assert cli.main(c + ["stats", "--check"]) == 3
     assert "points past the matrix" in capsys.readouterr().out
+
+
+# --- the scan: exact ranking, fast on a big scope ---------------------------------
+
+def _near_ties(n=3000, dim=64, seed=7):
+    """Unit vectors whose cosines to `q` differ by less than a float16 ulp
+    near the top, and several chunks sharing one matrix row (same text)."""
+    rng = np.random.default_rng(seed)
+    q = rng.standard_normal(dim).astype(np.float32)
+    q /= np.linalg.norm(q)
+    noise = rng.standard_normal((n, dim)).astype(np.float32)
+    noise -= np.outer(noise @ q, q)                       # orthogonal to q
+    noise /= np.linalg.norm(noise, axis=1, keepdims=True)
+    cos = 0.9 + 0.0004 * rng.standard_normal(n).astype(np.float32)   # crowded top
+    m = cos[:, None] * q + np.sqrt(1 - cos ** 2)[:, None] * noise
+    matrix = m.astype("<f2")
+    rows = np.concatenate([np.arange(n), rng.integers(0, n, 400)])  # duplicates share a row
+    return matrix, rows, q
+
+
+def _exact(matrix, rows, q, depth):
+    s = np.asarray(matrix[rows], dtype=np.float32) @ q
+    order = np.lexsort((np.arange(len(rows)), -s))[:depth]
+    return order, s[order]
+
+
+def test_a_big_scope_is_preranked_in_fp16_and_rescored_exactly(monkeypatch):
+    """Above FAST_MIN the whole matrix is scored once in float16 (one fast
+    matrix-vector product), and only the best PREFILTER are re-scored in
+    float32: the answer equals the exact float32 ranking, ties by position."""
+    import torch
+    matrix, rows, q = _near_ties()
+    fp16_order = np.argsort(-(torch.mv(torch.from_numpy(matrix), torch.from_numpy(q.astype("<f2")))
+                               .float().numpy()[rows]), kind="stable")[:100]
+    ref, ref_scores = _exact(matrix, rows, q, 100)
+    assert not np.array_equal(fp16_order, ref), "precondition: float16 alone misorders the top"
+    calls = []
+    real = semantic._fp16_scores
+    monkeypatch.setattr(semantic, "_fp16_scores", lambda m, v: calls.append(1) or real(m, v))
+    monkeypatch.setattr(semantic, "FAST_MIN", 1000)
+    monkeypatch.setattr(semantic, "PREFILTER", 400)
+    pos, scores = semantic.top_rows(matrix, rows, q, 100)
+    assert calls, "the big scope took the fp16 pre-ranking"
+    assert np.array_equal(pos, ref)
+    assert np.allclose(scores, ref_scores, atol=1e-6)
+
+
+def test_a_small_scope_is_scored_exactly_without_the_prefilter(monkeypatch):
+    matrix, rows, q = _near_ties(n=500)
+    monkeypatch.setattr(semantic, "_fp16_scores", lambda m, v: pytest.fail("no prefilter below FAST_MIN"))
+    pos, scores = semantic.top_rows(matrix, rows, q, 100)
+    ref, ref_scores = _exact(matrix, rows, q, 100)
+    assert np.array_equal(pos, ref) and np.allclose(scores, ref_scores, atol=1e-6)

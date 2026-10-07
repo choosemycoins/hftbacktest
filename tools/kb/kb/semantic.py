@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 
 import numpy as np
 
@@ -21,6 +22,8 @@ from .embed import MatrixStore
 RRF_K = 60
 DEPTH = 100
 BLOCK = 32768
+FAST_MIN = 20_000        # a scope this big is pre-ranked by one float16 product over the matrix
+PREFILTER = 1_000        # ... and only its best PREFILTER are re-scored exactly in float32
 
 
 class SemanticIndex:
@@ -80,15 +83,48 @@ class SemanticIndex:
         idx = np.nonzero(m)[0]
         if not len(idx):
             return []
-        q = np.asarray(qvec, dtype=np.float32)
-        scores = np.empty(len(idx), dtype=np.float32)
-        for i in range(0, len(idx), BLOCK):
-            part = self.rows[idx[i:i + BLOCK]]
-            scores[i:i + BLOCK] = np.asarray(self.matrix[part], dtype=np.float32) @ q
-        k = min(depth, len(idx))
-        top = np.argpartition(-scores, k - 1)[:k]
-        top = top[np.argsort(-scores[top], kind="stable")]
-        return [(int(self.rowids[idx[t]]), float(scores[t])) for t in top]
+        pos, scores = top_rows(self.matrix, self.rows[idx], np.asarray(qvec, dtype=np.float32), depth)
+        return [(int(self.rowids[idx[p]]), float(s)) for p, s in zip(pos, scores)]
+
+
+def _exact_scores(matrix, rows: np.ndarray, q: np.ndarray) -> np.ndarray:
+    scores = np.empty(len(rows), dtype=np.float32)
+    for i in range(0, len(rows), BLOCK):
+        scores[i:i + BLOCK] = np.asarray(matrix[rows[i:i + BLOCK]], dtype=np.float32) @ q
+    return scores
+
+
+def _fp16_scores(matrix, q: np.ndarray) -> np.ndarray | None:
+    """Cosine of every matrix row in one float16 matrix-vector product (torch
+    reads the float16 memmap as is; numpy has no fast float16 path). None
+    when torch is unavailable — the caller then scores exactly."""
+    try:
+        import torch
+    except ImportError:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)     # a read-only memmap: only read here
+        m = torch.from_numpy(np.asarray(matrix))
+    return torch.mv(m, torch.from_numpy(q.astype("<f2"))).float().numpy()
+
+
+def top_rows(matrix, rows: np.ndarray, q: np.ndarray, depth: int = DEPTH):
+    """(positions in `rows`, float32 scores) of the `depth` best cosines, best
+    first, ties by position — the exact ranking. `rows[i]` is the matrix row
+    of candidate i (chunks with one text share a row). A scope of FAST_MIN or
+    more is pre-ranked by `_fp16_scores` over the whole matrix and only its
+    best PREFILTER candidates are re-scored in float32: gathering and
+    converting 194k×1024 rows in numpy costs ~900 ms a query, the float16
+    product ~25 ms [measured 07.10]; float16 alone misorders near-ties."""
+    pos = np.arange(len(rows))
+    if len(rows) >= FAST_MIN and len(rows) > max(PREFILTER, depth):
+        pre = _fp16_scores(matrix, q)
+        if pre is not None:
+            k = max(PREFILTER, depth)
+            pos = np.sort(np.argpartition(-pre[rows], k - 1)[:k])
+    scores = _exact_scores(matrix, rows[pos], q)
+    order = np.lexsort((pos, -scores))[:depth]
+    return pos[order], scores[order]
 
 
 def rrf(fts: list[int], sem: list[int], dates: dict[int, str], k: int = RRF_K):
