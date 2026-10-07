@@ -196,3 +196,46 @@ def test_the_semantic_head_never_cuts_a_secret_in_two():
     assert text[:SEMANTIC_HEAD * 2].endswith(TG_TOKEN[:45]), "precondition: the cut lands inside it"
     out = snippet(text, None, semantic_only=True)
     assert TG_SECRET[:12] not in out, out
+
+
+# --- query.terms: a pasted secret, lowercased and cut into pieces ------------------
+# Terms are stems / normalized words: lowercased and split at `:`, `-`, `_`.
+# Each piece passed `redact` on its own and no shape survives that (the mixed
+# case of a Binance key is gone, a bot token is four pieces), so `--json` and
+# MCP answered with the key spelled out in `query.terms`.
+
+JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+
+
+@pytest.mark.parametrize("query,secret,kept", [
+    (f"ключ {BINANCE} выдан", BINANCE, "ключ"),
+    (f"бот {TG_TOKEN} алерты", TG_TOKEN, "бот"),
+    (f"сессия {JWT} истекла", JWT, "сесс"),
+    ("export DB_PASSWORD=hunter2xyz", "hunter2xyz", "password"),
+    (f"raw:ключ AND {BINANCE}", BINANCE, "ключ"),
+    ("raw:password=hunterxyz*", "hunterxyz", "password"),
+])
+def test_query_terms_never_spell_a_pasted_secret(query, secret, kept):
+    from kb.search import parse_query, shown_terms
+    from kb.stem import TOKEN_RE, normalize, stem_word
+    shown = shown_terms(parse_query(query))
+    pieces = {p for p in TOKEN_RE.findall(normalize(secret)) if len(p) >= 4}
+    pieces |= {stem_word(p) for p in pieces}
+    assert not pieces & {t.rstrip("*") for t in shown}, shown
+    assert "[redacted]" in shown and kept in shown, shown
+
+
+def test_query_terms_without_a_secret_are_the_terms():
+    from kb.search import parse_query, shown_terms
+    for query in ("почему прод терял деньги на комиссиях", "raw:теря* AND szDecimals"):
+        q = parse_query(query)
+        assert shown_terms(q) == q.terms + [p + "*" for p in q.prefixes]
+
+
+def test_cli_json_query_terms_carry_no_pasted_secret(corpus, capsys):
+    assert cli.main(c(corpus) + ["update", "--lock-timeout", "0"]) == 0
+    capsys.readouterr()
+    assert cli.main(c(corpus) + ["search", f"ключ {BINANCE}", "--mode", "fts", "--json"]) == 0
+    out = capsys.readouterr().out
+    assert BINANCE.lower() not in out and BINANCE not in out
+    assert json.loads(out)["query"]["terms"] == ["ключ", "[redacted]"]

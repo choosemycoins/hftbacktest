@@ -318,3 +318,16 @@ def test_a_hot_journal_is_reported_with_the_cure_not_the_rebuild(served):
     r = call(server, "kb_search", {"query": "монетизирует латентность"})
     assert r.is_error
     assert "kb update" in r.content[0].text and "build --full" not in r.content[0].text
+
+
+def test_kb_search_query_terms_carry_no_pasted_secret(served):
+    """`query.terms` are lowercased pieces of the query: the bot token below
+    came back as four terms no masking rule recognises one by one."""
+    server, _ = served
+    bot = "1234567890:AAHdq-TcvCH1vGWJxfSe_ofSAs0K5PALDs1"
+    for query in (f"бот {bot} алерты", f"Binance secret {FAKE_BINANCE}"):
+        text = call(server, "kb_search", {"query": query, "mode": "fts"}).content[0].text
+        for piece in ("1234567890", "aahdq", "tcvch1vgwjxfse", "ofsas0k5palds1",
+                      FAKE_BINANCE.lower()):
+            assert piece not in text, (query, piece)
+        assert "[redacted]" in json.loads(text)["query"]["terms"]

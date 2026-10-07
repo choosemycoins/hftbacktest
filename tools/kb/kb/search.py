@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -119,12 +120,29 @@ def _query_words(text: str) -> list[str]:
     return kept
 
 
+def shown_terms(q: Query) -> list[str]:
+    """`query.terms` as they leave the process (CLI --json, MCP). A term is a
+    lowercased piece of the query — `:`, `-`, `_` split tokens — so each
+    piece of a pasted key passed `redact` on its own, and none is a shape
+    redact knows (a Binance key lost its mixed case, a bot token is four
+    pieces). A term is shown only if the query masked by the same `redact`
+    still yields it (as typed, normalized or stemmed); else `[redacted]`."""
+    terms = q.terms + [p + "*" for p in q.prefixes]
+    masked = redact(q.text)
+    if masked == q.text:
+        return terms
+    visible = set()
+    for word in TOKEN_RE.findall(masked):
+        n = normalize(word)
+        visible |= {n, stem_word(n), unicodedata.normalize("NFKC", word).lower()}
+    return [t if t.rstrip("*") in visible else "[redacted]" for t in terms]
+
+
 def raw_or_query(text: str) -> Query:
     """Eval baseline `fts_raw_or`: the same words OR-ed over the RAW columns,
     no stemming — the measure of what stemming adds."""
     if text.strip().startswith("raw:"):
         return parse_query(text)
-    import unicodedata
     toks = TOKEN_RE.findall(unicodedata.normalize("NFKC", text).lower())   # ё kept: raw columns keep it
     kept = [t for t in toks if t not in STOPWORDS and t.replace("ё", "е") not in STOPWORDS] or toks
     if not kept:
@@ -472,8 +490,7 @@ def search(index: Index, query: str, mode: str = "hybrid", kind=None, project=No
     return {
         "notice": NOTICE,
         "index": info,
-        "query": {"mode": mode, "used": mode_used, "raw": q.raw,
-                  "terms": q.terms + [p + "*" for p in q.prefixes]},
+        "query": {"mode": mode, "used": mode_used, "raw": q.raw, "terms": shown_terms(q)},
         "coverage": coverage,
         "degraded": degraded,
         "results": [hit_json(h, match, "fts" not in h.ranks) for h in final],
