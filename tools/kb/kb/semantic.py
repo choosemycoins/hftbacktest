@@ -10,7 +10,6 @@ hybrid    reciprocal-rank fusion of the fts and semantic lists:
 
 from __future__ import annotations
 
-import os
 import re
 import warnings
 
@@ -27,8 +26,13 @@ PREFILTER = 1_000        # ... and only its best PREFILTER are re-scored exactly
 
 
 class SemanticIndex:
-    """Metadata arrays + the float16 matrix of one model, reloaded when the
-    database file is replaced or emb_version changes."""
+    """Metadata arrays + the float16 matrix of one model, reloaded whenever
+    the database changed under them: the stamp is (connection generation,
+    PRAGMA data_version), and data_version moves on EVERY commit of another
+    connection — `kb update` rewriting chunks in place, an embedding append,
+    a gc — not only on the ones that remember to bump a counter. Loaded inside
+    the caller's read snapshot, so the arrays match what the same search
+    fetches."""
 
     def __init__(self, index, model_key: str, dim: int):
         self.index = index
@@ -38,9 +42,13 @@ class SemanticIndex:
 
     def _load(self):
         conn = self.index.conn()
-        stamp = (os.stat(self.index.path).st_ino, store.get_meta(conn, "emb_version", "0"))
-        if stamp == self._stamp:
-            return
+        with store.snapshot(conn):
+            stamp = (self.index.generation, conn.execute("PRAGMA data_version").fetchone()[0])
+            if stamp != self._stamp:
+                self._fill(conn)
+                self._stamp = stamp
+
+    def _fill(self, conn):
         rows = conn.execute(
             "SELECT c.rowid, c.kind, c.project, c.date, COALESCE(r.row, -1) FROM chunk c "
             "LEFT JOIN emb_row r ON r.model_key = ? AND r.text_sha = c.text_sha", (self.key,)).fetchall()
@@ -55,9 +63,7 @@ class SemanticIndex:
         self.dates = np.array([r[3] for r in rows], dtype="U20")
         self.rows = np.fromiter((r[4] for r in rows), dtype=np.int64, count=len(rows))
         self.matrix = MatrixStore(self.index.path, self.key, self.dim).load(conn)
-        if len(self.matrix):
-            self.rows[self.rows >= len(self.matrix)] = -1      # never trust a short file
-        self._stamp = stamp
+        self.rows[self.rows >= len(self.matrix)] = -1          # never trust a short (or empty) file
 
     def mask(self, scope, restrict=None) -> np.ndarray:
         self._load()

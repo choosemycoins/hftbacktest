@@ -224,3 +224,129 @@ def test_update_embed_that_skips_the_embedding_pass_is_incomplete(corpus, capsys
     assert "embeddings skipped" in err and "INCOMPLETE" in err
     assert cli.main(c + ["embed"]) == 3
     assert cli.main(c + ["update", "--lock-timeout", "0"]) == 0, "without --embed nothing was skipped"
+
+
+# --- a long-lived engine (kb mcp) after `kb update` changes chunks in place ----------
+# The arrays (rowid -> matrix row, kind/project/date masks) were reloaded only
+# when emb_version changed; `kb update` deletes / rewrites / adds chunks without
+# touching it.
+
+@pytest.fixture()
+def live(corpus):
+    cfg = cfgmod.load_config(corpus["config"])
+    update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    fe = FakeEmbedder()
+    conn = store.open_rw(corpus["db"])
+    embed.embed_pass(conn, corpus["db"], fe)
+    conn.close()
+    idx = Index(corpus["db"])
+    eng = semantic.Engine(idx, "fake", fe.dim, embedder=fe)
+    eng.preload()                                   # what `kb mcp` does at start-up
+    return idx, eng, cfg, corpus
+
+
+def _upd(cfg, corpus):
+    return update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+
+
+BOOK_Q = "anytime-valid methods are absent"
+
+
+def test_a_long_lived_engine_forgets_a_chunk_deleted_by_update(live):
+    idx, eng, cfg, corpus = live
+    assert any("book-notes.md" in r["where"] for r in S(idx, eng, BOOK_Q, mode="semantic", limit=50)["results"])
+    (corpus["research"] / "book-notes.md").unlink()
+    assert _upd(cfg, corpus)["kinds"]["note"]["units_deleted"] == 1
+    for mode in ("semantic", "hybrid"):
+        resp = S(idx, eng, BOOK_Q, mode=mode, limit=50)
+        assert not any("book-notes.md" in r["where"] for r in resp["results"]), mode
+
+
+def test_a_long_lived_engine_never_ranks_an_edited_chunk_by_its_old_vector(live):
+    idx, eng, cfg, corpus = live
+    (corpus["research"] / "book-notes.md").write_text("# Book\n\nсовершенно другой текст про очереди\n")
+    _upd(cfg, corpus)
+    res = S(idx, eng, BOOK_Q, mode="semantic", limit=50)["results"]
+    assert not [r for r in res if "book-notes.md" in r["where"]], "the new text has no vector yet"
+
+
+def test_a_long_lived_engine_sees_new_chunks_and_moved_metadata(live):
+    idx, eng, cfg, corpus = live
+    before = S(idx, eng, BOOK_Q, mode="semantic")["coverage"]
+    (corpus["research"] / "fresh3.md").write_text("# F3\n\nновая заметка без вектора\n")
+    p = corpus["config"]
+    p.write_text(p.read_text().replace('= "eacc-review"', '= "eacc-forecasts"'))
+    cfg = cfgmod.load_config(p)
+    _upd(cfg, corpus)
+    after = S(idx, eng, BOOK_Q, mode="semantic")["coverage"]
+    assert after["in_scope"] == before["in_scope"] + 1 and after["embedded"] == before["embedded"]
+    res = S(idx, eng, "разбор прогнозов", mode="semantic", project="eacc-forecasts")["results"]
+    assert res and all(r["project"] == "eacc-forecasts" for r in res), "the mask follows the alias"
+
+
+def test_one_search_reads_one_snapshot(live, monkeypatch):
+    """fts, the semantic arrays and the fetch see one committed state: a writer
+    cannot commit between them (it waits for the reader's SHARED lock)."""
+    import sqlite3
+    idx, eng, cfg, corpus = live
+    real = search.fts_ranked
+    seen = []
+
+    def fts_then_a_writer(conn, q, scope, **kw):
+        out = real(conn, q, scope, **kw)
+        w = sqlite3.connect(corpus["db"], timeout=0.1, isolation_level=None)
+        try:
+            w.execute("UPDATE meta SET value = value WHERE key = 'updated_at'")
+            seen.append("committed")
+        except sqlite3.OperationalError as exc:
+            seen.append(str(exc))
+        finally:
+            w.close()
+        return out
+    monkeypatch.setattr(search, "fts_ranked", fts_then_a_writer)
+    S(idx, eng, BOOK_Q, mode="hybrid")
+    assert seen == ["database is locked"]
+
+
+def test_a_rowid_missing_from_the_fetch_is_skipped_not_a_crash(live, monkeypatch):
+    idx, eng, cfg, corpus = live
+    real = search.fetch_hits
+    monkeypatch.setattr(search, "fetch_hits", lambda conn, rowids: dict(list(real(conn, rowids).items())[1:]))
+    for mode in ("semantic", "hybrid", "fts"):
+        S(idx, eng, BOOK_Q, mode=mode)
+
+
+def test_an_empty_matrix_file_is_no_vectors_not_a_crash(corpus):
+    """`never trust a short file` held for a short file, not for an empty one
+    (emb_row rows >= 0 indexed a zero-row matrix)."""
+    import os
+    from kb.embed import MatrixStore
+    cfg = cfgmod.load_config(corpus["config"])
+    _upd(cfg, corpus)
+    fe = FakeEmbedder()
+    conn = store.open_rw(corpus["db"])
+    embed.embed_pass(conn, corpus["db"], fe)
+    ms = MatrixStore(corpus["db"], "fake", fe.dim)
+    os.truncate(ms.path(ms.gen(conn)), 0)
+    conn.close()
+    idx = Index(corpus["db"])
+    eng = semantic.Engine(idx, "fake", fe.dim, embedder=fe)
+    resp = S(idx, eng, BOOK_Q, mode="hybrid")
+    assert resp["coverage"]["embedded"] == 0 and resp["results"]
+
+
+def test_a_file_replaced_mid_search_does_not_break_the_search(live, monkeypatch):
+    """`kb build --full` renames a new file in while a search holds its read
+    snapshot: the search finishes on the handle it started with (the arrays
+    are not reloaded from the new file under it), the next one reads the new."""
+    idx, eng, cfg, corpus = live
+    real = eng.sem.ranked
+
+    def replace_then_rank(*a, **kw):
+        update.build_full(cfg, corpus["db"], warn=lambda m: None)
+        return real(*a, **kw)
+    monkeypatch.setattr(eng.sem, "ranked", replace_then_rank)
+    gen = idx.generation
+    assert S(idx, eng, BOOK_Q, mode="hybrid")["results"]
+    monkeypatch.setattr(eng.sem, "ranked", real)
+    assert S(idx, eng, BOOK_Q, mode="hybrid")["results"] and idx.generation == gen + 1

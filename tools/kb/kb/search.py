@@ -316,12 +316,19 @@ def snippet(text: str, match, semantic_only=False) -> str:
 # ---------------------------------------------------------------------------
 
 class Index:
+    """One read-only handle, reopened when `kb build --full` replaces the
+    file (new inode). `generation` counts the handles: a value read through
+    one handle (PRAGMA data_version) is never compared with another's."""
+
     def __init__(self, db_path):
         self.path = Path(db_path)
         self._conn = None
         self._ino = None
+        self.generation = 0
 
     def conn(self) -> sqlite3.Connection:
+        if self._conn is not None and self._conn.in_transaction:
+            return self._conn            # never swapped under an open read snapshot
         try:
             st = os.stat(self.path)
         except OSError as exc:
@@ -329,6 +336,7 @@ class Index:
         if self._conn is None or st.st_ino != self._ino:
             if self._conn is not None:
                 self._conn.close()
+                self._conn = None
             conn = store.open_ro(self.path)
             try:
                 store.check_schema(conn)
@@ -336,6 +344,7 @@ class Index:
                 conn.close()
                 raise QueryError(str(exc)) from exc
             self._conn, self._ino = conn, st.st_ino
+            self.generation += 1
         return self._conn
 
     def meta(self) -> dict:
@@ -399,50 +408,44 @@ def search(index: Index, query: str, mode: str = "hybrid", kind=None, project=No
     scope = make_scope(kind, project, since)
     q = fts_query(query) if fts_query else parse_query(query)
     conn = index.conn()
-    meta = index.meta()
     table = _restrict_table(index, conn, restrict)
-    degraded = None
-    sem: list[tuple[int, float]] = []
-    want_sem = mode in ("semantic", "hybrid")
-    if want_sem:
+    degraded, qv = None, None
+    if mode in ("semantic", "hybrid"):
+        # the query vector BEFORE the read snapshot: waiting for the model
+        # must never hold a lock a writer's commit would wait on
         emb, why = engine.embedder(wait) if engine is not None else (None, "no embedding model configured")
         if emb is None:
             degraded = f"semantic unavailable ({why}); fts only"
-            mode_used = "fts"
         else:
             qv = emb.embed_query(semantic_text(q))
-            sem = engine.sem.ranked(qv, scope, restrict=restrict)
-            mode_used = mode
-    else:
-        mode_used = "fts"
-    fts = fts_ranked(conn, q, scope, restrict_table=table) if mode_used in ("fts", "hybrid") else []
-    sem_ids = [r for r, _ in sem]
-    hits = fetch_hits(conn, list(dict.fromkeys(fts + sem_ids)))
+    mode_used = mode if qv is not None else "fts"
+    with store.snapshot(conn):
+        # one committed state for everything below: the semantic arrays, the
+        # fts list, the rows fetched for both, the coverage, the meta
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        sem = engine.sem.ranked(qv, scope, restrict=restrict) if qv is not None else []
+        fts = fts_ranked(conn, q, scope, restrict_table=table) if mode_used in ("fts", "hybrid") else []
+        sem_ids = [r for r, _ in sem]
+        hits = fetch_hits(conn, list(dict.fromkeys(fts + sem_ids)))
+        if engine is not None:
+            coverage = engine.sem.coverage(scope, restrict)
+        else:
+            coverage = {"embedded": 0, "in_scope": count_scope(conn, scope)}
+    ordered = []
     if mode_used == "hybrid":
-        fused = rrf(fts, sem_ids, {r: h.date for r, h in hits.items()})
-        ordered = []
-        for r, score, ranks in fused:
-            h = hits[r]
-            h.score, h.ranks = score, ranks
-            ordered.append(h)
+        scored = rrf(fts, sem_ids, {r: h.date for r, h in hits.items()})
     elif mode_used == "semantic":
-        ordered = []
-        for i, (r, score) in enumerate(sem, 1):
-            h = hits[r]
-            h.score, h.ranks = score, {"sem": i}
-            ordered.append(h)
+        scored = [(r, score, {"sem": i}) for i, (r, score) in enumerate(sem, 1)]
     else:
-        ordered = []
-        for i, r in enumerate(fts, 1):
-            h = hits[r]
-            h.score, h.ranks = 1.0 / i, {"fts": i}
-            ordered.append(h)
+        scored = [(r, 1.0 / i, {"fts": i}) for i, r in enumerate(fts, 1)]
+    for r, score, ranks in scored:
+        h = hits.get(r)
+        if h is None:              # gone under us: never a KeyError for the caller
+            continue
+        h.score, h.ranks = score, ranks
+        ordered.append(h)
     final = dedup_diversify(ordered, limit)
     match = make_matcher(q)
-    if engine is not None:
-        coverage = engine.sem.coverage(scope, restrict)
-    else:
-        coverage = {"embedded": 0, "in_scope": count_scope(conn, scope)}
     info = index_info(meta)
     info["model"] = engine.model_key if engine is not None else None
     return {
@@ -510,19 +513,21 @@ def _stale(conn, unit_id: int, abs_path: str, kind: str):
 def read_pointer(index: Index, pointer: str, context: int = 1) -> dict:
     """Resolve a pointer THROUGH THE INDEX ONLY; never read arbitrary files."""
     conn = index.conn()
-    rowid = _resolve(conn, pointer)
-    if rowid is None:
-        raise QueryError("not an indexed pointer (use a kb:<id> or a `where` from kb search)")
-    h = fetch_hits(conn, [rowid])[rowid]
-    context = 0 if h.kind == "commit" else max(0, min(int(context), MAX_CONTEXT))
+    with store.snapshot(conn):           # the chunk and its neighbours from one state
+        rowid = _resolve(conn, pointer)
+        if rowid is None:
+            raise QueryError("not an indexed pointer (use a kb:<id> or a `where` from kb search)")
+        h = fetch_hits(conn, [rowid])[rowid]
+        context = 0 if h.kind == "commit" else max(0, min(int(context), MAX_CONTEXT))
+        rows = conn.execute(
+            "SELECT ordinal, text FROM chunk WHERE unit_id=? AND ordinal BETWEEN ? AND ? "
+            "AND ordinal != ? ORDER BY ordinal",
+            (h.unit_id, h.ordinal - context, h.ordinal + context, h.ordinal)).fetchall() if context else []
+        stale = _stale(conn, h.unit_id, h.abs_path, h.kind)
     text = h.text[:READ_CAP]
     budget = READ_CAP - len(text)
     before, after = [], []
     if context:
-        rows = conn.execute(
-            "SELECT ordinal, text FROM chunk WHERE unit_id=? AND ordinal BETWEEN ? AND ? "
-            "AND ordinal != ? ORDER BY ordinal",
-            (h.unit_id, h.ordinal - context, h.ordinal + context, h.ordinal)).fetchall()
         near = sorted(rows, key=lambda r: (abs(r[0] - h.ordinal), r[0]))
         for ordinal, t in near:
             if budget <= 0:
@@ -531,6 +536,6 @@ def read_pointer(index: Index, pointer: str, context: int = 1) -> dict:
             budget -= len(piece)
             (before if ordinal < h.ordinal else after).append((ordinal, piece))
     return {"id": f"kb:{h.chunk_id}", "where": h.where, "kind": h.kind, "project": h.project,
-            "date": h.date, "title": h.title, "stale": _stale(conn, h.unit_id, h.abs_path, h.kind),
+            "date": h.date, "title": h.title, "stale": stale,
             "text": text, "before": [t for _, t in sorted(before)],
             "after": [t for _, t in sorted(after)]}

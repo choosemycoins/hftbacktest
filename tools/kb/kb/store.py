@@ -168,6 +168,23 @@ def transaction(conn: sqlite3.Connection):
     conn.execute("COMMIT")
 
 
+@contextmanager
+def snapshot(conn: sqlite3.Connection):
+    """One read transaction: every statement inside sees the same committed
+    state (a SHARED lock; a writer's commit waits for its end, busy_timeout).
+    Nested use joins the outer one. Keep it short: nothing slow (a model load,
+    a query embedding) belongs inside."""
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if conn.in_transaction:         # some errors end the transaction themselves
+            conn.execute("COMMIT")      # read-only: only drops the lock
+
+
 def get_meta(conn: sqlite3.Connection, key: str, default=None):
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row[0] if row else default

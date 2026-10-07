@@ -287,3 +287,23 @@ def test_prefix_queries_cannot_spell_out_a_masked_key(corpus):
     assert known == "0x", f"{len(known) - 2} hex digit(s) learned through hit / no-hit"
     r = call(server, "kb_search", {"query": f"raw:{key[:6]}*", "mode": "fts"})
     assert r.is_error and "prefix" in r.content[0].text
+
+
+def test_kb_search_after_an_update_deleted_an_embedded_chunk(corpus):
+    """The server's engine outlives `kb update`: the default (hybrid) mode must
+    not answer `internal error (KeyError)`."""
+    cfg = cfgmod.load_config(corpus["config"])
+    update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    fe = FakeEmbedder()
+    conn = store.open_rw(corpus["db"])
+    embed.embed_pass(conn, corpus["db"], fe)
+    conn.close()
+    idx = Index(corpus["db"])
+    eng = semantic.Engine(idx, "fake", fe.dim, embedder=fe)
+    eng.preload()
+    server = mcp_server.build_server(idx, eng)
+    assert payload(call(server, "kb_search", {"query": "anytime-valid methods are absent"}))["results"]
+    (corpus["research"] / "book-notes.md").unlink()
+    update.update(cfg, corpus["db"], warn=lambda m: None, lock_timeout=0)
+    resp = payload(call(server, "kb_search", {"query": "anytime-valid methods are absent"}))
+    assert not any("book-notes.md" in r["where"] for r in resp["results"])
