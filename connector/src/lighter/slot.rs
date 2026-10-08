@@ -334,50 +334,22 @@ impl Outbound {
     }
 }
 
+/// Test doubles for the sweep, shared by this module's tests and `order_path`'s.
 #[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
+pub(crate) mod testing {
+    use std::collections::VecDeque;
 
-    use super::{
-        AmbiguousFate,
-        CancelFollowUp,
-        DeadlineAction,
-        NonceAction,
-        Outbound,
-        OutboundSpans,
-        Placement,
-        SWEEP_ATTEMPTS,
-        SweepFollowUp,
-        SweepSend,
-        cancel_after_send,
-        deadline_action,
-        fate_of_ambiguous,
-        nonce_action,
-        placement_after_deadline,
-        sweep_follow_up,
-        sweep_with_retries,
-    };
-    use crate::lighter::{
-        private_msg::AccountOrder,
-        rest::{SendOutcome, SendTxAck, TxVerdict},
-    };
+    use super::SweepSend;
+    use crate::lighter::rest::SendOutcome;
 
-    fn ack() -> SendTxAck {
-        SendTxAck {
-            tx_hash: "ab".to_string(),
-            ratelimit: Some("Ratelimit is off".to_string()),
-            predicted_execution_time_ms: None,
-        }
-    }
-
-    /// A venue that answers each sweep from a script, in order.
-    struct ScriptedVenue {
-        answers: std::collections::VecDeque<Result<SendOutcome, String>>,
-        sends: u32,
+    /// A venue that answers each sweep attempt from a script, in order, and counts the sends.
+    pub(crate) struct ScriptedVenue {
+        pub(crate) answers: VecDeque<Result<SendOutcome, String>>,
+        pub(crate) sends: u32,
     }
 
     impl ScriptedVenue {
-        fn new(answers: Vec<Result<SendOutcome, String>>) -> Self {
+        pub(crate) fn new(answers: Vec<Result<SendOutcome, String>>) -> Self {
             Self {
                 answers: answers.into(),
                 sends: 0,
@@ -394,10 +366,48 @@ mod tests {
         }
     }
 
-    fn throttled() -> SendOutcome {
+    /// The venue's throttle answer to a `sendTx`.
+    pub(crate) fn throttled() -> SendOutcome {
         SendOutcome::Ambiguous {
             status: 429,
             detail: "Too Many Requests".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        AmbiguousFate,
+        CancelFollowUp,
+        DeadlineAction,
+        NonceAction,
+        Outbound,
+        OutboundSpans,
+        Placement,
+        SWEEP_ATTEMPTS,
+        SweepFollowUp,
+        cancel_after_send,
+        deadline_action,
+        fate_of_ambiguous,
+        nonce_action,
+        placement_after_deadline,
+        sweep_follow_up,
+        sweep_with_retries,
+    };
+    use crate::lighter::{
+        private_msg::AccountOrder,
+        rest::{SendOutcome, SendTxAck, TxVerdict},
+        slot::testing::{ScriptedVenue, throttled},
+    };
+
+    fn ack() -> SendTxAck {
+        SendTxAck {
+            tx_hash: "ab".to_string(),
+            ratelimit: Some("Ratelimit is off".to_string()),
+            predicted_execution_time_ms: None,
         }
     }
 

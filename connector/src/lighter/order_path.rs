@@ -607,19 +607,13 @@ impl SlotTask {
                             self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
                         }
                         Some(Command::CancelAll { market_index, reply }) => {
-                            // Whether it took is reported twice: by `send_cancel_all` itself (an
-                            // `error!` and a critical to the bots, after its retries), and on the
-                            // reply, which `OrderPath::sweep` folds into the `SweepOutcome` an
-                            // orderly stop turns into its exit code.
-                            let ok = self
-                                .send_cancel_all(&mut signer, &mut nonce, market_index)
-                                .await;
-                            if let Some(reply) = reply {
-                                // Finding 2: answer with the REAL outcome, never an
-                                // unconditional success — the `bool` reply type is what makes
-                                // "success after a failed send_cancel_all" impossible to write.
-                                let _ = reply.send(ok);
-                            }
+                            let mut sender = CancelAllSender {
+                                slot: &self,
+                                signer: &mut signer,
+                                nonce: &mut nonce,
+                                market_index,
+                            };
+                            sweep_market(&mut sender, &self.ev_tx, market_index, reply).await;
                         }
                         Some(Command::MintAuth { deadline, reply }) => {
                             let token = signer
@@ -940,53 +934,6 @@ impl SlotTask {
         // here reports it, so a refused transport does not look like a cancel that took.
     }
 
-    /// One market's `CancelAllOrders` (§3.4), sent until the venue takes it or
-    /// [`crate::lighter::slot::SWEEP_ATTEMPTS`] are spent ([`sweep_with_retries`]). Returns
-    /// whether it took — the real outcome, which the `CancelAll` reply carries to
-    /// [`OrderPath::sweep`] and from there to the stop's exit code (`SweepOutcome`).
-    ///
-    /// A sweep that did not take is an `error!` and a `CriticalConnectionError` to every bot.
-    /// It used to be one send and an `info!` "Sent a Lighter CancelAllOrders sweep." whatever
-    /// came back — a `21104` or a 429 included — so the one line an operator reads after a
-    /// bot's death or a stop said the market had been swept while its orders kept resting.
-    async fn send_cancel_all(
-        &self,
-        signer: &mut SignerClient,
-        nonce: &mut NonceOwner,
-        market_index: i32,
-    ) -> bool {
-        let result = sweep_with_retries(&mut CancelAllSender {
-            slot: self,
-            signer,
-            nonce,
-            market_index,
-        })
-        .await;
-        match result {
-            Ok(attempts) => {
-                info!(
-                    market_index,
-                    attempts, "Sent a Lighter CancelAllOrders sweep; the venue took it."
-                );
-                true
-            }
-            Err(reason) => {
-                error!(
-                    market_index,
-                    %reason,
-                    "A Lighter CancelAllOrders sweep FAILED; orders may still be resting on this \
-                     market."
-                );
-                report_error(
-                    &self.ev_tx,
-                    ErrorKind::CriticalConnectionError,
-                    &format!("CancelAllOrders on market {market_index} failed: {reason}"),
-                );
-                false
-            }
-        }
-    }
-
     /// One reserve-sign-send round of a sweep. `Err` is why nothing was sent, or why no answer
     /// came back; the nonce is left exactly as the order path leaves it for any other send.
     async fn cancel_all_once(
@@ -1134,6 +1081,54 @@ impl SlotTask {
             );
         }
     }
+}
+
+/// One market's `CancelAllOrders` (§3.4) driven to its verdict — the slot's whole answer to a
+/// [`Command::CancelAll`]: sent until the venue takes it or
+/// [`crate::lighter::slot::SWEEP_ATTEMPTS`] are spent ([`sweep_with_retries`]), a failure
+/// reported loudly, and the verdict answered on `reply`. Returns whether it took.
+///
+/// The reply carries the **real** outcome, after every retry, never an unconditional success:
+/// [`OrderPath::sweep`] folds it into the `SweepOutcome` an orderly stop exits on, so a sweep
+/// that never took is a non-zero stop rather than the exit 0 a bare "done" reply gave.
+///
+/// A sweep that did not take is an `error!` and a `CriticalConnectionError` to every bot. It
+/// used to be one send and an `info!` "Sent a Lighter CancelAllOrders sweep." whatever came back
+/// — a `21104` or a 429 included — so the one line an operator reads after a bot's death or a
+/// stop said the market had been swept while its orders kept resting.
+async fn sweep_market(
+    sender: &mut impl SweepSend,
+    ev_tx: &UnboundedSender<PublishEvent>,
+    market_index: i32,
+    reply: Option<oneshot::Sender<bool>>,
+) -> bool {
+    let took = match sweep_with_retries(sender).await {
+        Ok(attempts) => {
+            info!(
+                market_index,
+                attempts, "Sent a Lighter CancelAllOrders sweep; the venue took it."
+            );
+            true
+        }
+        Err(reason) => {
+            error!(
+                market_index,
+                %reason,
+                "A Lighter CancelAllOrders sweep FAILED; orders may still be resting on this \
+                 market."
+            );
+            report_error(
+                ev_tx,
+                ErrorKind::CriticalConnectionError,
+                &format!("CancelAllOrders on market {market_index} failed: {reason}"),
+            );
+            false
+        }
+    };
+    if let Some(reply) = reply {
+        let _ = reply.send(took);
+    }
+    took
 }
 
 /// The slot's [`SweepSend`]: one market's `CancelAllOrders`, one reserve-sign-send round at a
@@ -1769,9 +1764,10 @@ mod tests {
         clamp_auth_lifetime,
         markets_to_sweep_on_connect,
         subscription_frames,
+        sweep_market,
     };
     use crate::{
-        connector::PublishEvent,
+        connector::{PublishEvent, SweepOutcome},
         lighter::{
             LighterError,
             fixtures::{
@@ -1782,8 +1778,13 @@ mod tests {
             },
             order::OrderManager,
             private_msg::AccountOrder,
-            rest::MarketInfo,
+            rest::{MarketInfo, SendOutcome, SendTxAck},
+            slot::{
+                SWEEP_ATTEMPTS,
+                testing::{ScriptedVenue, throttled},
+            },
         },
+        supervision::{DrainOutcome, StopKind, StopReport, exit_code},
         utils::testing::{RecordingSink, closed_read, read_after_connect},
     };
 
@@ -2906,5 +2907,76 @@ mod tests {
             !task.account_stream_live.load(Ordering::SeqCst),
             "a dropped connection must not leave submits open"
         );
+    }
+
+    // ---- a sweep's verdict reaches the exit code ---------------------------------------
+
+    /// Drives one supervision sweep of market 42 the way the slot serves it: `OrderPath::sweep`
+    /// asks for a `CancelAllOrders`, and the slot's own handler ([`sweep_market`]) answers it
+    /// against `venue`. Returns the folded outcome, the exit code an orderly stop would take
+    /// on it, and what the bots were told.
+    async fn stop_after_sweeping_against(
+        venue: &mut ScriptedVenue,
+    ) -> (SweepOutcome, i32, Vec<PublishEvent>) {
+        let (order_path, mut command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
+        let sweep = order_path.sweep(vec![42]);
+        let Some(Command::CancelAll {
+            market_index,
+            reply,
+        }) = command_rx.recv().await
+        else {
+            panic!("a sweep asks the slot for one CancelAllOrders per market");
+        };
+        assert_eq!(market_index, 42);
+
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        sweep_market(venue, &ev_tx, market_index, reply).await;
+        let outcome = sweep.await.expect("the sweep task does not panic");
+        let code = exit_code(&StopReport {
+            kind: StopKind::Orderly,
+            sweep: Some(outcome),
+            drain: Some(DrainOutcome::SendersDropped { published: 0 }),
+        });
+        let mut told = Vec::new();
+        while let Ok(event) = ev_rx.try_recv() {
+            told.push(event);
+        }
+        (outcome, code, told)
+    }
+
+    /// **A Lighter sweep whose `CancelAllOrders` failed every retry stops the connector
+    /// non-zero.** The whole chain, with only the signer and the REST call replaced by a venue
+    /// that throttles every attempt: the slot's handler retries `SWEEP_ATTEMPTS` times, answers
+    /// `false`, `OrderPath::sweep` folds that into `SweepOutcome::Failed`, and the stop's exit
+    /// code is 1 — the supervisor sees a stop that left orders resting, rather than the exit 0
+    /// it got while the reply carried no verdict. The bots hear a `CriticalConnectionError`.
+    ///
+    /// The witness below it is the same chain against a venue that takes the sweep: exit 0.
+    #[tokio::test(start_paused = true)]
+    async fn a_lighter_sweep_whose_cancel_all_never_took_stops_the_connector_non_zero() {
+        let mut venue = ScriptedVenue::new((0..10).map(|_| Ok(throttled())).collect());
+
+        let (outcome, code, told) = stop_after_sweeping_against(&mut venue).await;
+
+        assert_eq!(venue.sends, SWEEP_ATTEMPTS, "every retry was spent");
+        assert_eq!(outcome, SweepOutcome::Failed);
+        assert_eq!(code, 1, "a stop whose sweep never took must not exit 0");
+        assert!(
+            told.iter().any(|event| matches!(
+                event,
+                PublishEvent::LiveEvent(LiveEvent::Error(error))
+                    if error.kind == ErrorKind::CriticalConnectionError
+            )),
+            "the bots are told the market may still hold orders"
+        );
+
+        let mut venue = ScriptedVenue::new(vec![Ok(SendOutcome::Accepted(SendTxAck {
+            tx_hash: "ab".to_string(),
+            ratelimit: None,
+            predicted_execution_time_ms: None,
+        }))]);
+        let (outcome, code, _) = stop_after_sweeping_against(&mut venue).await;
+        assert_eq!(outcome, SweepOutcome::Cancelled);
+        assert_eq!(code, 0, "witness: a sweep the venue took is a clean stop");
     }
 }
