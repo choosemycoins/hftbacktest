@@ -32,7 +32,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     // `Instant` unqualified in this file is `tokio::time::Instant` (the confirmation
     // deadlines); the outbound stopwatch is plain monotonic time, so it is spelled out.
     time::{Duration, Instant as StdInstant},
@@ -275,6 +279,10 @@ pub struct OrderPath {
     order_manager: Arc<Mutex<OrderManager>>,
     command_tx: UnboundedSender<Command>,
     tasks: Vec<JoinHandle<()>>,
+    /// Whether the private account stream is live: connected AND snapshotted since it last
+    /// (re)connected. Written by the [`PrivateStreamTask`], read by [`Self::submit`], which
+    /// refuses to place an order whose fill nothing would report.
+    account_stream_live: Arc<AtomicBool>,
 }
 
 impl OrderPath {
@@ -317,6 +325,7 @@ impl OrderPath {
         };
         tasks.push(tokio::spawn(slot.run(command_rx)));
 
+        let account_stream_live = Arc::new(AtomicBool::new(false));
         let stream = PrivateStreamTask {
             config: config.clone(),
             rest_url,
@@ -328,6 +337,7 @@ impl OrderPath {
             order_manager: order_manager.clone(),
             command_tx: command_tx.clone(),
             ev_tx,
+            account_stream_live: account_stream_live.clone(),
         };
         tasks.push(tokio::spawn(stream.run()));
 
@@ -335,6 +345,7 @@ impl OrderPath {
             order_manager,
             command_tx,
             tasks,
+            account_stream_live,
         }
     }
 
@@ -352,6 +363,13 @@ impl OrderPath {
         let plan = {
             let mut manager = self.order_manager.lock().unwrap();
             match manager.market_info(symbol) {
+                // Checked before `new_order`, so a refused order is never tracked (its id
+                // would otherwise be refused as already live for the life of the process).
+                Some(_) if !self.account_stream_live.load(Ordering::Acquire) => {
+                    Err(crate::lighter::order::OrderError::AccountStreamDown {
+                        symbol: symbol.to_string(),
+                    })
+                }
                 Some(market) => manager.new_order(symbol, &market, order),
                 // The market has not resolved yet — the zero-fills bug's true cause. Report it
                 // as its own error, NOT the reused `OrderNotFound` ("no live order …") message
@@ -1132,6 +1150,9 @@ struct PrivateStreamTask {
     order_manager: Arc<Mutex<OrderManager>>,
     command_tx: UnboundedSender<Command>,
     ev_tx: UnboundedSender<PublishEvent>,
+    /// Shared with [`OrderPath`]: set on this connection's `account_all_orders` snapshot,
+    /// cleared the moment the connection ends ([`Self::serve`]).
+    account_stream_live: Arc<AtomicBool>,
 }
 
 impl PrivateStreamTask {
@@ -1246,6 +1267,37 @@ impl PrivateStreamTask {
     /// account-scoped, not per-symbol, so a newly registered symbol needs only its market
     /// resolved, not a resubscribe.
     pub(crate) async fn serve<S, R>(
+        &mut self,
+        write: &mut S,
+        read: &mut R,
+        lifetime_s: i64,
+    ) -> Result<StreamEnd, LighterError>
+    where
+        S: SinkExt<Message> + Unpin,
+        LighterError: From<S::Error>,
+        R: StreamExt<Item = Result<Message, WsError>> + Unpin,
+    {
+        let ended = self.serve_connection(write, read, lifetime_s).await;
+        // Whatever ended it — a drop, a close, a token refresh — the order state is no longer
+        // current until the next connection snapshots. Orders wait for that
+        // ([`OrderPath::submit`]); cancels do not.
+        if self.account_stream_live.swap(false, Ordering::AcqRel) {
+            match &ended {
+                Ok(StreamEnd::TokenRefresh) => info!(
+                    "The Lighter account stream is cycling for its token refresh; new orders \
+                     wait for the next snapshot."
+                ),
+                Err(error) => warn!(
+                    ?error,
+                    "The Lighter account stream is down; new orders are refused until it has \
+                     reconnected and snapshotted."
+                ),
+            }
+        }
+        ended
+    }
+
+    async fn serve_connection<S, R>(
         &mut self,
         write: &mut S,
         read: &mut R,
@@ -1531,6 +1583,11 @@ impl PrivateStreamTask {
                         }
                     }
                 }
+                if snapshot && !self.account_stream_live.swap(true, Ordering::AcqRel) {
+                    // The order state is current again: from here a fill is seen, so orders
+                    // may go out ([`OrderPath::submit`]).
+                    info!("The Lighter account stream is live; orders may be placed.");
+                }
             }
             PrivateFrame::Positions { positions, .. } => {
                 // NANOseconds: the unit every other backend publishes on
@@ -1601,7 +1658,11 @@ fn expire_unsent(symbol: &str, order: &Order, ev_tx: &UnboundedSender<PublishEve
 mod tests {
     use std::{
         collections::HashSet,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc,
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         task::Poll,
         time::Duration,
     };
@@ -1652,7 +1713,7 @@ mod tests {
             private_msg::AccountOrder,
             rest::MarketInfo,
         },
-        utils::testing::{RecordingSink, read_after_connect},
+        utils::testing::{RecordingSink, closed_read, read_after_connect},
     };
 
     /// **The 8 h auth ceiling is server-only (§3.4): a 9 h token mints without error and is
@@ -1829,6 +1890,7 @@ mod tests {
             order_manager: Arc::new(Mutex::new(OrderManager::new(1))),
             command_tx,
             ev_tx,
+            account_stream_live: Arc::new(AtomicBool::new(false)),
         };
         (task, symbol_tx, command_rx, ev_rx)
     }
@@ -2421,6 +2483,7 @@ mod tests {
             order_manager: Arc::new(Mutex::new(OrderManager::new(1))),
             command_tx,
             tasks: Vec::new(),
+            account_stream_live: Arc::new(AtomicBool::new(false)),
         };
 
         order_path.submit("ETH", &an_order(), &ev_tx);
@@ -2608,6 +2671,114 @@ mod tests {
             order_manager.lock().unwrap().market_info("ETH").is_some(),
             "a symbol registered after connect must be resolved and tracked by the wake arm — \
              without it every submit for ETH is expired before signing (the zero-fills bug)"
+        );
+    }
+
+    // ---- the account stream gates submits ---------------------------------------------
+
+    /// An order path over a resolved ETH market, with the account stream `live` or not.
+    fn order_path_over_eth(
+        live: bool,
+    ) -> (
+        OrderPath,
+        tokio::sync::mpsc::UnboundedReceiver<Command>,
+        tokio::sync::mpsc::UnboundedSender<PublishEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<PublishEvent>,
+    ) {
+        let (command_tx, command_rx) = unbounded_channel();
+        let (ev_tx, ev_rx) = unbounded_channel();
+        let order_manager = Arc::new(Mutex::new(OrderManager::new(1)));
+        order_manager.lock().unwrap().track_market(MarketInfo {
+            symbol: "ETH".to_string(),
+            market_id: 42,
+            price_decimals: 2,
+            size_decimals: 4,
+            ..Default::default()
+        });
+        let order_path = OrderPath {
+            order_manager,
+            command_tx,
+            tasks: Vec::new(),
+            account_stream_live: Arc::new(AtomicBool::new(live)),
+        };
+        (order_path, command_rx, ev_tx, ev_rx)
+    }
+
+    /// **No order is placed while the account stream is down.** Fills, cancels and the
+    /// position all arrive on that one socket: an order sent while it is down fills unseen,
+    /// the bot keeps its level "resting", re-quotes over it at the next requote, and sizes a
+    /// risk-off flatten off a position that is no longer true. The public book keeps the bot
+    /// believing all is well — its recovery machine resumes on the first depth frame — so the
+    /// refusal has to be here. Refused before a nonce is spent, expired back first, and
+    /// reported under its own name (never "no live order", which the bot's classifier reads
+    /// as benign).
+    #[test]
+    fn a_submit_while_the_account_stream_is_down_is_expired_and_never_sent() {
+        let (order_path, mut command_rx, ev_tx, mut ev_rx) = order_path_over_eth(false);
+
+        order_path.submit("ETH", &an_order(), &ev_tx);
+
+        assert!(
+            command_rx.try_recv().is_err(),
+            "nothing may reach the slot while the account stream is down"
+        );
+        let Ok(PublishEvent::LiveEvent(LiveEvent::Order { order, .. })) = ev_rx.try_recv() else {
+            panic!("the refused order is expired back first");
+        };
+        assert_eq!(order.status, Status::Expired);
+        let Ok(PublishEvent::LiveEvent(LiveEvent::Error(error))) = ev_rx.try_recv() else {
+            panic!("then reported");
+        };
+        assert_eq!(error.kind, ErrorKind::OrderError);
+        let Value::String(message) = error.value else {
+            panic!("the reason rides as a string");
+        };
+        assert!(message.contains("account stream"), "{message}");
+        assert!(!message.contains("no live order"), "{message}");
+        assert_eq!(
+            order_path.order_manager.lock().unwrap().tracked(),
+            0,
+            "a refused order is not left tracked — its id would be refused for ever"
+        );
+
+        // The witness: the same order with the stream live goes to the slot.
+        order_path.account_stream_live.store(true, Ordering::SeqCst);
+        order_path.submit("ETH", &an_order(), &ev_tx);
+        assert!(
+            matches!(command_rx.try_recv(), Ok(Command::Submit { .. })),
+            "with the stream live the order is queued for signing"
+        );
+    }
+
+    /// The stream is live once THIS connection's `account_all_orders` snapshot has arrived —
+    /// the moment the order state and the reconciliation are current — and not on a bare
+    /// update.
+    #[test]
+    fn the_account_stream_is_live_only_once_this_connection_has_snapshotted() {
+        let (task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        task.on_frame(PRIVATE_ORDERS_UPDATE_CANCELED);
+        assert!(
+            !task.account_stream_live.load(Ordering::SeqCst),
+            "an update is not a snapshot"
+        );
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT_EMPTY);
+        assert!(task.account_stream_live.load(Ordering::SeqCst));
+    }
+
+    /// ...and it stops being live the moment the connection ends, whatever ended it.
+    #[tokio::test]
+    async fn a_connection_that_ended_is_not_live() {
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        task.account_stream_live.store(true, Ordering::SeqCst);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = closed_read();
+
+        let ended = task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S).await;
+
+        assert!(ended.is_err(), "the read half closed");
+        assert!(
+            !task.account_stream_live.load(Ordering::SeqCst),
+            "a dropped connection must not leave submits open"
         );
     }
 }
