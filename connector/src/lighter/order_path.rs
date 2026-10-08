@@ -4634,6 +4634,35 @@ mod tests {
         );
     }
 
+    /// **The one place "as before" is not byte for byte, pinned so it stays deliberate**
+    /// (§4.16): before `RateLimited` existed, a 429/405 whose body carried `21104` was read as
+    /// `InvalidNonce` and its order expired at once; now the status decides first, and without
+    /// a cooldown it is `Ambiguous` — the nonce re-read all the same, the order kept tracked for
+    /// its fate check instead of expired. The rate limiter answered; whether the transaction
+    /// was processed is not something its body can vouch for, and expiring an order that may
+    /// rest is the orphan §3.3 exists to prevent.
+    #[tokio::test]
+    async fn without_a_cooldown_a_429_carrying_21104_is_still_read_as_ambiguous() {
+        let mut slot = slot_on_scripted_venue(|_| {}).await;
+        slot.venue.answer_send_tx_with([(
+            429,
+            r#"{"code":21104,"message":"invalid nonce"}"#.to_string(),
+        )]);
+        slot.submit(&eth_order(1, Side::Buy));
+        slot.venue_until(|venue| venue.count("/api/v1/nextNonce") == 2)
+            .await;
+        time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            slot.events.try_recv().is_err(),
+            "not expired at once as an invalid nonce would be: its fate is checked first"
+        );
+        assert_eq!(
+            slot.order_path.order_manager.lock().unwrap().tracked(),
+            1,
+            "still tracked"
+        );
+    }
+
     // ---- the private stream's own error frames reach the bots (§4.17) ------------------
 
     /// The bots' next error, if any is waiting.
