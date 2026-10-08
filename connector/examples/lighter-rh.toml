@@ -1,0 +1,112 @@
+# Lighter on Robinhood Chain (`lighter-rh`) connector.
+#
+# The same backend as `lighter` (connector/examples/lighter.toml — read it for how the feed,
+# the catalog and the order path work); this file is only what differs on this instance.
+#
+# Run:
+#   cargo run -p connector -- <connector-name> lighter-rh connector/examples/lighter-rh.toml
+# where <connector-name> is the name the bot passes to Instrument::new (myhft: the iceoryx
+# channel name, e.g. `rh`).
+#
+# --- What is NOT in this file, on purpose ------------------------------------------------
+#
+# * ENDPOINTS. `lighter-rh` dials wss://api.rh.lighter.xyz/stream and
+#   https://api.rh.lighter.xyz, fixed in code (connector/src/lighter/mod.rs RH_*_URL), and
+#   REFUSES to start if this file names `public_url` or `rest_url` — even the right ones.
+#   BTC is market 1 on mainnet and here, so a copied mainnet URL would trade the wrong
+#   venue with every symbol resolving and nothing in the log to say so.
+#
+# * THE CHAIN ID. Every transaction is hashed with 466324 (RH_CHAIN_ID). The connector tells
+#   the signer sidecar (--network-url / --expect-chain-id) and checks the sidecar's answer
+#   before its first send; a key file for another chain is refused at startup. The auth
+#   token carries no chain id, so without that check a wrong-chain signer would pass the
+#   private stream's auth and have every order AND every CancelAllOrders refused.
+#
+# * THE KEY. It lives only in the sidecar's own file (connector/lighter-signer/
+#   signer.rh.example.toml; the real one mode 0600 under ~/.config/hftbacktest-connector/).
+#   This file only says where that file is.
+#
+# * COLLATERAL. Perps on this instance are margined in USDG (asset_id 3 — the slot USDC has
+#   on mainnet). The connector never touches balances; deposits and withdrawals are the
+#   operator's, through the venue (myhft docs/lighter-rh-OPERATOR.md).
+
+# Symbols to resolve and subscribe at startup, before any bot registers. Listing every
+# symbol a bot will trade here is ALSO the workaround for late registration: the order path
+# resolves markets for symbols present when its private stream connects (and, with the
+# merged #45 Fix B, for ones registered after — but listing them costs nothing).
+#
+# The names are the instance's own: perps are BARE names (SPY, XAU, BTC); a name with a
+# slash (SPY/USDG) is a SPOT pair — no position is reported for it, so a bot cannot see its
+# inventory there. Do not trade spot through this connector.
+#
+# The market map is NOT mainnet's: HYPE is 2 here (24 on mainnet), SOL 3 (2), id 36 is
+# CASHCAT (CRV on mainnet). Measured 2026-10-08 (GET https://api.rh.lighter.xyz/api/v1/
+# orderBooks); copy the bot's tick/lot from the connector's "Resolved a Lighter instrument"
+# line, never from mainnet:
+#   SPY  market 26: tick_size = 0.01  lot_size = 0.0001  min_base 0.0100  min_quote $10
+#   XAU  market 40: tick_size = 0.01  lot_size = 0.0001  min_base 0.0020  min_quote $10
+#   BTC  market  1: tick_size = 0.1   lot_size = 0.00001 min_base 0.00020 min_quote $10
+#   ETH  market  0: tick_size = 0.01  lot_size = 0.0001  min_base 0.0050  min_quote $10
+# An order below min_base OR below min_quote ($10 notional) is refused by the venue AFTER it
+# has spent a nonce and a sendTx; size the bot's order_qty with headroom over both.
+symbols = ["SPY", "XAU"]
+
+# --- Supervision (generic; read by connector/src/supervision.rs) ------------------------
+
+[shutdown]
+# Cancel the orders of every registered instrument when the connector stops. Leave ON: on
+# Lighter orders survive both a socket drop and the death of the process.
+sweep_orders = true
+
+# How long the publish task waits for the stream tasks to let go before it stops anyway, ms.
+# Does NOT bound the sweep (sweep_timeout_ms does).
+grace_ms = 5000
+
+# How long the stop may spend cancelling before giving up, ms. Running out exits NON-ZERO.
+sweep_timeout_ms = 30000
+
+[bot_liveness]
+# Cancel a bot's orders when it stops heartbeating (it is watched only after its first
+# heartbeat). On ONE account shared by two bots the sweep is per symbol, not per bot: a
+# symbol still quoted by a live bot is left alone (supervision.rs DeadBot).
+enabled = true
+
+# Silence, ms, after which a heartbeating bot is presumed dead. Must clear the bot's
+# heartbeat interval (1 s), not the length of its `elapse` calls.
+timeout_ms = 10000
+
+# --- Order path — OPT-IN, and OFF in this file. ------------------------------------------
+#
+# ABSENT ⇒ market data only: no key, no signer, every order refused locally. That is the
+# shape for a DRY RUN (myhft `--dry-run`): nothing can reach the venue even if the bot
+# misbehaved, because there is nothing here that can sign.
+#
+# PRESENT ⇒ the connector signs, places and cancels. Arm it only after the operator's
+# explicit go, with a key registered for THIS instance (never a mainnet/testnet key).
+#
+# [order_path]
+# # YOUR Robinhood Chain account index (GET https://api.rh.lighter.xyz/api/v1/
+# # accountsByL1Address?l1_address=0x… — read-only). Not the mainnet one.
+# account_index = 0
+#
+# # The api-key slot the key was registered on: >= 4 (0-3 and 157 are the venue's own
+# # front-ends). Check it is the key you registered:
+# #   GET https://api.rh.lighter.xyz/api/v1/apikeys?account_index=<N>&api_key_index=<slot>
+# api_key_index = 4
+#
+# # The signer sidecar: interpreter (a venv with lighter-sdk==1.1.2), the script, and the
+# # sidecar's OWN key file. Point signer_script at a copy that will not change under the
+# # running process (a release directory, not a git checkout that switches branches).
+# signer_python = "/path/to/lighter-signer-venv/bin/python"
+# signer_script = "/path/to/release/lighter-signer/sidecar.py"
+# signer_config = "/home/<user>/.config/hftbacktest-connector/lighter-rh-signer.toml"
+#
+# # How long account_all_orders has to confirm a placement before GET /tx is asked, ms.
+# # Standard accounts carry a 200 ms maker speed bump; the default 5000 is generous over it.
+# confirm_deadline_ms = 5000
+#
+# # Orders already resting when the private stream (re)connects. "cancel_all" for an account
+# # that only this connector trades: every (re)connect starts from an empty book on the
+# # venue, which is what makes a restart free of duplicates. Each sweep is one sendTx per
+# # market — Standard allows ~60 requests a minute in total, so a reconnect storm spends it.
+# connect_policy = "cancel_all"

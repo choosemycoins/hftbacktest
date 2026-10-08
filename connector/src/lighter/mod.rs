@@ -1171,4 +1171,61 @@ mod tests {
             );
         }
     }
+
+    /// The shipped RH example builds as `lighter-rh` — no endpoint keys, so it is not
+    /// refused — ships DISARMED, names only perps that resolve on the RH catalog, parses as
+    /// the generic supervision config, and its commented `[order_path]` block parses with
+    /// the policy and slot it documents once uncommented.
+    #[test]
+    fn the_shipped_rh_example_config_parses() {
+        let text = include_str!("../../examples/lighter-rh.toml");
+        let connector = Lighter::build_for(Instance::RobinhoodChain, text).unwrap();
+        assert_eq!(connector.config.rest_url, RH_REST_URL);
+        assert!(
+            connector.config.order_path.is_none(),
+            "the example ships disarmed"
+        );
+
+        let (resolved, refused) = match_catalog(&connector.config.symbols, RH_ORDER_BOOKS).unwrap();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(resolved.len(), connector.config.symbols.len());
+        for symbol in &connector.config.symbols {
+            assert!(!symbol.contains('/'), "spot pair in the example: {symbol}");
+        }
+
+        let supervision: crate::supervision::SupervisionConfig = toml::from_str(text).unwrap();
+        assert!(supervision.shutdown.sweep_orders);
+        assert!(supervision.bot_liveness.enabled);
+
+        // Uncomment the [order_path] block exactly as an operator would.
+        let mut armed = String::new();
+        let mut in_block = false;
+        for line in text.lines() {
+            if line.trim() == "# [order_path]" {
+                in_block = true;
+            }
+            if in_block {
+                if let Some(rest) = line.strip_prefix("# ") {
+                    if !rest.starts_with('#') {
+                        armed.push_str(rest);
+                        armed.push('\n');
+                        continue;
+                    }
+                }
+                continue;
+            }
+            armed.push_str(line);
+            armed.push('\n');
+        }
+        let connector = Lighter::build_for(Instance::RobinhoodChain, &armed).unwrap();
+        let order_path = connector
+            .config
+            .order_path
+            .expect("the block arms the path");
+        assert!(order_path.api_key_index >= 4, "slots 0-3 are the venue's");
+        assert_eq!(
+            order_path.connect_policy,
+            crate::lighter::order_path::ConnectPolicy::CancelAll
+        );
+    }
 }
