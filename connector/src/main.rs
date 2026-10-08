@@ -112,7 +112,7 @@ use crate::{
     binancefutures::BinanceFutures,
     binancespot::BinanceSpot,
     bybit::Bybit,
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     hyperliquid::Hyperliquid,
     lighter::{Instance, Lighter},
     supervision::{
@@ -122,6 +122,7 @@ use crate::{
         StopKind,
         StopReport,
         SupervisionConfig,
+        await_sweep,
         drain_publish,
         exit_code,
         publishable_while_stopping,
@@ -931,26 +932,7 @@ async fn run() {
     // from "ran but may have left orders resting". A panic (`Ok(Err(_))`) or a timeout is
     // `Failed` — orders may be on the venue — not a silent success. `None` here means no sweep
     // task ran at all (disabled, nothing registered, or a backend with no order path).
-    let sweep = match sweep {
-        Some(handle) => match tokio::time::timeout(sweep_timeout, handle).await {
-            Ok(Ok(outcome)) => Some(outcome),
-            Ok(Err(error)) => {
-                error!(?error, "The shutdown sweep task failed.");
-                Some(SweepOutcome::Failed)
-            }
-            Err(_) => {
-                error!(
-                    ?sweep_timeout,
-                    "The shutdown sweep did not finish in time. Orders may still be resting \
-                     on the venue with nothing managing them — check the venue before \
-                     restarting, and raise `shutdown.sweep_timeout_ms` if this is normal for \
-                     this deployment."
-                );
-                Some(SweepOutcome::Failed)
-            }
-        },
-        None => None,
-    };
+    let sweep = await_sweep(sweep, sweep_timeout).await;
 
     // After the sweep, so a sweep in flight is not aborted along with the streams.
     connector.shutdown();

@@ -21,6 +21,7 @@ use std::{
 use hftbacktest::live::ipc::iceoryx::ChannelError;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::error;
 
 use crate::connector::{PublishEvent, SweepOutcome};
 
@@ -419,6 +420,39 @@ pub fn exit_code(report: &StopReport) -> i32 {
 /// out as usual.
 pub fn publishable_while_stopping(event: &PublishEvent) -> bool {
     !matches!(event, PublishEvent::RegisterInstrument { .. })
+}
+
+/// Waits for a sweep's verdict, bounded by `timeout`, and folds how the wait ended into it.
+///
+/// `None` — no sweep task ran at all (disabled, nothing registered, or a backend with no
+/// order path) — stays `None`. A task that finished answers for itself. One that panicked or
+/// was cancelled (a `JoinError`), and one that is still running at `timeout`, are
+/// [`SweepOutcome::Failed`]: orders may be resting on the venue, and neither is a silent
+/// success (Finding 2). A task left running past the timeout is not cancelled: dropping its
+/// handle does not stop it, and a cancel it still lands is a cancel.
+pub async fn await_sweep(
+    sweep: Option<tokio::task::JoinHandle<SweepOutcome>>,
+    timeout: Duration,
+) -> Option<SweepOutcome> {
+    match tokio::time::timeout(timeout, sweep?).await {
+        Ok(Ok(outcome)) => Some(outcome),
+        Ok(Err(error)) => {
+            error!(
+                ?error,
+                "A sweep task failed; whatever it was cancelling may still be resting."
+            );
+            Some(SweepOutcome::Failed)
+        }
+        Err(_) => {
+            error!(
+                ?timeout,
+                "A sweep did not finish in time. Orders may still be resting on the venue with \
+                 nothing managing them — check the venue before restarting, and on a stop raise \
+                 `shutdown.sweep_timeout_ms` if this is normal for this deployment."
+            );
+            Some(SweepOutcome::Failed)
+        }
+    }
 }
 
 /// Drains everything still in flight, then waits for the senders to go away.
@@ -951,6 +985,47 @@ mod tests {
                 ..clean
             }),
             1
+        );
+    }
+
+    /// **A sweep is waited for, never trusted to have worked.** Every way the wait can end has
+    /// a verdict, and only a task that finished answers for itself: one still running at the
+    /// timeout and one whose task failed (a `JoinError` — a panic or a cancel) are `Failed`,
+    /// because orders may still be resting; no sweep at all stays `None`, which the exit code
+    /// reads as clean. This used to be a `match` inline in `main`, where nothing could reach it.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_is_waited_for_and_every_ending_has_a_verdict() {
+        let timeout = Duration::from_secs(30);
+        assert_eq!(await_sweep(None, timeout).await, None, "no sweep ran");
+
+        for outcome in [
+            SweepOutcome::Cancelled,
+            SweepOutcome::Failed,
+            SweepOutcome::NotImplemented,
+        ] {
+            let finished = tokio::spawn(async move { outcome });
+            assert_eq!(await_sweep(Some(finished), timeout).await, Some(outcome));
+        }
+
+        let started = tokio::time::Instant::now();
+        let wedged = tokio::spawn(std::future::pending::<SweepOutcome>());
+        assert_eq!(
+            await_sweep(Some(wedged), timeout).await,
+            Some(SweepOutcome::Failed),
+            "a sweep still running at the timeout may have left orders resting"
+        );
+        assert_eq!(
+            started.elapsed(),
+            timeout,
+            "and it was given exactly its timeout"
+        );
+
+        let gone = tokio::spawn(std::future::pending::<SweepOutcome>());
+        gone.abort();
+        assert_eq!(
+            await_sweep(Some(gone), timeout).await,
+            Some(SweepOutcome::Failed),
+            "a sweep task that failed confirmed nothing"
         );
     }
 
