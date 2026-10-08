@@ -1179,6 +1179,30 @@ mod tests {
         }
     }
 
+    /// **A misspelt `[order_path]` key stops the connector at startup.** Every protective field
+    /// in this section is optional with the unprotected behaviour as its default, so a key
+    /// serde silently skipped — `rate_limit_cooldown = 60000`, one `_ms` short — used to arm an
+    /// order path with no cooldown at all while the file said otherwise, and nothing logged it.
+    #[test]
+    fn a_misspelt_order_path_key_is_refused_at_startup() {
+        for typo in [
+            "rate_limit_cooldown = 60000",
+            "tx_budget = 48",
+            "tx_reserves = 12",
+        ] {
+            let Err(error) = armed_rh(typo) else {
+                panic!("{typo:?} must be refused, not ignored");
+            };
+            assert!(matches!(error, LighterError::Config(_)), "{typo}: {error}");
+            let key = typo.split(' ').next().unwrap();
+            assert!(error.to_string().contains(key), "names the key: {error}");
+        }
+        assert!(
+            armed_rh("rate_limit_cooldown_ms = 60000").is_ok(),
+            "witness"
+        );
+    }
+
     /// **The rate-limit cooldown is optional — absent, a 429/405 is handled as before — and a
     /// cooldown of nothing is refused at startup** rather than read as one.
     #[test]

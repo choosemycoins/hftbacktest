@@ -161,6 +161,9 @@ timeout_ms = 10000
 # the sidecar reads and this process never sees (§3.2). This section only names WHERE the
 # sidecar is and WHICH account/slot to act as.
 #
+# An unknown key in this section (a typo) stops the connector at startup with a Config error
+# naming it; every optional protection below would otherwise be silently off.
+#
 # [order_path]
 # # The account to act as. A subaccount per bot is the scoping unit for cancels (§3.4).
 # account_index = 516

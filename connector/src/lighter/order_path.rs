@@ -185,7 +185,14 @@ pub enum ConnectPolicy {
 }
 
 /// The `[order_path]` config. Present ⇒ the order path is armed.
+///
+/// **An unknown key is refused at startup.** Every protective field here is optional, with
+/// the unprotected behaviour as its default, so a misspelt one — `rate_limit_cooldown = 60000`
+/// — would otherwise arm an order path without what the file says it has, silently. The rest
+/// of the file is shared with the generic supervision config and stays permissive; this
+/// section is the backend's alone.
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct OrderPathConfig {
     /// This connector's account (a subaccount per bot is the scoping unit, §3.4).
     pub account_index: i64,

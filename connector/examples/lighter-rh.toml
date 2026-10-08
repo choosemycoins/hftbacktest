@@ -84,6 +84,10 @@ timeout_ms = 10000
 # PRESENT ⇒ the connector signs, places and cancels. Arm it only after the operator's
 # explicit go, with a key registered for THIS instance (never a mainnet/testnet key).
 #
+# A key this section does not know — a typo such as `rate_limit_cooldown = 60000` — STOPS
+# the connector at startup (Config error naming the key), rather than arming an order path
+# without the protection the file claims.
+#
 # [order_path]
 # # YOUR Robinhood Chain account index (GET https://api.rh.lighter.xyz/api/v1/
 # # accountsByL1Address?l1_address=0x… — read-only). Not the mainnet one.
