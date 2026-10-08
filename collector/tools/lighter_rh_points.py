@@ -47,6 +47,7 @@ import gzip
 import json
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -55,7 +56,9 @@ from typing import Callable, Optional
 
 BASE_URL = "https://api.rh.lighter.xyz"
 PAGE_LIMIT = 100  # the documented maximum; 1000 is refused with code 20001
-PAGE_PAUSE_S = 0.5  # 36 pages a day; the REST budget is not published
+PAGE_PAUSE_S = 3.0  # 36 pages a day; the REST budget is not published and
+# is shared per IP with the collectors — 0.5 s drew a 429 on the first deploy
+BACKOFF_S = (15, 60, 180)  # waits before each retry of a 429, then give up
 MAX_PAGES = 1000  # 100k accounts — a runaway guard, not an expectation
 TIMEOUT_S = 20
 SCHEMA = "lighter-rh-points-v1"
@@ -72,6 +75,27 @@ def http_get(path: str, params: dict) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": "hft-collector-points/1"})
     with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
         return json.load(resp)
+
+
+def with_backoff(fetch: Fetch, pause: Callable[[float], None] = time.sleep) -> Fetch:
+    """``fetch`` that waits out a 429 and asks again, ``BACKOFF_S`` times.
+
+    Only a rate limit is retried: any other refusal says something about the
+    request or the venue, and a retry would only hide it. A venue still
+    refusing after the last wait fails the run as before.
+    """
+    def patient(path: str, params: dict) -> dict:
+        for wait in BACKOFF_S:
+            try:
+                return fetch(path, params)
+            except urllib.error.HTTPError as error:
+                if error.code != 429:
+                    raise
+                print(f"lighter_rh_points: 429 on {path}, retrying in {wait} s",
+                      file=sys.stderr)
+                pause(wait)
+        return fetch(path, params)
+    return patient
 
 
 def leaderboard(fetch: Fetch, kind: str) -> list:
@@ -182,7 +206,7 @@ def main(argv=None, fetch: Fetch = http_get) -> int:
         return 2
     now = datetime.now(timezone.utc)
     try:
-        record = snapshot(fetch, now=now)
+        record = snapshot(with_backoff(fetch), now=now)
     except (SnapshotError, OSError, ValueError) as error:
         print(f"lighter_rh_points: no snapshot written: {error}", file=sys.stderr)
         return 1

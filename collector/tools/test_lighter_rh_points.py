@@ -118,3 +118,50 @@ def test_main_appends_one_line_per_run_and_flags_an_incomplete_walk(tmp_path, mo
     record = json.loads(lines[0])
     assert record["volume_complete"] is False
     assert len(record["leaderboard_all"]) == 10
+
+
+def http_429():
+    import urllib.error
+    return urllib.error.HTTPError("https://api.rh.lighter.xyz/x", 429, "Too Many Requests", {}, None)
+
+
+def test_a_rate_limited_request_is_retried_after_a_growing_wait():
+    # The first deployed run (2026-10-08 12:16Z) died on a 429 a few pages
+    # into the walk: the venue's REST budget is unpublished and shared per IP.
+    answers = [http_429(), http_429(), {"ok": 1}]
+    waits = []
+
+    def fetch(path, params):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    patient = lp.with_backoff(fetch, pause=waits.append)
+    assert patient("/p", {}) == {"ok": 1}
+    assert waits == list(lp.BACKOFF_S[:2])
+    assert waits[0] < waits[1]
+
+
+def test_a_venue_that_keeps_refusing_still_fails_the_run():
+    waits = []
+
+    def fetch(path, params):
+        raise http_429()
+
+    patient = lp.with_backoff(fetch, pause=waits.append)
+    with pytest.raises(OSError):
+        patient("/p", {})
+    assert waits == list(lp.BACKOFF_S)
+
+
+def test_only_a_rate_limit_is_retried():
+    import urllib.error
+    waits = []
+
+    def fetch(path, params):
+        raise urllib.error.HTTPError("u", 500, "boom", {}, None)
+
+    with pytest.raises(OSError):
+        lp.with_backoff(fetch, pause=waits.append)("/p", {})
+    assert waits == []
