@@ -20,6 +20,9 @@
 #   etc/instance.env.example
 #   etc/alert.env.example
 #   tools/quality_report.py         the gate's only dependency; stdlib-only
+#   tools/lighter_rh_points.py      Lighter-RH points snapshot; stdlib-only
+#   etc/hft-lighter-rh-points.{service,timer}
+#   etc/lighter-rh.env.example
 #   README.md
 #   RELEASE                         (manifest read by install.sh)
 #
@@ -107,6 +110,14 @@ install -m 644 "${DEPLOY_DIR}/alert.env.example"          "${BUILD_DIR}/etc/aler
 # Shipping them would put a dependency on the recording host that nothing there
 # can satisfy.
 install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/tools/quality_report.py"
+
+# The Lighter-on-Robinhood-Chain points snapshot and its timer, and the RH
+# instance's env example. Stdlib-only for the same reason as the gate: it runs
+# under the host's python3 and needs nothing installed.
+install -m 644 "${REPO_ROOT}/collector/tools/lighter_rh_points.py" "${BUILD_DIR}/tools/lighter_rh_points.py"
+install -m 644 "${DEPLOY_DIR}/hft-lighter-rh-points.service" "${BUILD_DIR}/etc/hft-lighter-rh-points.service"
+install -m 644 "${DEPLOY_DIR}/hft-lighter-rh-points.timer"   "${BUILD_DIR}/etc/hft-lighter-rh-points.timer"
+install -m 644 "${DEPLOY_DIR}/lighter-rh.env.example"        "${BUILD_DIR}/etc/lighter-rh.env.example"
 
 # Ship rollback.sh inside the release so a rollback is possible from a host
 # that has nothing but /opt — the operator should never need the source repo

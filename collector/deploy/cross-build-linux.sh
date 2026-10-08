@@ -94,6 +94,10 @@ install -m 644 "${DEPLOY_DIR}/alert.env.example"        "${BUILD_DIR}/etc/alert.
 # build_dataset.py and backtest_first.py need numpy and belong on the machine
 # that assembles datasets rather than on the box that records them.
 install -m 644 "${REPO_ROOT}/collector/tools/quality_report.py" "${BUILD_DIR}/tools/quality_report.py"
+install -m 644 "${REPO_ROOT}/collector/tools/lighter_rh_points.py" "${BUILD_DIR}/tools/lighter_rh_points.py"
+install -m 644 "${DEPLOY_DIR}/hft-lighter-rh-points.service" "${BUILD_DIR}/etc/hft-lighter-rh-points.service"
+install -m 644 "${DEPLOY_DIR}/hft-lighter-rh-points.timer"   "${BUILD_DIR}/etc/hft-lighter-rh-points.timer"
+install -m 644 "${DEPLOY_DIR}/lighter-rh.env.example"        "${BUILD_DIR}/etc/lighter-rh.env.example"
 
 # A cross-built binary cannot be executed here, so `binary_version` is left
 # unknown on purpose. install.sh treats that as "cannot cross-check" rather
