@@ -74,6 +74,9 @@ pub mod rest;
 pub mod signer;
 /// Phase 2 order-path: the slot owner's nonce/placement decisions (§3.3, §4.11).
 pub mod slot;
+/// Test doubles: an in-process signer stand-in and a scripted venue REST, for driving the slot.
+#[cfg(test)]
+pub mod test_venue;
 pub mod trades;
 
 #[derive(Error, Debug)]

@@ -33,8 +33,8 @@ use std::process::Stdio;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
+    process::{Child, Command},
 };
 
 #[derive(Error, Debug)]
@@ -351,12 +351,21 @@ pub fn python_sidecar_command(
     cmd
 }
 
+/// The write half of the line protocol: the sidecar's stdin.
+type RequestPipe = Box<dyn AsyncWrite + Send + Unpin>;
+/// The read half of the line protocol: the sidecar's stdout.
+type ResponsePipe = Box<dyn AsyncRead + Send + Unpin>;
+
 /// A running signer sidecar. Owns the child's stdin and a line reader over its stdout.
 /// Not `Clone`: one client owns one sidecar owns one api-key slot's signing (§4.12).
+///
+/// The pipes are boxed so a test can stand an in-process sidecar on the other end
+/// ([`Self::over`]) and drive the slot that owns this client without a subprocess or a key.
 pub struct SignerClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    /// `None` only for an in-process test sidecar.
+    child: Option<Child>,
+    stdin: RequestPipe,
+    stdout: Lines<BufReader<ResponsePipe>>,
     next_id: u64,
 }
 
@@ -377,11 +386,27 @@ impl SignerClient {
             .take()
             .ok_or_else(|| SignerError::Malformed("no stdout".into()))?;
         Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout).lines(),
+            child: Some(child),
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout) as ResponsePipe).lines(),
             next_id: 1,
         })
+    }
+
+    /// A client over pipes the caller holds the other ends of — an in-process stand-in for
+    /// the sidecar, so a test can drive the slot task end to end without a subprocess, a key
+    /// or a signature.
+    #[cfg(test)]
+    pub(crate) fn over(
+        stdin: impl AsyncWrite + Send + Unpin + 'static,
+        stdout: impl AsyncRead + Send + Unpin + 'static,
+    ) -> Self {
+        Self {
+            child: None,
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout) as ResponsePipe).lines(),
+            next_id: 1,
+        }
     }
 
     async fn round_trip(&mut self, line: String) -> Result<String, SignerError> {
@@ -489,9 +514,11 @@ impl SignerClient {
     }
 
     /// Close the sidecar (drop its stdin so it sees EOF, then reap).
-    pub async fn shutdown(mut self) -> Result<(), SignerError> {
+    pub async fn shutdown(self) -> Result<(), SignerError> {
         drop(self.stdin);
-        let _ = self.child.wait().await?;
+        if let Some(mut child) = self.child {
+            let _ = child.wait().await?;
+        }
         Ok(())
     }
 }

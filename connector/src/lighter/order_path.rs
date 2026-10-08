@@ -527,14 +527,14 @@ struct Awaiting {
 }
 
 impl SlotTask {
-    async fn run(self, mut command_rx: UnboundedReceiver<Command>) {
+    async fn run(self, command_rx: UnboundedReceiver<Command>) {
         let command = python_sidecar_command(
             &self.config.signer_python,
             &self.config.signer_script,
             &self.config.signer_config,
             &self.network,
         );
-        let mut signer = match SignerClient::spawn(command).await {
+        let signer = match SignerClient::spawn(command).await {
             Ok(signer) => signer,
             Err(error) => {
                 // Fail closed: without the signer nothing can be sent. Say so loudly; the
@@ -551,7 +551,16 @@ impl SlotTask {
                 return;
             }
         };
+        self.serve(signer, command_rx).await;
+    }
 
+    /// The slot's life once its signer is up: verify what it signs for, seed the nonce, then
+    /// serve commands and confirmation deadlines until the command channel closes.
+    ///
+    /// Split from [`Self::run`] so a test can hand it an in-process signer
+    /// ([`SignerClient::over`]) and drive the whole money path — admission, nonce, sign,
+    /// `sendTx`, the answer — against a scripted venue, with no subprocess and no key.
+    async fn serve(self, mut signer: SignerClient, mut command_rx: UnboundedReceiver<Command>) {
         // Before anything is signed: does the sidecar sign for the network, account and slot
         // this connector serves? A sidecar that resolved another chain exits on its own (its
         // stderr says why, and `identity` sees the pipe close); one that started on the wrong
@@ -1760,6 +1769,7 @@ mod tests {
         OrderPath,
         OrderPathConfig,
         PrivateStreamTask,
+        SlotTask,
         auth_refresh_after,
         clamp_auth_lifetime,
         markets_to_sweep_on_connect,
@@ -1779,10 +1789,12 @@ mod tests {
             order::OrderManager,
             private_msg::AccountOrder,
             rest::{MarketInfo, SendOutcome, SendTxAck},
+            signer::SignerNetwork,
             slot::{
                 SWEEP_ATTEMPTS,
                 testing::{ScriptedVenue, throttled},
             },
+            test_venue::{ScriptedRestVenue, SidecarIdentity, fake_signer},
         },
         supervision::{DrainOutcome, StopKind, StopReport, exit_code},
         utils::testing::{RecordingSink, closed_read, read_after_connect},
@@ -2978,5 +2990,170 @@ mod tests {
         let (outcome, code, _) = stop_after_sweeping_against(&mut venue).await;
         assert_eq!(outcome, SweepOutcome::Cancelled);
         assert_eq!(code, 0, "witness: a sweep the venue took is a clean stop");
+    }
+
+    // ---- the slot, end to end against a scripted venue ---------------------------------
+    //
+    // The slot task, with its signer replaced by an in-process stand-in that signs nothing
+    // (`test_venue::fake_signer`) and the venue's REST by a local server that answers from a
+    // script and records every request (`test_venue::ScriptedRestVenue`). Real time, not a
+    // paused clock: the requests are real local HTTP, and a paused clock would fire the
+    // client's own timeouts while a request is in flight.
+
+    /// A slot serving ETH (market 42) on a scripted venue, and the `OrderPath` handle in front
+    /// of it — the same pair `OrderPath::spawn` builds, minus the private stream (the account
+    /// stream is taken as live).
+    struct SlotOnScriptedVenue {
+        order_path: OrderPath,
+        ev_tx: tokio::sync::mpsc::UnboundedSender<PublishEvent>,
+        events: tokio::sync::mpsc::UnboundedReceiver<PublishEvent>,
+        venue: ScriptedRestVenue,
+    }
+
+    /// The `[order_path]` the scripted slot runs with before a test tweaks it: no budget, no
+    /// cooldown, a confirmation deadline far outside any test.
+    fn scripted_config() -> OrderPathConfig {
+        OrderPathConfig {
+            account_index: 516,
+            api_key_index: 5,
+            signer_python: String::new(),
+            signer_script: String::new(),
+            signer_config: String::new(),
+            confirm_deadline_ms: 60_000,
+            connect_policy: ConnectPolicy::Reconcile,
+        }
+    }
+
+    async fn slot_on_scripted_venue(
+        tweak: impl FnOnce(&mut OrderPathConfig),
+    ) -> SlotOnScriptedVenue {
+        crate::install_crypto_provider();
+        let venue = ScriptedRestVenue::start(7).await;
+        let mut config = scripted_config();
+        tweak(&mut config);
+        let order_manager = Arc::new(Mutex::new(OrderManager::new(1)));
+        order_manager.lock().unwrap().track_market(MarketInfo {
+            symbol: "ETH".to_string(),
+            market_id: 42,
+            price_decimals: 2,
+            size_decimals: 4,
+            ..Default::default()
+        });
+        let (ev_tx, events) = unbounded_channel();
+        let (command_tx, command_rx) = unbounded_channel();
+        let signer = fake_signer(SidecarIdentity {
+            url: venue.url.clone(),
+            chain_id: 466_324,
+            account_index: config.account_index,
+            api_key_index: config.api_key_index,
+        });
+        let slot = SlotTask {
+            config,
+            network: SignerNetwork {
+                url: venue.url.clone(),
+                chain_id: Some(466_324),
+            },
+            rest_url: venue.url.clone(),
+            order_manager: order_manager.clone(),
+            ev_tx: ev_tx.clone(),
+        };
+        tokio::spawn(slot.serve(signer, command_rx));
+        let order_path = OrderPath {
+            order_manager,
+            command_tx,
+            tasks: Vec::new(),
+            account_stream_live: Arc::new(AtomicBool::new(true)),
+        };
+        SlotOnScriptedVenue {
+            order_path,
+            ev_tx,
+            events,
+            venue,
+        }
+    }
+
+    impl SlotOnScriptedVenue {
+        fn submit(&self, order: &Order) {
+            self.order_path.submit("ETH", order, &self.ev_tx);
+        }
+
+        /// Waits for the next event the bots would receive.
+        async fn next_event(&mut self) -> PublishEvent {
+            time::timeout(Duration::from_secs(5), self.events.recv())
+                .await
+                .expect("an event within 5 s")
+                .expect("the channel is open")
+        }
+
+        /// Waits until `done` holds of what the venue has seen.
+        async fn venue_until(&self, done: impl Fn(&ScriptedRestVenue) -> bool) {
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            while !done(&self.venue) {
+                assert!(
+                    time::Instant::now() < deadline,
+                    "the venue never saw it: {:?}",
+                    self.venue.seen()
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    fn order(order_id: u64, side: Side) -> Order {
+        Order::new(
+            order_id,
+            100_000,
+            0.01,
+            0.01,
+            side,
+            OrdType::Limit,
+            TimeInForce::GTX,
+        )
+    }
+
+    /// The error the bots receive next, as `(kind, prose)`.
+    fn as_error(event: PublishEvent) -> (ErrorKind, String) {
+        let PublishEvent::LiveEvent(LiveEvent::Error(error)) = event else {
+            panic!("an error was expected");
+        };
+        let Value::String(message) = error.value else {
+            panic!("the reason rides as a string");
+        };
+        (error.kind, message)
+    }
+
+    /// **The harness, on the wiring it must reproduce: a submit goes out once, signed with the
+    /// nonce the slot seeded from `nextNonce`; a `21104` expires it back and re-reads the
+    /// counter before the next send.** Nothing new here — this is what the slot already does —
+    /// and it is pinned first so that the pins built on this harness stand on a harness that is
+    /// known to see the slot's real traffic.
+    #[tokio::test]
+    async fn the_scripted_slot_sends_with_the_seeded_nonce_and_resyncs_on_21104() {
+        let mut slot = slot_on_scripted_venue(|_| {}).await;
+
+        slot.submit(&order(1, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent(), [("create_order".to_string(), 7)]);
+        assert_eq!(slot.venue.count("/api/v1/nextNonce"), 1, "seeded once");
+
+        slot.venue.answer_send_tx_with([(
+            400,
+            r#"{"code":21104,"message":"invalid nonce"}"#.to_string(),
+        )]);
+        slot.submit(&order(2, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the refused order comes back first");
+        };
+        assert_eq!((order.order_id, order.status), (2, Status::Expired));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("21104"), "{message}");
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            2,
+            "a 21104 re-reads the counter"
+        );
+        assert_eq!(slot.venue.sent()[1], ("create_order".to_string(), 8));
     }
 }
