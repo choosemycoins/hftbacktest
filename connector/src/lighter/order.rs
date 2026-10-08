@@ -37,7 +37,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::{
-    connector::GetOrders,
+    connector::{ApplyOutcome, GetOrders},
     lighter::{
         private_msg::{AccountOrder, AccountPosition},
         rest::{MarketInfo, MarketType},
@@ -383,24 +383,26 @@ impl OrderManager {
 
     /// Applies one `account_all_orders` entry — the **only** acceptance signal (§4.11).
     ///
-    /// Returns the `(symbol, order)` to publish when this is one of ours and the update moved
-    /// it; `None` for a foreign COI, a previous run's, or a stale frame. Ordered strictly by
-    /// `transaction_time` (§4.12): a frame older than the last applied is dropped, never
-    /// rewound. A terminal status (canceled/filled) takes the order out of tracking.
-    pub fn apply_order_update(&mut self, update: &AccountOrder) -> Option<(String, Order)> {
-        // A status this connector cannot read moves nothing — not the status, not the fill, not
-        // the watermark. Read as `Unsupported` it is not `active()`, so the order would leave
-        // tracking and be published as gone while it may still rest: the bot frees the level
-        // and quotes over it. Kept, the next reconnect's snapshot settles it (`reconcile`); the
-        // caller pages.
-        if !status_is_known(&update.status) {
-            return None;
-        }
+    /// [`ApplyOutcome::Publish`] carries the `(symbol, order)` to publish when this is one of
+    /// ours and the update moved it; [`ApplyOutcome::Ignored`] is a foreign COI, a previous
+    /// run's, or a stale frame. Ordered strictly by `transaction_time` (§4.12): a frame older
+    /// than the last applied is dropped, never rewound. A terminal status (canceled/filled)
+    /// takes the order out of tracking.
+    ///
+    /// [`ApplyOutcome::Unrecognised`] is a status this connector cannot read
+    /// ([`status_is_known`]), and it moves nothing — not the status, not the fill, not the
+    /// watermark, not even the confirmation. Read as `Unsupported` it is not `active()`, so the
+    /// order would leave tracking and be published as gone while it may still rest: the bot
+    /// frees the level and quotes over it, one ghost per requote. Kept, the next reconnect's
+    /// snapshot settles it (`reconcile`); the caller pages.
+    pub fn apply_order_update(&mut self, update: &AccountOrder) -> ApplyOutcome<(String, Order)> {
         let coi = update.client_order_index;
         let (active, symbol, order, order_id) = {
             // A COI this connector never minted — a human's order, or a previous run's — is
             // ignored, not published as ours (§4.11 / HL model).
-            let tracked = self.orders.get_mut(&coi)?;
+            let Some(tracked) = self.orders.get_mut(&coi) else {
+                return ApplyOutcome::Ignored;
+            };
             // §4.12: the only monotone key is `transaction_time`; a frame older than the last
             // applied is stale and must not rewind the order (e.g. a late "open" after a
             // "canceled").
@@ -410,13 +412,29 @@ impl OrderManager {
                     stale_by_us = tracked.update_ts_us - update.transaction_time_us,
                     "Ignoring an out-of-order Lighter order update (§4.12)."
                 );
-                return None;
+                return ApplyOutcome::Ignored;
+            }
+            // Finding 3: map the status **before any mutation**. If this connector cannot
+            // classify it (`Status::Unsupported`), leave the order exactly as it is — not
+            // transitioned, not removed, not even marked confirmed — and return `Unrecognised`.
+            // Treating it as terminal drops an order that may still be resting (a re-quote into
+            // a double position); treating it as live quotes against one that is gone. §1.1
+            // fail closed: keep it, and let the caller escalate so reconciliation settles it.
+            let mapped = map_status(&update.status);
+            if mapped == Status::Unsupported {
+                warn!(
+                    coi,
+                    status = %update.status,
+                    "Keeping a Lighter order whose status this connector does not recognise; \
+                     reconciliation will resolve it (Finding 3, §1.1)."
+                );
+                return ApplyOutcome::Unrecognised;
             }
             tracked.update_ts_us = update.transaction_time_us;
             tracked.order_index = Some(update.order_index);
             tracked.confirmed = true;
             tracked.order.req = Status::None;
-            tracked.order.status = map_status(&update.status);
+            tracked.order.status = mapped;
             // §4.12: `transaction_time` is MICROseconds and `Order::exch_timestamp` is
             // nanoseconds, so the factor is 1_000 — the same conversion `trades.rs` and
             // `depth.rs` make from this venue's stamps, and NOT the `* 1_000_000` the
@@ -463,7 +481,7 @@ impl OrderManager {
             self.by_order_id.remove(&(symbol.clone(), order_id));
             self.orders.remove(&coi);
         }
-        Some((symbol, order))
+        ApplyOutcome::Publish((symbol, order))
     }
 
     /// Expires an order whose `sendTx` never produced one (a lapsed confirmation deadline, or
@@ -621,7 +639,7 @@ mod tests {
 
     use super::{MAX_COI, OrderError, OrderManager, map_status, venue_refusal};
     use crate::{
-        connector::GetOrders,
+        connector::{ApplyOutcome, GetOrders},
         lighter::{
             private_msg::{AccountOrder, AccountPosition},
             rest::{MarketInfo, MarketType},
@@ -744,6 +762,7 @@ mod tests {
                 "open",
                 1785431774184833,
             ))
+            .published()
             .expect("our order, opened");
         assert_eq!(symbol, "BTC");
         assert_eq!(order.status, Status::New);
@@ -783,6 +802,7 @@ mod tests {
         // A real `transaction_time` off the testnet channel: 2026-07-30 17:16:14.184833 UTC.
         let (_, order) = m
             .apply_order_update(&account_order(coi, 5, "open", 1_785_431_774_184_833))
+            .published()
             .expect("our order, opened");
         assert_eq!(
             order.exch_timestamp, 1_785_431_774_184_833_000,
@@ -811,6 +831,7 @@ mod tests {
         absurd.filled_base_amount = 0.001;
         let (_, order) = m
             .apply_order_update(&absurd)
+            .published()
             .expect("the update is delivered even though its stamp is unusable");
         assert_eq!(
             order.status,
@@ -836,11 +857,13 @@ mod tests {
         // A cancel at a later transaction_time takes it out...
         let (_, canceled) = m
             .apply_order_update(&account_order(coi, 5, "canceled", 3_000))
+            .published()
             .expect("cancel applied");
         assert_eq!(canceled.status, Status::Canceled);
         // ...and an older "open" frame arriving afterwards must NOT bring it back.
         assert!(
             m.apply_order_update(&account_order(coi, 5, "open", 1_000))
+                .published()
                 .is_none(),
             "a stale open frame must not resurrect a canceled order"
         );
@@ -859,6 +882,7 @@ mod tests {
         // A repeat of the terminal frame is a no-op, not a resurrection.
         assert!(
             m.apply_order_update(&account_order(coi, 5, "canceled", 2_000))
+                .published()
                 .is_none()
         );
         assert_eq!(m.tracked(), 0);
@@ -880,9 +904,11 @@ mod tests {
         m.apply_order_update(&account_order(coi, 5, "open", 1_000));
 
         assert!(
-            m.apply_order_update(&account_order(coi, 5, "frozen-by-venue", 2_000))
-                .is_none(),
-            "nothing is published for a status nobody can read"
+            matches!(
+                m.apply_order_update(&account_order(coi, 5, "frozen-by-venue", 2_000)),
+                ApplyOutcome::Unrecognised
+            ),
+            "nothing is published for a status nobody can read; the caller is told to page"
         );
 
         assert_eq!(m.tracked(), 1, "the order is still tracked");
@@ -911,11 +937,44 @@ mod tests {
     #[test]
     fn an_update_for_a_foreign_coi_is_ignored() {
         let mut m = manager();
-        assert!(
-            m.apply_order_update(&account_order(999_999, 5, "open", 1_000))
-                .is_none()
-        );
+        assert!(matches!(
+            m.apply_order_update(&account_order(999_999, 5, "open", 1_000)),
+            ApplyOutcome::Ignored
+        ));
         assert_eq!(m.tracked(), 0);
+    }
+
+    /// **Finding 3: an unrecognised status keeps the order and signals reconcile — it does not
+    /// drop it.** `map_status` maps a status this connector cannot classify to
+    /// [`Status::Unsupported`]; `apply_order_update` must then leave the order exactly as it is
+    /// (still tracked, still active) and return [`ApplyOutcome::Unrecognised`], so the strategy
+    /// cannot re-quote a level that may still be resting into a double position (§1.1).
+    /// Transitioning it to the (inactive) `Unsupported` status and removing it — the old
+    /// behaviour — is the bug.
+    #[test]
+    fn an_unrecognised_status_keeps_the_order_and_signals_reconcile() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        // Live and resting.
+        assert!(matches!(
+            m.apply_order_update(&account_order(coi, 5, "open", 1_000)),
+            ApplyOutcome::Publish(_)
+        ));
+
+        // The venue now reports a status this connector does not recognise, at a later time.
+        assert!(
+            matches!(
+                m.apply_order_update(&account_order(coi, 5, "what-is-this", 2_000)),
+                ApplyOutcome::Unrecognised
+            ),
+            "an unrecognised status must signal reconcile, not drop the order"
+        );
+        // Untouched: still tracked, still active (New, not rewritten to Unsupported), still
+        // listed — the strategy can neither re-use the id nor re-quote the price level.
+        assert_eq!(m.tracked(), 1);
+        let live = m.orders(None);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].status, Status::New);
     }
 
     /// Cancelling an unknown order errors rather than guessing, and cancelling one that is not
@@ -977,6 +1036,7 @@ mod tests {
         // channel) carries our COI. Adoption keys on the retained COI and publishes it live.
         let (symbol, order) = m
             .apply_order_update(&account_order(coi, 844424914280027, "open", 1_000))
+            .published()
             .expect("a still-tracked COI is adoptable — never orphaned");
         assert_eq!(symbol, "BTC");
         assert_eq!(order.order_id, 1);
@@ -992,6 +1052,7 @@ mod tests {
         assert!(
             orphaned
                 .apply_order_update(&account_order(coi2, 844424914280027, "open", 1_000))
+                .published()
                 .is_none(),
             "an expired-and-removed COI can never be re-adopted — the silent-resting-order bug"
         );
@@ -1155,6 +1216,7 @@ mod tests {
         let (coi, _) = m.new_order("BTC", &btc(), &bid(3, 58300.0, 0.001)).unwrap();
         let (_, order) = m
             .apply_order_update(&account_order(coi, 9, "canceled-post-only", 1_000))
+            .published()
             .expect("our order");
         assert_eq!(order.status, Status::Canceled);
         assert!(!order.active());

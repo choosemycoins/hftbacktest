@@ -63,7 +63,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use crate::{
-    connector::PublishEvent,
+    connector::{ApplyOutcome, PublishEvent, SweepOutcome},
     lighter::{
         LighterError,
         SharedSymbolSet,
@@ -260,11 +260,13 @@ enum Command {
         coi: i64,
         plan: CancelPlan,
     },
-    /// Cancel-all for a market (`255` = all). `reply` fires once the sweep's `sendTx` has been
-    /// answered, so an orderly stop can wait for it before the tasks are aborted.
+    /// Cancel-all for a market (`255` = all). `reply` carries **whether the sweep's `sendTx`
+    /// succeeded** (Finding 2) — not merely that it was attempted — so an orderly stop can turn
+    /// a failed sweep into a non-zero exit rather than claiming success. The `bool` type makes
+    /// answering success after a failed send structurally impossible.
     CancelAll {
         market_index: i32,
-        reply: Option<oneshot::Sender<()>>,
+        reply: Option<oneshot::Sender<bool>>,
     },
     /// Mint a WS auth token expiring at `deadline` (absolute unix seconds). The private stream
     /// asks the slot because the slot owns the one signer.
@@ -439,13 +441,19 @@ impl OrderPath {
     }
 
     /// Sweeps the given markets with one `CancelAllOrders` tx each (§3.4), and returns a task
-    /// that completes once every sweep's `sendTx` has been answered — so an orderly stop can
-    /// wait for the cancels to be sent before the tasks are torn down. Bounded, so a wedged
-    /// slot cannot hang the stop.
-    pub fn sweep(&self, market_indices: Vec<i32>) -> JoinHandle<()> {
+    /// that resolves to the folded [`SweepOutcome`] once every sweep's `sendTx` has been
+    /// answered — so an orderly stop can both wait for the cancels and learn whether they
+    /// succeeded (Finding 2). Bounded, so a wedged slot cannot hang the stop.
+    ///
+    /// Fail closed ([`SweepOutcome::from_confirmations`]): a market whose `CancelAll` could not
+    /// even be queued (the slot task is gone), whose reply was dropped, or which timed out
+    /// counts as an unconfirmed cancel — [`SweepOutcome::Failed`] — because its orders may
+    /// still be resting. An empty market list is [`SweepOutcome::Cancelled`]: nothing to do.
+    pub fn sweep(&self, market_indices: Vec<i32>) -> JoinHandle<SweepOutcome> {
         let command_tx = self.command_tx.clone();
         tokio::spawn(async move {
             let mut replies = Vec::new();
+            let mut confirmations: Vec<bool> = Vec::new();
             for market_index in market_indices {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 if command_tx
@@ -456,13 +464,21 @@ impl OrderPath {
                     .is_ok()
                 {
                     replies.push(reply_rx);
+                } else {
+                    // The slot task is gone; this market cannot be swept.
+                    confirmations.push(false);
                 }
             }
             for reply in replies {
-                // A dropped sender (slot gone) resolves the await immediately; the bound keeps
-                // a slow one from hanging the stop.
-                let _ = time::timeout(Duration::from_secs(20), reply).await;
+                // A dropped sender (slot gone) or a timeout is an unconfirmed cancel; the bound
+                // keeps a slow one from hanging the stop. Only an explicit `true` confirms.
+                let confirmed = matches!(
+                    time::timeout(Duration::from_secs(20), reply).await,
+                    Ok(Ok(true))
+                );
+                confirmations.push(confirmed);
             }
+            SweepOutcome::from_confirmations(confirmations)
         })
     }
 
@@ -591,14 +607,18 @@ impl SlotTask {
                             self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
                         }
                         Some(Command::CancelAll { market_index, reply }) => {
-                            // Whether it took is reported by `send_cancel_all` itself (an
-                            // `error!` and a critical to the bots). The reply only says the
-                            // sweep is over: `Connector::sweep`'s handle carries no outcome
-                            // yet, so a failed shutdown sweep still exits 0 — the open item
-                            // a `SweepOutcome` (connector `feat/connector-failclosed`) closes.
-                            let _took = self.send_cancel_all(&mut signer, &mut nonce, market_index).await;
+                            // Whether it took is reported twice: by `send_cancel_all` itself (an
+                            // `error!` and a critical to the bots, after its retries), and on the
+                            // reply, which `OrderPath::sweep` folds into the `SweepOutcome` an
+                            // orderly stop turns into its exit code.
+                            let ok = self
+                                .send_cancel_all(&mut signer, &mut nonce, market_index)
+                                .await;
                             if let Some(reply) = reply {
-                                let _ = reply.send(());
+                                // Finding 2: answer with the REAL outcome, never an
+                                // unconditional success — the `bool` reply type is what makes
+                                // "success after a failed send_cancel_all" impossible to write.
+                                let _ = reply.send(ok);
                             }
                         }
                         Some(Command::MintAuth { deadline, reply }) => {
@@ -821,14 +841,34 @@ impl SlotTask {
                         .lock()
                         .unwrap()
                         .apply_order_update(&order);
-                    if let Some((symbol, published)) = applied {
-                        warn!(
-                            coi,
-                            %symbol,
-                            "An ambiguous Lighter send DID land; adopting the resting order from \
-                             accountActiveOrders — no re-send, no duplicate (§3.3, §5 gate)."
-                        );
-                        publish_order(&self.ev_tx, &symbol, published);
+                    match applied {
+                        ApplyOutcome::Publish((symbol, published)) => {
+                            warn!(
+                                coi,
+                                %symbol,
+                                "An ambiguous Lighter send DID land; adopting the resting order \
+                                 from accountActiveOrders — no re-send, no duplicate (§3.3, §5 \
+                                 gate)."
+                            );
+                            publish_order(&self.ev_tx, &symbol, published);
+                        }
+                        ApplyOutcome::Ignored => {}
+                        // Finding 3: the landed order carries a status this connector cannot
+                        // classify. Keep it (never dropped) and escalate; the next reconnect's
+                        // reconciliation resolves it — Lighter has no periodic reconcile.
+                        ApplyOutcome::Unrecognised => {
+                            error!(
+                                coi,
+                                status = %order.status,
+                                "An ambiguous Lighter send landed with an unrecognised status; \
+                                 keeping the order and escalating (Finding 3, §1.1)."
+                            );
+                            report_error(
+                                &self.ev_tx,
+                                ErrorKind::CriticalConnectionError,
+                                &format!("unrecognised Lighter order status {:?}", order.status),
+                            );
+                        }
                     }
                 }
             }
@@ -902,7 +942,8 @@ impl SlotTask {
 
     /// One market's `CancelAllOrders` (§3.4), sent until the venue takes it or
     /// [`crate::lighter::slot::SWEEP_ATTEMPTS`] are spent ([`sweep_with_retries`]). Returns
-    /// whether it took.
+    /// whether it took — the real outcome, which the `CancelAll` reply carries to
+    /// [`OrderPath::sweep`] and from there to the stop's exit code (`SweepOutcome`).
     ///
     /// A sweep that did not take is an `error!` and a `CriticalConnectionError` to every bot.
     /// It used to be one send and an `info!` "Sent a Lighter CancelAllOrders sweep." whatever
@@ -1590,19 +1631,27 @@ impl PrivateStreamTask {
                 }
                 for order in &orders {
                     let applied = self.order_manager.lock().unwrap().apply_order_update(order);
-                    if let Some((symbol, published)) = applied {
-                        publish_order(&self.ev_tx, &symbol, published);
-                        // The order went terminal for a reason the bot must hear about (a
-                        // margin refusal, a liquidation): after the order, so its state is
-                        // clean before the handler runs — the same order `reject_order` keeps.
-                        if let Some((kind, message)) = venue_refusal(&order.status) {
-                            warn!(
-                                %symbol,
-                                status = %order.status,
-                                "Lighter refused an order of ours."
-                            );
-                            report_error(&self.ev_tx, kind, &format!("{symbol}: {message}"));
+                    match applied {
+                        ApplyOutcome::Publish((symbol, published)) => {
+                            publish_order(&self.ev_tx, &symbol, published);
+                            // The order went terminal for a reason the bot must hear about (a
+                            // margin refusal, a liquidation): after the order, so its state is
+                            // clean before the handler runs — the same order `reject_order`
+                            // keeps.
+                            if let Some((kind, message)) = venue_refusal(&order.status) {
+                                warn!(
+                                    %symbol,
+                                    status = %order.status,
+                                    "Lighter refused an order of ours."
+                                );
+                                report_error(&self.ev_tx, kind, &format!("{symbol}: {message}"));
+                            }
                         }
+                        ApplyOutcome::Ignored => {}
+                        // Kept exactly as it was (`apply_order_update`), and already paged
+                        // above — once per frame, naming every unreadable status in it, whether
+                        // or not the order is ours.
+                        ApplyOutcome::Unrecognised => {}
                     }
                 }
                 if snapshot && !self.account_stream_live.swap(true, Ordering::AcqRel) {

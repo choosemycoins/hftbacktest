@@ -27,7 +27,7 @@ use crate::{
         ordermanager::{OrderManager, SharedOrderManager},
         rest::BinanceFuturesClient,
     },
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepOutcome, SweepReason},
     utils::{ExponentialBackoff, Retry},
 };
 
@@ -382,19 +382,26 @@ impl Connector for BinanceFutures {
     /// **Not implemented for this backend.** A sweep here would have to reach the venue's
     /// `DELETE /fapi/v1/allOpenOrders` and reconcile what came back; until it is written,
     /// orders left by a dead bot stay resting and this says so rather than pretending.
+    ///
+    /// Reports [`SweepOutcome::NotImplemented`], **not `None`** (Finding 2): this backend has
+    /// an order path, so orders it placed can be resting. Documented, non-fatal (§4.7).
     fn sweep(
         &self,
         symbols: Vec<String>,
         reason: SweepReason,
-        _tx: UnboundedSender<PublishEvent>,
-    ) -> Option<JoinHandle<()>> {
+        tx: UnboundedSender<PublishEvent>,
+    ) -> Option<JoinHandle<SweepOutcome>> {
         warn!(
             ?reason,
             ?symbols,
             "The Binance Futures backend does not implement a sweep, so these orders are \
              left resting on the venue."
         );
-        None
+        // Drop `tx` at once so it does not hold the publish channel open through the drain.
+        Some(tokio::spawn(async move {
+            drop(tx);
+            SweepOutcome::NotImplemented
+        }))
     }
 
     /// **Not implemented for this backend.** See `Bybit::shutdown`.
