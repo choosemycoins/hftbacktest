@@ -87,10 +87,11 @@ pub enum OrderError {
     NotConfirmed { symbol: String, order_id: u64 },
     /// The private account stream is down, or has not snapshotted since it last connected:
     /// a fill of this order would reach neither the order state nor the position, so the bot
-    /// would go on quoting blind. Refused before a nonce is spent; transient by nature.
+    /// would go on quoting blind. Refused before a nonce is spent; transient by nature. The
+    /// symbol is not repeated in the message: `expire_unsent` prefixes it.
     #[error(
-        "{symbol}: the Lighter account stream is not live (disconnected, or no snapshot since \
-         it reconnected); an order now would fill unseen, so it was not sent"
+        "the Lighter account stream is not live (disconnected, or no snapshot since it \
+         reconnected); an order now would fill unseen, so it was not sent"
     )]
     AccountStreamDown { symbol: String },
     #[error("the client-order-index allocator is exhausted (reached 2^48-1)")]
