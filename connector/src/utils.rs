@@ -384,6 +384,25 @@ pub fn generate_rand_string(length: usize) -> String {
 pub(crate) mod testing {
     //! Seams shared by the connector's socketless tests.
 
+    /// Keeps every `tracing` callsite interested for the life of the test process, so a test
+    /// that captures log events on its own thread (`tracing::subscriber::set_default`) cannot
+    /// lose them to another test. Call it before installing such a capture.
+    ///
+    /// The race (`AGENTS.md` §4.2): `tracing-core` caches each callsite's interest globally,
+    /// and while at most one dispatcher is registered it rebuilds that cache with the interest
+    /// of **whichever thread happens to rebuild it** (`Rebuilder::JustOne`). A test thread with
+    /// no subscriber of its own answers for the global no-op one — `Interest::never()` — and
+    /// switches the callsite off for every thread, the capturing one included. With a
+    /// process-wide default that is interested in everything (a bare registry, which records
+    /// nothing), no thread ever answers `never`; and while a capture is active there are two
+    /// dispatchers, so a rebuild takes the union of their interests instead.
+    pub(crate) fn keep_every_callsite_interested() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
     use std::{
         marker::PhantomData,
         pin::Pin,

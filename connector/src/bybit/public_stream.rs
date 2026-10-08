@@ -633,6 +633,7 @@ mod tests {
         /// polls the future on the calling thread, so the loop under test logs in here while
         /// every other test's subscriber is left alone.
         fn capturing(&self) -> tracing::subscriber::DefaultGuard {
+            crate::utils::testing::keep_every_callsite_interested();
             tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
         }
 
