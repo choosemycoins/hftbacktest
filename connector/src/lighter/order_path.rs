@@ -212,9 +212,10 @@ pub struct OrderPathConfig {
     #[serde(default)]
     pub tx_budget_per_minute: Option<u32>,
     /// Of `tx_budget_per_minute`, how many only **risk-reducing** sends may take — cancels,
-    /// `CancelAllOrders`, and submits that shrink the position — so a burst of quotes cannot
-    /// leave the account unable to cancel them. Absent ⇒ 0. Needs `tx_budget_per_minute`, and
-    /// must leave at least one token for quotes; anything else is refused at startup.
+    /// `CancelAllOrders`, and IOC (or reduce-only) submits that shrink |position|; a post-only
+    /// quote is a quote on either side — so a burst of quotes cannot leave the account unable to
+    /// cancel them. Absent ⇒ 0. Needs `tx_budget_per_minute`, and must leave at least one token
+    /// for quotes; anything else is refused at startup.
     #[serde(default)]
     pub tx_reserve: Option<u32>,
     /// How long nothing is sent after the venue answers a `sendTx` with 429/405, ms (§4.16).
@@ -1336,8 +1337,10 @@ impl SlotTask {
 
     /// Whether submit `coi` may go out now (§4.15). A refused one is handed back to the bot
     /// exactly as a submit refused while the account stream is down — `Expired`, then an
-    /// `OrderError` — before a nonce is reserved, so nothing is spent on it. A submit that
-    /// shrinks the position may take the reserve; a quote may not.
+    /// `OrderError` — before a nonce is reserved, so nothing is spent on it. An IOC (or
+    /// reduce-only) submit that shrinks |position| may take the reserve
+    /// ([`OrderManager::reduces_position`]); a quote may not — a post-only one on the reducing
+    /// side included.
     fn admit_submit(&self, gate: &mut SendGate, coi: i64) -> bool {
         let class = if self.order_manager.lock().unwrap().reduces_position(coi) {
             TxClass::RiskReducing
@@ -3563,6 +3566,13 @@ mod tests {
         )
     }
 
+    /// The same order as an IOC — what a flatten sends.
+    fn eth_ioc(order_id: u64, side: Side) -> Order {
+        let mut order = eth_order(order_id, side);
+        order.time_in_force = TimeInForce::IOC;
+        order
+    }
+
     /// The error the bots receive next, as `(kind, prose)`.
     fn as_error(event: PublishEvent) -> (ErrorKind, String) {
         let PublishEvent::LiveEvent(LiveEvent::Error(error)) = event else {
@@ -3643,10 +3653,10 @@ mod tests {
             "names its symbol: {message}"
         );
 
-        // The witness that it reserved no nonce: the next admitted send — a sell that shrinks a
-        // long, so it may take the reserve — goes out with the very next nonce.
+        // The witness that it reserved no nonce: the next admitted send — an IOC sell that
+        // shrinks a long, so it may take the reserve — goes out with the very next nonce.
         slot.state_position(0.05);
-        slot.submit(&eth_order(3, Side::Sell));
+        slot.submit(&eth_ioc(3, Side::Sell));
         slot.venue_until(|venue| venue.sent().len() == 2).await;
         assert_eq!(
             slot.venue.sent(),
@@ -3662,10 +3672,13 @@ mod tests {
         );
     }
 
-    /// **The reserve is for getting out.** With 3 a minute and 1 held back: two quotes spend the
-    /// open part; a third quote is refused while a position-reducing sell still goes, on the
-    /// reserve; then the budget is spent through, and a cancel is handed back to the bot as a
-    /// cancel that did not go — its request cleared, the order still live — with the reason.
+    /// **The reserve is for getting out, and a quote is not a way out.** With 3 a minute and 1
+    /// held back: two quotes spend the open part. A post-only ask against the long is a QUOTE —
+    /// refused, not handed the reserve: on the 2026-10-08 probe three such asks took the whole
+    /// reserve between them and the next cancel, of the bid that was opening the account up,
+    /// was refused. An IOC sell no larger than the long goes, on the reserve. Then the budget is
+    /// spent through, and a cancel is handed back to the bot as a cancel that did not go — its
+    /// request cleared, the order still live — with the reason.
     #[tokio::test]
     async fn the_reserve_is_kept_for_what_gets_the_account_out() {
         let mut slot = slot_on_scripted_venue(|config| {
@@ -3679,16 +3692,19 @@ mod tests {
         slot.venue_until(|venue| venue.sent().len() == 2).await;
 
         slot.state_position(0.05);
-        slot.submit(&eth_order(3, Side::Buy));
-        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
-        else {
-            panic!("a quote into the reserve is refused");
-        };
-        assert_eq!((order.order_id, order.status), (3, Status::Expired));
-        let (kind, _) = as_error(slot.next_event().await);
-        assert_eq!(kind, ErrorKind::OrderError);
+        for (order_id, side) in [(3, Side::Buy), (4, Side::Sell)] {
+            slot.submit(&eth_order(order_id, side));
+            let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+            else {
+                panic!("a quote into the reserve is refused, whichever side it rests on");
+            };
+            assert_eq!((order.order_id, order.status), (order_id, Status::Expired));
+            let (kind, message) = as_error(slot.next_event().await);
+            assert_eq!(kind, ErrorKind::OrderError);
+            assert!(message.contains("sendTx budget is spent"), "{message}");
+        }
 
-        slot.submit(&eth_order(4, Side::Sell));
+        slot.submit(&eth_ioc(5, Side::Sell));
         slot.venue_until(|venue| venue.sent().len() == 3).await;
 
         // Spent through, reserve included: a cancel goes back to the bot as one that did not go.

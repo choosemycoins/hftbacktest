@@ -13,8 +13,11 @@
 //!   minute (a full bucket's burst plus a minute of refill) and walk straight into the venue's
 //!   limit;
 //! * of which `tx_reserve` only **risk-reducing** sends may take: cancels, `CancelAllOrders`,
-//!   and a submit that shrinks the position. A burst of new quotes then cannot leave the
-//!   account unable to cancel them;
+//!   and an IOC (or reduce-only) submit that shrinks |position| — an order that gets the
+//!   account out the moment it lands. A post-only quote on the reducing side is a quote: it
+//!   may rest unfilled as long as any other, and three of them once took the whole reserve
+//!   between them (2026-10-08 probe). A burst of new quotes then cannot leave the account
+//!   unable to cancel them;
 //! * and when the venue answers 429/405 anyway, a **cooldown** of `rate_limit_cooldown_ms`
 //!   during which nothing is sent at all (§4.16): the venue's firewall holds a rate-limited
 //!   address for a static 60 s, and every send into that only earns another refusal.
@@ -36,10 +39,11 @@ pub const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(10);
 /// What a send is for — the only thing the gate asks about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxClass {
-    /// A new order that does not shrink the position: a quote.
+    /// A new order that is not a way out: every quote — a post-only one on the reducing side
+    /// included — and any order that could add to |position|.
     Open,
-    /// A cancel, a `CancelAllOrders`, or a submit that shrinks |position| — what the reserve
-    /// is held for.
+    /// A cancel, a `CancelAllOrders`, or an IOC (or reduce-only) submit that shrinks
+    /// |position| (`OrderManager::reduces_position`) — what the reserve is held for.
     RiskReducing,
 }
 
@@ -149,7 +153,7 @@ impl fmt::Display for Refusal {
                 f,
                 "the connector's sendTx budget is spent ({per_minute} a rolling minute for the \
                  whole account, the last {reserve} held for cancels and position-reducing \
-                 orders); rate-limited, not sent"
+                 IOCs); rate-limited, not sent"
             ),
             Self::Budget {
                 class: TxClass::RiskReducing,
@@ -371,7 +375,7 @@ mod tests {
     }
 
     /// **The reserve is for getting out, not for quoting.** With 48 and a reserve of 12, quotes
-    /// stop at 36 and cancels, sweeps and position-reducing submits still have 12.
+    /// stop at 36 and cancels, sweeps and position-reducing IOCs still have 12.
     #[test]
     fn the_reserve_is_only_for_risk_reducing_sends() {
         let t0 = Instant::now();

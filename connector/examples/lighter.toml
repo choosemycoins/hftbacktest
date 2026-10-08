@@ -210,8 +210,10 @@ timeout_ms = 10000
 # # does not count (REST reads, other processes on the address).
 # tx_budget_per_minute = 48
 #
-# # Of the budget, how many only cancels, CancelAllOrders and position-reducing submits may take.
-# # Optional (default 0); needs tx_budget_per_minute and must be smaller than it.
+# # Of the budget, how many only cancels, CancelAllOrders and IOC (or reduce-only) submits that
+# # shrink |position| may take; a post-only quote on the reducing side is a quote. Optional
+# # (default 0); needs tx_budget_per_minute and must be smaller than it. At 48/12 quotes get at
+# # most 36 sends a rolling minute.
 # tx_reserve = 12
 #
 # # After a sendTx answered 429/405, send nothing for this long, ms (§4.16). Optional; absent =

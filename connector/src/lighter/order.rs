@@ -136,6 +136,11 @@ struct Tracked {
     /// reconnect reconciliation must not expire it — its fate is the slot task's deadline to
     /// decide (§4.11), not a snapshot's silence.
     confirmed: bool,
+    /// Whether the order executes on arrival or not at all (IOC, a market order) or may only
+    /// reduce (`reduce_only` on the wire) — the only submits that can be shown to get the
+    /// account out when they are sent ([`OrderManager::reduces_position`]). A post-only quote
+    /// is not one of them, whichever side it rests on.
+    exits_on_arrival: bool,
 }
 
 /// Owns this connector's order state for one account.
@@ -349,6 +354,8 @@ impl OrderManager {
                 update_ts_us: 0,
                 filled: 0.0,
                 confirmed: false,
+                exits_on_arrival: wire.time_in_force == TIF_IMMEDIATE_OR_CANCEL
+                    || wire.reduce_only != 0,
             },
         );
         Ok((coi, wire))
@@ -533,14 +540,30 @@ impl OrderManager {
             .is_some_and(|tracked| tracked.order.active() && tracked.order.req == Status::Canceled)
     }
 
-    /// Whether the tracked submit `coi` would shrink |position| on its symbol — a sell against
-    /// a long, a buy against a short, no larger than the position — judged against the last
-    /// position the account stream stated. No statement yet, or an order this manager does not
-    /// track, is not reducing: nothing can be shown to be.
+    /// Whether the tracked submit `coi` gets the account out — the question the send budget's
+    /// reserve is spent on (`crate::lighter::gate`, §4.15).
+    ///
+    /// Only an order that executes now or never — IOC or market — or that may only reduce
+    /// (`reduce_only`) can be shown to, and only one that shrinks |position| on its symbol: a
+    /// sell against a long, a buy against a short, judged against the last position the
+    /// account stream stated **less what the same-side IOCs submitted before it will take off
+    /// it** once they fill. Two flatten IOCs of the whole position are one way out, not two.
+    ///
+    /// A post-only quote is a quote on either side. Measured (2026-10-08 probe): three GTX asks
+    /// against a long counted as reducing took the whole reserve, and the next cancel was
+    /// refused for want of it — a resting ask may sit unfilled as long as any other quote.
+    ///
+    /// No statement yet, or an order this manager does not track, is not reducing: nothing
+    /// can be shown to be. The IOCs ahead are counted at their unfilled size, so a fill whose
+    /// position frame has not arrived yet is briefly counted twice in the account's favour —
+    /// a bucket question only; the order goes out either way.
     pub fn reduces_position(&self, coi: i64) -> bool {
         let Some(tracked) = self.orders.get(&coi) else {
             return false;
         };
+        if !tracked.exits_on_arrival {
+            return false;
+        }
         let Some(&position) = self.positions.get(&tracked.symbol) else {
             return false;
         };
@@ -549,9 +572,25 @@ impl OrderManager {
             Side::Buy => position < 0.0,
             _ => false,
         };
+        if !against {
+            return false;
+        }
+        // COIs are minted in submit order, so a smaller one was asked for first.
+        let ahead: f64 = self
+            .orders
+            .iter()
+            .filter(|(other, ahead)| {
+                **other < coi
+                    && ahead.exits_on_arrival
+                    && ahead.symbol == tracked.symbol
+                    && ahead.order.side == tracked.order.side
+                    && ahead.order.active()
+            })
+            .map(|(_, ahead)| ahead.order.leaves_qty)
+            .sum();
         // The order's size is the quantised one the venue would see; the slack forgives float
         // rounding between two decimal strings, never a lot.
-        against && tracked.order.qty <= position.abs() * (1.0 + 1e-9)
+        tracked.order.qty + ahead <= position.abs() * (1.0 + 1e-9)
     }
 
     /// Reconciles against the venue's open-order snapshot on (re)connect.
@@ -1123,56 +1162,124 @@ mod tests {
 
     /// **A submit counts as position-reducing only against the last position the account
     /// stream stated, and only if it cannot overshoot it** — the test the send budget's reserve
-    /// is spent on (`gate.rs`). Long 0.003: a sell of 0.002 or 0.003 shrinks it; a sell of
+    /// is spent on (`gate.rs`). Long 0.003: an IOC sell of 0.002 or 0.003 shrinks it; one of
     /// 0.004 would flip it; a buy grows it. No position stated yet: nothing is reducing, because
     /// nothing can be shown to be.
     #[test]
     fn a_submit_reduces_the_position_only_against_the_last_stated_one() {
-        let mut m = manager();
-        let order = |id: u64, side: Side, qty: f64| {
-            let mut order = bid(id, 58300.0, qty);
-            order.side = side;
-            order
-        };
-        let (sell_two, _) = m
-            .new_order("BTC", &btc(), &order(1, Side::Sell, 0.002))
-            .unwrap();
-        assert!(
-            !m.reduces_position(sell_two),
-            "no position stated yet: not reducing"
-        );
-
         let long = |position: f64| AccountPosition {
             market_index: 1,
             symbol: "BTC".to_string(),
             position,
             open_order_count: 0,
         };
-        m.apply_position(&long(0.003), 1);
-        let (sell_three, _) = m
-            .new_order("BTC", &btc(), &order(2, Side::Sell, 0.003))
-            .unwrap();
-        let (sell_four, _) = m
-            .new_order("BTC", &btc(), &order(3, Side::Sell, 0.004))
-            .unwrap();
-        let (buy_one, _) = m
-            .new_order("BTC", &btc(), &order(4, Side::Buy, 0.001))
-            .unwrap();
-        assert!(m.reduces_position(sell_two));
-        assert!(m.reduces_position(sell_three), "down to flat, not past it");
-        assert!(!m.reduces_position(sell_four), "past flat it opens a short");
-        assert!(!m.reduces_position(buy_one), "a buy grows a long");
+        // One IOC on a fresh manager at a time, so no order is judged behind another (the
+        // queueing rule has its own pin below). `position: None` states nothing.
+        let reduces = |position: Option<f64>, side: Side, qty: f64| {
+            let mut m = manager();
+            if let Some(position) = position {
+                m.apply_position(&long(position), 1);
+            }
+            let mut order = bid(1, 58300.0, qty);
+            order.side = side;
+            order.time_in_force = TimeInForce::IOC;
+            let (coi, _) = m.new_order("BTC", &btc(), &order).unwrap();
+            m.reduces_position(coi)
+        };
+        assert!(
+            !reduces(None, Side::Sell, 0.002),
+            "no position stated yet: not reducing"
+        );
 
-        // The LAST statement counts: the same orders against a short.
-        m.apply_position(&long(-0.003), 2);
-        assert!(m.reduces_position(buy_one));
-        assert!(!m.reduces_position(sell_two));
+        assert!(reduces(Some(0.003), Side::Sell, 0.002));
+        assert!(
+            reduces(Some(0.003), Side::Sell, 0.003),
+            "down to flat, not past it"
+        );
+        assert!(
+            !reduces(Some(0.003), Side::Sell, 0.004),
+            "past flat it opens a short"
+        );
+        assert!(
+            !reduces(Some(0.003), Side::Buy, 0.001),
+            "a buy grows a long"
+        );
+
+        // The same orders against a short.
+        assert!(reduces(Some(-0.003), Side::Buy, 0.001));
+        assert!(!reduces(Some(-0.003), Side::Sell, 0.002));
         // Flat: nothing reduces.
-        m.apply_position(&long(0.0), 3);
-        assert!(!m.reduces_position(buy_one));
-        assert!(!m.reduces_position(sell_two));
+        assert!(!reduces(Some(0.0), Side::Buy, 0.001));
+        assert!(!reduces(Some(0.0), Side::Sell, 0.002));
+
+        // The LAST statement counts.
+        let mut m = manager();
+        let mut buy = bid(1, 58300.0, 0.001);
+        buy.time_in_force = TimeInForce::IOC;
+        let (buy, _) = m.new_order("BTC", &btc(), &buy).unwrap();
+        m.apply_position(&long(-0.003), 1);
+        assert!(m.reduces_position(buy));
+        m.apply_position(&long(0.003), 2);
+        assert!(!m.reduces_position(buy));
         // An order this manager does not track is not reducing.
         assert!(!m.reduces_position(999_999));
+    }
+
+    /// **A post-only quote is a quote, whichever side it rests on.** Measured on the 2026-10-08
+    /// probe: three GTX asks of 0.01 against a long of 0.02 each counted as position-reducing,
+    /// took the whole reserve between them, and the next cancel — of the bid that was opening
+    /// the account up — was refused "its reserve included". A resting quote gets nobody out:
+    /// it may sit unfilled as long as any other. Only an order that executes now or never
+    /// (IOC, a market order) can be shown to shrink |position| when it is sent.
+    ///
+    /// And IOCs queue: a second sell behind one still in flight is judged against what will
+    /// be left of the long once the first has filled, not against the long as stated — so two
+    /// flatten IOCs of the whole position do not both count as getting out.
+    #[test]
+    fn only_an_order_that_executes_now_reduces_the_position_and_ioc_ahead_of_it_count() {
+        let mut m = manager();
+        let long = |position: f64| AccountPosition {
+            market_index: 1,
+            symbol: "BTC".to_string(),
+            position,
+            open_order_count: 0,
+        };
+        m.apply_position(&long(0.002), 1);
+        let ask = |id: u64, qty: f64, tif: TimeInForce| {
+            let mut order = bid(id, 58400.0, qty);
+            order.side = Side::Sell;
+            order.time_in_force = tif;
+            order
+        };
+
+        for (id, tif) in [(1, TimeInForce::GTX), (2, TimeInForce::GTC)] {
+            let (coi, _) = m.new_order("BTC", &btc(), &ask(id, 0.001, tif)).unwrap();
+            assert!(
+                !m.reduces_position(coi),
+                "{tif:?}: a resting ask against a long is a quote, not a way out"
+            );
+        }
+
+        let (first, _) = m
+            .new_order("BTC", &btc(), &ask(3, 0.002, TimeInForce::IOC))
+            .unwrap();
+        let (second, _) = m
+            .new_order("BTC", &btc(), &ask(4, 0.001, TimeInForce::IOC))
+            .unwrap();
+        assert!(m.reduces_position(first), "the IOC takes the long to flat");
+        assert!(
+            !m.reduces_position(second),
+            "behind an IOC that already takes the long to flat, a second sell opens a short"
+        );
+
+        // The first one is done: the venue closes it, and the second is judged afresh.
+        let mut gone = account_order(first, 7, "canceled", 2_000);
+        gone.is_ask = true;
+        m.apply_order_update(&gone);
+        assert!(
+            m.reduces_position(second),
+            "with nothing ahead of it, a sell of half the long gets out"
+        );
     }
 
     /// **Reconciliation expires an order the venue no longer lists** (§3.4, §5.10) — the
