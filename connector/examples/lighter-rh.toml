@@ -123,7 +123,8 @@ timeout_ms = 10000
 # # under the venue for what the connector does not count — its own REST reads, which the docs
 # # do not say are a separate bucket on Standard, and the poller on the same host. A send over
 # # it is refused before a nonce is spent and goes back to the bot as a rate-limit error.
-# # Absent: no budget (the behaviour before it existed). design note §4.15.
+# # Absent: no budget (the behaviour before it existed). 1..=100000, else refused at startup.
+# # design note §4.15.
 # tx_budget_per_minute = 48
 #
 # # Of those 48, the last 12 only cancels, CancelAllOrders and IOC (or reduce-only) submits

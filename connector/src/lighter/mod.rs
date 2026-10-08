@@ -1179,6 +1179,24 @@ mod tests {
         }
     }
 
+    /// **A budget past every tier the venue sells is refused at startup.** The window keeps one
+    /// stamp per send it may hold, sized up front, so `tx_budget_per_minute = 4294967295` asks
+    /// for tens of gigabytes before the first quote — and a budget no account can reach guards
+    /// nothing while looking like a limit. The venue's largest `sendTx` tier is 24 000 a minute
+    /// (Premium, RH docs 2026-09-30); 100 000 is the ceiling, and it is accepted.
+    #[test]
+    fn a_send_budget_past_any_tier_is_refused_at_startup() {
+        let Err(error) = armed_rh("tx_budget_per_minute = 100001") else {
+            panic!("a budget past the ceiling must be refused");
+        };
+        assert!(matches!(error, LighterError::Config(_)), "{error}");
+        assert!(
+            error.to_string().contains("100000"),
+            "names the ceiling: {error}"
+        );
+        assert!(armed_rh("tx_budget_per_minute = 100000").is_ok());
+    }
+
     /// **A misspelt `[order_path]` key stops the connector at startup.** Every protective field
     /// in this section is optional with the unprotected behaviour as its default, so a key
     /// serde silently skipped — `rate_limit_cooldown = 60000`, one `_ms` short — used to arm an

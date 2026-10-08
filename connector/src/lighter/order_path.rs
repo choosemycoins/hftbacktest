@@ -151,6 +151,12 @@ const SWEEP_REPLY_WAIT: Duration = Duration::from_secs(20);
 /// How often the same private-stream error code is told to the bots at most (§4.17).
 const VENUE_ERROR_EVERY: Duration = Duration::from_secs(10);
 
+/// The largest `tx_budget_per_minute` a config may name. The venue's largest `sendTx` tier is
+/// 24 000 a minute (Premium; RH docs "Rate Limits", 2026-09-30), and the window is sized up front
+/// to hold one stamp per send (`gate::TxBudget`), so a number past this guards nothing a real
+/// account can reach while asking for gigabytes at startup.
+const MAX_TX_BUDGET_PER_MINUTE: u32 = 100_000;
+
 /// How the order path treats orders already resting on the venue when it (re)connects (§3.4).
 ///
 /// The account channels re-snapshot on every (re)connect, and on this venue orders outlive
@@ -250,6 +256,10 @@ impl OrderPathConfig {
                 "[order_path] tx_budget_per_minute = 0 would refuse every send, cancels included"
                     .to_string(),
             ),
+            (Some(per_minute), _) if per_minute > MAX_TX_BUDGET_PER_MINUTE => Err(format!(
+                "[order_path] tx_budget_per_minute = {per_minute} is past every tier the venue \
+                 sells (the largest is 24000 a minute); at most {MAX_TX_BUDGET_PER_MINUTE}"
+            )),
             (Some(per_minute), Some(reserve)) if reserve >= per_minute => Err(format!(
                 "[order_path] tx_reserve = {reserve} leaves no token of tx_budget_per_minute = \
                  {per_minute} for a new order"

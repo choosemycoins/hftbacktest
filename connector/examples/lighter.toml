@@ -210,7 +210,8 @@ timeout_ms = 10000
 # # cooldown that stops cancels too. Every send counts — submits, cancels, each CancelAllOrders
 # # attempt — and one over the budget is refused before a nonce is spent and handed back to the
 # # bot as a rate-limit error. On Standard set it under 60, e.g. 48, to leave room for what it
-# # does not count (REST reads, other processes on the address).
+# # does not count (REST reads, other processes on the address). 1..=100000 (the largest tier
+# # is 24000), anything else is refused at startup.
 # tx_budget_per_minute = 48
 #
 # # Of the budget, how many only cancels, CancelAllOrders and IOC (or reduce-only) submits that
