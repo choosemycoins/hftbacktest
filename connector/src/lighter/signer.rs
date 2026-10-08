@@ -53,6 +53,10 @@ pub enum SignerError {
     /// The sidecar closed its stdout — it exited (fail-closed setup failure, or crash).
     #[error("signer sidecar closed the connection")]
     Closed,
+    /// The sidecar signs for another network, account or slot than this connector's
+    /// ([`verify_identity`]). Not recoverable by retrying: the key file is misprovisioned.
+    #[error("signer identity: {0}")]
+    Identity(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -102,6 +106,135 @@ impl CreateOrder {
             "order_expiry": self.order_expiry,
         })
     }
+}
+
+// ---- the network a signer signs for ---------------------------------------------------
+
+/// The network a signer must sign for (§3.2): the REST base the connector dials, and the
+/// chain id every transaction is hashed with.
+///
+/// The chain id enters the hash the Schnorr signature is over **and nothing else** — the
+/// auth token carries none — so a signer on the wrong chain passes the private stream's
+/// auth and has every transaction refused, `CancelAllOrders` included. The connector
+/// therefore names the network to the sidecar ([`python_sidecar_command`]) and checks the
+/// sidecar's answer ([`verify_identity`]) before the slot sends anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignerNetwork {
+    /// The REST base the connector dials — what the sidecar's `CreateClient` is told.
+    pub url: String,
+    /// The chain id every transaction must hash with, when this connector knows it.
+    /// `None` only for a configured URL outside [`known_chain_id`]'s table: the sidecar's
+    /// own config must then state it, and url, account and slot are still checked here.
+    pub chain_id: Option<u32>,
+}
+
+/// The chain id of each Lighter instance this connector knows, by REST base. The same
+/// table as the sidecar's `KNOWN_CHAIN_IDS` (`lighter-signer/sidecar.py`), which
+/// `test_sidecar.py` checks against lighter-sdk's own `endpoint_profiles`.
+pub fn known_chain_id(rest_url: &str) -> Option<u32> {
+    match normalize_url(rest_url) {
+        "https://mainnet.zklighter.elliot.ai" => Some(304),
+        "https://testnet.zklighter.elliot.ai" => Some(300),
+        "https://api.rh.lighter.xyz" => Some(crate::lighter::RH_CHAIN_ID),
+        "https://api.rh-testnet.lighter.xyz" => Some(300),
+        _ => None,
+    }
+}
+
+fn normalize_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
+/// What a running sidecar says it signs for — its answer to `ping`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignerIdentity {
+    pub chain_id: u32,
+    pub url: String,
+    pub account_index: i64,
+    pub api_key_slots: Vec<u8>,
+}
+
+/// Refuses a signer that does not sign for this connector's network, account and slot.
+///
+/// Fail closed (`AGENTS.md` §1.1): a mismatch here is a misprovisioned key file, and the
+/// venue's answer to it would be every transaction refused — after the nonce was spent and
+/// with the sweep reporting success. Refusing before the first send is the only place the
+/// mistake is cheap.
+pub fn verify_identity(
+    identity: &SignerIdentity,
+    network: &SignerNetwork,
+    account_index: i64,
+    api_key_index: u8,
+) -> Result<(), SignerError> {
+    if normalize_url(&identity.url) != normalize_url(&network.url) {
+        return Err(SignerError::Identity(format!(
+            "the signer signs for {} but this connector dials {}",
+            identity.url, network.url
+        )));
+    }
+    if let Some(chain_id) = network.chain_id
+        && identity.chain_id != chain_id
+    {
+        return Err(SignerError::Identity(format!(
+            "the signer hashes with chain {} but {} is chain {chain_id}",
+            identity.chain_id, network.url
+        )));
+    }
+    if identity.account_index != account_index {
+        return Err(SignerError::Identity(format!(
+            "the signer holds account {} but the connector's [order_path] names account \
+             {account_index}",
+            identity.account_index
+        )));
+    }
+    if !identity.api_key_slots.contains(&api_key_index) {
+        return Err(SignerError::Identity(format!(
+            "the signer has no key for api_key_index {api_key_index} (its slots: {:?})",
+            identity.api_key_slots
+        )));
+    }
+    Ok(())
+}
+
+fn parse_identity(line: &str, expect_id: u64) -> Result<SignerIdentity, SignerError> {
+    let obj = parse_envelope(line, expect_id)?;
+    let missing = |field: &str| {
+        SignerError::Malformed(format!(
+            "the signer's ping answer has no `{field}`: a signer that cannot say what it signs \
+             for is not used (an older sidecar?)"
+        ))
+    };
+    let chain_id = obj
+        .get("chain_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| missing("chain_id"))?;
+    let url = obj
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("url"))?
+        .to_string();
+    let account_index = obj
+        .get("account_index")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| missing("account_index"))?;
+    let api_key_slots = obj
+        .get("api_key_slots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| missing("api_key_slots"))?
+        .iter()
+        .map(|slot| {
+            slot.as_u64()
+                .and_then(|slot| u8::try_from(slot).ok())
+                .ok_or_else(|| missing("api_key_slots"))
+        })
+        .collect::<Result<Vec<u8>, _>>()?;
+    Ok(SignerIdentity {
+        chain_id,
+        url,
+        account_index,
+        api_key_slots,
+    })
 }
 
 // ---- pure codec (unit-tested without a subprocess) ---------------------------------
@@ -196,9 +329,25 @@ fn parse_auth(line: &str, expect_id: u64) -> Result<String, SignerError> {
 /// sidecar opens to read its key — it is NOT the key. `LIGHTER_SDK_PATH` can point the
 /// sidecar at a non-default SDK install (tests); omit in production where the sidecar's
 /// venv has `lighter-sdk`.
-pub fn python_sidecar_command(python: &str, script: &str, config: &str) -> Command {
+///
+/// The network is named on the command line — `--network-url`, and `--expect-chain-id`
+/// when this connector knows the chain — so the sidecar signs for the network the
+/// connector dials instead of inferring one from its own file (it used to infer testnet's
+/// 300 for any URL that was not mainnet's). Neither is a secret; the key never rides here.
+pub fn python_sidecar_command(
+    python: &str,
+    script: &str,
+    config: &str,
+    network: &SignerNetwork,
+) -> Command {
     let mut cmd = Command::new(python);
-    cmd.arg(script).arg(config);
+    cmd.arg(script)
+        .arg(config)
+        .arg("--network-url")
+        .arg(&network.url);
+    if let Some(chain_id) = network.chain_id {
+        cmd.arg("--expect-chain-id").arg(chain_id.to_string());
+    }
     cmd
 }
 
@@ -256,6 +405,15 @@ impl SignerClient {
         let line = request_line(id, "ping", 0, None, json!({}));
         let resp = self.round_trip(line).await?;
         parse_envelope(&resp, id).map(|_| ())
+    }
+
+    /// What the sidecar signs for: its `ping` answer read as a [`SignerIdentity`]. The slot
+    /// checks it with [`verify_identity`] before it sends anything.
+    pub async fn identity(&mut self) -> Result<SignerIdentity, SignerError> {
+        let id = self.take_id();
+        let line = request_line(id, "ping", 0, None, json!({}));
+        let resp = self.round_trip(line).await?;
+        parse_identity(&resp, id)
     }
 
     pub async fn create_order(
@@ -490,6 +648,163 @@ mod tests {
         ));
     }
 
+    // ---- the network the signer signs for --------------------------------------------
+
+    fn rh() -> SignerNetwork {
+        SignerNetwork {
+            url: "https://api.rh.lighter.xyz".into(),
+            chain_id: Some(466_324),
+        }
+    }
+
+    fn identity(chain_id: u32, url: &str, account_index: i64, slots: &[u8]) -> SignerIdentity {
+        SignerIdentity {
+            chain_id,
+            url: url.into(),
+            account_index,
+            api_key_slots: slots.to_vec(),
+        }
+    }
+
+    /// The table the connector checks a signer against — the same one the sidecar resolves
+    /// with (`sidecar.py` `KNOWN_CHAIN_IDS`, itself checked against lighter-sdk's profiles).
+    #[test]
+    fn every_known_network_has_its_own_chain_id() {
+        assert_eq!(
+            known_chain_id("https://mainnet.zklighter.elliot.ai"),
+            Some(304)
+        );
+        assert_eq!(
+            known_chain_id("https://testnet.zklighter.elliot.ai"),
+            Some(300)
+        );
+        assert_eq!(known_chain_id("https://api.rh.lighter.xyz"), Some(466_324));
+        assert_eq!(known_chain_id("https://api.rh.lighter.xyz/"), Some(466_324));
+        assert_eq!(
+            known_chain_id("https://api.rh-testnet.lighter.xyz"),
+            Some(300)
+        );
+        assert_eq!(known_chain_id("https://api.example.xyz"), None);
+    }
+
+    /// The sidecar is **told** the network and the chain it must sign for; it no longer
+    /// guesses one from its own config. Neither is a secret, so argv is the right place —
+    /// the key still never rides on it.
+    #[test]
+    fn the_sidecar_is_told_the_network_and_the_chain_it_must_sign_for() {
+        let cmd = python_sidecar_command("python3", "sidecar.py", "/keys/rh.toml", &rh());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "sidecar.py",
+                "/keys/rh.toml",
+                "--network-url",
+                "https://api.rh.lighter.xyz",
+                "--expect-chain-id",
+                "466324",
+            ]
+        );
+        // An unknown network names its URL and leaves the chain id to the sidecar's config.
+        let unknown = SignerNetwork {
+            url: "https://api.example.xyz".into(),
+            chain_id: None,
+        };
+        let cmd = python_sidecar_command("python3", "sidecar.py", "/keys/x.toml", &unknown);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "sidecar.py",
+                "/keys/x.toml",
+                "--network-url",
+                "https://api.example.xyz"
+            ]
+        );
+    }
+
+    /// The `ping` answer, as the sidecar writes it (captured from `sidecar.py`, fictional key).
+    #[test]
+    fn a_ping_answer_is_read_as_the_signers_identity() {
+        let line = r#"{"ok": true, "chain_id": 466324, "url": "https://api.rh.lighter.xyz", "account_index": 1, "api_key_slots": [2], "id": 1}"#;
+        assert_eq!(
+            parse_identity(line, 1).unwrap(),
+            identity(466_324, "https://api.rh.lighter.xyz", 1, &[2])
+        );
+    }
+
+    /// An older sidecar answers `ping` with a bare `ok`. That is not an identity, and a
+    /// signer that cannot say what it signs for must not be used.
+    #[test]
+    fn a_ping_without_an_identity_is_malformed() {
+        let line = r#"{"ok": true, "id": 1}"#;
+        assert!(matches!(
+            parse_identity(line, 1),
+            Err(SignerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_signer_on_the_expected_network_account_and_slot_is_accepted() {
+        let ok = identity(466_324, "https://api.rh.lighter.xyz", 1234, &[5, 6]);
+        assert!(verify_identity(&ok, &rh(), 1234, 5).is_ok());
+        // A trailing slash is the same network.
+        let slash = identity(466_324, "https://api.rh.lighter.xyz/", 1234, &[5]);
+        assert!(verify_identity(&slash, &rh(), 1234, 5).is_ok());
+    }
+
+    /// **The Robinhood Chain failure, refused at startup**: a signer on chain 300 (the old
+    /// inference for any non-mainnet URL) would have every transaction refused while the
+    /// private stream's auth — which carries no chain id — kept passing.
+    #[test]
+    fn a_signer_on_another_chain_is_refused() {
+        let testnet_chain = identity(300, "https://api.rh.lighter.xyz", 1234, &[5]);
+        let Err(error) = verify_identity(&testnet_chain, &rh(), 1234, 5) else {
+            panic!("chain 300 must be refused on Robinhood Chain");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("300") && message.contains("466324"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_signer_for_another_url_is_refused() {
+        let mainnet = identity(466_324, "https://mainnet.zklighter.elliot.ai", 1234, &[5]);
+        assert!(verify_identity(&mainnet, &rh(), 1234, 5).is_err());
+    }
+
+    #[test]
+    fn a_signer_for_another_account_or_without_the_slot_is_refused() {
+        let other_account = identity(466_324, "https://api.rh.lighter.xyz", 999, &[5]);
+        assert!(verify_identity(&other_account, &rh(), 1234, 5).is_err());
+        let other_slot = identity(466_324, "https://api.rh.lighter.xyz", 1234, &[6]);
+        assert!(verify_identity(&other_slot, &rh(), 1234, 5).is_err());
+    }
+
+    /// A configured URL outside the table: the chain id is the sidecar's config to state,
+    /// and url, account and slot are still checked here.
+    #[test]
+    fn an_unknown_network_still_checks_url_account_and_slot() {
+        let unknown = SignerNetwork {
+            url: "https://api.example.xyz".into(),
+            chain_id: None,
+        };
+        let ok = identity(777, "https://api.example.xyz", 1, &[4]);
+        assert!(verify_identity(&ok, &unknown, 1, 4).is_ok());
+        let wrong_url = identity(777, "https://api.other.xyz", 1, &[4]);
+        assert!(verify_identity(&wrong_url, &unknown, 1, 4).is_err());
+    }
+
     // Live round-trip against the real sidecar. Ignored by default: needs a Python venv
     // with `lighter-sdk` and the native library. Set the three env vars and run with
     // `--ignored`. Uses the FICTIONAL golden key via LIGHTER_SIGNER_TEST_CONFIG — never a
@@ -503,7 +818,11 @@ mod tests {
             std::env::var("LIGHTER_SIGNER_TEST_SCRIPT").expect("LIGHTER_SIGNER_TEST_SCRIPT");
         let config =
             std::env::var("LIGHTER_SIGNER_TEST_CONFIG").expect("LIGHTER_SIGNER_TEST_CONFIG");
-        let cmd = python_sidecar_command(&python, &script, &config);
+        let network = SignerNetwork {
+            url: "https://testnet.zklighter.elliot.ai".into(),
+            chain_id: Some(300),
+        };
+        let cmd = python_sidecar_command(&python, &script, &config, &network);
         let mut client = SignerClient::spawn(cmd).await.unwrap();
         client.ping().await.unwrap();
         let order = CreateOrder {

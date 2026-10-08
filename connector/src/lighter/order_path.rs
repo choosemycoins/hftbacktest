@@ -76,7 +76,13 @@ use crate::{
         },
         publish_error,
         rest::{self, MarketInfo, Resolution, SendOutcome},
-        signer::{CreateOrder, SignerClient, python_sidecar_command},
+        signer::{
+            CreateOrder,
+            SignerClient,
+            SignerNetwork,
+            python_sidecar_command,
+            verify_identity,
+        },
         slot::{
             AmbiguousFate,
             DeadlineAction,
@@ -283,6 +289,7 @@ impl OrderPath {
     /// impulse to re-read it, exactly as `public_stream` uses it (`AGENTS.md` §4.2).
     pub fn spawn(
         config: OrderPathConfig,
+        network: SignerNetwork,
         rest_url: String,
         public_url: String,
         symbols: SharedSymbolSet,
@@ -299,6 +306,7 @@ impl OrderPath {
 
         let slot = SlotTask {
             config: config.clone(),
+            network,
             rest_url: rest_url.clone(),
             order_manager: order_manager.clone(),
             ev_tx: ev_tx.clone(),
@@ -461,6 +469,9 @@ impl OrderPath {
 /// Owns the signer and the nonce for one slot, and serialises the venue traffic through them.
 struct SlotTask {
     config: OrderPathConfig,
+    /// What the signer must sign for; checked against the sidecar's own answer before the
+    /// slot sends anything ([`verify_identity`]).
+    network: SignerNetwork,
     rest_url: String,
     order_manager: Arc<Mutex<OrderManager>>,
     ev_tx: UnboundedSender<PublishEvent>,
@@ -483,6 +494,7 @@ impl SlotTask {
             &self.config.signer_python,
             &self.config.signer_script,
             &self.config.signer_config,
+            &self.network,
         );
         let mut signer = match SignerClient::spawn(command).await {
             Ok(signer) => signer,
@@ -501,6 +513,44 @@ impl SlotTask {
                 return;
             }
         };
+
+        // Before anything is signed: does the sidecar sign for the network, account and slot
+        // this connector serves? A sidecar that resolved another chain exits on its own (its
+        // stderr says why, and `identity` sees the pipe close); one that started on the wrong
+        // network for any other reason is refused here. Either way the slot never sends —
+        // the venue's answer to a wrong-chain signature is every transaction refused, after
+        // the nonce is spent and with a sweep reporting success.
+        match signer.identity().await.and_then(|identity| {
+            verify_identity(
+                &identity,
+                &self.network,
+                self.config.account_index,
+                self.config.api_key_index,
+            )
+            .map(|()| identity)
+        }) {
+            Ok(identity) => info!(
+                chain_id = identity.chain_id,
+                url = %identity.url,
+                account_index = identity.account_index,
+                api_key_index = self.config.api_key_index,
+                "The Lighter signer signs for the network this connector dials."
+            ),
+            Err(error) => {
+                error!(
+                    %error,
+                    "The Lighter signer does not sign for this connector's network, account \
+                     or slot; the order path is down."
+                );
+                report_error(
+                    &self.ev_tx,
+                    ErrorKind::CriticalConnectionError,
+                    &format!("signer refused: {error}"),
+                );
+                let _ = signer.shutdown().await;
+                return;
+            }
+        }
 
         let mut nonce = NonceOwner::new(self.config.api_key_index);
         self.reseed(&mut nonce).await;

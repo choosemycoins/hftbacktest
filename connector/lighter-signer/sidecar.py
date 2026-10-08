@@ -20,6 +20,19 @@ Protocol: line-delimited JSON on stdin/stdout, one response per request, in orde
   response  {"id": <int>, "ok": true,  ...}            on success
             {"id": <int>, "ok": false, "error": "..."} on a signing refusal (recoverable)
 
+``ping`` answers with what this process signs for — ``chain_id``, ``url``,
+``account_index``, ``api_key_slots`` — so the connector can refuse a signer that is
+not on the network it dials (connector/src/lighter/signer.rs, ``verify_identity``).
+
+Network. The chain id every transaction is hashed with is resolved from the network
+URL — the config's ``url``, or ``--network-url`` from the connector, which must agree
+when both are given — through ``KNOWN_CHAIN_IDS``; an unknown URL needs an explicit
+``chain_id``, a ``chain_id`` that contradicts a known URL is refused, and so is a
+mismatch with ``--expect-chain-id``. There is **no default**: the sidecar used to
+infer 300 (testnet) for any URL that was not mainnet's, which on Robinhood Chain
+(466324) signs every transaction for the wrong chain while the auth token — it
+carries no chain id — keeps the private stream looking healthy.
+
 Only signing refusals come back as ``ok:false``; the connector decides policy. A
 setup failure (missing key, unreadable library, unconfigured slot at startup) exits
 non-zero so the connector sees the pipe close and fails closed (AGENTS.md §1.1).
@@ -29,6 +42,7 @@ signature), the hash is a pure function of the tx fields incl. ExpiredAt. Expire
 set inside the native library from the clock (10-min tx lifetime) and cannot be passed
 in (§3.2); it comes back inside ``tx_info``.
 """
+import argparse
 import ctypes
 import json
 import os
@@ -48,10 +62,57 @@ def log(msg: str) -> None:
     print(f"[lighter-signer] {msg}", file=sys.stderr, flush=True)
 
 
+# ---- the network a transaction is signed for -------------------------------------------
+# REST base -> the chain id its transactions are hashed with. Mirrors lighter-sdk's
+# ``lighter.endpoint_profiles`` (test_sidecar.py checks the two agree) and
+# ``known_chain_id`` in connector/src/lighter/signer.rs.
+KNOWN_CHAIN_IDS = {
+    "https://mainnet.zklighter.elliot.ai": 304,
+    "https://testnet.zklighter.elliot.ai": 300,
+    "https://api.rh.lighter.xyz": 466324,
+    "https://api.rh-testnet.lighter.xyz": 300,
+}
+
+
+def normalize_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+def resolve_network(cfg_url, cfg_chain_id, network_url, expect_chain_id):
+    """The ``(url, chain_id)`` to sign for. Raises ``ValueError`` on anything ambiguous.
+
+    ``cfg_*`` come from the sidecar's own config, ``network_url`` and
+    ``expect_chain_id`` from the connector's command line. Fail closed: no URL at
+    all, two URLs that disagree, an unknown URL without a chain id, a chain id that
+    contradicts a known URL, or a resolved chain id other than the expected one.
+    """
+    urls = {normalize_url(u) for u in (cfg_url, network_url) if u}
+    if not urls:
+        raise ValueError("no network: set `url` in the signer config or pass --network-url "
+                         "(there is no default network)")
+    if len(urls) > 1:
+        raise ValueError(f"the signer config's url {cfg_url!r} and the connector's "
+                         f"--network-url {network_url!r} name different networks")
+    url = urls.pop()
+    known = KNOWN_CHAIN_IDS.get(url)
+    if cfg_chain_id is not None:
+        chain_id = int(cfg_chain_id)
+        if known is not None and chain_id != known:
+            raise ValueError(f"chain_id {chain_id} contradicts {url}, whose chain id is {known}")
+    elif known is not None:
+        chain_id = known
+    else:
+        raise ValueError(f"unknown network {url}: set chain_id explicitly in the signer config")
+    if expect_chain_id is not None and chain_id != int(expect_chain_id):
+        raise ValueError(f"this signer would sign for chain {chain_id} on {url}, but the "
+                         f"connector expects chain {int(expect_chain_id)}")
+    return url, chain_id
+
+
 # ---- flat-TOML config reader (py3.10 has no tomllib; lighter-sdk pulls no toml lib) --
 def read_config(path: str) -> dict:
-    """Read the flat testnet/mainnet config. Keys: url?, chain_id?, account_index,
-    api_key_index, private_key. A [[key]] table list is also accepted for several
+    """Read the flat signer config. Keys: url?, chain_id?, account_index,
+    api_key_index, private_key (url/chain_id are resolved by resolve_network). A [[key]] table list is also accepted for several
     api-key slots (§3.3: parallelism is more slots, not a nonce window).
     """
     cfg: dict = {"keys": {}}  # api_key_index -> private_key
@@ -96,13 +157,10 @@ def read_config(path: str) -> dict:
 
 
 class Signer:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, url: str, chain_id: int):
+        """``url``/``chain_id`` come from :func:`resolve_network` — never a default."""
         self.signer = sc.get_signer()  # loads the platform-appropriate native library
         self.account_index = int(cfg["account_index"])
-        url = cfg.get("url", "https://testnet.zklighter.elliot.ai")
-        chain_id = cfg.get("chain_id")
-        if chain_id is None:
-            chain_id = 304 if "mainnet.zklighter" in url else 300
         self.chain_id = int(chain_id)
         self.url = url
         self.slots = set()
@@ -167,7 +225,9 @@ class Signer:
     def handle(self, req: dict) -> dict:
         op = req.get("op")
         if op == "ping":
-            return {"ok": True}
+            # What this process signs for — the connector checks it (verify_identity).
+            return {"ok": True, "chain_id": self.chain_id, "url": self.url,
+                    "account_index": self.account_index, "api_key_slots": sorted(self.slots)}
         fn = {
             "create_order": self.create_order,
             "cancel_order": self.cancel_order,
@@ -179,10 +239,24 @@ class Signer:
         return fn(req)
 
 
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="sidecar.py", description="Lighter signer sidecar (line-delimited JSON on stdio).")
+    parser.add_argument("config", nargs="?", default=os.environ.get("LIGHTER_SIGNER_CONFIG"),
+                        help="the signer's own key config (or LIGHTER_SIGNER_CONFIG)")
+    parser.add_argument("--network-url", default=None,
+                        help="the REST base the connector dials; must agree with the config's url")
+    parser.add_argument("--expect-chain-id", type=int, default=None,
+                        help="refuse to start unless the resolved chain id is this one")
+    return parser.parse_args(argv)
+
+
 def main() -> int:
-    path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LIGHTER_SIGNER_CONFIG")
+    args = parse_args(sys.argv[1:])
+    path = args.config
     if not path:
-        log("usage: sidecar.py <config.toml>  (or set LIGHTER_SIGNER_CONFIG)")
+        log("usage: sidecar.py <config.toml> [--network-url URL] [--expect-chain-id N]  "
+            "(or set LIGHTER_SIGNER_CONFIG)")
         return 2
     try:
         cfg = read_config(path)
@@ -190,7 +264,13 @@ def main() -> int:
         log(f"fatal: cannot read config: {e}")
         return 2
     try:
-        signer = Signer(cfg)
+        url, chain_id = resolve_network(cfg.get("url"), cfg.get("chain_id"),
+                                        args.network_url, args.expect_chain_id)
+    except ValueError as e:  # the wrong chain signs nothing the venue will take
+        log(f"fatal: network: {e}")
+        return 3
+    try:
+        signer = Signer(cfg, url, chain_id)
     except Exception as e:  # noqa: BLE001 — a slot that cannot sign must not start
         log(f"fatal: signer init: {e}")
         return 3

@@ -6,7 +6,8 @@
 # Never point a testnet key at mainnet (chain_id 304).
 
 url = "https://testnet.zklighter.elliot.ai"
-chain_id = 300           # optional; inferred from url when omitted (300 testnet / 304 mainnet)
+chain_id = 300           # optional for a known url (300 testnet / 304 mainnet / 466324 Robinhood Chain);
+                         # required for any other url; must match the url and the connector, or the sidecar refuses
 account_index = 516      # this account's index on the venue
 
 # One api-key slot. Parallelism is MORE slots, not a nonce window (§3.3, §4.12):

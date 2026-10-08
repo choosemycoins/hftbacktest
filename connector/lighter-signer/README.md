@@ -56,7 +56,7 @@ Request: `{"id": <int>, "op": <op>, "api_key_index": <int>, "nonce": <int>, ...}
 | `cancel_order` | `market_index, order_index` | `tx_type=15, tx_info, tx_hash` |
 | `cancel_all` | `time_in_force` (0 IMMEDIATE→`time_ms` must be 0; 1 SCHEDULED; 2 ABORT), `time_ms`, `market_index` (255 = all) | `tx_type=16, tx_info, tx_hash` |
 | `auth_token` | `deadline` (absolute unix **seconds**; server ceiling 8 h → refresh before expiry, §3.4) | `auth` |
-| `ping` | — | — |
+| `ping` | — | `chain_id, url, account_index, api_key_slots` — what this process signs for; the connector refuses a sidecar that does not match its own network, account and slot (`signer.rs::verify_identity`) |
 
 Response: `{"id": <int>, "ok": true, ...}` or `{"id": <int>, "ok": false, "error": "..."}`.
 
@@ -84,12 +84,35 @@ Sidecar (its venv must have `lighter-sdk` importable; `LIGHTER_SDK_PATH` can poi
 non‑default install for tests):
 
 ```
-python sidecar.py <config.toml>          # or set LIGHTER_SIGNER_CONFIG
+python sidecar.py <config.toml> --network-url <REST base> [--expect-chain-id <N>]
 ```
 
-Config format: [`signer.example.toml`](signer.example.toml). The connector spawns it
-via `connector::lighter::signer::python_sidecar_command(python, script, config)` and
-talks through `SignerClient`.
+Config format: [`signer.example.toml`](signer.example.toml) (testnet/mainnet) and
+[`signer.rh.example.toml`](signer.rh.example.toml) (Robinhood Chain). The connector
+spawns it via `connector::lighter::signer::python_sidecar_command(python, script,
+config, network)` — which passes `--network-url` and, when it knows the chain,
+`--expect-chain-id` — and talks through `SignerClient`.
+
+## Network and chain id — there is no default
+
+The chain id enters the hash every signature is over, and nothing else: the auth
+token carries none. A signer on the wrong chain therefore passes the private stream's
+auth and has **every** transaction refused, `CancelAllOrders` included, while the
+connector looks healthy. The sidecar used to infer the chain id from its URL as
+`304 if "mainnet.zklighter" in url else 300` and defaulted the URL to testnet — on
+Robinhood Chain (466324) that is exactly this failure. Now:
+
+| | |
+|---|---|
+| URL | the config's `url`, or the connector's `--network-url`; both given ⇒ they must agree; neither ⇒ refuse |
+| chain id | the config's `chain_id`, else `KNOWN_CHAIN_IDS[url]` (mainnet 304, testnet 300, Robinhood Chain 466324, RH testnet 300 — checked against lighter-sdk's `endpoint_profiles`); an unknown URL without `chain_id` ⇒ refuse; a `chain_id` contradicting a known URL ⇒ refuse |
+| connector | `--expect-chain-id` (always 466324 for `lighter-rh`) must equal the resolved one, else refuse; and the connector checks the `ping` answer again before its first send |
+
+A refusal is a non-zero exit with one `fatal: network: …` line on stderr (never the
+key). Tests: `<venv>/bin/python -m unittest test_sidecar` — offline, fictional key;
+it includes an end-to-end check that a Robinhood Chain sidecar's tx hash equals the Go
+reference's hash **for 466324** and differs from 300 and 304 (needs Go; the reference
+is `pin/`, whose `serve` mode takes an optional chain per line).
 
 ## Golden‑vector test — `python golden_vector_test.py`
 

@@ -1,0 +1,23 @@
+# Lighter signer sidecar config for Robinhood Chain (`lighter-rh`) — the file the sidecar
+# opens ITSELF to read its key. The key never rides on the command line and never enters
+# the connector process (design note docs/design-lighter-connector.md §3.2).
+#
+# Keep the real file mode 0600, outside any repository, e.g.
+#   ~/.config/hftbacktest-connector/lighter-rh-signer.toml
+#
+# The key is for THIS instance only: generated fresh and registered on Robinhood Chain
+# (myhft: docs/lighter-rh-OPERATOR.md, scripts/lighter_rh_apikey.py). Never reuse a
+# Lighter mainnet/testnet key, or any other venue's key, here.
+
+# Optional: the connector passes --network-url itself. If present it must name the same
+# network, or the sidecar refuses to start.
+url = "https://api.rh.lighter.xyz"
+# Optional: resolved from the url (Robinhood Chain = 466324). If present it must be 466324,
+# and the `lighter-rh` connector refuses any other value before its first send.
+chain_id = 466324
+# YOUR account index on Robinhood Chain — not the mainnet one (the instances are separate).
+account_index = 0
+
+# One api-key slot: >= 4 (0-3 and 157 are reserved for the venue's own front-ends).
+api_key_index = 4
+private_key = "0x<80-hex-chars-written-by-the-key-script>"   # NEVER commit a real key

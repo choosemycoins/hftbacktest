@@ -52,6 +52,7 @@ use crate::{
     lighter::{
         order_path::{OrderPath, OrderPathConfig},
         public_stream::PublicStream,
+        signer::SignerNetwork,
     },
 };
 
@@ -238,6 +239,22 @@ impl Instance {
             Self::RobinhoodChain => "lighter-rh",
         }
     }
+
+    /// The network the order path's signer must sign for (§3.2). `lighter-rh` is Robinhood
+    /// Chain whatever it is handed; `lighter` signs for its configured REST base and names
+    /// the chain when the table knows it ([`signer::known_chain_id`]).
+    pub fn signer_network(self, rest_url: &str) -> SignerNetwork {
+        match self {
+            Self::RobinhoodChain => SignerNetwork {
+                url: RH_REST_URL.to_string(),
+                chain_id: Some(RH_CHAIN_ID),
+            },
+            Self::Configured => SignerNetwork {
+                url: rest_url.to_string(),
+                chain_id: signer::known_chain_id(rest_url),
+            },
+        }
+    }
 }
 
 /// Reads a connector config for `instance`.
@@ -414,8 +431,16 @@ impl Connector for Lighter {
                 account_index = config.account_index,
                 "Arming the Lighter order path."
             );
+            let network = self.instance.signer_network(&self.config.rest_url);
+            info!(
+                url = %network.url,
+                chain_id = ?network.chain_id,
+                "The Lighter signer must sign for this network; a sidecar that does not is \
+                 refused before the first send."
+            );
             self.order_path = Some(OrderPath::spawn(
                 config,
+                network,
                 self.config.rest_url.clone(),
                 self.config.public_url.clone(),
                 self.symbols.clone(),
@@ -626,6 +651,7 @@ mod tests {
             fixtures::RH_ORDER_BOOKS,
             reject_order,
             rest::{MarketInfo, match_catalog},
+            signer::SignerNetwork,
         },
     };
 
@@ -1113,6 +1139,36 @@ mod tests {
                 "{symbol} tick"
             );
             assert!((info.lot_size() - lot).abs() < lot * 1e-9, "{symbol} lot");
+        }
+    }
+
+    /// `lighter-rh` signs for Robinhood Chain's URL and chain id, whatever URL it is handed
+    /// (none can be configured): a key provisioned for another chain is then refused at the
+    /// slot's startup instead of having every transaction refused by the venue.
+    #[test]
+    fn lighter_rh_signs_for_chain_466324() {
+        let rh = SignerNetwork {
+            url: RH_REST_URL.to_string(),
+            chain_id: Some(466_324),
+        };
+        assert_eq!(Instance::RobinhoodChain.signer_network(RH_REST_URL), rh);
+        assert_eq!(
+            Instance::RobinhoodChain.signer_network("https://mainnet.zklighter.elliot.ai"),
+            rh
+        );
+        // `lighter` signs for the URL it is configured with, and names the chain when known.
+        for (url, chain_id) in [
+            ("https://mainnet.zklighter.elliot.ai", Some(304)),
+            ("https://testnet.zklighter.elliot.ai", Some(300)),
+            ("https://api.example.xyz", None),
+        ] {
+            assert_eq!(
+                Instance::Configured.signer_network(url),
+                SignerNetwork {
+                    url: url.to_string(),
+                    chain_id
+                }
+            );
         }
     }
 }

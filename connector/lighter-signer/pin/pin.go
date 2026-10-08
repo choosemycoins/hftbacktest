@@ -35,6 +35,13 @@ func mustClient() *client.TxClient {
 }
 
 func createOrderHash(c *client.TxClient, expiredAt, nonce int64) string {
+	return createOrderHashOn(c, expiredAt, nonce, CHAIN)
+}
+
+// createOrderHashOn hashes the golden CreateOrder for an explicit chain id: the hash a
+// signer on that chain signs over (test_sidecar.py: a Robinhood Chain sidecar must
+// match 466324 and differ from 300/304).
+func createOrderHashOn(c *client.TxClient, expiredAt, nonce int64, chain uint32) string {
 	tx := &types.CreateOrderTxReq{
 		MarketIndex: 1, ClientOrderIndex: 123456789, BaseAmount: 1000, Price: 6500000,
 		IsAsk: 0, Type: 0, TimeInForce: 2, ReduceOnly: 0, TriggerPrice: 0,
@@ -45,7 +52,7 @@ func createOrderHash(c *client.TxClient, expiredAt, nonce int64) string {
 	if err != nil {
 		panic(err)
 	}
-	h, err := txInfo.Hash(CHAIN)
+	h, err := txInfo.Hash(chain)
 	if err != nil {
 		panic(err)
 	}
@@ -71,8 +78,10 @@ func check(label, got, want string) {
 	fmt.Printf("%-28s got=%s\n%-28s want=%s  MATCH=%v\n", label, got, "", want, ok)
 }
 
-// serve reads "create|cancel <expiredAt> <nonce>" lines and prints the hash per line.
-// Used by the .so-vs-reference differential test.
+// serve reads "create|cancel <expiredAt> <nonce> [chain]" lines and prints the hash per
+// line (chain defaults to CHAIN; it is honoured for create). Every line gets exactly one
+// answer — "ERR" for one it cannot read — so a caller reading a line per request never
+// blocks. Used by the .so-vs-reference differential test and test_sidecar.py.
 func serve() {
 	c := mustClient()
 	sc := bufio.NewScanner(os.Stdin)
@@ -80,16 +89,28 @@ func serve() {
 	defer w.Flush()
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
-		if len(f) != 3 {
+		if len(f) != 3 && len(f) != 4 {
+			fmt.Fprintln(w, "ERR")
+			w.Flush()
 			continue
 		}
 		ea, _ := strconv.ParseInt(f[1], 10, 64)
 		n, _ := strconv.ParseInt(f[2], 10, 64)
+		chain := CHAIN
+		if len(f) == 4 {
+			parsed, err := strconv.ParseUint(f[3], 10, 32)
+			if err != nil {
+				fmt.Fprintln(w, "ERR")
+				w.Flush()
+				continue
+			}
+			chain = uint32(parsed)
+		}
 		var h string
 		if f[0] == "cancel" {
 			h = cancelOrderHash(c, ea, n)
 		} else {
-			h = createOrderHash(c, ea, n)
+			h = createOrderHashOn(c, ea, n, chain)
 		}
 		fmt.Fprintln(w, h)
 		w.Flush()
