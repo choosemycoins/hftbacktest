@@ -3771,7 +3771,7 @@ mod tests {
     #[tokio::test]
     async fn a_429_holds_every_send_for_the_cooldown_and_reads_nothing_meanwhile() {
         let mut slot = slot_on_scripted_venue(|config| {
-            config.rate_limit_cooldown_ms = Some(600);
+            config.rate_limit_cooldown_ms = Some(1_500);
             config.confirm_deadline_ms = 100;
         })
         .await;
@@ -3818,7 +3818,7 @@ mod tests {
         };
         assert_eq!((order.order_id, order.status), (1, Status::Expired));
         assert!(
-            started.elapsed() >= Duration::from_millis(600),
+            started.elapsed() >= Duration::from_millis(1_500),
             "not before the cooldown ended"
         );
         assert_eq!(slot.venue.count("/api/v1/accountActiveOrders"), 1);
@@ -3842,7 +3842,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_inside_the_cooldown_is_held_and_goes_out_after_it() {
         let mut slot = slot_on_scripted_venue(|config| {
-            config.rate_limit_cooldown_ms = Some(500);
+            config.rate_limit_cooldown_ms = Some(1_500);
         })
         .await;
         let resting = eth_order(1, Side::Buy);
@@ -3867,7 +3867,7 @@ mod tests {
         slot.venue_until(|venue| venue.sent().len() == 3).await;
         assert_eq!(slot.venue.sent()[2].0, "cancel_order");
         assert!(
-            told_at.elapsed() >= Duration::from_millis(400),
+            told_at.elapsed() >= Duration::from_millis(1_000),
             "it went out when the cooldown was over, not before"
         );
     }
@@ -3913,7 +3913,7 @@ mod tests {
     #[tokio::test]
     async fn a_held_cancel_for_an_order_that_went_meanwhile_is_dropped() {
         let mut slot = slot_on_scripted_venue(|config| {
-            config.rate_limit_cooldown_ms = Some(400);
+            config.rate_limit_cooldown_ms = Some(1_500);
         })
         .await;
         let resting = eth_order(1, Side::Buy);
@@ -3943,7 +3943,7 @@ mod tests {
             });
             assert!(filled.published().is_some());
         }
-        time::sleep(Duration::from_millis(800)).await;
+        time::sleep(Duration::from_millis(2_000)).await;
         assert_eq!(
             slot.venue.sent().len(),
             2,
@@ -3957,7 +3957,7 @@ mod tests {
     #[tokio::test]
     async fn a_sweep_waits_out_a_cooldown_that_ends_before_its_deadline() {
         let mut slot = slot_on_scripted_venue(|config| {
-            config.rate_limit_cooldown_ms = Some(500);
+            config.rate_limit_cooldown_ms = Some(1_500);
         })
         .await;
         slot.venue.answer_send_tx_with([too_many_requests()]);
@@ -3967,7 +3967,7 @@ mod tests {
 
         let outcome = slot.order_path.sweep(vec![42]).await.unwrap();
         assert_eq!(outcome, SweepOutcome::Cancelled);
-        assert!(told_at.elapsed() >= Duration::from_millis(400));
+        assert!(told_at.elapsed() >= Duration::from_millis(1_000));
         assert_eq!(
             slot.venue.sent().last().map(|(op, _)| op.as_str()),
             Some("cancel_all")
