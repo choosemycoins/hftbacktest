@@ -334,6 +334,8 @@ _TOPOLOGY = {
     "bybit": Topology("bybit", SINGLE_READER),
     "hyperliquid": Topology("hyperliquid", SINGLE_READER),
     "lighter": Topology("lighter", SINGLE_READER),
+    # The same backend dialling the Robinhood Chain instance (`lighter::Endpoints`).
+    "lighter-rh": Topology("lighter", SINGLE_READER),
     "paradex": Topology("paradex", SINGLE_READER),
     # The Binance base: one multiplexed socket, plus the named producers beside
     # it. Which of the two a backend runs is not uniform — COIN-M and spot have
@@ -914,6 +916,7 @@ PARADEX = "paradex"
 #: does NOT share is its expectations: see `expected_streams`.
 _FAMILY = {
     "lighter": LIGHTER,
+    "lighter-rh": LIGHTER,
     "hyperliquid": HYPERLIQUID,
     "binancefutures": BINANCE,
     "binancefuturesum": BINANCE,
@@ -931,8 +934,14 @@ _FAMILY = {
 #: verbatim. Canonicalised here, in one place, so the same recorded bytes are
 #: not buildable or unbuildable depending on which word was typed on the command
 #: line. The word as recorded stays in the report as `exchange_as_recorded`.
+#:
+#: `lighter-rh` is the same pattern one level up: one backend, two instances
+#: of the venue (mainnet and Lighter on Robinhood Chain), chosen by name in
+#: `lighter::Endpoints`. Same frames, same checks; the instance survives as
+#: `exchange_as_recorded` and as `lighter_endpoints` in `session_start`.
 _EXCHANGE_ALIAS = {
     "binancefutures": "binancefuturesum",
+    "lighter-rh": "lighter",
 }
 
 

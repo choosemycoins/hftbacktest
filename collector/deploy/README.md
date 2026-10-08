@@ -66,7 +66,7 @@ journalctl -u 'hft-collector@*' -f
 
 | Переменная | Обязательна | Значение |
 |---|---|---|
-| `COLLECTOR_EXCHANGE` | да | `hyperliquid` \| `binancefutures`/`binancefuturesum` \| `binancefuturescm` \| `binance`/`binancespot` \| `bybit` \| `lighter` |
+| `COLLECTOR_EXCHANGE` | да | `hyperliquid` \| `binancefutures`/`binancefuturesum` \| `binancefuturescm` \| `binance`/`binancespot` \| `bybit` \| `lighter` \| `lighter-rh` (Lighter на Robinhood Chain, см. `lighter-rh.env.example`) |
 | `COLLECTOR_SYMBOLS` | да | символы через пробел, В НОТАЦИИ БИРЖИ: HL — `BTC`, `xyz:GOLD` (dex-префикс — часть имени); Binance/Bybit — `BTCUSDT`. Каждый символ проверяется на бирже при старте, неизвестный = отказ запуска |
 | `RUST_LOG` | нет (`info`) | verbosity; `debug` очень шумный на тиках |
 | `COLLECTOR_DATA_DIR` | нет | дефолт `/opt/hft-collector/data/<instance>` — правильный: две записи в одну директорию запрещены и пресекаются замком. Если выносите за `/opt/hft-collector/data` — расширьте `ReadWritePaths` юнита drop-in'ом |

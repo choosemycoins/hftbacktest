@@ -18,13 +18,7 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
-use super::{
-    CLIENT_MSG_BUDGET_PER_MIN,
-    MarketInfo,
-    SUBSCRIBE_BUDGET_PER_MIN,
-    SubscriptionSpec,
-    WS_URL,
-};
+use super::{CLIENT_MSG_BUDGET_PER_MIN, MarketInfo, SUBSCRIBE_BUDGET_PER_MIN, SubscriptionSpec};
 use crate::{
     backoff::reconnect_delay,
     meta::{self, StreamEnd},
@@ -359,6 +353,7 @@ async fn connect(
 }
 
 pub async fn keep_connection(
+    ws_url: String,
     subscriptions: Vec<SubscriptionSpec>,
     markets: Vec<MarketInfo>,
     mut resub_rx: UnboundedReceiver<i64>,
@@ -383,7 +378,7 @@ pub async fn keep_connection(
         // what was going to be asked for.
         meta::emit(
             &ws_tx,
-            meta::subscribe(WS_URL.as_str(), attempt, serde_json::json!(&frames)),
+            meta::subscribe(&ws_url, attempt, serde_json::json!(&frames)),
         );
         attempt += 1;
 
@@ -395,15 +390,7 @@ pub async fn keep_connection(
         let dial_time = Instant::now();
         let mut connected_at = None;
 
-        match connect(
-            WS_URL.as_str(),
-            frames,
-            &ws_tx,
-            &mut resub_rx,
-            &mut connected_at,
-        )
-        .await
-        {
+        match connect(&ws_url, frames, &ws_tx, &mut resub_rx, &mut connected_at).await {
             Err(error) => {
                 error!(?error, "websocket error");
                 // A disconnect is otherwise indistinguishable from a quiet
