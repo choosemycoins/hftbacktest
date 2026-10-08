@@ -1069,7 +1069,16 @@ rate-limits RH (2026-09-30) говорит только «You will receive HTTP 
   - `CancelAllOrders` ждёт конца кулдауна (или следующей пробы, ниже), если тот наступает до
     дедлайна свипа (15 с от запроса), иначе свип провален сразу и неотправленным (`error!`,
     `CriticalConnectionError`, `SweepOutcome::Failed` → ненулевой выход на остановке). При 60 с
-    кулдауне без проб это почти всегда второе;
+    кулдауне без проб это почти всегда второе. **429 на сам `CancelAllOrders`** — то же событие,
+    что на любую отправку: кулдаун запущен, ботам одна `OrderError`; без проб второй попытки до
+    конца кулдауна нет — повтор упирается в закрытый гейт за дедлайном 15 с, и свип провален
+    неотправленным (`Critical`, `Failed`); с пробами вторая попытка — первая проба
+    (пины `a_429_on_the_sweep_itself_starts_the_cooldown_and_gets_no_second_attempt_inside_it`,
+    `with_probes_a_sweep_answered_429_tries_again_on_the_first_probe`). Класс свипа —
+    `RiskReducing`: резерв, оставленный котировками, он берёт сразу
+    (`a_sweep_takes_the_reserve_the_quotes_left`). Свип у подключения (`connect_policy =
+    "cancel_all"`) держится того же дедлайна 15 с
+    (`the_connect_sweep_waits_for_the_gate_no_longer_than_any_sweep`);
 - **пробы `[order_path] rate_limit_cancel_probe_ms` [2026-10-09]** (RH-пример: 5000, **не
   измерено**; поля нет — прежнее поведение, отмены ждут весь кулдаун). Сокращающие риск отправки —
   отмена (в том числе удержанная), `CancelAllOrders`, сокращающий IOC по §4.15 — пробуют раньше:

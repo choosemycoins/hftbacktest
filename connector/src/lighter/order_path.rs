@@ -2362,6 +2362,8 @@ mod tests {
         OrderPath,
         OrderPathConfig,
         PrivateStreamTask,
+        SWEEP_GATE_DEADLINE,
+        SWEEP_REPLY_WAIT,
         SlotTask,
         auth_refresh_after,
         clamp_auth_lifetime,
@@ -3593,6 +3595,60 @@ mod tests {
         assert_eq!(code, 0, "witness: a sweep the venue took is a clean stop");
     }
 
+    /// **A sweep the slot cannot even be asked for is a failed sweep** — the slot task is gone
+    /// (its command channel closed), so nothing will cancel that market's orders; a stop that
+    /// read it as done would exit 0 over a resting grid. Nothing to sweep is done, though.
+    #[tokio::test]
+    async fn a_sweep_the_slot_cannot_be_asked_for_is_failed() {
+        let (order_path, command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
+        drop(command_rx);
+        assert_eq!(
+            order_path.sweep(vec![42]).await.unwrap(),
+            SweepOutcome::Failed
+        );
+        assert_eq!(
+            order_path.sweep(Vec::new()).await.unwrap(),
+            SweepOutcome::Cancelled,
+            "no market to sweep is nothing left resting"
+        );
+    }
+
+    /// **A sweep the slot never answers is failed once its wait is up — and not before.** A
+    /// wedged slot must not hang the stop, and a verdict that never came is not a cancel.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_the_slot_never_answers_is_failed_after_its_wait() {
+        let (order_path, mut command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
+        let started = time::Instant::now();
+        let sweep = order_path.sweep(vec![42]);
+        let Some(Command::CancelAll { reply, .. }) = command_rx.recv().await else {
+            panic!("the sweep asks the slot");
+        };
+        // Held, never answered: the slot is alive and silent.
+        let _unanswered = reply;
+        assert_eq!(sweep.await.unwrap(), SweepOutcome::Failed);
+        assert_eq!(
+            started.elapsed(),
+            SWEEP_REPLY_WAIT,
+            "it waited exactly its wait"
+        );
+    }
+
+    /// **The connect-time sweep is held to the sweep's own deadline.** Under `cancel_all` a
+    /// (re)connect's `CancelAllOrders` waits for a shut send gate no longer than any sweep —
+    /// 15 s from when it was asked for — so a cooldown it cannot outwait fails it loudly rather
+    /// than parking the slot's queue behind it.
+    #[tokio::test(start_paused = true)]
+    async fn the_connect_sweep_waits_for_the_gate_no_longer_than_any_sweep() {
+        assert_eq!(SWEEP_GATE_DEADLINE, Duration::from_secs(15));
+        let (mut task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let asked = time::Instant::now();
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
+        let Ok(Command::CancelAll { deadline, .. }) = command_rx.try_recv() else {
+            panic!("cancel_all sweeps the market the snapshot lists");
+        };
+        assert_eq!(deadline, asked + SWEEP_GATE_DEADLINE);
+    }
+
     // ---- the slot, end to end against a scripted venue ---------------------------------
     //
     // The slot task, with its signer replaced by an in-process stand-in that signs nothing
@@ -3950,6 +4006,31 @@ mod tests {
         assert_eq!(slot.venue.sent().len(), 3, "the fourth send was refused");
     }
 
+    /// **A sweep is risk-reducing: it takes the reserve the quotes left.** With 3 a minute and
+    /// 1 held back, two quotes spend everything a quote may take; the sweep still goes, on the
+    /// reserve, at once — it answers for orders nobody is managing any more.
+    #[tokio::test]
+    async fn a_sweep_takes_the_reserve_the_quotes_left() {
+        let slot = slot_on_scripted_venue(|config| {
+            config.tx_budget_per_minute = Some(3);
+            config.tx_reserve = Some(1);
+        })
+        .await;
+        slot.submit(&eth_order(1, Side::Buy));
+        slot.submit(&eth_order(2, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        let started = time::Instant::now();
+        assert_eq!(
+            slot.order_path.sweep(vec![42]).await.unwrap(),
+            SweepOutcome::Cancelled
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "on the reserve, not after a token came back"
+        );
+        assert_eq!(slot.venue.sent()[2].0, "cancel_all");
+    }
+
     /// Without `tx_budget_per_minute` nothing is refused — the behaviour before the budget.
     #[tokio::test]
     async fn without_a_send_budget_nothing_is_refused() {
@@ -4113,6 +4194,65 @@ mod tests {
             slot.events.try_recv().is_err(),
             "no hand-back: the cancel stayed pending throughout"
         );
+    }
+
+    /// **Held cancels go out before anything newer.** Once the cooldown is over, the first
+    /// command the slot is woken for — here a new quote — finds the held cancel sent ahead of
+    /// it, so a requote can never overtake the cancel of the quote it replaces. The quote is
+    /// asked for 2 ms after the cooldown; the slot's own 250 ms tick, which would release the
+    /// cancel by itself, almost never comes in between.
+    #[tokio::test]
+    async fn held_cancels_go_out_before_anything_newer() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(1_500);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let _ = as_error(slot.next_event().await);
+        let told_at = time::Instant::now();
+        slot.cancel(&resting);
+
+        time::sleep_until(told_at + Duration::from_millis(1_502)).await;
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 4).await;
+        let ops: Vec<String> = slot.venue.sent().into_iter().map(|(op, _)| op).collect();
+        assert_eq!(ops[2..], ["cancel_order", "create_order"]);
+    }
+
+    /// **A cancel asked for twice in a cooldown goes out once.** After a partial fill the bot
+    /// sees no cancel pending and may ask again; holding it twice would spend two `sendTx` on
+    /// one order, the second into a refusal.
+    #[tokio::test]
+    async fn a_cancel_asked_for_twice_in_a_cooldown_goes_out_once() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(1_000);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let _ = as_error(slot.next_event().await);
+
+        slot.cancel(&resting);
+        slot.cancel(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        // A few more ticks for a second one to show up, if it were coming.
+        time::sleep(Duration::from_millis(800)).await;
+        let cancels = slot
+            .venue
+            .sent()
+            .iter()
+            .filter(|(op, _)| op == "cancel_order")
+            .count();
+        assert_eq!(cancels, 1);
     }
 
     /// A held cancel whose order has gone meanwhile — filled, or canceled by the venue — is
@@ -4407,6 +4547,73 @@ mod tests {
             slot.events.try_recv().is_err(),
             "no hand-back and no error for a probe that could not be signed"
         );
+    }
+
+    /// **A 429 on the sweep itself starts the cooldown, tells the bots once, and — without
+    /// probes — gets no second attempt before the cooldown is over.** The retry finds the gate
+    /// shut past the sweep's 15 s and the sweep fails there, unsent, loudly (a
+    /// `CriticalConnectionError`; a stop exits non-zero on it). The cooldown it started holds
+    /// the next quote.
+    #[tokio::test]
+    async fn a_429_on_the_sweep_itself_starts_the_cooldown_and_gets_no_second_attempt_inside_it() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(60_000);
+        })
+        .await;
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        let started = time::Instant::now();
+        assert_eq!(
+            slot.order_path.sweep(vec![42]).await.unwrap(),
+            SweepOutcome::Failed
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "failed at once");
+        assert_eq!(slot.venue.sent(), [("cancel_all".to_string(), 7)]);
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(
+            kind,
+            ErrorKind::OrderError,
+            "the cooldown's one rate-limit error"
+        );
+        assert!(message.contains("rate-limited"), "{message}");
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::CriticalConnectionError, "the failed sweep");
+        assert!(message.contains("cooldown"), "{message}");
+
+        slot.submit(&eth_order(1, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the cooldown the sweep started holds the next quote");
+        };
+        assert_eq!(order.status, Status::Expired);
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("until its cooldown is over"), "{message}");
+    }
+
+    /// **With probes, the sweep answered 429 tries again on the first probe** — still one
+    /// error to the bots, and the sweep takes well inside the cooldown.
+    #[tokio::test]
+    async fn with_probes_a_sweep_answered_429_tries_again_on_the_first_probe() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(60_000);
+            config.rate_limit_cancel_probe_ms = Some(300);
+        })
+        .await;
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        let started = time::Instant::now();
+        assert_eq!(
+            slot.order_path.sweep(vec![42]).await.unwrap(),
+            SweepOutcome::Cancelled
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(5),
+            "on the first probe: {elapsed:?}"
+        );
+        let ops: Vec<String> = slot.venue.sent().into_iter().map(|(op, _)| op).collect();
+        assert_eq!(ops, ["cancel_all", "cancel_all"]);
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(slot.events.try_recv().is_err(), "one error, nothing more");
     }
 
     /// **Without `rate_limit_cooldown_ms` a 429 is handled exactly as before**: as an
