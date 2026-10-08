@@ -85,10 +85,12 @@ use crate::{
         },
         slot::{
             AmbiguousFate,
+            CancelFollowUp,
             DeadlineAction,
             NonceAction,
             Outbound,
             Placement,
+            cancel_after_send,
             deadline_action,
             fate_of_ambiguous,
             nonce_action,
@@ -855,7 +857,14 @@ impl SlotTask {
             }
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
-            Ok(outcome) => self.apply_nonce(nonce, &outcome).await,
+            Ok(outcome) => {
+                self.apply_nonce(nonce, &outcome).await;
+                // A `21104` or an ambiguous answer (a 429 among them) must not leave the order
+                // looking cancel-pending to the bot while it stands on the venue (§3.3).
+                if let CancelFollowUp::HandBack(reason) = cancel_after_send(&outcome) {
+                    self.clear_cancel_request(coi, &reason);
+                }
+            }
             Err(error) => {
                 nonce.invalidated();
                 self.reseed(nonce).await;

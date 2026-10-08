@@ -44,6 +44,39 @@ pub fn nonce_action(outcome: &SendOutcome) -> NonceAction {
     }
 }
 
+/// What a cancel's `sendTx` outcome leaves for the bot (§3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelFollowUp {
+    /// HTTP 200: the venue took the transaction; the channel's `canceled` (or a fill) closes
+    /// the order. Nothing to tell the bot yet.
+    AwaitChannel,
+    /// The cancel did not take, or may not have: clear the order's `req = Canceled` and
+    /// report why, so the bot can cancel again instead of waiting for an answer that will
+    /// never come.
+    HandBack(String),
+}
+
+/// The follow-up a cancel's `sendTx` outcome calls for.
+///
+/// A `21104` means the cancel was rejected on nonce grounds — it did not take. An ambiguous
+/// outcome (a 429/405 throttle, a 5xx, a 200 without a hash) may or may not have taken; the
+/// order stays tracked either way, so handing the cancel back is safe in both cases: if it
+/// took, the channel's `canceled` removes the order; if not, the bot's next cancel is the
+/// retry. Leaving `req = Canceled` set — what the slot did before — left the quote standing on
+/// the venue with the bot believing a cancel was in flight.
+pub fn cancel_after_send(outcome: &SendOutcome) -> CancelFollowUp {
+    match outcome {
+        SendOutcome::Accepted(_) => CancelFollowUp::AwaitChannel,
+        SendOutcome::InvalidNonce { .. } => CancelFollowUp::HandBack(
+            "the venue rejected the cancel's nonce (21104); the cancel did not take".to_string(),
+        ),
+        SendOutcome::Ambiguous { status, detail } => CancelFollowUp::HandBack(format!(
+            "the cancel's sendTx was ambiguous (HTTP {status}: {detail}); it may not have \
+             taken — cancel again"
+        )),
+    }
+}
+
 /// What became of an order whose confirmation deadline has now been examined (§4.11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
@@ -222,11 +255,13 @@ mod tests {
 
     use super::{
         AmbiguousFate,
+        CancelFollowUp,
         DeadlineAction,
         NonceAction,
         Outbound,
         OutboundSpans,
         Placement,
+        cancel_after_send,
         deadline_action,
         fate_of_ambiguous,
         nonce_action,
@@ -242,6 +277,40 @@ mod tests {
             tx_hash: "ab".to_string(),
             ratelimit: Some("Ratelimit is off".to_string()),
             predicted_execution_time_ms: None,
+        }
+    }
+
+    /// **A cancel the venue did not take is handed back to the bot.** Before, a cancel that got
+    /// a `21104` or an ambiguous answer (a 429 among them) only resynced the nonce: the order
+    /// kept `req = Canceled`, the bot believed a cancel was in flight and never sent another,
+    /// and the quote stood on the venue. A clean 200 waits for the channel's `canceled`; the
+    /// other two clear the request, so the bot can cancel again — which is safe even when an
+    /// ambiguous cancel did take (the channel's `canceled` then removes the order, and a
+    /// second cancel of a gone order is refused harmlessly).
+    #[test]
+    fn a_cancel_that_did_not_take_is_handed_back() {
+        assert_eq!(
+            cancel_after_send(&SendOutcome::Accepted(ack())),
+            CancelFollowUp::AwaitChannel
+        );
+        for outcome in [
+            SendOutcome::InvalidNonce {
+                message: "invalid nonce".to_string(),
+            },
+            SendOutcome::Ambiguous {
+                status: 429,
+                detail: "Too Many Requests".to_string(),
+            },
+            SendOutcome::Ambiguous {
+                status: 200,
+                detail: "no tx_hash".to_string(),
+            },
+        ] {
+            let CancelFollowUp::HandBack(reason) = cancel_after_send(&outcome) else {
+                panic!("{outcome:?} must hand the cancel back");
+            };
+            assert!(reason.contains("cancel"), "{reason}");
+            assert!(!reason.contains("no live order"), "{reason}");
         }
     }
 
