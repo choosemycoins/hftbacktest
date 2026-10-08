@@ -67,10 +67,16 @@ use crate::{
     lighter::{
         LighterError,
         SharedSymbolSet,
-        gate::{Refusal, SendGate, TxBudget, TxClass, admit_by},
+        gate::{LogThrottle, Refusal, SendGate, TxBudget, TxClass, admit_by},
         nonce::NonceOwner,
         order::{CancelPlan, OrderManager, status_is_known, venue_refusal},
-        private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
+        private_msg::{
+            AccountOrder,
+            PrivateFrame,
+            VenueErrorScope,
+            parse_private_frame,
+            venue_error_scope,
+        },
         public_stream::{
             BACKOFF_MAX,
             BACKOFF_MIN,
@@ -141,6 +147,9 @@ const SWEEP_GATE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// How long [`OrderPath::sweep`] waits for each market's verdict before counting it unconfirmed.
 const SWEEP_REPLY_WAIT: Duration = Duration::from_secs(20);
+
+/// How often the same private-stream error code is told to the bots at most (§4.17).
+const VENUE_ERROR_EVERY: Duration = Duration::from_secs(10);
 
 /// How the order path treats orders already resting on the venue when it (re)connects (§3.4).
 ///
@@ -416,6 +425,7 @@ impl OrderPath {
             command_tx: command_tx.clone(),
             ev_tx,
             account_stream_live: account_stream_live.clone(),
+            venue_errors: HashMap::new(),
         };
         tasks.push(tokio::spawn(stream.run()));
 
@@ -1543,6 +1553,8 @@ struct PrivateStreamTask {
     /// Shared with [`OrderPath`]: set on this connection's `account_all_orders` snapshot,
     /// cleared the moment the connection ends ([`Self::serve`]).
     account_stream_live: Arc<AtomicBool>,
+    /// When each venue error code was last told to the bots ([`Self::on_venue_error`]).
+    venue_errors: HashMap<i64, LogThrottle>,
 }
 
 impl PrivateStreamTask {
@@ -1919,7 +1931,7 @@ impl PrivateStreamTask {
         }
     }
 
-    fn on_frame(&self, text: &str) {
+    fn on_frame(&mut self, text: &str) {
         let frame = match parse_private_frame(text) {
             Ok(frame) => frame,
             Err(error) => {
@@ -2042,11 +2054,54 @@ impl PrivateStreamTask {
                     "A Lighter account_all_trades delta arrived (shape unmeasured, §6.Б.3)."
                 );
             }
-            PrivateFrame::VenueError { code, message } => {
-                warn!(code, %message, "The Lighter private stream returned an error frame.");
-            }
+            PrivateFrame::VenueError { code, message } => self.on_venue_error(code, &message),
             _ => {}
         }
+    }
+}
+
+impl PrivateStreamTask {
+    /// An error frame on the private socket, told to the bots (§4.17): an `OrderError` when it
+    /// is about a transaction (`21xxx`), a `CriticalConnectionError` when it is about the
+    /// account — auth, a subscription — or is a code not known to be about a transaction (fail
+    /// closed; [`venue_error_scope`]). It used to be a `warn!` and nothing more, so a refused
+    /// subscription or a rejected token left the order state uncurrent with no bot told why.
+    ///
+    /// The same code is told at most once every [`VENUE_ERROR_EVERY`], with how many it held
+    /// back: a venue repeating itself — every subscription of a reconnect refused alike — must
+    /// not trip a bot's breaker on one condition many times over. A different code is new
+    /// information and goes straight through.
+    fn on_venue_error(&mut self, code: i64, message: &str) {
+        let now = Instant::now();
+        let Some(held_back) = self
+            .venue_errors
+            .entry(code)
+            .or_insert_with(|| LogThrottle::new(VENUE_ERROR_EVERY))
+            .admit(now)
+        else {
+            debug!(
+                code,
+                %message,
+                "A repeated Lighter private-stream error; not told to the bots again yet."
+            );
+            return;
+        };
+        let kind = match venue_error_scope(code) {
+            VenueErrorScope::Order => ErrorKind::OrderError,
+            VenueErrorScope::Account => ErrorKind::CriticalConnectionError,
+        };
+        error!(
+            code,
+            %message,
+            ?kind,
+            held_back,
+            "The Lighter private stream returned an error frame; telling the bots."
+        );
+        report_error(
+            &self.ev_tx,
+            kind,
+            &format!("Lighter private stream error {code}: {message}"),
+        );
     }
 }
 
@@ -2127,6 +2182,7 @@ mod tests {
         lighter::{
             LighterError,
             fixtures::{
+                PRIVATE_ERROR_AUTH_REQUIRED,
                 PRIVATE_ORDERS_SNAPSHOT,
                 PRIVATE_ORDERS_SNAPSHOT_EMPTY,
                 PRIVATE_ORDERS_UPDATE_CANCELED,
@@ -2324,6 +2380,7 @@ mod tests {
             command_tx,
             ev_tx,
             account_stream_live: Arc::new(AtomicBool::new(false)),
+            venue_errors: Default::default(),
         };
         (task, symbol_tx, command_rx, ev_rx)
     }
@@ -2503,7 +2560,7 @@ mod tests {
     /// the reconcile that follows cannot help, because the map is empty and the COI is foreign.
     #[test]
     fn cancel_all_sweeps_a_previous_runs_surviving_order_from_the_connect_snapshot() {
-        let (task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let (mut task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
         task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
         match command_rx.try_recv() {
             Ok(Command::CancelAll {
@@ -2527,7 +2584,7 @@ mod tests {
     /// budget on a blip — the reason the safe default adopts rather than sweeps.
     #[test]
     fn reconcile_never_sweeps_on_connect() {
-        let (task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let (mut task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
         task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
         assert!(
             command_rx.try_recv().is_err(),
@@ -2539,7 +2596,7 @@ mod tests {
     /// nothing resting, so no `CancelAllOrders` is sent and no nonce is spent.
     #[test]
     fn cancel_all_against_a_flat_snapshot_sends_no_sweep() {
-        let (task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let (mut task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
         task.on_frame(PRIVATE_ORDERS_SNAPSHOT_EMPTY);
         assert!(
             command_rx.try_recv().is_err(),
@@ -2554,7 +2611,7 @@ mod tests {
     /// bot's startup gate (snapshot-marker note). Never inferred from fills.
     #[test]
     fn a_positions_frame_is_published_as_a_live_position_even_when_flat() {
-        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
         // The connect resolves the catalog; here, track BTC (market 1) so the position frame
         // (which carries only the market index) maps back onto the registered symbol.
         task.order_manager.lock().unwrap().track_market(MarketInfo {
@@ -2618,7 +2675,7 @@ mod tests {
     /// never saw one error.
     #[test]
     fn a_margin_refusal_is_published_as_a_cancel_and_then_an_order_error() {
-        let (task, mut ev_rx, frame) = our_order_canceled_as("canceled-margin-not-allowed");
+        let (mut task, mut ev_rx, frame) = our_order_canceled_as("canceled-margin-not-allowed");
         task.on_frame(&frame);
         match ev_rx.try_recv() {
             Ok(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order })) => {
@@ -2644,7 +2701,7 @@ mod tests {
     /// means, and an error per bounce would trip a maker's own breaker.
     #[test]
     fn a_post_only_bounce_is_published_as_a_cancel_and_nothing_else() {
-        let (task, mut ev_rx, frame) = our_order_canceled_as("canceled-post-only");
+        let (mut task, mut ev_rx, frame) = our_order_canceled_as("canceled-post-only");
         task.on_frame(&frame);
         match ev_rx.try_recv() {
             Ok(PublishEvent::LiveEvent(LiveEvent::Order { order, .. })) => {
@@ -2670,7 +2727,7 @@ mod tests {
     /// of now, so the wrong unit cannot land inside the bracket by accident.
     #[test]
     fn a_position_is_stamped_in_nanoseconds() {
-        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
         task.order_manager.lock().unwrap().track_market(MarketInfo {
             symbol: "BTC".to_string(),
             market_id: 1,
@@ -3116,7 +3173,7 @@ mod tests {
     /// order state this process can no longer vouch for.
     #[test]
     fn an_unrecognised_order_status_pages_and_publishes_nothing() {
-        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
         task.order_manager.lock().unwrap().track_market(MarketInfo {
             symbol: "BTC".to_string(),
             market_id: 1,
@@ -3244,7 +3301,7 @@ mod tests {
     /// update.
     #[test]
     fn the_account_stream_is_live_only_once_this_connection_has_snapshotted() {
-        let (task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
         task.on_frame(PRIVATE_ORDERS_UPDATE_CANCELED);
         assert!(
             !task.account_stream_live.load(Ordering::SeqCst),
@@ -3959,6 +4016,85 @@ mod tests {
         assert!(
             slot.events.try_recv().is_err(),
             "no rate-limit error, and nothing handed back"
+        );
+    }
+
+    // ---- the private stream's own error frames reach the bots (§4.17) ------------------
+
+    /// The bots' next error, if any is waiting.
+    fn next_error(
+        ev_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PublishEvent>,
+    ) -> Option<(ErrorKind, String)> {
+        while let Ok(event) = ev_rx.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Error(error)) = event {
+                let Value::String(message) = error.value else {
+                    panic!("the reason rides as a string");
+                };
+                return Some((error.kind, message));
+            }
+        }
+        None
+    }
+
+    /// **An error frame about the account reaches the bots as a `CriticalConnectionError`.** It
+    /// used to be a `warn!` and nothing more: a refused subscription (`20001` auth required) or
+    /// a rejected token (`20013`) left the order state uncurrent with no bot told why.
+    #[tokio::test]
+    async fn a_private_stream_error_about_the_account_is_critical_to_the_bots() {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.on_frame(PRIVATE_ERROR_AUTH_REQUIRED);
+        let (kind, message) = next_error(&mut ev_rx).expect("the bots are told");
+        assert_eq!(kind, ErrorKind::CriticalConnectionError);
+        assert!(message.contains("20001"), "{message}");
+        assert!(message.contains("auth"), "{message}");
+    }
+
+    /// **One about a transaction is an `OrderError`** — a rate-limit-class refusal to the bot's
+    /// classifier, as the same code is when it comes back on a `sendTx`.
+    #[tokio::test]
+    async fn a_private_stream_error_about_a_transaction_is_an_order_error() {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.on_frame(r#"{"error":{"code":21104,"message":"invalid nonce"}}"#);
+        let (kind, message) = next_error(&mut ev_rx).expect("the bots are told");
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("21104"), "{message}");
+    }
+
+    /// **A code nobody has seen is critical** — fail closed: a private socket saying something
+    /// unknown is one whose account state this process cannot vouch for.
+    #[tokio::test]
+    async fn an_unknown_private_stream_error_is_critical() {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.on_frame(r#"{"error":{"code":77777,"message":"something new"}}"#);
+        let (kind, _) = next_error(&mut ev_rx).expect("the bots are told");
+        assert_eq!(kind, ErrorKind::CriticalConnectionError);
+    }
+
+    /// **The same error is told at most once every ten seconds, a different one at once.** A
+    /// venue repeating itself — every subscription of a reconnect refused alike — must not
+    /// trip a bot's critical breaker (8 a minute on the RH bots) on one condition many times
+    /// over; a new code is new information and goes straight through.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_private_stream_error_is_told_once_per_window() {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.on_frame(PRIVATE_ERROR_AUTH_REQUIRED);
+        task.on_frame(PRIVATE_ERROR_AUTH_REQUIRED);
+        task.on_frame(PRIVATE_ERROR_AUTH_REQUIRED);
+        assert!(next_error(&mut ev_rx).is_some());
+        assert!(
+            next_error(&mut ev_rx).is_none(),
+            "the repeats are held back"
+        );
+
+        task.on_frame(r#"{"error":{"code":20013,"message":"invalid auth: invalid deadline"}}"#);
+        let (_, message) = next_error(&mut ev_rx).expect("a different code goes through");
+        assert!(message.contains("20013"), "{message}");
+
+        time::advance(Duration::from_secs(10)).await;
+        task.on_frame(PRIVATE_ERROR_AUTH_REQUIRED);
+        assert!(
+            next_error(&mut ev_rx).is_some(),
+            "told again once the window has passed"
         );
     }
 }

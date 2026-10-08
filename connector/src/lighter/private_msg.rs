@@ -163,6 +163,34 @@ struct RawTradesFrame {
     trades: HashMap<String, Vec<serde_json::Value>>,
 }
 
+/// What a venue error frame on the private socket is about (§4.17). Its code is all the
+/// structure it has: the frame names neither a channel nor an order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VenueErrorScope {
+    /// A transaction the account sent: the `21xxx` application codes.
+    Order,
+    /// The account's session or subscriptions — or a code not known to be about a transaction.
+    Account,
+}
+
+/// The scope of a private-socket error code.
+///
+/// `21xxx` are the venue's application codes for a transaction — the two measured here are
+/// `21104` invalid nonce and `21728` duplicate client order index (§2.7, §4.11). `20xxx` is
+/// auth and parameters (`20001` auth required, `20013` invalid auth), `30xxx` subscriptions
+/// (`30003` already subscribed, `30005` invalid channel). The range is read off those codes,
+/// not off a published table — the venue publishes none — so it is narrow on purpose: only
+/// `21xxx` is about a transaction, and every other code, unknown ones included, is about the
+/// account. Fail closed: misreading an account-level error as one order's would hide it from
+/// the critical breaker it belongs to.
+pub fn venue_error_scope(code: i64) -> VenueErrorScope {
+    if (21_000..22_000).contains(&code) {
+        VenueErrorScope::Order
+    } else {
+        VenueErrorScope::Account
+    }
+}
+
 /// Parses one frame off the private socket.
 ///
 /// Like the public parser, every well-formed JSON object is a [`PrivateFrame`]; only bytes
@@ -478,6 +506,22 @@ mod tests {
                 assert!(message.contains("auth"), "{message}");
             }
             other => panic!("expected a venue error, got {other:?}"),
+        }
+    }
+
+    /// **A private-socket error is about a transaction only when its code says so; anything
+    /// else is about the account — and so is a code nobody has seen** (§4.17). `21xxx` are the
+    /// application codes measured on transactions (`21104` invalid nonce, `21728` duplicate
+    /// client order index); `20xxx` is auth and parameters (`20001`, `20013`), `30xxx`
+    /// subscriptions (`30003`, `30005`).
+    #[test]
+    fn a_private_error_is_about_a_transaction_only_by_its_code() {
+        use super::{VenueErrorScope, venue_error_scope};
+        for code in [21104, 21728, 21000, 21999] {
+            assert_eq!(venue_error_scope(code), VenueErrorScope::Order, "{code}");
+        }
+        for code in [20001, 20013, 30003, 30005, 0, -1, 22000, 99_999, 429] {
+            assert_eq!(venue_error_scope(code), VenueErrorScope::Account, "{code}");
         }
     }
 
