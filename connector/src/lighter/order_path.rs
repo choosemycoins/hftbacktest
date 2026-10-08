@@ -1975,7 +1975,14 @@ impl PrivateStreamTask {
                 }
                 message = read.next() => {
                     match message {
-                        Some(Ok(Message::Text(text))) => self.on_frame(&text),
+                        Some(Ok(Message::Text(text))) => {
+                            // An error frame about the account (§4.17) leaves this socket
+                            // serving nothing: drop it, and the next connect mints a fresh token
+                            // and subscribes again, behind the stream's backoff.
+                            if let Some(error) = self.on_frame(&text) {
+                                return Err(error);
+                            }
+                        }
                         Some(Ok(Message::Ping(_))) => {
                             write.send(Message::Pong(Default::default())).await?;
                         }
@@ -2123,12 +2130,14 @@ impl PrivateStreamTask {
         }
     }
 
-    fn on_frame(&mut self, text: &str) {
+    /// Applies one private frame. `Some` is a reason this connection must end — an error frame
+    /// about the account ([`Self::on_venue_error`]); everything else is applied in place.
+    fn on_frame(&mut self, text: &str) -> Option<LighterError> {
         let frame = match parse_private_frame(text) {
             Ok(frame) => frame,
             Err(error) => {
                 warn!(?error, "A malformed Lighter private frame was skipped.");
-                return;
+                return None;
             }
         };
         match frame {
@@ -2246,9 +2255,12 @@ impl PrivateStreamTask {
                     "A Lighter account_all_trades delta arrived (shape unmeasured, §6.Б.3)."
                 );
             }
-            PrivateFrame::VenueError { code, message } => self.on_venue_error(code, &message),
+            PrivateFrame::VenueError { code, message } => {
+                return self.on_venue_error(code, &message);
+            }
             _ => {}
         }
+        None
     }
 }
 
@@ -2263,7 +2275,18 @@ impl PrivateStreamTask {
     /// back: a venue repeating itself — every subscription of a reconnect refused alike — must
     /// not trip a bot's breaker on one condition many times over. A different code is new
     /// information and goes straight through.
-    fn on_venue_error(&mut self, code: i64, message: &str) {
+    ///
+    /// An error about the account also **ends the connection** — returned as the reason, every
+    /// time, told or not: a refused subscription or token leaves the socket serving nothing
+    /// while it answers pings, and only a reconnect, with a fresh token, recovers it.
+    fn on_venue_error(&mut self, code: i64, message: &str) -> Option<LighterError> {
+        let scope = venue_error_scope(code);
+        let ends = (scope == VenueErrorScope::Account).then(|| {
+            LighterError::ConnectionAbort(format!(
+                "the Lighter private stream reported an account-level error {code}: {message}; \
+                 reconnecting with a fresh token"
+            ))
+        });
         let now = Instant::now();
         let Some(held_back) = self
             .venue_errors
@@ -2276,9 +2299,9 @@ impl PrivateStreamTask {
                 %message,
                 "A repeated Lighter private-stream error; not told to the bots again yet."
             );
-            return;
+            return ends;
         };
-        let kind = match venue_error_scope(code) {
+        let kind = match scope {
             VenueErrorScope::Order => ErrorKind::OrderError,
             VenueErrorScope::Account => ErrorKind::CriticalConnectionError,
         };
@@ -2294,6 +2317,7 @@ impl PrivateStreamTask {
             kind,
             &format!("Lighter private stream error {code}: {message}"),
         );
+        ends
     }
 }
 
@@ -4739,6 +4763,72 @@ mod tests {
         assert!(
             next_error(&mut ev_rx).is_some(),
             "told again once the window has passed"
+        );
+    }
+
+    /// **An error frame about the account ends the connection, so the stream reconnects with a
+    /// fresh token.** A refused subscription (`20001`) or token (`20013`) leaves this socket
+    /// serving nothing — no fill, no cancel, no position — while it answers pings. Telling the
+    /// bots (§4.17) is not a recovery: the connection has to go, and the next connect mints a
+    /// new token and subscribes again, with the stream's backoff between attempts. Orders wait
+    /// for that connection's snapshot, as after any drop.
+    #[tokio::test]
+    async fn an_account_level_error_frame_ends_the_connection() {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.account_stream_live.store(true, Ordering::SeqCst);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read =
+            read_after_the_first_poll(|| {}, vec![PRIVATE_ERROR_AUTH_REQUIRED.to_string()]);
+        let ended = time::timeout(
+            Duration::from_secs(2),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await
+        .expect("the connection ends on the frame, not on a timeout");
+        let Err(error) = ended else {
+            panic!("an account-level error is a connection that failed");
+        };
+        assert!(error.to_string().contains("20001"), "{error}");
+        assert!(
+            !task.account_stream_live.load(Ordering::SeqCst),
+            "and no order goes out until the next connection has snapshotted"
+        );
+        let (kind, message) = next_error(&mut ev_rx).expect("the bots are told, as before");
+        assert_eq!(kind, ErrorKind::CriticalConnectionError);
+        assert!(message.contains("20001"), "{message}");
+
+        // The reconnect is refused alike within the throttle's window: the bots are not told
+        // again, and the connection still goes — a quiet repeat is no less a dead socket.
+        let mut read =
+            read_after_the_first_poll(|| {}, vec![PRIVATE_ERROR_AUTH_REQUIRED.to_string()]);
+        let ended = time::timeout(
+            Duration::from_secs(2),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await
+        .expect("the repeat ends its connection too");
+        assert!(ended.is_err());
+        assert!(next_error(&mut ev_rx).is_none(), "and is not told twice");
+    }
+
+    /// ...while one about a transaction (`21xxx`) leaves the connection serving: it is one
+    /// order's business, and the socket still carries everything else.
+    #[tokio::test]
+    async fn an_error_frame_about_a_transaction_leaves_the_connection_up() {
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_the_first_poll(
+            || {},
+            vec![r#"{"error":{"code":21104,"message":"invalid nonce"}}"#.to_string()],
+        );
+        assert!(
+            time::timeout(
+                Duration::from_millis(500),
+                task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+            )
+            .await
+            .is_err(),
+            "still serving"
         );
     }
 }
