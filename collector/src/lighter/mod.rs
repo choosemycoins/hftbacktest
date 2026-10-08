@@ -48,26 +48,60 @@ use crate::{
 
 /// Mainnet endpoints. Testnet lives at `testnet.zklighter.elliot.ai` and has
 /// its own market ids, so it is not a drop-in substitution.
-///
-/// Both endpoints are overridable at process start via environment variables —
-/// `LIGHTER_WS_URL` for the stream socket, `LIGHTER_REST_URL` for the
-/// catalog/REST base — each falling back to the mainnet literal below when
-/// unset. This is how the operator points the collector at testnet; note that
-/// testnet's market ids differ, so the symbol set must be adjusted to match.
-/// The overrides are read once, at first use of the static.
 const MAINNET_WS: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 const MAINNET_REST: &str = "https://mainnet.zklighter.elliot.ai";
 
-/// Reads `key` from the environment, falling back to `default` when the
-/// variable is unset or not valid UTF-8.
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// Lighter on Robinhood Chain: a separate exchange instance (own markets, own
+/// ids, own points programme, maker = taker = 0) speaking the same protocol —
+/// compared frame for frame against mainnet on 2026-10-08, see `fixtures.rs`.
+const RH_WS: &str = "wss://api.rh.lighter.xyz/stream";
+const RH_REST: &str = "https://api.rh.lighter.xyz";
+
+/// Which Lighter instance one collector records, as its two URLs.
+///
+/// Chosen by the backend name, and the name only: `lighter` is mainnet,
+/// `lighter-rh` is the Robinhood Chain instance. The two share symbol names —
+/// BTC is market 1 on both — so nothing in a recording would show that the
+/// wrong one had been dialled; a separate name, stamped into `session_start`
+/// with these URLs beside it, is what keeps the two apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    pub ws: String,
+    pub rest: String,
 }
 
-pub static WS_URL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| env_or("LIGHTER_WS_URL", MAINNET_WS));
-pub static REST_URL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| env_or("LIGHTER_REST_URL", MAINNET_REST));
+impl Endpoints {
+    /// The endpoints for a backend name, or `None` if it is not a Lighter one.
+    ///
+    /// `lighter` honours `LIGHTER_WS_URL` / `LIGHTER_REST_URL`, which is how
+    /// the operator points it at testnet (whose market ids differ, so the
+    /// symbol set has to follow). `lighter-rh` deliberately does not: see
+    /// `the_endpoint_override_applies_to_mainnet_only`.
+    pub fn for_exchange(exchange: &str) -> Option<Self> {
+        Self::for_exchange_with(exchange, |key| std::env::var(key).ok())
+    }
+
+    /// [`Self::for_exchange`] with the environment supplied, so the choice is
+    /// testable without touching process-global state.
+    fn for_exchange_with(exchange: &str, env: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        match exchange {
+            "lighter" => Some(Self {
+                ws: env("LIGHTER_WS_URL").unwrap_or_else(|| MAINNET_WS.to_string()),
+                rest: env("LIGHTER_REST_URL").unwrap_or_else(|| MAINNET_REST.to_string()),
+            }),
+            "lighter-rh" => Some(Self {
+                ws: RH_WS.to_string(),
+                rest: RH_REST.to_string(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The form `session_start` records them in.
+    pub fn record(&self) -> serde_json::Value {
+        serde_json::json!({ "ws": self.ws, "rest": self.rest })
+    }
+}
 
 /// The channels taken for every market.
 ///
@@ -712,6 +746,7 @@ async fn fetch_catalog(
 }
 
 pub async fn run_collection(
+    endpoints: Endpoints,
     markets: Vec<MarketInfo>,
     writer_tx: Tx<Record>,
 ) -> Result<(), anyhow::Error> {
@@ -736,7 +771,7 @@ pub async fn run_collection(
     // indistinguishable from a network error while REST keeps working — so the
     // catalog fetch above proves nothing about the socket. Without this the
     // collector would reconnect for ever, recording nothing, and exit 0.
-    if let Err(error) = http::probe(WS_URL.as_str()).await {
+    if let Err(error) = http::probe(&endpoints.ws).await {
         // `probe_failed`, not `symbol_check_failed`: every symbol resolved a
         // moment ago (`main` does it before `session_start`), and what refused
         // is the WebSocket upgrade. Borrowing the nearer name would have the
@@ -746,7 +781,7 @@ pub async fn run_collection(
         if let Err(queue_error) = writer_tx.send((
             Utc::now(),
             META_STREAM.to_string(),
-            meta::probe_failed(WS_URL.as_str(), &error.to_string()).to_string(),
+            meta::probe_failed(&endpoints.ws, &error.to_string()).to_string(),
         )) {
             error!(
                 ?queue_error,
@@ -772,7 +807,7 @@ pub async fn run_collection(
 
     pump(
         writer_tx,
-        |ws_tx| keep_connection(subscriptions, markets, resub_rx, ws_tx),
+        |ws_tx| keep_connection(endpoints.ws, subscriptions, markets, resub_rx, ws_tx),
         move |writer_tx, recv_time, data| {
             handle(
                 &mut chains,
@@ -901,8 +936,8 @@ mod route_tests {
     #[test]
     fn every_lifecycle_record_reaches_the_sidecar() {
         for value in [
-            meta::subscribe(WS_URL.as_str(), 0, serde_json::json!([])),
-            meta::connected(WS_URL.as_str()),
+            meta::subscribe(MAINNET_WS, 0, serde_json::json!([])),
+            meta::connected(MAINNET_WS),
             meta::disconnected("Connection reset without closing handshake", 1194),
             meta::dial_failed("connection refused", 12),
             meta::stream_ended(1194),
@@ -912,22 +947,20 @@ mod route_tests {
         }
     }
 
-    /// The endpoint override reads the environment when the variable is set and
-    /// the mainnet literal otherwise. Uses a process-unique key so it cannot
-    /// race the (once-read, process-global) `WS_URL`/`REST_URL` statics or any
-    /// parallel test touching the same variable.
+    /// Every channel of the Robinhood Chain instance files exactly as
+    /// mainnet's does: the response spelling `<channel>:<id>` is the same
+    /// there, captured 2026-10-08.
     #[test]
-    fn env_or_prefers_the_environment_and_falls_back_to_the_default() {
-        let key = "LIGHTER_ENV_OR_TEST_KEY_UNIQUE_9f3c";
-        let unset = "LIGHTER_ENV_OR_TEST_KEY_UNSET_9f3c";
-
-        // SAFETY: single-threaded within this test; the key is unique to it so
-        // no other thread reads or writes it.
-        unsafe { std::env::set_var(key, "wss://override.example/stream") };
-        assert_eq!(env_or(key, MAINNET_WS), "wss://override.example/stream");
-        unsafe { std::env::remove_var(key) };
-
-        assert_eq!(env_or(unset, MAINNET_REST), MAINNET_REST);
+    fn every_rh_channel_is_filed_under_its_symbol() {
+        for frame in [
+            RH_ORDER_BOOK_SNAPSHOT_BTC,
+            RH_CHAIN_A_BTC,
+            RH_TICKER_BTC,
+            RH_TRADE_BTC,
+            RH_MARKET_STATS_BTC,
+        ] {
+            assert_eq!(r(frame), "BTC", "{frame}");
+        }
     }
 
     /// Every frame is written, and written byte for byte. A deletion on this
@@ -1312,7 +1345,7 @@ mod nonce_tests {
     fn a_reconnect_starts_the_chain_again() {
         let mut h = Harness::new();
         h.feed(ORDER_BOOK_AFTER_SNAPSHOT_ETH);
-        h.feed_record(meta::connected(WS_URL.as_str()));
+        h.feed_record(meta::connected(MAINNET_WS));
         h.feed(ORDER_BOOK_DELETE_ETH);
 
         assert!(
@@ -1323,6 +1356,28 @@ mod nonce_tests {
             h.resubscribes().is_empty(),
             "and no repair is spent on a phantom break"
         );
+    }
+
+    /// The Robinhood Chain instance publishes the same chain: snapshot, then
+    /// diffs whose `begin_nonce` continues the previous `nonce`. Captured there
+    /// on 2026-10-08, and read by the very same check — so the chain is
+    /// checked on that instance, not merely tolerated.
+    #[test]
+    fn the_rh_instance_chains_its_book_the_way_mainnet_does() {
+        let mut h = Harness::new();
+        h.feed(RH_ORDER_BOOK_SNAPSHOT_BTC);
+        h.feed(RH_CHAIN_A_BTC);
+        h.feed(RH_CHAIN_B_BTC);
+        assert!(h.gaps().is_empty(), "a consecutive RH run is not a break");
+
+        // And a skipped batch on that instance is seen as one.
+        let mut h = Harness::new();
+        h.feed(RH_ORDER_BOOK_SNAPSHOT_BTC);
+        h.feed(RH_CHAIN_B_BTC);
+        let gaps = h.gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0]["symbol"], "BTC");
+        assert_eq!(h.resubscribes(), vec![1]);
     }
 
     /// The venue's own answers to the repair, both captured. Neither may be
@@ -1551,5 +1606,149 @@ mod catalog_tests {
         assert_eq!(record["markets"][0]["symbol"], "ETH");
         assert_eq!(record["markets"][0]["market_id"], 0);
         assert_eq!(record["markets"][0]["supported_size_decimals"], 4);
+    }
+
+    fn rh_catalog() -> serde_json::Value {
+        serde_json::from_str(super::fixtures::RH_ORDER_BOOKS).unwrap()
+    }
+
+    /// The RH instance has its own ids — they happen to agree with mainnet for
+    /// ETH and BTC and nowhere else — and its own decimals. Resolved against
+    /// the catalog captured from `api.rh.lighter.xyz` on 2026-10-08.
+    #[test]
+    fn the_rh_catalog_resolves_its_own_market_ids() {
+        let symbols: Vec<String> = ["BTC", "SPY", "ANTHROPIC", "CASHCAT"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = match_catalog(&symbols, &rh_catalog()).unwrap();
+        let ids: Vec<(&str, i64, i64, i64)> = got
+            .iter()
+            .map(|m| {
+                (
+                    m.symbol.as_str(),
+                    m.market_id,
+                    m.price_decimals,
+                    m.size_decimals,
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("BTC", 1, 1, 5),
+                ("SPY", 26, 2, 4),
+                ("ANTHROPIC", 38, 1, 5),
+                ("CASHCAT", 36, 5, 1),
+            ]
+        );
+        assert!(got.iter().all(|m| m.market_type == "perp"));
+    }
+
+    /// Every spot pair on the instance is spelled `<BASE>/USDG`, which cannot
+    /// be a filename; it is refused at startup like any other such symbol
+    /// rather than ending the recording on the first frame.
+    #[test]
+    fn an_rh_spot_pair_is_refused_at_startup() {
+        let err = match_catalog(&["SPY/USDG".to_string()], &rh_catalog()).unwrap_err();
+        assert!(err.to_string().contains("cannot be a filename"), "{err}");
+    }
+
+    /// The symbol set shipped for the RH instance resolves, every name to an
+    /// active perp, within the per-connection market cap — checked against the
+    /// real catalog so a typo or a name that only exists on mainnet fails here
+    /// rather than at the host's first start.
+    #[test]
+    fn the_deployed_rh_symbol_set_resolves_against_the_rh_catalog() {
+        let env = include_str!("../../deploy/lighter-rh.env.example");
+        let value = |key: &str| {
+            env.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("{key} missing from lighter-rh.env.example"))
+                .to_string()
+        };
+        assert_eq!(value("COLLECTOR_EXCHANGE"), "lighter-rh");
+        assert!(Endpoints::for_exchange("lighter-rh").is_some());
+
+        let symbols: Vec<String> = value("COLLECTOR_SYMBOLS")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let got = match_catalog(&symbols, &rh_catalog()).unwrap();
+        assert_eq!(got.len(), symbols.len());
+        assert!(got.len() <= MAX_MARKETS);
+        assert!(
+            got.iter().all(|m| m.market_type == "perp"),
+            "{:?}",
+            got.iter()
+                .map(|m| (&m.symbol, &m.market_type))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// The backend name is what selects the instance. Both are Lighter, share
+    /// the protocol and even share symbols (BTC is market 1 on both), so the
+    /// name is the only thing standing between the two recordings.
+    #[test]
+    fn each_backend_name_selects_its_own_instance() {
+        assert_eq!(
+            Endpoints::for_exchange_with("lighter-rh", no_env),
+            Some(Endpoints {
+                ws: "wss://api.rh.lighter.xyz/stream".to_string(),
+                rest: "https://api.rh.lighter.xyz".to_string(),
+            })
+        );
+        assert_eq!(
+            Endpoints::for_exchange_with("lighter", no_env),
+            Some(Endpoints {
+                ws: MAINNET_WS.to_string(),
+                rest: MAINNET_REST.to_string(),
+            })
+        );
+        assert_eq!(Endpoints::for_exchange_with("bybit", no_env), None);
+    }
+
+    /// The environment override (how the operator points `lighter` at
+    /// testnet) applies to `lighter` only. Were it to reach `lighter-rh`, a
+    /// stray `LIGHTER_WS_URL` in a shared env file would record another
+    /// instance into this one's directory, under this one's name, and every
+    /// symbol would still resolve.
+    #[test]
+    fn the_endpoint_override_applies_to_mainnet_only() {
+        let env = |key: &str| match key {
+            "LIGHTER_WS_URL" => Some("wss://override.example/stream".to_string()),
+            "LIGHTER_REST_URL" => Some("https://override.example".to_string()),
+            _ => None,
+        };
+        let core = Endpoints::for_exchange_with("lighter", env).unwrap();
+        assert_eq!(core.ws, "wss://override.example/stream");
+        assert_eq!(core.rest, "https://override.example");
+
+        let rh = Endpoints::for_exchange_with("lighter-rh", env).unwrap();
+        assert_eq!(rh.ws, "wss://api.rh.lighter.xyz/stream");
+        assert_eq!(rh.rest, "https://api.rh.lighter.xyz");
+    }
+
+    /// What `session_start` carries, so a recording says which instance it
+    /// came from in addition to the backend name.
+    #[test]
+    fn the_endpoints_are_recorded_as_urls() {
+        let rh = Endpoints::for_exchange_with("lighter-rh", no_env).unwrap();
+        assert_eq!(
+            rh.record(),
+            serde_json::json!({
+                "ws": "wss://api.rh.lighter.xyz/stream",
+                "rest": "https://api.rh.lighter.xyz",
+            })
+        );
     }
 }

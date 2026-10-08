@@ -66,7 +66,7 @@ journalctl -u 'hft-collector@*' -f
 
 | Переменная | Обязательна | Значение |
 |---|---|---|
-| `COLLECTOR_EXCHANGE` | да | `hyperliquid` \| `binancefutures`/`binancefuturesum` \| `binancefuturescm` \| `binance`/`binancespot` \| `bybit` \| `lighter` |
+| `COLLECTOR_EXCHANGE` | да | `hyperliquid` \| `binancefutures`/`binancefuturesum` \| `binancefuturescm` \| `binance`/`binancespot` \| `bybit` \| `lighter` \| `lighter-rh` (Lighter на Robinhood Chain, см. `lighter-rh.env.example`) |
 | `COLLECTOR_SYMBOLS` | да | символы через пробел, В НОТАЦИИ БИРЖИ: HL — `BTC`, `xyz:GOLD` (dex-префикс — часть имени); Binance/Bybit — `BTCUSDT`. Проверка символов на бирже при старте есть только у HL/Paradex/Extended/Lighter; **у Binance и Bybit её нет** — опечатка принимается, акается и молча не отдаёт ничего (замерено 2026-08-27). Ловят её, по порядку: отсутствие файла символа, `COLLECTOR_LIVENESS_TIMEOUT_S` (WARN + запись в `_meta`), `COLLECTOR_STALL_TIMEOUT_MIN` (если молчат все — фатал), и утренний гейт (`missing_required` = RED). Сверяйте первый `ls` каталога данных со списком |
 | `RUST_LOG` | нет (`info`) | verbosity; `debug` очень шумный на тиках |
 | `COLLECTOR_DATA_DIR` | нет | дефолт `/opt/hft-collector/data/<instance>` — правильный: две записи в одну директорию запрещены и пресекаются замком. Если выносите за `/opt/hft-collector/data` — расширьте `ReadWritePaths` юнита drop-in'ом |

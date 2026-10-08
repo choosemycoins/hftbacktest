@@ -400,13 +400,14 @@ async fn main() -> Result<(), anyhow::Error> {
     // stamped into `session_start` below — the recorded payloads are keyed by
     // the integer, so a recording that does not carry the key cannot be read
     // back after the venue relists a market.
-    let lighter_markets = if args.exchange == "lighter" {
-        match lighter::resolve_markets(
-            &args.symbols,
-            lighter::REST_URL.as_str(),
-            !args.no_symbol_check,
-        )
-        .await
+    //
+    // Two backend names, two instances of the same venue: `lighter` is
+    // mainnet and `lighter-rh` is Lighter on Robinhood Chain. The name picks
+    // the endpoints (see `lighter::Endpoints`), and both travel together from
+    // here on so the catalog, the socket and `session_start` cannot disagree.
+    let lighter_endpoints = lighter::Endpoints::for_exchange(&args.exchange);
+    let lighter_markets = if let Some(endpoints) = &lighter_endpoints {
+        match lighter::resolve_markets(&args.symbols, &endpoints.rest, !args.no_symbol_check).await
         {
             Ok(markets) => Some(markets),
             Err(error) => {
@@ -469,6 +470,13 @@ async fn main() -> Result<(), anyhow::Error> {
         // are venue configuration and can be reassigned between recordings.
         // The fuller catalog — tick sizes, minimums, market type — travels in
         // the `universe` record the backend writes next.
+        //
+        // The endpoints go in beside it: the backend name already says which
+        // instance, and the URLs say which host was actually dialled — the one
+        // fact that would tell a testnet override apart from mainnet.
+        if let Some(endpoints) = &lighter_endpoints {
+            session_start["lighter_endpoints"] = endpoints.record();
+        }
         if let Some(markets) = &lighter_markets {
             session_start["lighter_markets"] = markets
                 .iter()
@@ -606,10 +614,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 !args.no_symbol_check,
             ))
         }
-        "lighter" => {
+        "lighter" | "lighter-rh" => {
             // Resolved before `session_start`, which is the only place it can
             // be: the venue has no symbol addressing at all, so there is
             // nothing to hand this backend until the catalog has been read.
+            let endpoints =
+                lighter_endpoints.expect("lighter endpoints are chosen for this exchange");
             let markets = lighter_markets.expect("lighter markets are resolved for this exchange");
             info!(
                 markets = markets.len(),
@@ -618,7 +628,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 "lighter markets"
             );
 
-            tokio::spawn(lighter::run_collection(markets, writer_tx))
+            tokio::spawn(lighter::run_collection(endpoints, markets, writer_tx))
         }
         "paradex" => {
             // Markets are addressed by symbol (BTC-USD-PERP), so no catalog

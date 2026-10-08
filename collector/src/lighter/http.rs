@@ -24,7 +24,6 @@ use super::{
     MarketInfo,
     SUBSCRIBE_BUDGET_PER_MIN,
     SubscriptionSpec,
-    WS_URL,
     subscription::{ADMITTED_BEFORE_REFUSAL, Subscriptions, Verdict, abandon_budget, on_idle_tick},
 };
 use crate::{
@@ -490,6 +489,7 @@ async fn connect(
 }
 
 pub async fn keep_connection(
+    ws_url: String,
     subscriptions: Vec<SubscriptionSpec>,
     markets: Vec<MarketInfo>,
     mut resub_rx: UnboundedReceiver<i64>,
@@ -518,7 +518,7 @@ pub async fn keep_connection(
         // what was going to be asked for.
         meta::emit(
             &ws_tx,
-            meta::subscribe(WS_URL.as_str(), attempt, serde_json::json!(&frames)),
+            meta::subscribe(&ws_url, attempt, serde_json::json!(&frames)),
         );
         attempt += 1;
 
@@ -531,7 +531,7 @@ pub async fn keep_connection(
         let mut connected_at = None;
 
         match connect(
-            WS_URL.as_str(),
+            &ws_url,
             frames,
             &ws_tx,
             &mut resub_rx,

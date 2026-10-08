@@ -1,4 +1,5 @@
-//! Frames captured verbatim from Lighter mainnet on 2026-07-28.
+//! Frames captured verbatim from Lighter mainnet on 2026-07-28, and from the
+//! Robinhood Chain instance on 2026-10-08 (the `RH_` constants at the end).
 //!
 //! Every fixture in this file is a line of a real `wss://mainnet.zklighter.
 //! elliot.ai/stream` session, copied byte for byte — nothing here was written
@@ -105,3 +106,44 @@ pub const ERROR_TOO_MANY_MESSAGES: &str =
 /// with both client frames sent back to back and no wait for this ack in
 /// between.
 pub const UNSUBSCRIBED_ETH: &str = r#"{"type": "unsubscribed", "channel": "order_book:0"}"#;
+
+// ---------------------------------------------------------------------------
+// Lighter on Robinhood Chain (`wss://api.rh.lighter.xyz/stream`), captured
+// verbatim on 2026-10-08 in one 20 s read-only session subscribed to market 1.
+// The protocol was compared key-for-key against a mainnet session taken in the
+// same minute: the subscribe/unsubscribe spellings, the `connected`/`pong`/
+// error frames (30003 duplicate, 30005 unknown market) and the order-book
+// envelope with its `begin_nonce`..`nonce` chain are identical (294 diffs, 0
+// breaks). The full catalog the same session resolved against is
+// `fixtures/rh_order_books_20261008.json`.
+// ---------------------------------------------------------------------------
+
+/// `subscribed/order_book` for BTC (market 1 on this instance too). The real
+/// frame is 400 KB — 6083 asks, 4736 bids, four times mainnet's ETH book —
+/// and its levels are truncated to two a side; the envelope is untouched.
+pub const RH_ORDER_BOOK_SNAPSHOT_BTC: &str = r#"{"channel":"order_book:1","last_updated_at":1791452751417472,"offset":5205762,"order_book":{"code":0,"asks":[{"price":"83121.1","size":"0.02483"},{"price":"83123.4","size":"0.00500"}],"bids":[{"price":"83115.7","size":"0.00495"},{"price":"83115.6","size":"0.00500"}],"offset":5205762,"nonce":3031976414,"last_updated_at":1791452751417472,"begin_nonce":0},"timestamp":1791452751463,"type":"subscribed/order_book"}"#;
+
+/// The first diff after [`RH_ORDER_BOOK_SNAPSHOT_BTC`]: `begin_nonce` == the
+/// snapshot's `nonce`, exactly as on mainnet.
+pub const RH_CHAIN_A_BTC: &str = r#"{"channel":"order_book:1","last_updated_at":1791452751471277,"offset":5205764,"order_book":{"code":0,"asks":[{"price":"83123.9","size":"0.05000"},{"price":"83127.7","size":"0.12031"},{"price":"83127.8","size":"0.32705"}],"bids":[],"offset":5205764,"nonce":3031976449,"last_updated_at":1791452751471277,"begin_nonce":3031976414},"timestamp":1791452751478,"type":"update/order_book"}"#;
+
+/// The next diff, consecutive on the wire. Carries a deletion
+/// (`"size":"0.00000"`, BTC's five size decimals).
+pub const RH_CHAIN_B_BTC: &str = r#"{"channel":"order_book:1","last_updated_at":1791452751484175,"offset":5205765,"order_book":{"code":0,"asks":[{"price":"83145.5","size":"3.00000"},{"price":"83149.2","size":"0.00000"}],"bids":[],"offset":5205765,"nonce":3031976475,"last_updated_at":1791452751484175,"begin_nonce":3031976449},"timestamp":1791452751530,"type":"update/order_book"}"#;
+
+/// `ticker` on the RH instance. Same envelope as mainnet's.
+pub const RH_TICKER_BTC: &str = r#"{"channel":"ticker:1","last_updated_at":1791452751528690,"nonce":3031976479,"ticker":{"s":"BTC","a":{"price":"83121.1","size":"0.02483"},"b":{"price":"83115.6","size":"0.00500"},"last_updated_at":1791452751528690},"timestamp":1791452751529,"type":"update/ticker"}"#;
+
+/// `trade` on the RH instance. The one shape difference from mainnet: the
+/// prints carry no fee fields at all (`taker_fee`, `market_kind`,
+/// `integrator_*` and the allocated-margin pairs are absent) — the instance
+/// charges 0/0. Nothing in the collector reads them; the converter must not
+/// require them.
+pub const RH_TRADE_BTC: &str = r#"{"channel":"trade:1","liquidation_trades":[],"nonce":3031982266,"trades":[{"trade_id":1423880765,"trade_id_str":"1423880765","tx_hash":"00000001515e0221000001a11ae7c62d000000000000000000000000000000000000000000000000","type":"trade","market_id":1,"size":"0.00001","price":"83126.8","usd_amount":"0.831268","ask_id":562950080549007,"ask_id_str":"562950080549007","bid_id":844424802741871,"bid_id_str":"844424802741871","ask_client_id":1791452758463,"ask_client_id_str":"1791452758463","bid_client_id":0,"bid_client_id_str":"0","ask_account_id":3994,"bid_account_id":281474976710102,"is_maker_ask":true,"block_height":34857165,"timestamp":1791452759597,"taker_position_size_before":"0.30100","taker_entry_quote_before":"24157.309589","taker_initial_margin_fraction_before":1428,"maker_position_size_before":"-0.00020","maker_entry_quote_before":"16.623010","maker_initial_margin_fraction_before":200,"transaction_time":1791452759597495,"ask_order_version":0,"bid_order_version":0}],"type":"update/trade"}"#;
+
+/// `market_stats` on the RH instance. Same keys as mainnet's.
+pub const RH_MARKET_STATS_BTC: &str = r#"{"channel":"market_stats:1","market_stats":{"symbol":"BTC","market_id":1,"index_price":"83150.2","mark_price":"83112.7","mid_price":"83109.2","best_ask_price":"83109.2","best_bid_price":"83109.1","open_interest":"20721513.747902","open_interest_limit":"72057594037927936.000000","funding_clamp_small":"0.0500","funding_clamp_big":"4.0000","last_trade_price":"83118.3","current_funding_rate":"0.0012","funding_rate":"-0.0003","funding_timestamp":1791450000000,"daily_base_token_volume":1686.03332,"daily_quote_token_volume":140229272.246212,"daily_price_low":82171.9,"daily_price_high":83933.5,"daily_price_change":-0.7474691261454167,"base_interest_rate":"0.0100","premium":"-0.0399"},"timestamp":1791452751902,"type":"update/market_stats"}"#;
+
+/// `/api/v1/orderBooks` on the RH instance, the whole response: 58 perps and
+/// 27 `<BASE>/USDG` spot pairs, every one `active` with maker = taker = 0.
+pub const RH_ORDER_BOOKS: &str = include_str!("fixtures/rh_order_books_20261008.json");

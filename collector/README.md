@@ -63,7 +63,7 @@ exactly these streams.
 | `binance`, `binancespot` | `@trade`, `@bookTicker`, `@depth@100ms` |
 | `bybit` | `orderbook.{--bybit-depths}`, `publicTrade` |
 | `hyperliquid` | `trades`, `bbo`, `activeAssetCtx`, `l2Book` × `{--hl-l2-modes}` |
-| `lighter` | `order_book`, `ticker`, `trade`, `market_stats` — all four per market |
+| `lighter`, `lighter-rh` | `order_book`, `ticker`, `trade`, `market_stats` — all four per market. `lighter` is mainnet, `lighter-rh` the Robinhood Chain instance (`api.rh.lighter.xyz`); same backend, endpoints chosen by the name and stamped into `session_start` as `lighter_endpoints` |
 | `extended` | `orderbooks` (all-markets firehose, filtered), `publicTrades` + `funding` + `prices/mark` per market, `orderbooks/rfq` per RFQ market |
 
 USD-M is the odd row: it carries no `@markPrice@1s`, because **that class

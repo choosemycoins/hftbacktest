@@ -3428,6 +3428,39 @@ def test_the_binancefutures_alias_is_canonicalised_to_the_backend_name(tmp_path)
     assert report["venues"]["binancefuturesum"]["exchange_as_recorded"] == "binancefutures"
 
 
+def test_the_lighter_rh_instance_is_checked_as_lighter(tmp_path):
+    """`lighter-rh` is the same backend as `lighter` pointed at the Robinhood
+    Chain instance, with the same frames. Without the alias the gate would
+    refuse the directory as an unknown exchange; with it the recording is held
+    to the Lighter checks and still says which instance it was."""
+    d = tmp_path / "lighter-rh"
+    d.mkdir()
+    recs = [
+        (ns(0), lighter_book(1, ns(0), begin=0, nonce=100, kind="subscribed")),
+        (ns(1), lighter_ticker(1, ns(1), symbol="BTC")),
+        (ns(2), lighter_trade(1, ns(2))),
+        (ns(3), lighter_stats(1, ns(3), symbol="BTC")),
+        (ns(10), lighter_book(1, ns(10), begin=100, nonce=170)),
+        (ns(10), lighter_ticker(1, ns(10), symbol="BTC")),
+        (ns(10), lighter_trade(1, ns(10))),
+        (ns(10), lighter_stats(1, ns(10), symbol="BTC")),
+    ]
+    write_gz(d / f"btc_{DAY}.gz", recs)
+    start = lighter_session_start(["BTC"], markets={"BTC": 1})
+    start["exchange"] = "lighter-rh"
+    start["lighter_endpoints"] = {
+        "ws": "wss://api.rh.lighter.xyz/stream",
+        "rest": "https://api.rh.lighter.xyz",
+    }
+    write_meta(d, "lighter-rh", DAY, [(ns(0), start)])
+    code, report = run(d, out=tmp_path / "r.json")
+    assert code == 0, report
+    assert set(report["venues"]) == {"lighter"}
+    venue = report["venues"]["lighter"]
+    assert venue["exchange_as_recorded"] == "lighter-rh"
+    assert "btc" in venue["days"][DAY]["symbols"]
+
+
 # --------------------------------------------------------------------------
 # Index, oracle and funding: the informational stream class
 #
@@ -4640,13 +4673,13 @@ def dispatched_backends() -> dict:
         "authoritative venue list and cannot be left guessing"
     )
     heads = list(
-        re.finditer(r'^ {8}("[a-z]+"(?: *\| *"[a-z]+")*) *=> *\{', block.group(1), re.M)
+        re.finditer(r'^ {8}("[a-z-]+"(?: *\| *"[a-z-]+")*) *=> *\{', block.group(1), re.M)
     )
     arms = {}
     for i, head in enumerate(heads):
         end = heads[i + 1].start() if i + 1 < len(heads) else len(block.group(1))
         body = block.group(1)[head.start() : end]
-        for name in re.findall(r'"([a-z]+)"', head.group(1)):
+        for name in re.findall(r'"([a-z-]+)"', head.group(1)):
             arms[name] = body
     return arms
 
@@ -4825,7 +4858,7 @@ ONE_CONNECTION = {
     "aster": "|ws_tx| keep_connection(streams, symbols, ws_tx)",
     "bybit": "|ws_tx| keep_connection(topics, symbols, ws_tx)",
     "hyperliquid": "|ws_tx| keep_connection(subscriptions, symbols, ws_tx)",
-    "lighter": "|ws_tx| keep_connection(subscriptions, markets, resub_rx, ws_tx)",
+    "lighter": "|ws_tx| keep_connection(endpoints.ws, subscriptions, markets, resub_rx, ws_tx)",
     "paradex": "|ws_tx| keep_connection(CHANNELS.to_vec(), markets, ws_tx)",
 }
 

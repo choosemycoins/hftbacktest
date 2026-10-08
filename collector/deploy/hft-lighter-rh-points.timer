@@ -1,0 +1,19 @@
+# Once a day, plus once on Friday evening after the weekly points drop.
+#
+# The drop time is not published ("at the end of each program period, every
+# Friday"), so the Friday run is a guess placed late in the UTC day; the next
+# daily run at 00:20 UTC Saturday brackets it from the other side. Two
+# snapshots around the drop are what separate the weekly drop from the
+# real-time accrual.
+[Unit]
+Description=Lighter-RH points snapshot: daily 00:20 UTC and Friday 20:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+OnCalendar=Fri *-*-* 20:00:00 UTC
+RandomizedDelaySec=120
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
