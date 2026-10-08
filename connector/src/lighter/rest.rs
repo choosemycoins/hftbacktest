@@ -378,7 +378,17 @@ pub enum SendOutcome {
     /// slot must **not** guess the counter forward (§3.3); it hard-refreshes from `nextNonce`
     /// and reconciles the order via `account_all_orders`.
     Ambiguous { status: u16, detail: String },
+    /// HTTP 429 or 405 — the venue's rate limiter ("Rate Limit Exceeding Behavior" in its
+    /// docs; §2.5). The docs promise a cooldown, **not** that the transaction went unprocessed,
+    /// and no 429 has been observed here yet (§6.Б.1), so the fate is as unknown as an
+    /// ambiguous answer's — what differs is the timing: nothing is sent, and nothing is read,
+    /// until the cooldown is over (§4.16).
+    RateLimited { status: u16, detail: String },
 }
+
+/// The statuses the venue answers a rate-limited request with (its docs: "You will receive
+/// HTTP 429, or HTTP 405").
+const RATE_LIMITED_STATUSES: [u16; 2] = [429, 405];
 
 #[derive(Deserialize)]
 struct RespSendTx {
@@ -438,6 +448,13 @@ pub fn classify_send_outcome(status: u16, body: &str) -> SendOutcome {
                 status,
                 detail: clip(body),
             },
+        };
+    }
+    // The rate limiter answers by status, whatever the body says (§4.16).
+    if RATE_LIMITED_STATUSES.contains(&status) {
+        return SendOutcome::RateLimited {
+            status,
+            detail: clip(body),
         };
     }
     // The one rejection that leaves the nonce untouched is `21104` (§2.7); every other
@@ -948,7 +965,6 @@ mod tests {
             (503u16, "upstream unavailable"),
             (408, ""),
             (200, r#"{"code":200,"message":"ok"}"#),
-            (429, r#"{"code":429,"message":"rate limited"}"#),
         ] {
             assert!(
                 matches!(
@@ -958,6 +974,41 @@ mod tests {
                 "status {status} body {body:?} should be Ambiguous"
             );
         }
+    }
+
+    /// **429 and 405 are the venue's rate limiter, and an outcome of their own** — the two
+    /// statuses its docs name for "you exceeded a rate limit" (Rate Limit Exceeding Behavior),
+    /// whatever the body says, a 21104-looking one included. Folded into `Ambiguous` they cost
+    /// a `nextNonce` read and a fate check in exactly the minute the venue is refusing the
+    /// account; on their own they start the cooldown instead (design note §4.16).
+    #[test]
+    fn a_429_or_a_405_is_rate_limited_not_ambiguous() {
+        for (status, body) in [
+            (429u16, r#"{"code":429,"message":"Too Many Requests"}"#),
+            (429, ""),
+            (405, "<html>Method Not Allowed</html>"),
+            (429, r#"{"code":21104,"message":"invalid nonce"}"#),
+        ] {
+            match classify_send_outcome(status, body) {
+                SendOutcome::RateLimited {
+                    status: got,
+                    detail,
+                } => {
+                    assert_eq!(got, status);
+                    assert!(detail.len() <= 200, "the body is clipped");
+                }
+                other => panic!("HTTP {status} {body:?} must be RateLimited, got {other:?}"),
+            }
+        }
+        // Neighbours stay what they were.
+        assert!(matches!(
+            classify_send_outcome(400, r#"{"code":21104,"message":"invalid nonce"}"#),
+            SendOutcome::InvalidNonce { .. }
+        ));
+        assert!(matches!(
+            classify_send_outcome(404, ""),
+            SendOutcome::Ambiguous { .. }
+        ));
     }
 
     /// The `GET /tx` body triple-nests the verdict: `event_info` is a JSON string, and inside

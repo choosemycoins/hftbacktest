@@ -125,3 +125,13 @@ timeout_ms = 10000
 # # Of those 48, the last 12 only cancels, CancelAllOrders and position-reducing submits may
 # # take, so a burst of quotes can never leave the account unable to cancel them.
 # tx_reserve = 12
+#
+# # When the venue answers a sendTx with HTTP 429 or 405 anyway: send nothing for this long, ms.
+# # Its docs: a firewall rate limit holds the address a static 60 s, an API server's
+# # weight/(total/60); the connector cannot tell which answered, so it waits the longer. NOT
+# # measured on RH — no 429 has been seen here yet. Meanwhile: new orders go back to the bot as
+# # rate-limited, cancels are held and sent when it ends, a sweep waits for it only if it ends
+# # within the sweep's 15 s (otherwise the sweep fails, loudly, and a stop exits non-zero), and
+# # nothing is read from the venue on the order path. The bots hear one rate-limit error per
+# # 429/405. Absent: a 429/405 is handled as the ambiguous answer it was before. §4.16.
+# rate_limit_cooldown_ms = 60000

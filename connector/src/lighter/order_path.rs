@@ -60,7 +60,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error as WsError, Message, client::IntoClientRequest},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     connector::{ApplyOutcome, PublishEvent, SweepOutcome},
@@ -208,6 +208,15 @@ pub struct OrderPathConfig {
     /// must leave at least one token for quotes; anything else is refused at startup.
     #[serde(default)]
     pub tx_reserve: Option<u32>,
+    /// How long nothing is sent after the venue answers a `sendTx` with 429/405, ms (§4.16).
+    /// Its docs: a firewall rate limit holds the address a static 60 s, an API server's
+    /// `weight / (total / 60)`; which one answered cannot be told from here, so the longer is
+    /// the safe reading. Meanwhile new orders are refused locally, cancels are held and sent
+    /// when it ends, a sweep waits for it if it ends before the sweep's deadline, and the order
+    /// path reads nothing from the venue (no nonce re-read, no fate check). Absent ⇒ a 429/405
+    /// is handled as the ambiguous answer it was before.
+    #[serde(default)]
+    pub rate_limit_cooldown_ms: Option<u64>,
 }
 
 impl OrderPathConfig {
@@ -228,8 +237,18 @@ impl OrderPathConfig {
                 "[order_path] tx_reserve = {reserve} leaves no token of tx_budget_per_minute = \
                  {per_minute} for a new order"
             )),
+            _ if self.rate_limit_cooldown_ms == Some(0) => Err(
+                "[order_path] rate_limit_cooldown_ms = 0 is no cooldown; leave the field out for \
+                 the behaviour without one"
+                    .to_string(),
+            ),
             _ => Ok(()),
         }
+    }
+
+    /// The cooldown after a 429/405, if one is configured.
+    pub fn rate_limit_cooldown(&self) -> Option<Duration> {
+        self.rate_limit_cooldown_ms.map(Duration::from_millis)
     }
 
     /// The client-side `sendTx` budget, if one is configured.
@@ -659,8 +678,10 @@ impl SlotTask {
         let mut nonce = NonceOwner::new(self.config.api_key_index);
         self.reseed(&mut nonce).await;
 
-        // Asked before every `sendTx`, and before the nonce it would spend (§4.15).
-        let mut gate = SendGate::new(self.config.send_budget());
+        // Asked before every `sendTx`, and before the nonce it would spend (§4.15, §4.16).
+        let mut gate = SendGate::new(self.config.send_budget(), self.config.rate_limit_cooldown());
+        // Cancels a cooldown kept from going out, sent when it is over (§4.16).
+        let mut held = HeldCancels::default();
 
         let mut awaiting: HashMap<i64, Awaiting> = HashMap::new();
         let mut deadline_tick = time::interval(Duration::from_millis(250));
@@ -668,15 +689,18 @@ impl SlotTask {
         loop {
             select! {
                 command = command_rx.recv() => {
+                    // Held cancels go before anything newer, so a requote cannot overtake the
+                    // cancel of the quote it replaces.
+                    self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
                     match command {
                         Some(Command::Submit { coi, order, outbound }) => {
                             if self.admit_submit(&mut gate, coi) {
-                                self.send_order(&mut signer, &mut nonce, coi, &order, &outbound, &mut awaiting).await;
+                                self.send_order(&mut signer, &mut nonce, &mut gate, coi, &order, &outbound, &mut awaiting).await;
                             }
                         }
                         Some(Command::Cancel { coi, plan }) => {
-                            if self.admit_cancel(&mut gate, coi) {
-                                self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
+                            if self.admit_cancel(&mut gate, &mut held, coi, &plan) {
+                                self.send_cancel(&mut signer, &mut nonce, &mut gate, &mut held, coi, &plan).await;
                             }
                         }
                         Some(Command::CancelAll { market_index, reply, deadline }) => {
@@ -702,7 +726,8 @@ impl SlotTask {
                     }
                 }
                 _ = deadline_tick.tick() => {
-                    self.check_deadlines(&mut signer, &mut awaiting).await;
+                    self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
+                    self.check_deadlines(&mut signer, &gate, &mut awaiting).await;
                 }
             }
         }
@@ -730,10 +755,12 @@ impl SlotTask {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_order(
         &self,
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
+        gate: &mut SendGate,
         coi: i64,
         order: &CreateOrder,
         outbound: &Outbound,
@@ -777,6 +804,7 @@ impl SlotTask {
 
         match sent {
             Ok(outcome) => {
+                let outcome = self.received(gate, outcome);
                 self.apply_nonce(nonce, &outcome).await;
                 match outcome {
                     SendOutcome::Accepted(ack) => {
@@ -807,6 +835,21 @@ impl SlotTask {
                             %detail,
                             "An ambiguous Lighter sendTx; keeping the order tracked and \
                              resolving its fate against accountActiveOrders at the deadline (§3.3)."
+                        );
+                        self.arm_deadline(awaiting, coi, String::new(), market_index);
+                    }
+                    SendOutcome::RateLimited { status, detail } => {
+                        // The venue's docs promise a cooldown, not that a 429 went unprocessed
+                        // (§4.16): the order may rest. Kept tracked with no tx_hash, exactly as
+                        // an ambiguous send, so its fate is read off accountActiveOrders — once
+                        // the cooldown is over (`check_deadlines`); the nonce was invalidated,
+                        // not re-read. Never expired blind (§1.1).
+                        warn!(
+                            coi,
+                            status,
+                            %detail,
+                            "A Lighter sendTx was rate-limited; keeping the order tracked until \
+                             its fate can be read after the cooldown (§4.16)."
                         );
                         self.arm_deadline(awaiting, coi, String::new(), market_index);
                     }
@@ -966,6 +1009,8 @@ impl SlotTask {
         &self,
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
+        gate: &mut SendGate,
+        held: &mut HeldCancels,
         coi: i64,
         plan: &CancelPlan,
     ) {
@@ -992,11 +1037,16 @@ impl SlotTask {
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
+                let outcome = self.received(gate, outcome);
                 self.apply_nonce(nonce, &outcome).await;
-                // A `21104` or an ambiguous answer (a 429 among them) must not leave the order
-                // looking cancel-pending to the bot while it stands on the venue (§3.3).
-                if let CancelFollowUp::HandBack(reason) = cancel_after_send(&outcome) {
-                    self.clear_cancel_request(coi, &reason);
+                match cancel_after_send(&outcome) {
+                    CancelFollowUp::AwaitChannel => {}
+                    // A `21104` or an ambiguous answer must not leave the order looking
+                    // cancel-pending to the bot while it stands on the venue (§3.3).
+                    CancelFollowUp::HandBack(reason) => self.clear_cancel_request(coi, &reason),
+                    // Rate-limited under a cooldown: held, still pending, and sent again when the
+                    // cooldown is over unless the channel has closed the order by then (§4.16).
+                    CancelFollowUp::AfterCooldown => held.hold(coi, plan.clone()),
                 }
             }
             Err(error) => {
@@ -1015,6 +1065,7 @@ impl SlotTask {
         &self,
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
+        gate: &mut SendGate,
         market_index: i32,
     ) -> Result<SendOutcome, String> {
         let Some(reserved) = self.reserve(nonce).await else {
@@ -1033,6 +1084,7 @@ impl SlotTask {
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
+                let outcome = self.received(gate, outcome);
                 self.apply_nonce(nonce, &outcome).await;
                 Ok(outcome)
             }
@@ -1059,6 +1111,95 @@ impl SlotTask {
                 nonce.invalidated();
                 self.reseed(nonce).await;
             }
+            // Re-read by `reserve` before the next send, which the cooldown holds (§4.16).
+            NonceAction::Invalidate => nonce.invalidated(),
+        }
+    }
+
+    /// Reads the venue's answer to a send before anything acts on it (§4.16).
+    ///
+    /// * An ack's rate-limit report (`message.ratelimit`, §2.7 — its format on this instance is
+    ///   unmeasured) is logged at `debug!` every time, and quoted in a `warn!` — at most every
+    ///   10 s — while three quarters of the send budget are spent.
+    /// * A 429/405 starts the cooldown and is told to the bots **once**, as an `OrderError`
+    ///   (a rate limit to the myhft classifier), then handed on as
+    ///   [`SendOutcome::RateLimited`].
+    /// * Without a configured cooldown a 429/405 is handed on as `Ambiguous` — the answer it
+    ///   was before `RateLimited` existed — so that path is unchanged by construction.
+    fn received(&self, gate: &mut SendGate, outcome: SendOutcome) -> SendOutcome {
+        let now = Instant::now();
+        match outcome {
+            SendOutcome::Accepted(ack) => {
+                let ratelimit = ack.ratelimit.as_deref().unwrap_or("<none>");
+                debug!(ratelimit, "A Lighter sendTx was accepted.");
+                if gate.near_limit(now)
+                    && let Some(held_back) = gate.log_near_limit(now)
+                {
+                    let (used, per_minute) = gate.usage(now).unwrap_or_default();
+                    warn!(
+                        used,
+                        per_minute,
+                        held_back,
+                        ratelimit,
+                        "The Lighter account is near its sendTx budget; the venue's own \
+                         rate-limit report is quoted."
+                    );
+                }
+                SendOutcome::Accepted(ack)
+            }
+            SendOutcome::RateLimited { status, detail } => match gate.rate_limited(now) {
+                None => SendOutcome::Ambiguous { status, detail },
+                Some(until) => {
+                    let cooldown_ms = until.saturating_duration_since(now).as_millis() as u64;
+                    error!(
+                        status,
+                        %detail,
+                        cooldown_ms,
+                        "The venue rate-limited this Lighter account's sendTx; nothing is sent \
+                         until the cooldown is over — new orders are refused, cancels are held, \
+                         a sweep waits if it can (§4.16)."
+                    );
+                    report_error(
+                        &self.ev_tx,
+                        ErrorKind::OrderError,
+                        &format!(
+                            "the venue rate-limited this account's sendTx (HTTP {status}); the \
+                             connector sends nothing for {cooldown_ms} ms — new orders are \
+                             refused, cancels wait for it; rate-limited"
+                        ),
+                    );
+                    SendOutcome::RateLimited { status, detail }
+                }
+            },
+            other => other,
+        }
+    }
+
+    /// Sends the cancels a cooldown held, once it is over (§4.16). A held cancel whose order
+    /// has gone meanwhile — filled, closed by the venue — is dropped: there is nothing left to
+    /// cancel, and the cancel would spend a send on a refusal.
+    async fn release_held_cancels(
+        &self,
+        signer: &mut SignerClient,
+        nonce: &mut NonceOwner,
+        gate: &mut SendGate,
+        held: &mut HeldCancels,
+    ) {
+        if held.is_empty() || gate.cooling(Instant::now()).is_some() {
+            return;
+        }
+        for (coi, plan) in held.take() {
+            if !self.order_manager.lock().unwrap().cancel_pending(coi) {
+                info!(
+                    coi,
+                    "Dropping a Lighter cancel held through a cooldown: its order has gone."
+                );
+                continue;
+            }
+            if self.admit_cancel(gate, held, coi, &plan) {
+                self.send_cancel(signer, nonce, gate, held, coi, &plan)
+                    .await;
+            }
         }
     }
 
@@ -1072,9 +1213,21 @@ impl SlotTask {
     async fn check_deadlines(
         &self,
         signer: &mut SignerClient,
+        gate: &SendGate,
         awaiting: &mut HashMap<i64, Awaiting>,
     ) {
         let now = Instant::now();
+        if let Some(until) = gate.cooling(now) {
+            // `GET /tx` and `accountActiveOrders` are requests to a venue that is refusing this
+            // account; a deadline that lapses inside the cooldown is read once it is over
+            // (§4.16). An order that confirms on the channel meanwhile is simply dropped then.
+            for entry in awaiting.values_mut() {
+                if entry.deadline <= now {
+                    entry.deadline = until;
+                }
+            }
+            return;
+        }
         let due: Vec<i64> = awaiting
             .iter()
             .filter(|(_, a)| a.deadline <= now)
@@ -1191,12 +1344,26 @@ impl SlotTask {
         }
     }
 
-    /// Whether cancel `coi` may go out now (§4.15). A cancel may take the reserve, so it is
-    /// refused only when the whole budget is spent; then it goes back to the bot as a cancel
-    /// that did not go — request cleared, order still live — and the bot may cancel again.
-    fn admit_cancel(&self, gate: &mut SendGate, coi: i64) -> bool {
+    /// Whether cancel `coi` may go out now (§4.15, §4.16). A cancel may take the reserve, so
+    /// the budget refuses it only when it is spent through; then it goes back to the bot as a
+    /// cancel that did not go — request cleared, order still live — and the bot may cancel
+    /// again. A cooldown does not hand it back: it is held, still pending to the bot, and sent
+    /// the moment the cooldown is over ([`Self::release_held_cancels`]) — handed back, the bot
+    /// would only cancel again into the same cooldown.
+    fn admit_cancel(
+        &self,
+        gate: &mut SendGate,
+        held: &mut HeldCancels,
+        coi: i64,
+        plan: &CancelPlan,
+    ) -> bool {
         match gate.admit(Instant::now(), TxClass::RiskReducing) {
             Ok(()) => true,
+            Err(refusal @ Refusal::Cooldown { .. }) => {
+                self.log_refusal(gate, &refusal, "cancel, held");
+                held.hold(coi, plan.clone());
+                false
+            }
             Err(refusal) => {
                 self.log_refusal(gate, &refusal, "cancel");
                 self.hand_back_cancel(coi, &refusal.to_string());
@@ -1222,6 +1389,27 @@ impl SlotTask {
                 "The Lighter send gate refused a send; it went back to the bot unsent."
             );
         }
+    }
+}
+
+/// Cancels a rate-limit cooldown kept from going out, in the order they were asked for, to be
+/// sent when it is over (§4.16). One per order: a cancel already held is not held twice.
+#[derive(Default)]
+struct HeldCancels(Vec<(i64, CancelPlan)>);
+
+impl HeldCancels {
+    fn hold(&mut self, coi: i64, plan: CancelPlan) {
+        if !self.0.iter().any(|(held, _)| *held == coi) {
+            self.0.push((coi, plan));
+        }
+    }
+
+    fn take(&mut self) -> Vec<(i64, CancelPlan)> {
+        std::mem::take(&mut self.0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -1309,7 +1497,7 @@ impl SweepSend for CancelAllSender<'_> {
 
     fn send_once(&mut self) -> impl Future<Output = Result<SendOutcome, String>> + Send {
         self.slot
-            .cancel_all_once(self.signer, self.nonce, self.market_index)
+            .cancel_all_once(self.signer, self.nonce, self.gate, self.market_index)
     }
 }
 
@@ -2121,6 +2309,7 @@ mod tests {
             connect_policy: policy,
             tx_budget_per_minute: None,
             tx_reserve: None,
+            rate_limit_cooldown_ms: None,
         };
         let (symbol_tx, symbol_rx) = broadcast::channel(16);
         let task = PrivateStreamTask {
@@ -3185,6 +3374,7 @@ mod tests {
             connect_policy: ConnectPolicy::Reconcile,
             tx_budget_per_minute: None,
             tx_reserve: None,
+            rate_limit_cooldown_ms: None,
         }
     }
 
@@ -3504,5 +3694,271 @@ mod tests {
             slot.submit(&eth_order(order_id, Side::Buy));
         }
         slot.venue_until(|venue| venue.sent().len() == 5).await;
+    }
+
+    // ---- a 429/405: one cooldown for everything (§4.16) ---------------------------------
+
+    fn too_many_requests() -> (u16, String) {
+        (
+            429,
+            r#"{"code":429,"message":"Too Many Requests"}"#.to_string(),
+        )
+    }
+
+    /// **A 429 holds every send for the cooldown and reads nothing meanwhile — then the order
+    /// it left in doubt is settled off the venue.** The bots hear one rate-limit error for the
+    /// one 429; the order it answered is not handed back (the docs do not promise a 429 went
+    /// unprocessed, so it may rest) — its fate is read off `accountActiveOrders`, but only once
+    /// the cooldown is over, and the nonce is re-read only before the next send after it. A
+    /// quote asked for inside the cooldown goes back to the bot unsent, as over the budget.
+    #[tokio::test]
+    async fn a_429_holds_every_send_for_the_cooldown_and_reads_nothing_meanwhile() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(600);
+            config.confirm_deadline_ms = 100;
+        })
+        .await;
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        let started = time::Instant::now();
+        slot.submit(&eth_order(1, Side::Buy));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(
+            kind,
+            ErrorKind::OrderError,
+            "a rate limit, to the bot's classifier"
+        );
+        assert!(message.contains("rate-limited"), "{message}");
+        assert!(message.contains("429"), "{message}");
+
+        slot.submit(&eth_order(2, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("a quote inside the cooldown comes back");
+        };
+        assert_eq!((order.order_id, order.status), (2, Status::Expired));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("cooldown"), "{message}");
+        assert!(message.contains("rate-limited"), "{message}");
+
+        // Order 1's confirmation deadline (100 ms) lapses inside the cooldown.
+        time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(slot.venue.sent().len(), 1, "nothing sent into the cooldown");
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            1,
+            "the nonce is not re-read inside the cooldown"
+        );
+        assert_eq!(
+            slot.venue.count("/api/v1/accountActiveOrders"),
+            0,
+            "nor is the doubtful order's fate"
+        );
+
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the doubtful order is settled once the cooldown is over");
+        };
+        assert_eq!((order.order_id, order.status), (1, Status::Expired));
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "not before the cooldown ended"
+        );
+        assert_eq!(slot.venue.count("/api/v1/accountActiveOrders"), 1);
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            2,
+            "re-read once, before the first send after the cooldown"
+        );
+        assert_eq!(slot.venue.sent()[1], ("create_order".to_string(), 7));
+    }
+
+    /// **A cancel asked for inside the cooldown is held, not handed back, and goes out once
+    /// the cooldown is over.** Handed back, the bot would cancel again into the same cooldown —
+    /// every refusal another error toward its storm breaker — while the order stood on the
+    /// venue; held, it leaves the moment the venue will take it, even if the bot has died.
+    #[tokio::test]
+    async fn a_cancel_inside_the_cooldown_is_held_and_goes_out_after_it() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(500);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError, "the one rate-limit error");
+        let told_at = time::Instant::now();
+
+        slot.cancel(&resting);
+        time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(slot.venue.sent().len(), 2, "held inside the cooldown");
+        assert!(
+            slot.events.try_recv().is_err(),
+            "and not handed back to the bot"
+        );
+
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(slot.venue.sent()[2].0, "cancel_order");
+        assert!(
+            told_at.elapsed() >= Duration::from_millis(400),
+            "it went out when the cooldown was over, not before"
+        );
+    }
+
+    /// **A cancel the venue answered 429 is held too, and sent again once the cooldown is
+    /// over** — it may or may not have taken, and either way handing it back would only send
+    /// the bot's next cancel into the same cooldown. The bots hear the one rate-limit error and
+    /// nothing else.
+    #[tokio::test]
+    async fn a_cancel_answered_429_is_held_and_sent_again_after_the_cooldown() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(400);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.cancel(&resting);
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("rate-limited"), "{message}");
+
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(
+            slot.venue
+                .sent()
+                .into_iter()
+                .map(|(op, _)| op)
+                .collect::<Vec<_>>(),
+            ["create_order", "cancel_order", "cancel_order"]
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "no hand-back: the cancel stayed pending throughout"
+        );
+    }
+
+    /// A held cancel whose order has gone meanwhile — filled, or canceled by the venue — is
+    /// dropped, not sent: the venue holds nothing for it to cancel.
+    #[tokio::test]
+    async fn a_held_cancel_for_an_order_that_went_meanwhile_is_dropped() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(400);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let _ = slot.next_event().await;
+
+        slot.cancel(&resting);
+        // The account stream reports the order filled before the cooldown is over.
+        {
+            let mut manager = slot.order_path.order_manager.lock().unwrap();
+            let coi = manager.coi_for("ETH", 1).unwrap();
+            let filled = manager.apply_order_update(&AccountOrder {
+                market_index: 42,
+                client_order_index: coi,
+                order_index: 900_000 + coi,
+                is_ask: false,
+                status: "filled".to_string(),
+                price: 1_000.0,
+                initial_base_amount: 0.01,
+                remaining_base_amount: 0.0,
+                filled_base_amount: 0.01,
+                transaction_time_us: 2_000,
+            });
+            assert!(filled.published().is_some());
+        }
+        time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            slot.venue.sent().len(),
+            2,
+            "the cancel of a filled order never went out"
+        );
+    }
+
+    /// **A sweep waits out a cooldown that ends before its deadline**, and goes out once it is
+    /// over: a sweep answers for orders nobody manages any more, so it is held for the venue
+    /// rather than given up.
+    #[tokio::test]
+    async fn a_sweep_waits_out_a_cooldown_that_ends_before_its_deadline() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(500);
+        })
+        .await;
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(1, Side::Buy));
+        let _ = slot.next_event().await;
+        let told_at = time::Instant::now();
+
+        let outcome = slot.order_path.sweep(vec![42]).await.unwrap();
+        assert_eq!(outcome, SweepOutcome::Cancelled);
+        assert!(told_at.elapsed() >= Duration::from_millis(400));
+        assert_eq!(
+            slot.venue.sent().last().map(|(op, _)| op.as_str()),
+            Some("cancel_all")
+        );
+    }
+
+    /// **A sweep that cannot outwait the cooldown fails at once, unsent, and says so** — the
+    /// bots hear a `CriticalConnectionError`, the stop's exit code a `Failed` sweep — rather than
+    /// sending into a cooldown that will refuse it, or sleeping past the moment its waiter has
+    /// given up.
+    #[tokio::test]
+    async fn a_sweep_that_cannot_outwait_the_cooldown_fails_unsent() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(60_000);
+        })
+        .await;
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(1, Side::Buy));
+        let _ = slot.next_event().await;
+
+        let asked = time::Instant::now();
+        let outcome = slot.order_path.sweep(vec![42]).await.unwrap();
+        assert_eq!(outcome, SweepOutcome::Failed);
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "it did not wait for a cooldown it could not outlast"
+        );
+        assert_eq!(slot.venue.sent().len(), 1, "nothing sent into the cooldown");
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::CriticalConnectionError);
+        assert!(message.contains("cooldown"), "{message}");
+    }
+
+    /// **Without `rate_limit_cooldown_ms` a 429 is handled exactly as before**: as an
+    /// ambiguous answer — the nonce re-read at once, the order kept for its fate check, no
+    /// error of its own, and the next quote not held back.
+    #[tokio::test]
+    async fn without_a_cooldown_a_429_is_handled_as_before() {
+        let mut slot = slot_on_scripted_venue(|_| {}).await;
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(1, Side::Buy));
+        slot.venue_until(|venue| venue.count("/api/v1/nextNonce") == 2)
+            .await;
+        slot.submit(&eth_order(2, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        assert!(
+            slot.events.try_recv().is_err(),
+            "no rate-limit error, and nothing handed back"
+        );
     }
 }

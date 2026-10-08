@@ -524,6 +524,15 @@ impl OrderManager {
         Some((symbol, position.position, exch_ts_us))
     }
 
+    /// Whether order `coi` is still live and still waiting on a cancel this connector was
+    /// asked for — what a cancel held through a rate-limit cooldown checks before it goes out
+    /// (§4.16). Filled, closed by the venue, or untracked: there is nothing left to cancel.
+    pub fn cancel_pending(&self, coi: i64) -> bool {
+        self.orders
+            .get(&coi)
+            .is_some_and(|tracked| tracked.order.active() && tracked.order.req == Status::Canceled)
+    }
+
     /// Whether the tracked submit `coi` would shrink |position| on its symbol — a sell against
     /// a long, a buy against a short, no larger than the position — judged against the last
     /// position the account stream stated. No statement yet, or an order this manager does not

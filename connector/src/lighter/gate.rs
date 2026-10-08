@@ -14,7 +14,10 @@
 //!   limit;
 //! * of which `tx_reserve` only **risk-reducing** sends may take: cancels, `CancelAllOrders`,
 //!   and a submit that shrinks the position. A burst of new quotes then cannot leave the
-//!   account unable to cancel them.
+//!   account unable to cancel them;
+//! * and when the venue answers 429/405 anyway, a **cooldown** of `rate_limit_cooldown_ms`
+//!   during which nothing is sent at all (§4.16): the venue's firewall holds a rate-limited
+//!   address for a static 60 s, and every send into that only earns another refusal.
 //!
 //! Pure state with the clock passed in, owned by the one slot task (single writer,
 //! `AGENTS.md` §1.4), so all of it is unit-tested here without a socket.
@@ -118,6 +121,8 @@ pub enum Refusal {
         reserve: u32,
         free_at: Instant,
     },
+    /// The venue rate-limited the account (429/405) and nothing is sent until `until`.
+    Cooldown { until: Instant },
 }
 
 impl Refusal {
@@ -125,6 +130,7 @@ impl Refusal {
     pub fn free_at(&self) -> Instant {
         match self {
             Self::Budget { free_at, .. } => *free_at,
+            Self::Cooldown { until } => *until,
         }
     }
 }
@@ -153,6 +159,11 @@ impl fmt::Display for Refusal {
                 f,
                 "the connector's sendTx budget is spent, its reserve included ({per_minute} a \
                  rolling minute for the whole account); rate-limited, not sent"
+            ),
+            Self::Cooldown { .. } => write!(
+                f,
+                "the venue rate-limited this account's sendTx (HTTP 429/405) and the connector \
+                 sends nothing until its cooldown is over; rate-limited, not sent"
             ),
         }
     }
@@ -195,20 +206,59 @@ impl LogThrottle {
 #[derive(Debug)]
 pub struct SendGate {
     budget: Option<TxBudget>,
+    /// `[order_path] rate_limit_cooldown_ms`. `None`: a 429/405 starts nothing, and the slot
+    /// treats it as the ambiguous answer it was before it had a name.
+    cooldown: Option<Duration>,
+    /// When the running cooldown ends. Set by [`Self::rate_limited`].
+    cooling_until: Option<Instant>,
     refusals: LogThrottle,
+    near_limit: LogThrottle,
 }
 
 impl SendGate {
-    /// `budget: None` admits everything — the behaviour without `tx_budget_per_minute`.
-    pub fn new(budget: Option<TxBudget>) -> Self {
+    /// `budget: None` and `cooldown: None` admit everything — the behaviour without
+    /// `tx_budget_per_minute` and `rate_limit_cooldown_ms`.
+    pub fn new(budget: Option<TxBudget>, cooldown: Option<Duration>) -> Self {
         Self {
             budget,
+            cooldown,
+            cooling_until: None,
             refusals: LogThrottle::new(REFUSAL_LOG_EVERY),
+            near_limit: LogThrottle::new(REFUSAL_LOG_EVERY),
         }
     }
 
-    /// Admits a send of `class` at `now` — and counts it — or says why not.
+    /// The venue answered a send at `now` with 429/405: nothing goes out for the configured
+    /// cooldown. A second one inside it extends it; nothing shortens it. Returns when the
+    /// cooldown ends — `None` when none is configured, and then nothing changed.
+    pub fn rate_limited(&mut self, now: Instant) -> Option<Instant> {
+        let until = now + self.cooldown?;
+        let until = self
+            .cooling_until
+            .map_or(until, |running| running.max(until));
+        self.cooling_until = Some(until);
+        Some(until)
+    }
+
+    /// When the cooldown running at `now` ends, if one is.
+    pub fn cooling(&self, now: Instant) -> Option<Instant> {
+        self.cooling_until.filter(|&until| until > now)
+    }
+
+    /// Whether three quarters of the budget are spent at `now` — the point the venue's own
+    /// rate-limit report is worth a warning. Never, without a budget.
+    pub fn near_limit(&mut self, now: Instant) -> bool {
+        self.budget
+            .as_mut()
+            .is_some_and(|budget| budget.used(now) * 4 >= budget.per_minute() * 3)
+    }
+
+    /// Admits a send of `class` at `now` — and counts it — or says why not. A cooldown is
+    /// asked about first, and a send it holds back spends no token.
     pub fn admit(&mut self, now: Instant, class: TxClass) -> Result<(), Refusal> {
+        if let Some(until) = self.cooling(now) {
+            return Err(Refusal::Cooldown { until });
+        }
         let Some(budget) = &mut self.budget else {
             return Ok(());
         };
@@ -232,6 +282,11 @@ impl SendGate {
     /// Whether a refusal may be logged at `now` (see [`LogThrottle::admit`]).
     pub fn log_refusal(&mut self, now: Instant) -> Option<u64> {
         self.refusals.admit(now)
+    }
+
+    /// Whether a near-the-limit warning may be logged at `now` (see [`LogThrottle::admit`]).
+    pub fn log_near_limit(&mut self, now: Instant) -> Option<u64> {
+        self.near_limit.admit(now)
     }
 }
 
@@ -376,28 +431,109 @@ mod tests {
     #[test]
     fn without_a_budget_the_gate_admits_everything() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(None);
+        let mut gate = SendGate::new(None, None);
         for _ in 0..1_000 {
             assert!(gate.admit(t0, TxClass::Open).is_ok());
         }
         assert_eq!(gate.usage(t0), None);
     }
 
-    /// The gate's refusal names the budget, and never wears the words the bot's classifier
-    /// reads as a benign race.
+    /// The gate's refusal names the budget or the cooldown, and never wears the words the
+    /// bot's classifier reads as a benign race.
     #[test]
     fn a_refused_send_is_named_a_rate_limit_and_never_a_missing_order() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)));
+        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)), None);
         gate.admit(t0, TxClass::Open).unwrap();
+        let mut cooling = SendGate::new(None, Some(Duration::from_secs(60)));
+        cooling.rate_limited(t0);
         for class in [TxClass::Open, TxClass::RiskReducing] {
             let refusal = gate.admit(t0, class).expect_err("spent");
             assert!(matches!(refusal, Refusal::Budget { .. }));
-            let prose = refusal.to_string();
-            assert!(prose.contains("rate-limited"), "{prose}");
-            assert!(prose.contains("not sent"), "{prose}");
-            assert!(!prose.contains("no live order"), "{prose}");
+            let cooled = cooling.admit(t0, class).expect_err("cooling down");
+            assert!(matches!(cooled, Refusal::Cooldown { .. }));
+            for prose in [refusal.to_string(), cooled.to_string()] {
+                assert!(prose.contains("rate-limited"), "{prose}");
+                assert!(prose.contains("not sent"), "{prose}");
+                assert!(!prose.contains("no live order"), "{prose}");
+            }
         }
+    }
+
+    /// **A 429/405 shuts the gate for the cooldown: nothing goes out — cancels and sweeps
+    /// included — and a send held back spends no token.** The docs' firewall cooldown is 60 s
+    /// "static" and sending into it buys nothing but another refusal (§4.16). It opens on the
+    /// dot.
+    #[test]
+    fn a_cooldown_holds_every_send_until_it_ends() {
+        let t0 = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let mut gate = SendGate::new(Some(TxBudget::new(2, 1)), Some(cooldown));
+        assert_eq!(gate.rate_limited(t0), Some(t0 + cooldown));
+        let late = t0 + cooldown - Duration::from_millis(1);
+        for class in [TxClass::Open, TxClass::RiskReducing] {
+            assert_eq!(
+                gate.admit(late, class),
+                Err(Refusal::Cooldown {
+                    until: t0 + cooldown
+                }),
+                "{class:?}"
+            );
+        }
+        assert_eq!(gate.cooling(late), Some(t0 + cooldown));
+        assert_eq!(gate.usage(late), Some((0, 2)), "nothing was counted");
+        assert!(gate.admit(t0 + cooldown, TxClass::Open).is_ok());
+        assert_eq!(gate.cooling(t0 + cooldown), None);
+    }
+
+    /// A second rate limit inside the cooldown extends it, and an earlier one can never cut
+    /// a running cooldown short.
+    #[test]
+    fn a_rate_limit_inside_the_cooldown_extends_it_and_never_shortens_it() {
+        let t0 = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let mut gate = SendGate::new(None, Some(cooldown));
+        gate.rate_limited(t0 + Duration::from_secs(10));
+        assert_eq!(
+            gate.rate_limited(t0),
+            Some(t0 + Duration::from_secs(70)),
+            "the later end stands"
+        );
+        assert_eq!(
+            gate.rate_limited(t0 + Duration::from_secs(30)),
+            Some(t0 + Duration::from_secs(90))
+        );
+    }
+
+    /// Without `rate_limit_cooldown_ms` a 429 starts nothing — the caller then hands it on as
+    /// the ambiguous answer it was before `RateLimited` existed.
+    #[test]
+    fn without_a_cooldown_a_rate_limit_starts_nothing() {
+        let t0 = Instant::now();
+        let mut gate = SendGate::new(Some(TxBudget::new(48, 12)), None);
+        assert_eq!(gate.rate_limited(t0), None);
+        assert_eq!(gate.cooling(t0), None);
+        assert!(gate.admit(t0, TxClass::Open).is_ok());
+    }
+
+    /// **"Near the limit" is three quarters of the budget spent** — the point the venue's own
+    /// rate-limit report is worth a warning. For 48 with 12 held back that is where quotes
+    /// start being refused. Without a budget nothing is near anything.
+    #[test]
+    fn the_account_is_near_its_limit_at_three_quarters_of_the_budget() {
+        let t0 = Instant::now();
+        let mut gate = SendGate::new(Some(TxBudget::new(48, 12)), None);
+        for _ in 0..35 {
+            gate.admit(t0, TxClass::Open).unwrap();
+        }
+        assert!(!gate.near_limit(t0), "35 of 48");
+        gate.admit(t0, TxClass::Open).unwrap();
+        assert!(gate.near_limit(t0), "36 of 48");
+        assert!(
+            !gate.near_limit(t0 + WINDOW),
+            "and not once the window has moved on"
+        );
+        assert!(!SendGate::new(None, None).near_limit(t0));
     }
 
     /// The refusal log speaks at most once a period and says how much it held back.
@@ -423,7 +559,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_sweep_waits_for_the_gate_only_when_it_opens_before_the_deadline() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)));
+        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)), None);
         gate.admit(t0, TxClass::Open).unwrap();
 
         let short = admit_by(

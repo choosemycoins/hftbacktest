@@ -214,6 +214,13 @@ timeout_ms = 10000
 # # Optional (default 0); needs tx_budget_per_minute and must be smaller than it.
 # tx_reserve = 12
 #
+# # After a sendTx answered 429/405, send nothing for this long, ms (§4.16). Optional; absent =
+# # a 429/405 is treated as an ambiguous answer, as before. The venue's docs: firewall 60 s
+# # static, API server weight/(total/60). Meanwhile new orders are refused back to the bot,
+# # cancels are held until it ends, a sweep waits for it only within its own deadline, and the
+# # order path reads nothing from the venue; the bots hear one rate-limit error per 429/405.
+# rate_limit_cooldown_ms = 60000
+#
 # # AUTH TOKEN: minted by the sidecar, clamped below the venue's 8 h server ceiling, and
 # # REFRESHED automatically before it expires by a clean reconnect (§3.4) — no config. The
 # # 8 h ceiling is enforced only by the server (a longer token mints without error and is

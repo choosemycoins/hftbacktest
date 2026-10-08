@@ -36,6 +36,11 @@ pub enum NonceAction {
     /// The fate is unknown or the counter drifted (a `21104`, a 5xx, an unreadable body).
     /// Invalidate and hard-refresh from `nextNonce` — never guess forward (§3.3).
     Resync,
+    /// The fate is unknown and the venue is refusing the account (a 429/405 under a cooldown,
+    /// §4.16): invalidate, but do **not** ask `nextNonce` now — that is another request into
+    /// the refusal. The next `reserve` re-reads it, and the cooldown keeps the next send until
+    /// the venue answers again.
+    Invalidate,
 }
 
 /// The nonce action a `sendTx` outcome calls for.
@@ -43,6 +48,7 @@ pub fn nonce_action(outcome: &SendOutcome) -> NonceAction {
     match outcome {
         SendOutcome::Accepted(_) => NonceAction::Consumed,
         SendOutcome::InvalidNonce { .. } | SendOutcome::Ambiguous { .. } => NonceAction::Resync,
+        SendOutcome::RateLimited { .. } => NonceAction::Invalidate,
     }
 }
 
@@ -56,6 +62,10 @@ pub enum CancelFollowUp {
     /// report why, so the bot can cancel again instead of waiting for an answer that will
     /// never come.
     HandBack(String),
+    /// Rate-limited (429/405 under a cooldown, §4.16): it may or may not have taken, and a
+    /// cancel sent again now would only be refused. Keep the order's `req = Canceled` and send
+    /// it again once the cooldown is over — unless the channel has closed the order by then.
+    AfterCooldown,
 }
 
 /// The follow-up a cancel's `sendTx` outcome calls for.
@@ -76,6 +86,7 @@ pub fn cancel_after_send(outcome: &SendOutcome) -> CancelFollowUp {
             "the cancel's sendTx was ambiguous (HTTP {status}: {detail}); it may not have \
              taken — cancel again"
         )),
+        SendOutcome::RateLimited { .. } => CancelFollowUp::AfterCooldown,
     }
 }
 
@@ -120,6 +131,12 @@ pub fn sweep_follow_up(outcome: Result<&SendOutcome, &str>, attempt: u32) -> Swe
         Ok(SendOutcome::Ambiguous { status, detail }) => (
             format!("the sweep's sendTx was ambiguous (HTTP {status}: {detail})"),
             SWEEP_RETRY_BACKOFF * attempt,
+        ),
+        // The cooldown it started is the wait: the next attempt's admission holds it until the
+        // gate opens, or ends the sweep if that is past its deadline.
+        Ok(SendOutcome::RateLimited { status, detail }) => (
+            format!("the sweep's sendTx was rate-limited (HTTP {status}: {detail})"),
+            Duration::ZERO,
         ),
         Err(reason) => (reason.to_string(), SWEEP_RETRY_BACKOFF * attempt),
     };
@@ -574,6 +591,58 @@ mod tests {
             assert!(reason.contains("cancel"), "{reason}");
             assert!(!reason.contains("no live order"), "{reason}");
         }
+    }
+
+    /// **A 429/405 leaves the nonce untrusted but unread**: whether the tx was processed is not
+    /// known, so the counter cannot be advanced — and `nextNonce` is a request to the venue
+    /// that is refusing this account, so it is not asked now. `reserve` re-reads it before the
+    /// next send, which the cooldown keeps until the venue will answer (§4.16).
+    #[test]
+    fn a_rate_limited_send_invalidates_the_nonce_without_reading_it() {
+        assert_eq!(
+            nonce_action(&SendOutcome::RateLimited {
+                status: 429,
+                detail: "Too Many Requests".to_string()
+            }),
+            NonceAction::Invalidate
+        );
+    }
+
+    /// **A rate-limited cancel waits out the cooldown rather than going back to the bot.**
+    /// Handed back, the bot would cancel again into the same cooldown — each refusal another
+    /// error toward its storm breaker — while the order stood; held, it goes out the moment the
+    /// venue will take it, even if the bot has died meanwhile (§4.16).
+    #[test]
+    fn a_rate_limited_cancel_waits_for_the_cooldown() {
+        assert_eq!(
+            cancel_after_send(&SendOutcome::RateLimited {
+                status: 405,
+                detail: String::new()
+            }),
+            CancelFollowUp::AfterCooldown
+        );
+    }
+
+    /// A rate-limited sweep attempt is tried again with no wait of its own: the cooldown it
+    /// started is the wait, and the send gate decides whether it ends before the sweep's
+    /// deadline. The last attempt's failure still names the status.
+    #[test]
+    fn a_rate_limited_sweep_attempt_leaves_the_wait_to_the_gate() {
+        let limited = SendOutcome::RateLimited {
+            status: 429,
+            detail: "Too Many Requests".to_string(),
+        };
+        assert_eq!(
+            sweep_follow_up(Ok(&limited), 1),
+            SweepFollowUp::Retry {
+                after: Duration::ZERO
+            }
+        );
+        let SweepFollowUp::Failed(reason) = sweep_follow_up(Ok(&limited), SWEEP_ATTEMPTS) else {
+            panic!("the last attempt's failure is a failed sweep");
+        };
+        assert!(reason.contains("429"), "{reason}");
+        assert!(reason.contains("rate-limited"), "{reason}");
     }
 
     /// A clean 200 spends the nonce; a `21104` and any ambiguous outcome resync it — the slot

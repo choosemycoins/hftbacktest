@@ -59,7 +59,8 @@ use crate::{
 pub mod depth;
 #[cfg(test)]
 pub mod fixtures;
-/// Phase 2 order-path: the client-side `sendTx` budget the slot asks before every send (§4.15).
+/// Phase 2 order-path: the send gate the slot asks before every `sendTx` — the client-side
+/// budget (§4.15) and the cooldown after a 429/405 (§4.16).
 pub mod gate;
 pub mod msg;
 /// Phase 2 order-path: the sequential tx-nonce owner for one api-key slot (§3.3).
@@ -1177,6 +1178,27 @@ mod tests {
         }
     }
 
+    /// **The rate-limit cooldown is optional — absent, a 429/405 is handled as before — and a
+    /// cooldown of nothing is refused at startup** rather than read as one.
+    #[test]
+    fn the_rate_limit_cooldown_is_optional_and_never_zero() {
+        let absent = armed_rh("").unwrap().config.order_path.unwrap();
+        assert_eq!(absent.rate_limit_cooldown(), None);
+        let set = armed_rh("rate_limit_cooldown_ms = 60000")
+            .unwrap()
+            .config
+            .order_path
+            .unwrap();
+        assert_eq!(
+            set.rate_limit_cooldown(),
+            Some(std::time::Duration::from_secs(60))
+        );
+        let Err(error) = armed_rh("rate_limit_cooldown_ms = 0") else {
+            panic!("a zero cooldown must be refused");
+        };
+        assert!(matches!(error, LighterError::Config(_)), "{error}");
+    }
+
     /// The RH catalog maps symbols onto **its own** ids and decimals — the mainnet ones are
     /// different for most names, so this is the table the order path quantises onto.
     #[test]
@@ -1281,6 +1303,7 @@ mod tests {
             .expect("the block arms the path");
         assert_eq!(order_path.tx_budget_per_minute, Some(48));
         assert_eq!(order_path.tx_reserve, Some(12));
+        assert_eq!(order_path.rate_limit_cooldown_ms, Some(60_000));
     }
 
     /// The shipped RH example builds as `lighter-rh` — no endpoint keys, so it is not
@@ -1323,5 +1346,7 @@ mod tests {
         // getting out (design note §4.15).
         assert_eq!(order_path.tx_budget_per_minute, Some(48));
         assert_eq!(order_path.tx_reserve, Some(12));
+        // The venue's firewall cooldown (§4.16).
+        assert_eq!(order_path.rate_limit_cooldown_ms, Some(60_000));
     }
 }
