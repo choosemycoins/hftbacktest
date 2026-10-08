@@ -59,6 +59,52 @@ pub struct MarketInfo {
     pub price_decimals: i64,
     /// `supported_size_decimals`: the venue's size grid is `10^-size_decimals`.
     pub size_decimals: i64,
+    /// `market_type`. Only a [`MarketType::Perp`] reports a position on the private channel,
+    /// so only a perp can be traded through this connector without the bot losing sight of
+    /// its inventory.
+    pub market_type: MarketType,
+    /// `min_base_amount`: the smallest order size the venue accepts, in base units. An order
+    /// below it is refused by the venue only AFTER it has spent a nonce and a `sendTx`.
+    pub min_base_amount: Option<f64>,
+    /// `min_quote_amount`: the smallest order notional the venue accepts ($10 on every RH
+    /// market, 2026-10-08) — same refusal, same cost.
+    pub min_quote_amount: Option<f64>,
+}
+
+/// A market's `market_type`. Anything but `perp`/`spot` is [`MarketType::Other`] and, like
+/// spot, refused for orders: fail closed on a kind of market this connector does not model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketType {
+    Perp,
+    Spot,
+    Other,
+}
+
+impl MarketType {
+    fn of(market_type: &str) -> Self {
+        match market_type {
+            "perp" => Self::Perp,
+            "spot" => Self::Spot,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// For tests only: a perp with no minimums, so a literal can name just what it tests.
+/// Deliberately not available to production code, where every field comes from the catalog.
+#[cfg(test)]
+impl Default for MarketInfo {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            market_id: 0,
+            price_decimals: 0,
+            size_decimals: 0,
+            market_type: MarketType::Perp,
+            min_base_amount: None,
+            min_quote_amount: None,
+        }
+    }
 }
 
 impl MarketInfo {
@@ -90,6 +136,22 @@ struct Row {
     supported_price_decimals: i64,
     #[serde(default)]
     supported_size_decimals: i64,
+    #[serde(default)]
+    market_type: String,
+    /// Decimal strings on the wire ("0.0100", "10.000000").
+    #[serde(default)]
+    min_base_amount: Option<String>,
+    #[serde(default)]
+    min_quote_amount: Option<String>,
+}
+
+/// A catalog minimum as a number; an absent or unreadable one is `None` (no local check —
+/// the venue still enforces it).
+fn minimum(value: &Option<String>) -> Option<f64> {
+    value
+        .as_deref()
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .filter(|amount| amount.is_finite() && *amount > 0.0)
 }
 
 /// What a resolve produced: the markets that resolved, and per symbol the reason one did not.
@@ -190,6 +252,9 @@ fn resolve_one(symbol: &str, rows: &[Row]) -> Result<MarketInfo, LighterError> {
         market_id: row.market_id,
         price_decimals: row.supported_price_decimals,
         size_decimals: row.supported_size_decimals,
+        market_type: MarketType::of(&row.market_type),
+        min_base_amount: minimum(&row.min_base_amount),
+        min_quote_amount: minimum(&row.min_quote_amount),
     })
 }
 
@@ -647,6 +712,7 @@ mod tests {
         rest::{
             AuthCheck,
             MarketInfo,
+            MarketType,
             SendOutcome,
             TxVerdict,
             classify_auth_check,
@@ -677,6 +743,9 @@ mod tests {
                 market_id: 36,
                 price_decimals: 5,
                 size_decimals: 1,
+                market_type: MarketType::Perp,
+                min_base_amount: Some(35.0),
+                min_quote_amount: Some(10.0),
             }
         );
         assert_eq!(resolved[0].tick_size(), 1e-5);
@@ -1001,5 +1070,23 @@ mod tests {
             classify_auth_check(401, "<html>nope</html>"),
             AuthCheck::Invalid { .. }
         ));
+    }
+
+    /// The catalog's market type and minimums ride along with the address, so the order
+    /// path can refuse what the venue would refuse after spending a nonce: on Robinhood
+    /// Chain SPY is a perp with `min_base_amount` 0.01 and `min_quote_amount` $10, and
+    /// `SPY/USDG` is its SPOT pair.
+    #[test]
+    fn the_catalog_carries_the_market_type_and_the_order_minimums() {
+        use crate::lighter::fixtures::RH_ORDER_BOOKS;
+        let (resolved, refused) =
+            match_catalog(&wanted(&["SPY", "SPY/USDG", "XAU"]), RH_ORDER_BOOKS).unwrap();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(resolved[0].market_type, MarketType::Perp);
+        assert_eq!(resolved[0].min_base_amount, Some(0.01));
+        assert_eq!(resolved[0].min_quote_amount, Some(10.0));
+        assert_eq!(resolved[1].market_type, MarketType::Spot);
+        assert_eq!(resolved[1].market_id, 2065);
+        assert_eq!(resolved[2].min_base_amount, Some(0.002));
     }
 }

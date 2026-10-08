@@ -40,7 +40,7 @@ use crate::{
     connector::GetOrders,
     lighter::{
         private_msg::{AccountOrder, AccountPosition},
-        rest::MarketInfo,
+        rest::{MarketInfo, MarketType},
         signer::CreateOrder,
     },
 };
@@ -89,6 +89,19 @@ pub enum OrderError {
     CoiExhausted,
     #[error("the price, size or market does not fit the venue's integer wire form: {0}")]
     OutOfRange(String),
+    /// Below the catalog's `min_base_amount` or `min_quote_amount`. The venue would refuse it
+    /// too — after it had spent a nonce and one of a Standard account's ~60 requests a minute.
+    #[error(
+        "{symbol}: the order is below the venue's minimum ({detail}); refused before it spent a nonce"
+    )]
+    BelowMinimum { symbol: String, detail: String },
+    /// Not a perp. Only perps report a position on the private channel, so an order anywhere
+    /// else would leave the bot blind to its own inventory.
+    #[error(
+        "{symbol} is a {market_type} market on Lighter; this connector trades perps only (no \
+         position is reported for anything else)"
+    )]
+    NotPerp { symbol: String, market_type: String },
 }
 
 /// A cancel addressed the way the venue wants it — by `(market_index, order_index)` (§3.5).
@@ -200,6 +213,12 @@ impl OrderManager {
         market: &MarketInfo,
         order: &Order,
     ) -> Result<(i64, CreateOrder), OrderError> {
+        if market.market_type != MarketType::Perp {
+            return Err(OrderError::NotPerp {
+                symbol: symbol.to_string(),
+                market_type: format!("{:?}", market.market_type).to_lowercase(),
+            });
+        }
         let is_ask = match order.side {
             Side::Buy => 0,
             Side::Sell => 1,
@@ -235,6 +254,33 @@ impl OrderManager {
             )));
         }
         let base_amount = base_scaled as i64;
+
+        // The catalog's minimums, on the QUANTISED size — what the venue would see. A relative
+        // slack of 1e-9 forgives float rounding only, never a real lot. They apply to MAKER
+        // orders only (RH docs, "Signing Transactions": "those minimums only apply to maker
+        // orders"), so an IOC — the risk-off flatten of a residual smaller than a lot of
+        // minimums — is not refused here.
+        let quantised_qty = base_amount as f64 * market.lot_size();
+        let below = |amount: f64, minimum: f64| amount < minimum * (1.0 - 1e-9);
+        let resting = time_in_force != TIF_IMMEDIATE_OR_CANCEL;
+        if resting
+            && let Some(min_base) = market.min_base_amount
+            && below(quantised_qty, min_base)
+        {
+            return Err(OrderError::BelowMinimum {
+                symbol: symbol.to_string(),
+                detail: format!("size {quantised_qty} < min_base_amount {min_base}"),
+            });
+        }
+        if resting && let Some(min_quote) = market.min_quote_amount {
+            let notional = quantised_qty * order.price();
+            if below(notional, min_quote) {
+                return Err(OrderError::BelowMinimum {
+                    symbol: symbol.to_string(),
+                    detail: format!("notional ${notional:.4} < min_quote_amount ${min_quote}"),
+                });
+            }
+        }
 
         let market_index_wire = i16::try_from(market.market_id).map_err(|_| {
             OrderError::OutOfRange(format!("market_id {} exceeds i16", market.market_id))
@@ -555,7 +601,7 @@ mod tests {
         connector::GetOrders,
         lighter::{
             private_msg::{AccountOrder, AccountPosition},
-            rest::MarketInfo,
+            rest::{MarketInfo, MarketType},
         },
     };
 
@@ -566,6 +612,7 @@ mod tests {
             market_id: 1,
             price_decimals: 1,
             size_decimals: 5,
+            ..Default::default()
         }
     }
 
@@ -1097,5 +1144,63 @@ mod tests {
         }
         let (kind, _) = venue_refusal("canceled-liquidation").unwrap();
         assert_eq!(kind, ErrorKind::CriticalConnectionError);
+    }
+
+    fn spy(min_base: f64, min_quote: f64) -> MarketInfo {
+        MarketInfo {
+            symbol: "SPY".to_string(),
+            market_id: 26,
+            price_decimals: 2,
+            size_decimals: 4,
+            market_type: MarketType::Perp,
+            min_base_amount: Some(min_base),
+            min_quote_amount: Some(min_quote),
+        }
+    }
+
+    /// **An order the venue would refuse is refused here, before it costs a nonce and one of
+    /// the ~60 requests a minute a Standard account gets.** Both minimums, as the catalog
+    /// states them: SPY at $775 needs ≥ 0.0100 base AND ≥ $10 notional, so 0.0129 ($9.997)
+    /// is refused and 0.0150 ($11.6) is not.
+    #[test]
+    fn an_order_below_the_venues_minimum_is_refused_before_a_nonce_is_spent() {
+        let mut m = manager();
+        let market = spy(0.01, 10.0);
+        for (id, qty) in [(1, 0.009), (2, 0.0129)] {
+            let refused = m.new_order("SPY", &market, &bid(id, 775.0, qty));
+            assert!(
+                matches!(refused, Err(OrderError::BelowMinimum { .. })),
+                "{qty}: {refused:?}"
+            );
+            let message = refused.unwrap_err().to_string();
+            assert!(!message.contains("no live order"), "{message}");
+        }
+        assert_eq!(m.tracked(), 0, "nothing was registered for a refused order");
+        assert!(m.new_order("SPY", &market, &bid(3, 775.0, 0.015)).is_ok());
+
+        // The minimums are a MAKER rule: a flatten IOC for a residual below them is sent.
+        let mut ioc = bid(4, 775.0, 0.005);
+        ioc.time_in_force = TimeInForce::IOC;
+        assert!(
+            m.new_order("SPY", &market, &ioc).is_ok(),
+            "an IOC is not held to them"
+        );
+    }
+
+    /// Spot pairs report no position on the private channel, so an order there would leave
+    /// the bot blind to its own inventory: refused, by name.
+    #[test]
+    fn a_spot_market_is_refused_for_orders() {
+        let mut m = manager();
+        let mut spot = spy(0.01, 10.0);
+        spot.symbol = "SPY/USDG".to_string();
+        spot.market_id = 2065;
+        spot.market_type = MarketType::Spot;
+        let refused = m.new_order("SPY/USDG", &spot, &bid(1, 775.0, 0.015));
+        assert!(
+            matches!(refused, Err(OrderError::NotPerp { .. })),
+            "{refused:?}"
+        );
+        assert!(refused.unwrap_err().to_string().contains("SPY/USDG"));
     }
 }

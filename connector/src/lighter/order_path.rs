@@ -1909,6 +1909,7 @@ mod tests {
             market_id: 42,
             price_decimals: 2,
             size_decimals: 4,
+            ..Default::default()
         });
 
         drop(command_rx);
@@ -1996,6 +1997,7 @@ mod tests {
             market_id: 1,
             price_decimals: 1,
             size_decimals: 5,
+            ..Default::default()
         });
         task.on_frame(PRIVATE_POSITIONS_UPDATE_FLAT);
         match ev_rx.try_recv() {
@@ -2022,6 +2024,7 @@ mod tests {
             market_id: 1,
             price_decimals: 1,
             size_decimals: 5,
+            ..Default::default()
         };
         let coi = {
             let mut manager = task.order_manager.lock().unwrap();
@@ -2108,6 +2111,7 @@ mod tests {
             market_id: 1,
             price_decimals: 1,
             size_decimals: 5,
+            ..Default::default()
         });
 
         let before = Utc::now().timestamp_nanos_opt().unwrap();
@@ -2140,6 +2144,7 @@ mod tests {
                 market_id: 42,
                 price_decimals: 2,
                 size_decimals: 4,
+                ..Default::default()
             }],
             vec![(
                 "NOTACOIN".to_string(),

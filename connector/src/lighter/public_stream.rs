@@ -1404,6 +1404,7 @@ mod tests {
             market_id: 36,
             price_decimals: 5,
             size_decimals: 1,
+            ..Default::default()
         }
     }
 
@@ -1413,6 +1414,7 @@ mod tests {
             market_id: 24,
             price_decimals: 4,
             size_decimals: 2,
+            ..Default::default()
         }
     }
 
@@ -2531,6 +2533,7 @@ mod tests {
                 .expect("the recording has no order_book frames"),
             price_decimals: price_decimals as i64,
             size_decimals: size_decimals as i64,
+            ..Default::default()
         };
         eprintln!("replaying {} frames as {info:?}", frames.len());
 

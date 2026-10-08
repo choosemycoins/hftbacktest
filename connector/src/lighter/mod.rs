@@ -954,6 +954,7 @@ mod tests {
                 market_id: 1,
                 price_decimals: 1,
                 size_decimals: 5,
+                ..Default::default()
             });
 
         let reported = ReportedUnresolved::default();
