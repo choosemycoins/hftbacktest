@@ -175,6 +175,12 @@ pub struct FeedCounts {
     /// [`crate::lighter::depth::MirrorCounts`].
     pub collapsed_levels: u64,
     pub sub_lot_levels: u64,
+    // --- from the message budget (filled in by `PublicStream::counts`) ---
+    /// Client messages written to the socket since the process started — subscribes,
+    /// unsubscribes, keepalives. What the venue's 200-a-minute limit counts.
+    pub client_messages: u64,
+    /// Client messages inside the current sliding minute: the number to hold against 200.
+    pub client_messages_last_minute: u64,
 }
 
 impl FeedCounts {
@@ -213,6 +219,8 @@ pub fn degraded(previous: &FeedCounts, current: &FeedCounts) -> Option<(u64, u64
 pub struct MessageBudget {
     per_minute: usize,
     spent: VecDeque<Instant>,
+    /// Every message ever let through, for the counters line.
+    total: u64,
 }
 
 impl MessageBudget {
@@ -220,6 +228,7 @@ impl MessageBudget {
         Self {
             per_minute,
             spent: VecDeque::new(),
+            total: 0,
         }
     }
 
@@ -239,12 +248,18 @@ impl MessageBudget {
         for _ in 0..count {
             self.spent.push_back(now);
         }
+        self.total += count as u64;
         true
     }
 
     /// Messages spent inside the current window.
     pub fn spent(&self) -> usize {
         self.spent.len()
+    }
+
+    /// Messages spent since this budget was made — never ages out.
+    pub fn total_spent(&self) -> u64 {
+        self.total
     }
 }
 
@@ -783,6 +798,14 @@ impl PublicStream {
     ///
     /// The market state lives here, outside the connect loop, which is what makes the book
     /// mirrors and the print window survive a reconnect.
+    /// The feed counters, with what the message budget has let through.
+    pub fn counts(&self) -> FeedCounts {
+        let mut counts = self.state.counts();
+        counts.client_messages = self.budget.total_spent();
+        counts.client_messages_last_minute = self.budget.spent() as u64;
+        counts
+    }
+
     pub async fn run(&mut self) {
         let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
         let mut last_counts = FeedCounts::default();
@@ -791,7 +814,7 @@ impl PublicStream {
                 Ok(()) => LighterError::ConnectionInterrupted,
                 Err(error) => error,
             };
-            let counts = self.state.counts();
+            let counts = self.counts();
             error!(?error, ?counts, "The Lighter public stream disconnected.");
             self.report(&mut last_counts, counts);
             publish_error(&self.ev_tx, ErrorKind::ConnectionInterrupted, &error);
@@ -871,7 +894,7 @@ impl PublicStream {
                     self.report_concerns(now);
                     self.flush_repairs(write, now).await?;
                     self.subscribe_pending(write, &mut tracker).await?;
-                    let counts = self.state.counts();
+                    let counts = self.counts();
                     self.report(&mut last_counts, counts);
                 }
                 // The answer to a round trip started by one of the three impulses in
@@ -2231,6 +2254,38 @@ mod tests {
 
         // A sliding window, not a fixed one: the oldest spend ages out.
         assert!(budget.try_spend(2, now + Duration::from_secs(61)));
+    }
+
+    /// Every client message the budget lets through is counted, so the 200-a-minute venue
+    /// limit can be checked against what this connector actually sent — the feed counters
+    /// line carries both the running total and the current sliding minute.
+    #[test]
+    fn the_budget_counts_every_message_it_lets_through() {
+        let mut budget = MessageBudget::new(4);
+        let now = Instant::now();
+        assert!(budget.try_spend(3, now));
+        assert!(!budget.try_spend(2, now), "refused: nothing is counted");
+        assert!(budget.try_spend(1, now));
+        assert_eq!(budget.total_spent(), 4);
+        assert!(budget.try_spend(2, now + Duration::from_secs(61)));
+        assert_eq!(budget.total_spent(), 6, "the total never ages out");
+        assert_eq!(budget.spent(), 2, "the window does");
+    }
+
+    /// The counters a stream reports carry what its budget has let through: four
+    /// subscribes at connect for two symbols, and nothing else on a closed read.
+    #[tokio::test]
+    async fn the_feed_counters_report_the_client_messages_sent() {
+        let (mut stream, _ev_rx) = stream(&["CRV", "HYPE"], &[crv(), hype()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        stream
+            .serve(&mut sink, &mut closed_read())
+            .await
+            .unwrap_err();
+        let counts = stream.counts();
+        assert_eq!(counts.client_messages, sink.sent.len() as u64);
+        assert_eq!(counts.client_messages, 4);
+        assert_eq!(counts.client_messages_last_minute, 4);
     }
 
     /// The arithmetic the budget has to close, in the worst minute a connection can have:
