@@ -114,8 +114,16 @@ pub enum LighterError {
     /// `Result<_, LighterError>` in this module would otherwise pay for.
     #[error("Tungstenite: {0}")]
     Tungstenite(Box<tokio_tungstenite::tungstenite::Error>),
-    #[error("Config: {0:?}")]
-    Config(#[from] toml::de::Error),
+    /// The config could not be read. Carries the parser's message and line only — never the
+    /// document, which may be a key file passed by mistake ([`config_error`]).
+    #[error("Config: {0}")]
+    Config(String),
+    /// A `lighter-rh` config named an endpoint, which that instance fixes in code.
+    #[error(
+        "FixedEndpoint: lighter-rh fixes its endpoints in code ({RH_REST_URL}, {RH_PUBLIC_URL}); \
+         remove `{0}` from the config"
+    )]
+    FixedEndpoint(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for LighterError {
@@ -184,6 +192,147 @@ pub struct Config {
 
 pub(crate) type SharedSymbolSet = Arc<Mutex<HashSet<String>>>;
 
+/// Lighter on Robinhood Chain (`lighter-rh`): a separate exchange instance — its own
+/// markets, ids and decimals, its own points programme, maker = taker = 0 on the Standard
+/// tier — speaking the same protocol as mainnet (compared frame for frame on 2026-10-08,
+/// [`fixtures`]). Its endpoints are **fixed here and never read from a config**: the two
+/// instances share symbol names (BTC is market 1 on both), so a misdirected URL would trade
+/// the wrong venue with every symbol resolving and nothing in the log to say so. The
+/// collector's `lighter-rh` backend makes the same choice for the same reason.
+pub const RH_PUBLIC_URL: &str = "wss://api.rh.lighter.xyz/stream";
+/// See [`RH_PUBLIC_URL`].
+pub const RH_REST_URL: &str = "https://api.rh.lighter.xyz";
+/// The chain id every Robinhood Chain transaction is hashed with — lighter-sdk's
+/// `endpoint_profiles.ROBINHOOD`. It enters the hash the signature is over and nothing
+/// else: the auth token carries no chain id, so a signer on the wrong one passes the
+/// private stream's auth and has **every** transaction refused, `CancelAllOrders`
+/// included. The signer sidecar used to infer 300 (testnet) for any URL that was not
+/// mainnet's, which is exactly that failure on this instance.
+pub const RH_CHAIN_ID: u32 = 466_324;
+
+/// Which Lighter instance this connector process serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instance {
+    /// `lighter`: endpoints from the config — mainnet, or testnet for a shakeout.
+    Configured,
+    /// `lighter-rh`: Robinhood Chain. Endpoints and chain id are the constants above; a
+    /// config that names an endpoint is refused ([`LighterError::FixedEndpoint`]).
+    RobinhoodChain,
+}
+
+impl Instance {
+    /// The instance a backend name on the command line selects, or `None` if the name is
+    /// not a Lighter backend. The name is the **only** selector — exact, case included.
+    pub fn for_backend(name: &str) -> Option<Self> {
+        match name {
+            "lighter" => Some(Self::Configured),
+            "lighter-rh" => Some(Self::RobinhoodChain),
+            _ => None,
+        }
+    }
+
+    /// The backend name, as `main.rs` dispatches on it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Configured => "lighter",
+            Self::RobinhoodChain => "lighter-rh",
+        }
+    }
+}
+
+/// Reads a connector config for `instance`.
+///
+/// `lighter-rh` takes everything but the endpoints from the file, and refuses a file that
+/// names one rather than obey or ignore it: obeyed, a URL left over from a copied mainnet
+/// config trades mainnet; ignored, the file says one thing and the process does another.
+fn parse_config(instance: Instance, text: &str) -> Result<Config, LighterError> {
+    match instance {
+        Instance::Configured => toml::from_str(text).map_err(|error| config_error(text, &error)),
+        Instance::RobinhoodChain => {
+            let mut table: toml::Table =
+                toml::from_str(text).map_err(|error| config_error(text, &error))?;
+            for key in ["public_url", "rest_url"] {
+                if table.contains_key(key) {
+                    return Err(LighterError::FixedEndpoint(key.to_string()));
+                }
+            }
+            table.insert(
+                "public_url".to_string(),
+                toml::Value::String(RH_PUBLIC_URL.to_string()),
+            );
+            table.insert(
+                "rest_url".to_string(),
+                toml::Value::String(RH_REST_URL.to_string()),
+            );
+            toml::Value::Table(table)
+                .try_into()
+                .map_err(|error| config_error(text, &error))
+        }
+    }
+}
+
+/// A config error as it may be logged: the parser's message and the line it points at, and
+/// **never** the document. `toml::de::Error`'s `Debug` carries the whole input and its
+/// `Display` quotes the offending line, and build errors are logged — so a key file handed
+/// over as the connector config by mistake would otherwise put its private key in the log.
+fn config_error(text: &str, error: &toml::de::Error) -> LighterError {
+    let line = error.span().map(|span| {
+        // Bytes, not `str` slicing: a span need not land on a character boundary.
+        text.as_bytes()[..span.start.min(text.len())]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1
+    });
+    LighterError::Config(match line {
+        Some(line) => format!("{} (line {line})", error.message()),
+        None => error.message().to_string(),
+    })
+}
+
+impl Lighter {
+    /// Builds the connector for one instance. `ConnectorBuilder::build_from` is the
+    /// `lighter` (configured-endpoint) case of this.
+    pub fn build_for(instance: Instance, config: &str) -> Result<Self, LighterError> {
+        let config = parse_config(instance, config)?;
+        let (symbol_tx, _) = broadcast::channel(500);
+        let symbols: SharedSymbolSet = Default::default();
+        {
+            let mut set = symbols.lock().unwrap();
+            for symbol in &config.symbols {
+                set.insert(symbol.clone());
+            }
+        }
+        info!(
+            backend = instance.name(),
+            public_url = %config.public_url,
+            rest_url = %config.rest_url,
+            "The Lighter instance this connector serves."
+        );
+        if config.order_path.is_some() {
+            info!(
+                "The Lighter order path is ARMED (an [order_path] section is present): it will \
+                 sign, place and cancel orders. Acceptance is confirmed off the private channel, \
+                 not the sendTx 200 (§4.11)."
+            );
+        } else {
+            warn!(
+                "The Lighter backend is market-data only: no [order_path] section, so it serves \
+                 the feed and refuses every order. This is the fail-closed default."
+            );
+        }
+        Ok(Lighter {
+            instance,
+            config,
+            symbols,
+            symbol_tx,
+            no_orders: Arc::new(Mutex::new(NoOrders)),
+            order_path: None,
+            tasks: Vec::new(),
+        })
+    }
+}
+
 /// What a market-data-only connector reports: nothing, because it holds nothing.
 ///
 /// Deliberately not a stub that pretends. [`Lighter`] refuses every order with
@@ -198,6 +347,7 @@ impl GetOrders for NoOrders {
 }
 
 pub struct Lighter {
+    instance: Instance,
     config: Config,
     symbols: SharedSymbolSet,
     symbol_tx: Sender<String>,
@@ -216,35 +366,7 @@ impl ConnectorBuilder for Lighter {
     type Error = LighterError;
 
     fn build_from(config: &str) -> Result<Self, Self::Error> {
-        let config: Config = toml::from_str(config)?;
-        let (symbol_tx, _) = broadcast::channel(500);
-        let symbols: SharedSymbolSet = Default::default();
-        {
-            let mut set = symbols.lock().unwrap();
-            for symbol in &config.symbols {
-                set.insert(symbol.clone());
-            }
-        }
-        if config.order_path.is_some() {
-            info!(
-                "The Lighter order path is ARMED (an [order_path] section is present): it will \
-                 sign, place and cancel orders. Acceptance is confirmed off the private channel, \
-                 not the sendTx 200 (§4.11)."
-            );
-        } else {
-            warn!(
-                "The Lighter backend is market-data only: no [order_path] section, so it serves \
-                 the feed and refuses every order. This is the fail-closed default."
-            );
-        }
-        Ok(Lighter {
-            config,
-            symbols,
-            symbol_tx,
-            no_orders: Arc::new(Mutex::new(NoOrders)),
-            order_path: None,
-            tasks: Vec::new(),
-        })
+        Self::build_for(Instance::Configured, config)
     }
 }
 
@@ -493,12 +615,17 @@ mod tests {
         connector::{Connector, ConnectorBuilder, PublishEvent, SweepReason},
         lighter::{
             Config,
+            Instance,
             Lighter,
             LighterError,
             MAX_ERROR_BYTES,
+            RH_CHAIN_ID,
+            RH_PUBLIC_URL,
+            RH_REST_URL,
             TRUNCATION_MARK,
+            fixtures::RH_ORDER_BOOKS,
             reject_order,
-            rest::MarketInfo,
+            rest::{MarketInfo, match_catalog},
         },
     };
 
@@ -840,5 +967,152 @@ mod tests {
         assert!(message.len() <= MAX_ERROR_BYTES, "{}", message.len());
         assert!(message.ends_with(TRUNCATION_MARK), "{message}");
         encoded_len(message).unwrap();
+    }
+
+    // ---- lighter-rh: Lighter on Robinhood Chain ---------------------------------------
+
+    /// The backend is chosen by its name on the command line, and by nothing else: the two
+    /// instances share symbol names (BTC is market 1 on both), so nothing downstream would
+    /// show that the wrong one had been dialled.
+    #[test]
+    fn the_instance_is_chosen_by_the_backend_name_alone() {
+        assert_eq!(Instance::for_backend("lighter"), Some(Instance::Configured));
+        assert_eq!(
+            Instance::for_backend("lighter-rh"),
+            Some(Instance::RobinhoodChain)
+        );
+        for near_miss in ["lighter_rh", "lighterrh", "Lighter-RH", "rh", "lighter-rh "] {
+            assert_eq!(Instance::for_backend(near_miss), None, "{near_miss:?}");
+        }
+    }
+
+    /// `lighter-rh` dials Robinhood Chain's fixed endpoints, whatever else its config says.
+    #[test]
+    fn lighter_rh_dials_the_robinhood_chain_endpoints() {
+        let connector =
+            Lighter::build_for(Instance::RobinhoodChain, r#"symbols = ["SPY", "XAU"]"#).unwrap();
+
+        assert_eq!(connector.instance, Instance::RobinhoodChain);
+        assert_eq!(
+            connector.config.public_url,
+            "wss://api.rh.lighter.xyz/stream"
+        );
+        assert_eq!(connector.config.rest_url, "https://api.rh.lighter.xyz");
+        assert_eq!(RH_PUBLIC_URL, "wss://api.rh.lighter.xyz/stream");
+        assert_eq!(RH_REST_URL, "https://api.rh.lighter.xyz");
+        assert_eq!(RH_CHAIN_ID, 466_324);
+        let symbols = connector.symbols.lock().unwrap();
+        assert!(symbols.contains("SPY") && symbols.contains("XAU"));
+    }
+
+    /// An endpoint in a `lighter-rh` config is refused, not ignored and not obeyed. Obeyed,
+    /// a mainnet URL left over from a copied config would trade mainnet under names that all
+    /// resolve; ignored, the file would say one thing and the process do another. Refused
+    /// even when it names the right URL, so the rule has no exceptions to remember.
+    #[test]
+    fn a_lighter_rh_config_that_names_an_endpoint_is_refused() {
+        for (key, value) in [
+            ("rest_url", "https://mainnet.zklighter.elliot.ai"),
+            ("public_url", "wss://mainnet.zklighter.elliot.ai/stream"),
+            ("rest_url", "https://api.rh.lighter.xyz"),
+        ] {
+            let text = format!("{key} = \"{value}\"\nsymbols = [\"BTC\"]\n");
+            let Err(error) = Lighter::build_for(Instance::RobinhoodChain, &text) else {
+                panic!("{key} = {value} must be refused for lighter-rh");
+            };
+            let message = error.to_string();
+            assert!(
+                matches!(&error, LighterError::FixedEndpoint(named) if named == key),
+                "{key}: {message}"
+            );
+            assert!(message.contains(key), "{message}");
+        }
+    }
+
+    /// The mainnet/testnet backend is untouched: its endpoints still come from the config,
+    /// and a config without them is still refused.
+    #[test]
+    fn the_configured_instance_still_reads_its_endpoints_from_the_config() {
+        let connector = Lighter::build_for(
+            Instance::Configured,
+            r#"
+            public_url = "wss://testnet.zklighter.elliot.ai/stream"
+            rest_url = "https://testnet.zklighter.elliot.ai"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(connector.instance, Instance::Configured);
+        assert_eq!(
+            connector.config.rest_url,
+            "https://testnet.zklighter.elliot.ai"
+        );
+        assert!(Lighter::build_for(Instance::Configured, r#"symbols = ["BTC"]"#).is_err());
+    }
+
+    /// A config error names what is wrong and **never** echoes the document. The toml
+    /// error's `Debug` carries the whole input, and the connector logs build errors; a
+    /// sidecar key file passed as the connector config by mistake would put its private key
+    /// in the log.
+    #[test]
+    fn a_config_error_does_not_echo_the_document() {
+        let secret =
+            "0x5ec2e7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // A sidecar key file: no `public_url`/`rest_url`, so `lighter` refuses it as
+        // incomplete; a `[order_path]`-less RH config with only unknown keys would parse,
+        // so the RH case is the half-written file below, which no instance can read.
+        let sidecar_file = format!(
+            "url = \"https://api.rh.lighter.xyz\"\naccount_index = 1\napi_key_index = 5\nprivate_key = \"{secret}\"\n"
+        );
+        let not_toml = format!("private_key = \"{secret}\nsymbols = [");
+        let cases = [
+            (Instance::Configured, sidecar_file.as_str()),
+            (Instance::Configured, not_toml.as_str()),
+            (Instance::RobinhoodChain, not_toml.as_str()),
+        ];
+        for (instance, text) in cases {
+            let Err(error) = Lighter::build_for(instance, text) else {
+                panic!("{instance:?} must refuse {text:?}");
+            };
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains("5ec2e7"), "{instance:?}: {shown}");
+            assert!(matches!(error, LighterError::Config(_)), "{shown}");
+        }
+    }
+
+    /// The RH catalog maps symbols onto **its own** ids and decimals — the mainnet ones are
+    /// different for most names, so this is the table the order path quantises onto.
+    #[test]
+    fn the_rh_catalog_resolves_onto_robinhood_chain_markets() {
+        let wanted: Vec<String> = ["BTC", "ETH", "HYPE", "SOL", "SPY", "XAU", "CASHCAT"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (resolved, refused) = match_catalog(&wanted, RH_ORDER_BOOKS).unwrap();
+        assert!(refused.is_empty(), "{refused:?}");
+        let by_symbol = |symbol: &str| {
+            resolved
+                .iter()
+                .find(|info| info.symbol == symbol)
+                .cloned()
+                .unwrap()
+        };
+        // (symbol, market_id, tick, lot) — RH, 2026-10-08.
+        for (symbol, market_id, tick, lot) in [
+            ("ETH", 0, 0.01, 0.0001),
+            ("BTC", 1, 0.1, 0.00001),
+            ("HYPE", 2, 0.001, 0.001),
+            ("SOL", 3, 0.001, 0.001),
+            ("SPY", 26, 0.01, 0.0001),
+            ("CASHCAT", 36, 0.00001, 0.1),
+            ("XAU", 40, 0.01, 0.0001),
+        ] {
+            let info = by_symbol(symbol);
+            assert_eq!(info.market_id, market_id, "{symbol}");
+            assert!(
+                (info.tick_size() - tick).abs() < tick * 1e-9,
+                "{symbol} tick"
+            );
+            assert!((info.lot_size() - lot).abs() < lot * 1e-9, "{symbol} lot");
+        }
     }
 }

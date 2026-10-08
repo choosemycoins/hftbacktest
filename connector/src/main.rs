@@ -114,7 +114,7 @@ use crate::{
     bybit::Bybit,
     connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
     hyperliquid::Hyperliquid,
-    lighter::Lighter,
+    lighter::{Instance, Lighter},
     supervision::{
         BotRegistry,
         DrainOutcome,
@@ -626,7 +626,10 @@ struct Args {
     /// * binancespot: Binance Spot
     /// * bybit: Bybit Linear Futures
     /// * hyperliquid: Hyperliquid perpetuals (market data only; orders are rejected)
-    /// * lighter: Lighter perpetuals (market data only; orders are rejected)
+    /// * lighter: Lighter perpetuals, endpoints from the config (orders only with an
+    ///   `[order_path]` section)
+    /// * lighter-rh: Lighter on Robinhood Chain — endpoints and the signing chain id are
+    ///   fixed in code (orders only with an `[order_path]` section)
     connector: String,
 
     /// Connector's configuration file path.
@@ -759,9 +762,11 @@ async fn run() {
     // defaulted: silently falling back would turn a typo in `timeout_ms` into a connector
     // that looks protected and is not.
     let supervision: SupervisionConfig = toml::from_str(&config)
-        .map_err(|error| {
+        .map_err(|error: toml::de::Error| {
+            // The parser's message only: the error's Debug carries the whole document, and a
+            // key file passed here by mistake would put its key in the log.
             error!(
-                ?error,
+                error = error.message(),
                 config = args.config,
                 "Couldn't read the `[shutdown]` / `[bot_liveness]` supervision settings."
             );
@@ -812,10 +817,13 @@ async fn run() {
             connector.run(pub_tx.clone());
             Box::new(connector)
         }
-        "lighter" => {
-            let mut connector = Lighter::build_from(&config)
+        backend @ ("lighter" | "lighter-rh") => {
+            let instance = Instance::for_backend(backend).expect("matched a Lighter backend name");
+            // `%error`, not `?error`: a config error's Debug would carry the whole document,
+            // and this file may be a key file passed by mistake (`lighter::config_error`).
+            let mut connector = Lighter::build_for(instance, &config)
                 .map_err(|error| {
-                    error!(?error, "Couldn't build the Lighter connector.");
+                    error!(%error, backend, "Couldn't build the Lighter connector.");
                 })
                 .unwrap();
             connector.run(pub_tx.clone());

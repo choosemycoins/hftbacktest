@@ -195,3 +195,28 @@ pub const ACCOUNT_LIMITS_OK: &str = r#"{"code":200,"max_llp_percentage":100,"max
 /// connector switches to a doomed token.
 pub const ACCOUNT_LIMITS_INVALID_DEADLINE: &str =
     r#"{"code":20013,"message":"invalid auth: invalid deadline"}"#;
+
+// ---------------------------------------------------------------------------
+// Lighter on Robinhood Chain (`lighter-rh`), captured verbatim on 2026-10-08 by this
+// repository's collector (`collector/src/lighter/fixtures.rs`, branch
+// `feat/collector-lighter-rh`, which compared the protocol key-for-key against a mainnet
+// session taken in the same minute). The two instances share the protocol and **not** the
+// market map: BTC is market 1 on both, but HYPE is 2 here and 24 on mainnet, SOL 3 against
+// 2, and id 36 is CASHCAT here and CRV there — which is why a misdirected endpoint would
+// trade the wrong market under a name that resolves.
+// ---------------------------------------------------------------------------
+
+/// `subscribed/order_book` for BTC on Robinhood Chain (market 1). The real frame is 400 KB
+/// (6083 asks, 4736 bids); its levels are truncated to two a side, the envelope is untouched.
+pub const RH_ORDER_BOOK_SNAPSHOT_BTC: &str = r#"{"channel":"order_book:1","last_updated_at":1791452751417472,"offset":5205762,"order_book":{"code":0,"asks":[{"price":"83121.1","size":"0.02483"},{"price":"83123.4","size":"0.00500"}],"bids":[{"price":"83115.7","size":"0.00495"},{"price":"83115.6","size":"0.00500"}],"offset":5205762,"nonce":3031976414,"last_updated_at":1791452751417472,"begin_nonce":0},"timestamp":1791452751463,"type":"subscribed/order_book"}"#;
+
+/// The first diff after [`RH_ORDER_BOOK_SNAPSHOT_BTC`]: `begin_nonce` == the snapshot's `nonce`.
+pub const RH_CHAIN_A_BTC: &str = r#"{"channel":"order_book:1","last_updated_at":1791452751471277,"offset":5205764,"order_book":{"code":0,"asks":[{"price":"83123.9","size":"0.05000"},{"price":"83127.7","size":"0.12031"},{"price":"83127.8","size":"0.32705"}],"bids":[],"offset":5205764,"nonce":3031976449,"last_updated_at":1791452751471277,"begin_nonce":3031976414},"timestamp":1791452751478,"type":"update/order_book"}"#;
+
+/// `update/trade` on Robinhood Chain. Unlike mainnet's prints it carries **no fee fields**
+/// (the instance is 0/0).
+pub const RH_TRADE_BTC: &str = r#"{"channel":"trade:1","liquidation_trades":[],"nonce":3031982266,"trades":[{"trade_id":1423880765,"trade_id_str":"1423880765","tx_hash":"00000001515e0221000001a11ae7c62d000000000000000000000000000000000000000000000000","type":"trade","market_id":1,"size":"0.00001","price":"83126.8","usd_amount":"0.831268","ask_id":562950080549007,"ask_id_str":"562950080549007","bid_id":844424802741871,"bid_id_str":"844424802741871","ask_client_id":1791452758463,"ask_client_id_str":"1791452758463","bid_client_id":0,"bid_client_id_str":"0","ask_account_id":3994,"bid_account_id":281474976710102,"is_maker_ask":true,"block_height":34857165,"timestamp":1791452759597,"taker_position_size_before":"0.30100","taker_entry_quote_before":"24157.309589","taker_initial_margin_fraction_before":1428,"maker_position_size_before":"-0.00020","maker_entry_quote_before":"16.623010","maker_initial_margin_fraction_before":200,"transaction_time":1791452759597495,"ask_order_version":0,"bid_order_version":0}],"type":"update/trade"}"#;
+
+/// The whole `GET /api/v1/orderBooks` of the Robinhood Chain instance, fetched 2026-10-08:
+/// 58 perps (ids 0–57, bare names) and 27 spot pairs (ids 2048–2074, `X/USDG`).
+pub const RH_ORDER_BOOKS: &str = include_str!("fixtures/rh_order_books_20261008.json");
