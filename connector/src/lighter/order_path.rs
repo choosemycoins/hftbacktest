@@ -31,9 +31,11 @@
 //! concern (§6.В.3) and is left to provisioning, not hard-coded here.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    // `Instant` unqualified in this file is `tokio::time::Instant` (the confirmation
+    // deadlines); the outbound stopwatch is plain monotonic time, so it is spelled out.
+    time::{Duration, Instant as StdInstant},
 };
 
 use chrono::Utc;
@@ -43,6 +45,7 @@ use serde::Deserialize;
 use tokio::{
     select,
     sync::{
+        broadcast::{self, error::RecvError},
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
     },
@@ -51,7 +54,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{Error as WsError, Message, client::IntoClientRequest},
 };
 use tracing::{error, info, warn};
 
@@ -63,13 +66,22 @@ use crate::{
         nonce::NonceOwner,
         order::{CancelPlan, OrderManager},
         private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
-        public_stream::{BACKOFF_MAX, BACKOFF_MIN, CONNECT_TIMEOUT, PING_FRAME, PING_INTERVAL},
-        rest::{self, SendOutcome},
+        public_stream::{
+            BACKOFF_MAX,
+            BACKOFF_MIN,
+            CONNECT_TIMEOUT,
+            PING_FRAME,
+            PING_INTERVAL,
+            local_now,
+        },
+        publish_error,
+        rest::{self, MarketInfo, Resolution, SendOutcome},
         signer::{CreateOrder, SignerClient, python_sidecar_command},
         slot::{
             AmbiguousFate,
             DeadlineAction,
             NonceAction,
+            Outbound,
             Placement,
             deadline_action,
             fate_of_ambiguous,
@@ -225,6 +237,10 @@ enum Command {
     Submit {
         coi: i64,
         order: Box<CreateOrder>,
+        /// The clock marks this placement has collected so far, opened in
+        /// [`OrderPath::submit`]. Carried here because the queue wait it measures is the
+        /// wait on *this* channel, and only the two ends together can see it.
+        outbound: Outbound,
     },
     Cancel {
         coi: i64,
@@ -258,11 +274,19 @@ impl OrderPath {
     }
 
     /// Spawns the slot task and the private stream.
+    ///
+    /// `symbol_rx` is the registration wake-up (`Connector::register` broadcasts on it). The
+    /// private stream re-resolves any newly registered symbol off it, so a symbol registered
+    /// **after** the private stream connected is tracked for orders — without it, `market_info`
+    /// stays `None` and every submit is expired before signing (the zero-fills bug). The shared
+    /// symbol set stays authoritative for *what* is registered; the broadcast is only the
+    /// impulse to re-read it, exactly as `public_stream` uses it (`AGENTS.md` §4.2).
     pub fn spawn(
         config: OrderPathConfig,
         rest_url: String,
         public_url: String,
         symbols: SharedSymbolSet,
+        symbol_rx: broadcast::Receiver<String>,
         ev_tx: UnboundedSender<PublishEvent>,
     ) -> Self {
         // The COI allocator is seeded from a millisecond timestamp so a restart does not reuse
@@ -286,6 +310,9 @@ impl OrderPath {
             rest_url,
             public_url,
             symbols,
+            symbol_rx,
+            unlisted: HashSet::new(),
+            awaiting_catalog: false,
             order_manager: order_manager.clone(),
             command_tx: command_tx.clone(),
             ev_tx,
@@ -302,13 +329,26 @@ impl OrderPath {
     /// Registers a new order and queues it to be signed and sent. Acceptance is confirmed off
     /// the private channel, never here (§4.11).
     pub fn submit(&self, symbol: &str, order: &Order, ev_tx: &UnboundedSender<PublishEvent>) {
+        // Open the outbound stopwatch before anything else this call does, so nothing the
+        // connector spends is charged to the venue by omission. `order.local_timestamp` was
+        // stamped in the bot process before iceoryx.
+        let outbound = Outbound {
+            requested_ns: order.local_timestamp,
+            received_ns: local_now(),
+            queued: StdInstant::now(),
+        };
         let plan = {
             let mut manager = self.order_manager.lock().unwrap();
             match manager.market_info(symbol) {
                 Some(market) => manager.new_order(symbol, &market, order),
-                None => Err(crate::lighter::order::OrderError::OrderNotFound {
+                // The market has not resolved yet — the zero-fills bug's true cause. Report it
+                // as its own error, NOT the reused `OrderNotFound` ("no live order …") message
+                // that made this look like an order-id problem and that a downstream classifier
+                // downgrades to benign (`OrderError::MarketUnresolved` doc, `order.rs`). The
+                // registration wake arm resolves the symbol so this window is transient rather
+                // than permanent.
+                None => Err(crate::lighter::order::OrderError::MarketUnresolved {
                     symbol: symbol.to_string(),
-                    order_id: order.order_id,
                 }),
             }
         };
@@ -322,6 +362,7 @@ impl OrderPath {
                     .send(Command::Submit {
                         coi,
                         order: Box::new(wire),
+                        outbound,
                     })
                     .is_err()
                 {
@@ -471,8 +512,8 @@ impl SlotTask {
             select! {
                 command = command_rx.recv() => {
                     match command {
-                        Some(Command::Submit { coi, order }) => {
-                            self.send_order(&mut signer, &mut nonce, coi, &order, &mut awaiting).await;
+                        Some(Command::Submit { coi, order, outbound }) => {
+                            self.send_order(&mut signer, &mut nonce, coi, &order, &outbound, &mut awaiting).await;
                         }
                         Some(Command::Cancel { coi, plan }) => {
                             self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
@@ -529,14 +570,17 @@ impl SlotTask {
         nonce: &mut NonceOwner,
         coi: i64,
         order: &CreateOrder,
+        outbound: &Outbound,
         awaiting: &mut HashMap<i64, Awaiting>,
     ) {
-        let Some(reserved) = self.reserve(nonce).await else {
+        let dequeued = StdInstant::now();
+        let Some(reserved_nonce) = self.reserve(nonce).await else {
             self.expire(coi, "the nonce slot could not be seeded");
             return;
         };
+        let reserved_at = StdInstant::now();
         let signed = match signer
-            .create_order(order, reserved, self.config.api_key_index)
+            .create_order(order, reserved_nonce, self.config.api_key_index)
             .await
         {
             Ok(signed) => signed,
@@ -546,8 +590,26 @@ impl SlotTask {
                 return;
             }
         };
+        let signed_at = StdInstant::now();
         let market_index = order.market_index as i32;
-        match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
+        let sent = rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await;
+
+        // One line per placement, whatever the venue answered — the outbound leg cost what it
+        // cost even when the send failed. `info!`, not `debug!`: the running unit has no
+        // `RUST_LOG` and emits INFO only, so a `debug!` here would be invisible in exactly the
+        // deployment this measures. MEASURED: ~0.23 placements/s, so the volume is nothing.
+        let spans = outbound.spans(dequeued, reserved_at, signed_at, StdInstant::now());
+        info!(
+            coi,
+            ipc_us = spans.ipc_us,
+            queue_us = spans.queue_us,
+            nonce_us = spans.nonce_us,
+            sign_us = spans.sign_us,
+            send_us = spans.send_us,
+            "Lighter placement timing."
+        );
+
+        match sent {
             Ok(outcome) => {
                 self.apply_nonce(nonce, &outcome).await;
                 match outcome {
@@ -907,6 +969,7 @@ impl SlotTask {
 /// **not** a disconnection: the run loop reconnects immediately, resets the backoff and
 /// publishes no `ConnectionInterrupted`, so an 8 h-ceiling refresh (§3.4) never looks to a bot
 /// like a lost connection.
+#[derive(Debug)]
 enum StreamEnd {
     /// The auth token is nearing its expiry; cycle cleanly to mint a fresh one (§3.4).
     TokenRefresh,
@@ -918,13 +981,33 @@ struct PrivateStreamTask {
     rest_url: String,
     public_url: String,
     symbols: SharedSymbolSet,
+    /// The registration wake-up. Re-read on every connect and on every wake so a symbol
+    /// registered after this stream connected is resolved for orders (`AGENTS.md` §4.2). The
+    /// receiver lives across reconnects: the shared set is authoritative, so a wake missed
+    /// while disconnected is recovered by the connect-time re-resolve, and a `Lagged` is a
+    /// re-resolve, not a lost symbol.
+    symbol_rx: broadcast::Receiver<String>,
+    /// Symbols the venue has given a **listing verdict** about — "not listed", or listed and
+    /// not `active` (18 of mainnet's 228 markets were inactive when this was written).
+    ///
+    /// A verdict does not change while the process runs, so re-asking about one on every wake
+    /// buys nothing and spends a REST call each time; a typo in a bot's config would ask for
+    /// ever. Anything else — a catalog that could not be read — is deliberately **not** a
+    /// verdict and stays askable, because writing it off would cost every order on that symbol.
+    /// Re-armed by a fresh `register()` of the same symbol (a corrected typo, or a market that
+    /// has since listed) and by the connect, which re-asks about everything regardless.
+    unlisted: HashSet<String>,
+    /// Whether a catalog round trip is out. At most one is, ever — per connection: `serve`
+    /// clears it, because the answer to a trip started on a connection that has since dropped
+    /// is delivered to that connection's channel and goes nowhere.
+    awaiting_catalog: bool,
     order_manager: Arc<Mutex<OrderManager>>,
     command_tx: UnboundedSender<Command>,
     ev_tx: UnboundedSender<PublishEvent>,
 }
 
 impl PrivateStreamTask {
-    async fn run(self) {
+    async fn run(mut self) {
         let mut backoff = ExponentialBackoff::with_bounds(BACKOFF_MIN, BACKOFF_MAX);
         loop {
             match self.connect().await {
@@ -968,16 +1051,13 @@ impl PrivateStreamTask {
         Some((token, lifetime))
     }
 
-    async fn connect(&self) -> Result<StreamEnd, LighterError> {
-        // The market↔symbol map the position frames need, resolved once per connect (§3.4).
-        let registered: Vec<String> = self.symbols.lock().unwrap().iter().cloned().collect();
-        let (resolved, _refused) = rest::resolve_symbols(&self.rest_url, &registered).await;
-        {
-            let mut manager = self.order_manager.lock().unwrap();
-            for info in resolved {
-                manager.track_market(info);
-            }
-        }
+    async fn connect(&mut self) -> Result<StreamEnd, LighterError> {
+        // The market↔symbol map the position frames and every submit need, re-read in full on
+        // every connect (§3.4) — see [`Self::resolve_all_registered`] for why "in full" and not
+        // "only what is missing". Awaited rather than spawned, deliberately: there is no socket
+        // yet, so nothing can be starved, and the map is then in hand before the first account
+        // frame — which carries only a `market_index` — arrives.
+        self.resolve_all_registered().await;
 
         let (token, lifetime_s) = self
             .mint_auth()
@@ -1026,19 +1106,98 @@ impl PrivateStreamTask {
             write.send(Message::Text(frame.into())).await?;
         }
 
+        self.serve(&mut write, &mut read, lifetime_s).await
+    }
+
+    /// One connection: pump the account channels, keep it alive, refresh the token before it
+    /// expires — and re-resolve any symbol registered after connect off the wake-up.
+    ///
+    /// Split from [`Self::connect`] so the registration wake arm — the fix for the zero-fills
+    /// bug — is driven by the tests below with the halves in hand, rather than only modelled.
+    /// Modelled on `public_stream::serve`. No socket drop on a wake: the account channels are
+    /// account-scoped, not per-symbol, so a newly registered symbol needs only its market
+    /// resolved, not a resubscribe.
+    pub(crate) async fn serve<S, R>(
+        &mut self,
+        write: &mut S,
+        read: &mut R,
+        lifetime_s: i64,
+    ) -> Result<StreamEnd, LighterError>
+    where
+        S: SinkExt<Message> + Unpin,
+        LighterError: From<S::Error>,
+        R: StreamExt<Item = Result<Message, WsError>> + Unpin,
+    {
+        // Where a spawned catalog round trip delivers its answer — see [`Self::start_resolution`]
+        // for why it is spawned rather than awaited where it is needed. Per connection: an
+        // answer to a trip started on a connection that has since dropped has nowhere useful to
+        // go, because the next connect re-reads the whole catalog anyway.
+        let (catalog_tx, mut catalog_rx) = unbounded_channel::<Resolution>();
+        self.awaiting_catalog = false;
+
+        // The first tick fires immediately (`time::interval`), which is on purpose: it sends the
+        // keepalive at once and, if the connect-time resolve left anything unresolved, retries
+        // it straight away rather than a full period later. Every tick after that is a period
+        // apart, so the retry is bounded.
         let mut ping = time::interval(PING_INTERVAL);
         // Refresh the token by cycling cleanly before it expires — a connection must never
         // outlive its token (§3.4). Fires once, ~`AUTH_REFRESH_LEAD_S` before expiry.
         let refresh_at = auth_refresh_after(lifetime_s);
         let refresh = time::sleep(refresh_at);
         tokio::pin!(refresh);
+        // A closed broadcast resolves instantly and for ever; stop polling the arm once it has,
+        // or the loop spins at full tilt for the life of the connection (public_stream §4.2).
+        let mut registrations_closed = false;
         loop {
             select! {
                 _ = ping.tick() => {
+                    // Keepalive first: this connection's liveness does not depend on the
+                    // catalog, and the venue drops a connection with no client frame.
                     write.send(Message::Text(PING_FRAME.into())).await?;
+                    // The timed retry. A refused resolve used to be surfaced and then never
+                    // asked about again: a catalog blip while every symbol was already
+                    // registered left the whole account unable to place an order, and the only
+                    // impulses that could clear it were a *new* `register()`, a socket drop, or
+                    // the ~7.5 h token refresh. `public_stream` retries on its housekeeping
+                    // tick and `bybit` on its ping tick (`AGENTS.md` §4.2); this is the same
+                    // move. A healthy connection has nothing unresolved, so this sends nothing.
+                    self.start_resolution(&catalog_tx);
                 }
                 _ = &mut refresh => {
                     return Ok(StreamEnd::TokenRefresh);
+                }
+                // The answer to a round trip started by one of the impulses in
+                // `start_resolution`. A pattern that does not match disables this arm rather
+                // than ending the connection: the sender lives as long as this loop does, so
+                // `None` is unreachable.
+                Some((resolved, refused)) = catalog_rx.recv() => {
+                    self.awaiting_catalog = false;
+                    self.apply_resolution(resolved, refused);
+                }
+                registered = self.symbol_rx.recv(), if !registrations_closed => {
+                    match registered {
+                        Ok(symbol) => {
+                            // A symbol registered after this stream connected: resolve its
+                            // market so submits can address it. Without this arm `market_info`
+                            // stays `None` and every submit is expired before signing — the
+                            // zero-fills bug (§4.2, mirrors `public_stream`'s wake).
+                            info!(%symbol, "A Lighter symbol was registered; resolving its market for the order path.");
+                            // A fresh registration re-arms a symbol the venue had refused by
+                            // name: the operator may have corrected a typo, or the market may
+                            // have listed since.
+                            self.rearm(&symbol);
+                            self.start_resolution(&catalog_tx);
+                        }
+                        Err(RecvError::Lagged(missed)) => {
+                            // A missed wake never loses a symbol: the shared set is authoritative
+                            // and re-read here (§4.2). Which symbol was registered is exactly
+                            // what was lost, so every verdict is re-armed rather than guessing.
+                            warn!(missed, "Lighter order-path registration wake-ups were dropped; re-resolving the registered set.");
+                            self.unlisted.clear();
+                            self.start_resolution(&catalog_tx);
+                        }
+                        Err(RecvError::Closed) => registrations_closed = true,
+                    }
                 }
                 message = read.next() => {
                     match message {
@@ -1057,6 +1216,136 @@ impl PrivateStreamTask {
                     }
                 }
             }
+        }
+    }
+
+    /// Every registered symbol, tracked or not.
+    fn registered_symbols(&self) -> Vec<String> {
+        self.symbols.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Registered symbols with no catalog row in hand, minus the ones the venue has already
+    /// given a listing verdict about ([`Self::unlisted`]).
+    fn unresolved_symbols(&self) -> Vec<String> {
+        let registered = self.registered_symbols();
+        let manager = self.order_manager.lock().unwrap();
+        registered
+            .into_iter()
+            .filter(|symbol| {
+                manager.market_info(symbol).is_none() && !self.unlisted.contains(symbol)
+            })
+            .collect()
+    }
+
+    /// Un-remembers a listing verdict, so the symbol is asked about again.
+    fn rearm(&mut self, symbol: &str) {
+        self.unlisted.remove(symbol);
+    }
+
+    /// Re-reads the catalog for **every** registered symbol and re-tracks what it says. The
+    /// connect-time resolve, awaited before the socket exists.
+    ///
+    /// In full, not "only what is missing", and that is the money-safety call rather than a
+    /// missed optimisation. `market_id` cannot change under a running process, but
+    /// `price_decimals` / `size_decimals` are the exponents every wire price and size is scaled
+    /// by, and [`OrderManager::track_market`] is their only writer — so resolving only the
+    /// untracked symbols freezes the grid a symbol was first seen on for the life of the
+    /// **process**. A venue decimals migration would then mis-scale every order by a power of
+    /// ten, silently, in a direction that is harmless one way and catastrophic the other. One
+    /// REST call per reconnect does not buy that (`AGENTS.md` §7).
+    ///
+    /// Refusals are reported per symbol, not dropped (fold-1), and a refused symbol is left
+    /// untracked so a later impulse can ask again.
+    async fn resolve_all_registered(&mut self) {
+        let registered = self.registered_symbols();
+        if registered.is_empty() {
+            return;
+        }
+        let (resolved, refused) = rest::resolve_symbols(&self.rest_url, &registered).await;
+        self.apply_resolution(resolved, refused);
+    }
+
+    /// Asks the catalog about the still-unresolved symbols, **beside** the connection rather
+    /// than in front of it.
+    ///
+    /// [`Self::serve`] awaits its `select!` arms one at a time, so a round trip awaited inside
+    /// an arm stops the connection polling its read half for as long as the venue's REST takes
+    /// — up to [`rest::CATALOG_TIMEOUT`] (15 s), and again on every impulse for as long as the
+    /// symbol stays unresolved, because a transport failure is deliberately not a verdict. On
+    /// **this** connection the read half carries fills, cancel acknowledgements and position
+    /// updates, and the connector is shared: one bot registering a new symbol would otherwise
+    /// freeze another bot's money path for fifteen seconds at a time. So the round trip is
+    /// spawned and its answer arrives as an arm of the loop, exactly as
+    /// `public_stream::start_resolution` does it.
+    ///
+    /// **At most one is out**, and the arm that *applies* an answer does not start the next one
+    /// — a catalog that fails fast would then be retried as fast as it fails. The impulses are
+    /// the keepalive tick and a registration wake-up, so a symbol that is waiting on an
+    /// outstanding trip is asked about again within one [`PING_INTERVAL`].
+    ///
+    /// A panic inside the spawned task cannot wedge the flag: the connector's panic hook is
+    /// `exit(1)` for every thread (`AGENTS.md` §4.7).
+    fn start_resolution(&mut self, catalog_tx: &UnboundedSender<Resolution>) {
+        if self.awaiting_catalog {
+            return;
+        }
+        let symbols = self.unresolved_symbols();
+        if symbols.is_empty() {
+            return;
+        }
+        self.awaiting_catalog = true;
+        let rest_url = self.rest_url.clone();
+        let catalog_tx = catalog_tx.clone();
+        tokio::spawn(async move {
+            let resolution = rest::resolve_symbols(&rest_url, &symbols).await;
+            // The receiver lives as long as the connection that started this; a send that fails
+            // is a connection that has already dropped, and the next connect re-reads anyway.
+            let _ = catalog_tx.send(resolution);
+        });
+    }
+
+    /// Tracks what resolved and reports what did not, per symbol (fold-1, modelled on
+    /// `public_stream::apply_resolution`). A refused symbol is surfaced as a
+    /// [`ErrorKind::CriticalConnectionError`] — a symbol that resolves to no market can neither
+    /// be served nor traded, the same class of failure the market-data side reports — and is
+    /// left untracked. Split from the round trip so it is testable without a socket.
+    ///
+    /// A refusal that is a **listing verdict** is remembered ([`Self::unlisted`]) so later
+    /// impulses skip it; anything else — a catalog that could not be read — is not a verdict
+    /// and stays askable, because writing it off would cost every order on that symbol.
+    fn apply_resolution(
+        &mut self,
+        resolved: Vec<MarketInfo>,
+        refused: Vec<(String, LighterError)>,
+    ) {
+        {
+            let mut manager = self.order_manager.lock().unwrap();
+            for info in resolved {
+                info!(
+                    symbol = %info.symbol,
+                    market_id = info.market_id,
+                    "Tracked a Lighter market for the order path."
+                );
+                // A symbol that has just resolved is listed, whatever an earlier answer said.
+                self.unlisted.remove(&info.symbol);
+                manager.track_market(info);
+            }
+        }
+        for (symbol, error) in &refused {
+            let verdict = error.is_listing_verdict();
+            if verdict {
+                self.unlisted.insert(symbol.clone());
+            }
+            error!(
+                %symbol,
+                ?error,
+                listing_verdict = verdict,
+                "Refusing to track a Lighter symbol for the order path: it does not resolve to a \
+                 market. Every submit for it is expired until it resolves; a catalog that could \
+                 not be read is retried on the next keepalive tick, while a symbol the venue \
+                 says is not listed is asked about again only if it is registered afresh."
+            );
+            publish_error(&self.ev_tx, ErrorKind::CriticalConnectionError, error);
         }
     }
 
@@ -1105,7 +1394,11 @@ impl PrivateStreamTask {
                 }
             }
             PrivateFrame::Positions { positions, .. } => {
-                let now = Utc::now().timestamp_micros();
+                // NANOseconds: the unit every other backend publishes on
+                // `LiveEvent::Position.exch_ts` (bybit and both Binance scale their
+                // millisecond source by 1_000_000; Hyperliquid publishes nanoseconds). The
+                // frame carries no venue stamp of its own, so this is the local receive time.
+                let now = local_now();
                 for position in &positions {
                     let mapped = self
                         .order_manager
@@ -1167,17 +1460,38 @@ fn expire_unsent(symbol: &str, order: &Order, ev_tx: &UnboundedSender<PublishEve
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+        task::Poll,
+        time::Duration,
+    };
 
-    use hftbacktest::types::LiveEvent;
+    use chrono::Utc;
+    use futures_util::{Stream, stream};
+    use hftbacktest::types::{
+        ErrorKind,
+        LiveEvent,
+        OrdType,
+        Order,
+        Side,
+        Status,
+        TimeInForce,
+        Value,
+    };
     use serde::Deserialize;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::{
+        sync::{broadcast, mpsc::unbounded_channel},
+        time,
+    };
+    use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
     use super::{
         AUTH_MAX_LIFETIME_S,
         AUTH_REFRESH_MARGIN_S,
         Command,
         ConnectPolicy,
+        OrderPath,
         OrderPathConfig,
         PrivateStreamTask,
         auth_refresh_after,
@@ -1188,6 +1502,7 @@ mod tests {
     use crate::{
         connector::PublishEvent,
         lighter::{
+            LighterError,
             fixtures::{
                 PRIVATE_ORDERS_SNAPSHOT,
                 PRIVATE_ORDERS_SNAPSHOT_EMPTY,
@@ -1197,6 +1512,7 @@ mod tests {
             private_msg::AccountOrder,
             rest::MarketInfo,
         },
+        utils::testing::{RecordingSink, read_after_connect},
     };
 
     /// **The 8 h auth ceiling is server-only (§3.4): a 9 h token mints without error and is
@@ -1336,11 +1652,17 @@ mod tests {
     }
 
     /// Builds a stream task with a fresh (empty) order manager and the given policy — the
-    /// restarted-process state — returning the command and publish receivers to inspect.
+    /// restarted-process state — returning the registration sender and the command and publish
+    /// receivers to inspect.
+    ///
+    /// The sender comes back rather than being leaked so a caller can register a symbol the way
+    /// `Connector::register` does; holding it also keeps the broadcast open, so the wake arm
+    /// never sees the channel close.
     fn stream_task(
         policy: ConnectPolicy,
     ) -> (
         PrivateStreamTask,
+        broadcast::Sender<String>,
         tokio::sync::mpsc::UnboundedReceiver<Command>,
         tokio::sync::mpsc::UnboundedReceiver<PublishEvent>,
     ) {
@@ -1355,16 +1677,185 @@ mod tests {
             confirm_deadline_ms: 5_000,
             connect_policy: policy,
         };
+        let (symbol_tx, symbol_rx) = broadcast::channel(16);
         let task = PrivateStreamTask {
             config,
             rest_url: String::new(),
             public_url: String::new(),
             symbols: Arc::new(Mutex::new(Default::default())),
+            symbol_rx,
+            unlisted: HashSet::new(),
+            awaiting_catalog: false,
             order_manager: Arc::new(Mutex::new(OrderManager::new(1))),
             command_tx,
             ev_tx,
         };
-        (task, command_rx, ev_rx)
+        (task, symbol_tx, command_rx, ev_rx)
+    }
+
+    /// A read half that is **silent on its first two polls** and hands over `frames` after
+    /// that, running `script` on the second.
+    ///
+    /// The silence is the point. `time::interval` fires its first tick immediately, so the
+    /// connection's own timer arms are ready the moment `serve` starts; a read half that had a
+    /// frame waiting would race them, and `select!` picks at random. Staying quiet on the first
+    /// poll lets the timers go first, and running `script` on the second — then still returning
+    /// `Pending` — lets the arm the script wakes be served **before** the frame arrives. What
+    /// the loop did with the frame is then a fact about the loop, not about a coin flip.
+    ///
+    /// It wakes itself while silent on the first poll, so a loop with nothing else ready comes
+    /// back to it instead of parking until the next keepalive.
+    fn read_after_the_first_poll<F>(
+        script: F,
+        frames: Vec<String>,
+    ) -> impl Stream<Item = Result<Message, WsError>> + Unpin
+    where
+        F: FnOnce(),
+    {
+        let mut polls = 0usize;
+        let mut script = Some(script);
+        let mut frames = frames.into_iter();
+        stream::poll_fn(move |cx| {
+            polls += 1;
+            match polls {
+                1 => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                2 => {
+                    if let Some(script) = script.take() {
+                        script();
+                    }
+                    // No self-wake: whatever the script did (a registration broadcast) wakes the
+                    // arm that is waiting for it, and that arm must run before the frame below.
+                    Poll::Pending
+                }
+                _ => match frames.next() {
+                    Some(frame) => Poll::Ready(Some(Ok(Message::Text(frame.into())))),
+                    // Never ends: these tests assert on what the loop *did*, not on how it
+                    // stopped, and a read half that ended would end the loop with it.
+                    None => Poll::Pending,
+                },
+            }
+        })
+    }
+
+    /// A REST endpoint that accepts a connection and never answers it.
+    ///
+    /// The only shape that can starve anything: a refusal comes back in milliseconds, so a
+    /// connector that awaits its catalog inline looks healthy against one.
+    async fn never_answering_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// **The catalog round trip runs beside the private read loop, never in front of it.**
+    ///
+    /// `serve` awaits its `select!` arms one at a time, so a resolve awaited *inline* on the
+    /// registration wake stops the connection polling its read half for as long as the venue's
+    /// REST takes — up to [`crate::lighter::rest::CATALOG_TIMEOUT`] (15 s), and again on every
+    /// impulse for as long as the symbol stays unresolved. On this connection that read half
+    /// carries **fills, cancel acknowledgements and position updates**: a bot registering a new
+    /// symbol would freeze another bot's money path for fifteen seconds at a time, on a shared
+    /// connector, with nothing in the logs. `public_stream` already refuses to do this
+    /// (`start_resolution`); so must this one.
+    ///
+    /// Driven against an endpoint that accepts and never answers, with the registration
+    /// delivered by the read half itself so the wake arm is served **before** the frame — the
+    /// frame is therefore waiting while the round trip is outstanding, which is the whole
+    /// question.
+    #[tokio::test]
+    async fn a_resolve_in_flight_never_stalls_the_private_read_half() {
+        // `reqwest` builds its rustls backend when the client is built; a test has no `main` to
+        // install the process-level provider. Idempotent (`AGENTS.md` §4.7).
+        crate::install_crypto_provider();
+        let rest_url = never_answering_endpoint().await;
+        let (mut task, symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        task.rest_url = rest_url;
+
+        let symbols = task.symbols.clone();
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_the_first_poll(
+            move || {
+                // Exactly what `Connector::register` does: the authoritative set first, then
+                // the wake-up.
+                symbols.lock().unwrap().insert("ETH".to_string());
+                symbol_tx.send("ETH".to_string()).unwrap();
+            },
+            vec![PRIVATE_ORDERS_SNAPSHOT.to_string()],
+        );
+        let _ = time::timeout(
+            Duration::from_millis(500),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        // The snapshot names one market, and under `cancel_all` applying it emits one
+        // `CancelAllOrders` — an observable that only exists if the frame was read.
+        match command_rx.try_recv() {
+            Ok(Command::CancelAll { market_index, .. }) => assert_eq!(market_index, 1),
+            _ => panic!(
+                "the private frame waiting on the read half was not applied while the catalog \
+                 round trip was outstanding: the resolve is being awaited inline, so every fill, \
+                 cancel ack and position update on this connection waits out the venue's REST"
+            ),
+        }
+    }
+
+    /// **Every connect re-reads the catalog and re-tracks what it says** (§3.5, `AGENTS.md` §7).
+    ///
+    /// `price_decimals` / `size_decimals` are the exponents every wire price and size is scaled
+    /// by (`price * 10^price_decimals`). Resolving only the *not-yet-tracked* symbols freezes
+    /// them for the life of the **process**, because `track_market` is the only writer: a venue
+    /// that migrates a market's decimals is then mis-scaled by a power of ten on every order —
+    /// harmless in one direction, instantly catastrophic in the other. One saved REST call does
+    /// not buy that (§7: money-safety above performance), so the connect asks about every
+    /// registered symbol, tracked or not.
+    ///
+    /// Driven through the real `connect`, with the command receiver dropped so the mint that
+    /// follows the resolve fails and stops it — no socket, no token, and the one thing under
+    /// test already done.
+    #[tokio::test]
+    async fn every_connect_re_reads_the_decimals_the_venue_publishes() {
+        crate::install_crypto_provider();
+        let rest_url = catalog_server(
+            r#"{"order_books":[{"symbol":"ETH","market_id":42,"status":"active","supported_price_decimals":3,"supported_size_decimals":4}]}"#,
+        )
+        .await;
+        let (mut task, _symbol_tx, command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.rest_url = rest_url;
+        task.symbols.lock().unwrap().insert("ETH".to_string());
+        // Tracked on an earlier connection, with the decimals of that day.
+        task.order_manager.lock().unwrap().track_market(MarketInfo {
+            symbol: "ETH".to_string(),
+            market_id: 42,
+            price_decimals: 2,
+            size_decimals: 4,
+        });
+
+        drop(command_rx);
+        task.connect()
+            .await
+            .expect_err("no slot task, so the auth mint fails and the connect stops there");
+
+        assert_eq!(
+            task.order_manager
+                .lock()
+                .unwrap()
+                .market_info("ETH")
+                .unwrap()
+                .price_decimals,
+            3,
+            "a reconnect must re-read the decimals the venue now publishes; a tracked symbol \
+             whose grid the process never re-reads mis-scales every order by a power of ten"
+        );
     }
 
     /// **The §5 gate, socketless: after a `kill -9` and restart, the clean-slate sweep cancels
@@ -1376,7 +1867,7 @@ mod tests {
     /// the reconcile that follows cannot help, because the map is empty and the COI is foreign.
     #[test]
     fn cancel_all_sweeps_a_previous_runs_surviving_order_from_the_connect_snapshot() {
-        let (task, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let (task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
         task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
         match command_rx.try_recv() {
             Ok(Command::CancelAll {
@@ -1399,7 +1890,7 @@ mod tests {
     /// budget on a blip — the reason the safe default adopts rather than sweeps.
     #[test]
     fn reconcile_never_sweeps_on_connect() {
-        let (task, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let (task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
         task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
         assert!(
             command_rx.try_recv().is_err(),
@@ -1411,7 +1902,7 @@ mod tests {
     /// nothing resting, so no `CancelAllOrders` is sent and no nonce is spent.
     #[test]
     fn cancel_all_against_a_flat_snapshot_sends_no_sweep() {
-        let (task, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let (task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
         task.on_frame(PRIVATE_ORDERS_SNAPSHOT_EMPTY);
         assert!(
             command_rx.try_recv().is_err(),
@@ -1426,7 +1917,7 @@ mod tests {
     /// bot's startup gate (snapshot-marker note). Never inferred from fills.
     #[test]
     fn a_positions_frame_is_published_as_a_live_position_even_when_flat() {
-        let (task, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
         // The connect resolves the catalog; here, track BTC (market 1) so the position frame
         // (which carries only the market index) maps back onto the registered symbol.
         task.order_manager.lock().unwrap().track_market(MarketInfo {
@@ -1443,5 +1934,455 @@ mod tests {
             }
             _ => panic!("the positions snapshot must publish a LiveEvent::Position (§3.4)"),
         }
+    }
+
+    /// **`LiveEvent::Position.exch_ts` is nanoseconds**, the unit every other backend writes:
+    /// bybit and both Binance multiply their millisecond source by 1_000_000, Hyperliquid
+    /// publishes nanoseconds outright. Lighter stamped it `Utc::now().timestamp_micros()` — a
+    /// thousandfold under.
+    ///
+    /// It is inert today for the same reason the order stamp was: `main.rs`'s position cache
+    /// only compares the field against itself and `LiveBot` ignores it entirely. That is
+    /// exactly why it must be fixed in the same commit as `Order::exch_timestamp` — leaving one
+    /// microsecond field on a backend whose sibling field just became nanoseconds is the
+    /// mixed-unit trap itself, waiting for the first reader that compares the two.
+    ///
+    /// Bracketing the real clock is the pin: microseconds of now are ~1_000x below nanoseconds
+    /// of now, so the wrong unit cannot land inside the bracket by accident.
+    #[test]
+    fn a_position_is_stamped_in_nanoseconds() {
+        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.order_manager.lock().unwrap().track_market(MarketInfo {
+            symbol: "BTC".to_string(),
+            market_id: 1,
+            price_decimals: 1,
+            size_decimals: 5,
+        });
+
+        let before = Utc::now().timestamp_nanos_opt().unwrap();
+        task.on_frame(PRIVATE_POSITIONS_UPDATE_FLAT);
+        let after = Utc::now().timestamp_nanos_opt().unwrap();
+
+        match ev_rx.try_recv() {
+            Ok(PublishEvent::LiveEvent(LiveEvent::Position { exch_ts, .. })) => assert!(
+                (before..=after).contains(&exch_ts),
+                "the position stamp must be nanoseconds of now ({before}..={after}), got \
+                 {exch_ts} — microseconds are ~1000x under and every other backend publishes ns"
+            ),
+            _ => panic!("the positions snapshot must publish a LiveEvent::Position (§3.4)"),
+        }
+    }
+
+    /// **fold-1, socketless: what resolves is tracked, and what does not is reported per
+    /// symbol.** The old code did `let (resolved, _refused) = …` and dropped every refusal,
+    /// so a REST blip at connect rejected 100 % of orders for the ~7.5 h life of the
+    /// connection with no error at all. Modelled on `public_stream`'s
+    /// `an_unresolvable_symbol_is_refused_by_name`. A refused symbol is left untracked (so the
+    /// next wake asks again) and surfaced as a `CriticalConnectionError`.
+    #[test]
+    fn apply_resolution_tracks_resolved_markets_and_reports_refused_ones() {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+
+        task.apply_resolution(
+            vec![MarketInfo {
+                symbol: "ETH".to_string(),
+                market_id: 42,
+                price_decimals: 2,
+                size_decimals: 4,
+            }],
+            vec![(
+                "NOTACOIN".to_string(),
+                LighterError::UnknownSymbol("NOTACOIN is not listed on Lighter".into()),
+            )],
+        );
+
+        assert!(
+            task.order_manager
+                .lock()
+                .unwrap()
+                .market_info("ETH")
+                .is_some(),
+            "the resolved market must be tracked so submits can address it"
+        );
+        assert!(
+            task.order_manager
+                .lock()
+                .unwrap()
+                .market_info("NOTACOIN")
+                .is_none(),
+            "a refused symbol is left untracked, so the next wake re-resolves it"
+        );
+
+        let mut errors = Vec::new();
+        while let Ok(event) = ev_rx.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Error(error)) = event {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors.len(), 1, "the one refusal is reported, not dropped");
+        assert_eq!(
+            errors[0].kind,
+            ErrorKind::CriticalConnectionError,
+            "a symbol that resolves to no market can neither be served nor traded"
+        );
+    }
+
+    /// A local HTTP endpoint that answers `GET /api/v1/orderBooks` with `body` — the catalog
+    /// the resolve fetches — so the wake arm can be driven end to end without the internet.
+    /// Same shape the `public_stream` catalog tests use (a bound `TcpListener`), but this one
+    /// returns a body rather than holding the socket open.
+    async fn catalog_server(body: &'static str) -> String {
+        flaky_catalog_server(0, body).await
+    }
+
+    /// The same endpoint, with the first `refusals` requests answered `503` — a catalog that is
+    /// down and then comes back, which is the failure the timed retry exists for.
+    async fn flaky_catalog_server(refusals: usize, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Read the request line and headers (a GET has no body), then answer.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = if served < refusals {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: \
+                     close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                         {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                served += 1;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// Drives one connection for `window` of (virtual) time against a catalog that cannot be
+    /// read, and counts the refusals it reported — one per symbol per attempt, so with one
+    /// symbol registered this is the number of round trips the connection started.
+    ///
+    /// `already_refused_by_name` seeds the verdicts the venue is taken to have already given.
+    ///
+    /// The endpoint is an unreachable **URL**, not an unreachable host: it fails inside
+    /// `reqwest` with no socket and no timer of its own, so the count is a fact about the
+    /// connection's impulses rather than about how fast a network failed — which is what makes
+    /// it safe to measure on a paused clock.
+    async fn refusals_within(window: Duration, already_refused_by_name: &[&str]) -> usize {
+        crate::install_crypto_provider();
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.rest_url = "lighter-catalog-that-cannot-be-reached".to_string();
+        task.symbols.lock().unwrap().insert("ETH".to_string());
+        for symbol in already_refused_by_name {
+            task.unlisted.insert((*symbol).to_string());
+        }
+
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_connect(|| {});
+        let _ = time::timeout(
+            window,
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        let mut refusals = 0;
+        while let Ok(event) = ev_rx.try_recv() {
+            if matches!(event, PublishEvent::LiveEvent(LiveEvent::Error(_))) {
+                refusals += 1;
+            }
+        }
+        refusals
+    }
+
+    /// **A refused resolve is asked again — on the keepalive tick, and no faster.**
+    ///
+    /// A refusal was surfaced (`error!` + `CriticalConnectionError`) and then never retried:
+    /// the loop's only impulses were a *new* `register()`, a socket drop and the ~7.5 h token
+    /// refresh. So a catalog blip at connect, with every symbol already registered — a
+    /// connector restart under a bot that is already running is exactly that — left the account
+    /// unable to place a single order until one of those three happened, hours away. The other
+    /// half matters just as much: a transport failure is deliberately not a verdict, so "ask
+    /// again as soon as the failure comes back" would be a hot loop against a venue that is
+    /// already unwell. The tick is both the retry and its bound.
+    ///
+    /// Measured in refusals reported, over two virtual windows: one shorter than a tick period,
+    /// one spanning three more.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_catalog_is_retried_on_the_keepalive_tick_and_no_faster() {
+        assert_eq!(
+            refusals_within(Duration::from_secs(25), &[]).await,
+            1,
+            "one ask when the connection opens, and not another before the tick is due: a \
+             catalog that refuses instantly must not be retried as fast as it refuses"
+        );
+        assert_eq!(
+            refusals_within(Duration::from_secs(100), &[]).await,
+            4,
+            "and one on every keepalive tick after that (t = 0, 30, 60, 90 s) — without the \
+             retry a refused symbol takes no orders until a new register(), a socket drop or \
+             the ~7.5 h token refresh"
+        );
+    }
+
+    /// **A symbol the venue has refused *by name* is not asked about again on every tick.**
+    ///
+    /// The other side of the retry. `UnknownSymbol` is a verdict — a typo in a bot's config, or
+    /// a market that is listed and not `active` (18 of mainnet's 228 were, when this was
+    /// written) — and it does not change while the process runs. Retried on the keepalive it
+    /// would spend a REST call every thirty seconds for the life of the connector and never
+    /// once succeed. A catalog that could not be *read* is not a verdict and must keep being
+    /// asked, which is the assertion above; the two must not be treated alike in either
+    /// direction.
+    ///
+    /// Same connection, same window, same unreachable catalog as the pin above — only the
+    /// verdict differs, so the difference in the counts is the verdict and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn a_symbol_refused_by_name_is_not_asked_about_on_every_tick() {
+        assert_eq!(
+            refusals_within(Duration::from_secs(100), &["ETH"]).await,
+            0,
+            "a symbol the venue says is not listed must not be re-asked on every keepalive tick \
+             for the life of the process"
+        );
+    }
+
+    /// `symbols` is a `HashSet`, so anything derived from it comes out in whatever order it
+    /// comes out in.
+    fn sorted(mut symbols: Vec<String>) -> Vec<String> {
+        symbols.sort();
+        symbols
+    }
+
+    fn an_order() -> Order {
+        Order::new(
+            7,
+            100,
+            0.1,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        )
+    }
+
+    /// **A submit for a market that has not resolved says exactly that, and never says "no live
+    /// order".**
+    ///
+    /// This is the sentence the zero-fills bug shipped behind. The submit path borrowed
+    /// [`crate::lighter::order::OrderError::OrderNotFound`]'s message — "no live order {id} on
+    /// {symbol}" — for a market that had simply never been resolved, and that string is exactly
+    /// what a downstream classifier (`myhft/src/classifiers/lighter.rs`) reads as a cancel that
+    /// raced a fill and downgrades to benign. So every order the connector refused for the real
+    /// reason was reported as harmless on the way past, and the operator saw a quiet, healthy
+    /// bot placing nothing for hours.
+    ///
+    /// Driven through [`OrderPath::submit`] with an empty manager, because the reason rides
+    /// `expire_unsent`'s payload: comparing the two `Display`s side by side would leave the
+    /// call site free to go back to the old error without a single test noticing.
+    #[test]
+    fn a_submit_for_an_unresolved_market_reports_the_unresolved_market() {
+        let (command_tx, _command_rx) = unbounded_channel();
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        let order_path = OrderPath {
+            order_manager: Arc::new(Mutex::new(OrderManager::new(1))),
+            command_tx,
+            tasks: Vec::new(),
+        };
+
+        order_path.submit("ETH", &an_order(), &ev_tx);
+
+        // The order goes back first, so the bot's state is clean before an error handler that
+        // may abort the `elapse` ever runs.
+        let Ok(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order })) = ev_rx.try_recv()
+        else {
+            panic!("an unsendable order must be expired back to the bot before the error");
+        };
+        assert_eq!(symbol, "ETH");
+        assert_eq!(order.status, Status::Expired);
+
+        let Ok(PublishEvent::LiveEvent(LiveEvent::Error(error))) = ev_rx.try_recv() else {
+            panic!("the refusal must be reported");
+        };
+        let Value::String(message) = error.value else {
+            panic!("the error payload carries the reason as a string");
+        };
+        assert!(
+            message.contains("no resolved Lighter market"),
+            "the refusal must name its real cause: {message}"
+        );
+        assert!(
+            !message.contains("no live order"),
+            "and must never wear the message a downstream classifier downgrades to benign: \
+             {message}"
+        );
+    }
+
+    /// **A listing verdict is remembered; a catalog that could not be read is not — and a fresh
+    /// registration re-arms the verdict.**
+    ///
+    /// The unit-level counterpart of the two pins above, on the exact set the round trip asks
+    /// about. Three properties, because getting any of them backwards is silent: forget the
+    /// verdict and a typo re-asks for ever; remember the transport failure and every order on a
+    /// perfectly good symbol is expired until something reconnects; refuse to re-arm and a
+    /// corrected config needs a connector restart to take effect.
+    #[test]
+    fn a_listing_verdict_is_remembered_an_unreadable_catalog_is_not_and_registering_re_arms() {
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        for symbol in ["ETH", "NOTACOIN"] {
+            task.symbols.lock().unwrap().insert(symbol.to_string());
+        }
+        assert_eq!(
+            sorted(task.unresolved_symbols()),
+            ["ETH", "NOTACOIN"],
+            "precondition: nothing is tracked and nothing has been refused"
+        );
+
+        task.apply_resolution(
+            Vec::new(),
+            vec![
+                (
+                    "NOTACOIN".to_string(),
+                    LighterError::UnknownSymbol("NOTACOIN is not listed on Lighter".into()),
+                ),
+                (
+                    "ETH".to_string(),
+                    LighterError::CatalogUnavailable(
+                        "couldn't read the Lighter catalog for ETH: 503".into(),
+                    ),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            task.unresolved_symbols(),
+            ["ETH"],
+            "the venue's verdict is remembered and the transport failure is not"
+        );
+        assert_eq!(
+            sorted(task.registered_symbols()),
+            ["ETH", "NOTACOIN"],
+            "the connect is not bound by the memory — it re-reads everything, which is how a \
+             market that has since listed is picked up across a reconnect"
+        );
+
+        task.rearm("NOTACOIN");
+        assert_eq!(
+            sorted(task.unresolved_symbols()),
+            ["ETH", "NOTACOIN"],
+            "registering a symbol afresh asks about it again: the operator may have corrected a \
+             typo, or the market may have listed since"
+        );
+    }
+
+    /// **The recovery, end to end: a symbol refused at connect is resolved and tracked with no
+    /// new registration and no reconnect.**
+    ///
+    /// The catalog is down for the connect-time resolve and up afterwards. Nothing else
+    /// happens: no bot registers anything, the socket does not drop, the token does not
+    /// refresh. Only time passes — and the symbol becomes addressable, which is the difference
+    /// between a bot that quotes and a bot that has every order expired before signing.
+    #[tokio::test]
+    async fn a_symbol_refused_at_connect_is_resolved_without_a_registration_or_a_reconnect() {
+        crate::install_crypto_provider();
+        let rest_url = flaky_catalog_server(
+            1,
+            r#"{"order_books":[{"symbol":"ETH","market_id":42,"status":"active","supported_price_decimals":2,"supported_size_decimals":4}]}"#,
+        )
+        .await;
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.rest_url = rest_url;
+        task.symbols.lock().unwrap().insert("ETH".to_string());
+
+        // The connect-time resolve, against a catalog that is down.
+        task.resolve_all_registered().await;
+        let order_manager = task.order_manager.clone();
+        assert!(
+            order_manager.lock().unwrap().market_info("ETH").is_none(),
+            "precondition: the catalog refused, so nothing is tracked"
+        );
+
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_connect(|| {});
+        let _ = time::timeout(
+            Duration::from_millis(500),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        assert!(
+            order_manager.lock().unwrap().market_info("ETH").is_some(),
+            "a symbol the catalog refused at connect must be resolved by the connection itself \
+             once the catalog answers again — otherwise every order on it is expired before \
+             signing until something unrelated happens to reconnect the socket"
+        );
+    }
+
+    /// **The zero-fills bug, socketless: a symbol registered AFTER the private stream connected
+    /// is resolved for orders by the wake arm.**
+    ///
+    /// The order manager starts empty (the post-connect state) and no market is tracked. The
+    /// bot then registers `ETH` — the shared set gains it and a wake-up is broadcast, exactly
+    /// as `Connector::register` does. Driving `serve` (with the halves in hand, the way
+    /// `public_stream`'s reconnect pin drives it) must resolve `ETH` off the wake and track it,
+    /// so `market_info` goes `None` → `Some` and a submit would no longer be expired before
+    /// signing. Delete the wake arm and the market is never tracked — the mutation this pins.
+    ///
+    /// The registration is delivered by the read half rather than queued up front, so the
+    /// connection's own immediate keepalive tick runs first, against a still-empty registered
+    /// set. Without that the tick would resolve ETH by itself and the pin would survive the
+    /// mutation it exists for.
+    #[tokio::test]
+    async fn an_order_path_tracks_a_symbol_registered_after_connect() {
+        // `reqwest` builds its rustls backend when the client is built; a test has no `main` to
+        // install the process-level provider. Idempotent (`AGENTS.md` §4.7).
+        crate::install_crypto_provider();
+        let rest_url = catalog_server(
+            r#"{"order_books":[{"symbol":"ETH","market_id":42,"status":"active","supported_price_decimals":2,"supported_size_decimals":4}]}"#,
+        )
+        .await;
+        let (mut task, symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.rest_url = rest_url;
+
+        // Post-connect state: ETH is not registered yet, so nothing is tracked.
+        let order_manager = task.order_manager.clone();
+        assert!(
+            order_manager.lock().unwrap().market_info("ETH").is_none(),
+            "precondition: ETH is not tracked before it is registered"
+        );
+
+        // Drive the connection loop. A large lifetime keeps the token refresh far out of the
+        // window. Real time, so the local round trip runs; bounded so the (otherwise endless)
+        // loop is stopped.
+        let symbols = task.symbols.clone();
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_the_first_poll(
+            move || {
+                // The bot registers ETH after connect: the authoritative set gains it and the
+                // wake-up fires — exactly what `Connector::register` does.
+                symbols.lock().unwrap().insert("ETH".to_string());
+                symbol_tx.send("ETH".to_string()).unwrap();
+            },
+            Vec::new(),
+        );
+        let _ = time::timeout(
+            Duration::from_secs(2),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        assert!(
+            order_manager.lock().unwrap().market_info("ETH").is_some(),
+            "a symbol registered after connect must be resolved and tracked by the wake arm — \
+             without it every submit for ETH is expired before signing (the zero-fills bug)"
+        );
     }
 }
