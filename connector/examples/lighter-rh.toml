@@ -86,7 +86,9 @@ timeout_ms = 10000
 #
 # A key this section does not know — a typo such as `rate_limit_cooldown = 60000` — STOPS
 # the connector at startup (Config error naming the key), rather than arming an order path
-# without the protection the file claims.
+# without the protection the file claims. What it DOES run with is logged once at arming, one
+# INFO line to check after every deploy:
+#   send gate: budget 48/min, reserve 12, cooldown 60000 ms, ...      (or: send gate: OFF)
 #
 # [order_path]
 # # YOUR Robinhood Chain account index (GET https://api.rh.lighter.xyz/api/v1/

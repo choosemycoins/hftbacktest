@@ -283,6 +283,28 @@ impl OrderPathConfig {
         self.tx_budget_per_minute
             .map(|per_minute| TxBudget::new(per_minute, self.tx_reserve.unwrap_or(0)))
     }
+
+    /// What the send gate this config arms will do, in one line — `"OFF"` when it does
+    /// nothing, otherwise e.g. `"budget 48/min, reserve 12, cooldown 60000 ms"`. Logged once
+    /// at arming: the file is not the evidence of what the process runs with — a build that
+    /// predates a field never read it, and a field read as absent turns its protection off.
+    pub fn send_gate_summary(&self) -> String {
+        if self.tx_budget_per_minute.is_none() && self.rate_limit_cooldown_ms.is_none() {
+            return "OFF".to_string();
+        }
+        let budget = match self.tx_budget_per_minute {
+            Some(per_minute) => format!(
+                "budget {per_minute}/min, reserve {}",
+                self.tx_reserve.unwrap_or(0)
+            ),
+            None => "budget OFF".to_string(),
+        };
+        let cooldown = match self.rate_limit_cooldown_ms {
+            Some(cooldown_ms) => format!("cooldown {cooldown_ms} ms"),
+            None => "cooldown OFF".to_string(),
+        };
+        format!("{budget}, {cooldown}")
+    }
 }
 
 /// Clamps a requested auth-token lifetime (seconds) below the 8 h server ceiling, minus the

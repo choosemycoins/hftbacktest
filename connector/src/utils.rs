@@ -403,14 +403,88 @@ pub(crate) mod testing {
         });
     }
 
+    /// Captures one named field of the events at one level, on **this thread only**, for as
+    /// long as the guard [`Self::capturing`] returns lives — the pin for a line an operator
+    /// greps, when the log field is the only observable a behaviour has (`AGENTS.md` §4.2).
+    /// A `%`-recorded field arrives as its `Display`, a `&str` as itself, anything else as its
+    /// `Debug`.
+    #[derive(Clone)]
+    pub(crate) struct CapturedField {
+        field: &'static str,
+        level: Level,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CapturedField {
+        pub(crate) fn new(field: &'static str, level: Level) -> Self {
+            Self {
+                field,
+                level,
+                seen: Arc::default(),
+            }
+        }
+
+        pub(crate) fn capturing(&self) -> tracing::subscriber::DefaultGuard {
+            keep_every_callsite_interested();
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        /// Every value the field took, in the order the events were logged.
+        pub(crate) fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for CapturedField {
+        fn on_event(&self, event: &tracing::Event<'_>, _: LayerContext<'_, S>) {
+            if *event.metadata().level() != self.level {
+                return;
+            }
+            let mut visitor = FieldValue {
+                field: self.field,
+                value: None,
+            };
+            event.record(&mut visitor);
+            if let Some(value) = visitor.value {
+                self.seen.lock().unwrap().push(value);
+            }
+        }
+    }
+
+    struct FieldValue {
+        field: &'static str,
+        value: Option<String>,
+    }
+
+    impl Visit for FieldValue {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == self.field {
+                self.value = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == self.field {
+                self.value = Some(format!("{value:?}"));
+            }
+        }
+    }
+
     use std::{
         marker::PhantomData,
         pin::Pin,
+        sync::{Arc, Mutex},
         task::{Context, Poll},
     };
 
     use futures_util::{Sink, Stream, stream};
     use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+    use tracing::{
+        Level,
+        Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
 
     /// A write half that records what was written, so a subscribe path can be driven without
     /// a socket.

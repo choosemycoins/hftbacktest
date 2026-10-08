@@ -440,6 +440,10 @@ impl Connector for Lighter {
                 account_index = config.account_index,
                 "Arming the Lighter order path."
             );
+            // What the process runs with, not what the file says: a field the build does not
+            // read, or reads as absent, leaves its protection off without a word (§4.15).
+            let send_gate = config.send_gate_summary();
+            info!(%send_gate, "send gate: {send_gate}");
             let network = self.instance.signer_network(&self.config.rest_url);
             info!(
                 url = %network.url,
@@ -621,10 +625,6 @@ pub(crate) fn publish_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fmt,
-        sync::{Arc, Mutex},
-    };
 
     use hftbacktest::types::{
         ErrorKind,
@@ -638,13 +638,7 @@ mod tests {
         Value,
     };
     use tokio::sync::mpsc::unbounded_channel;
-    use tracing::{
-        Event as LogEvent,
-        Level,
-        Subscriber,
-        field::{Field, Visit},
-    };
-    use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
+    use tracing::Level;
 
     use crate::{
         connector::{Connector, ConnectorBuilder, PublishEvent, SweepReason},
@@ -663,6 +657,7 @@ mod tests {
             rest::{MarketInfo, match_catalog},
             signer::SignerNetwork,
         },
+        utils::testing::CapturedField,
     };
 
     /// The shipped example must parse with the code that reads it. `AGENTS.md` §6 requires
@@ -887,47 +882,48 @@ mod tests {
         );
     }
 
-    /// Captures the `unresolved` field of `warn!` events on **this thread only**, for as long
-    /// as the guard lives (the shape `bybit/public_stream.rs` uses; `AGENTS.md` §4.2 documents
-    /// why a log field sometimes has to be the pin, and that the pattern can flake when other
-    /// tests race the global callsite-interest cache).
-    #[derive(Clone, Default)]
-    struct ReportedUnresolved(Arc<Mutex<Vec<String>>>);
-
-    impl ReportedUnresolved {
-        fn capturing(&self) -> tracing::subscriber::DefaultGuard {
-            crate::utils::testing::keep_every_callsite_interested();
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    /// The `send_gate` field of every INFO line `run` logs, for `config` (on a dead local port:
+    /// `run` really starts its tasks).
+    fn send_gate_logged(config: &str) -> Vec<String> {
+        crate::install_crypto_provider();
+        let mut connector = Lighter::build_from(config).unwrap();
+        let (ev_tx, _events) = unbounded_channel();
+        let logged = CapturedField::new("send_gate", Level::INFO);
+        {
+            let _capturing = logged.capturing();
+            connector.run(ev_tx);
         }
-
-        fn reported(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
-        }
+        connector.shutdown();
+        logged.seen()
     }
 
-    impl<S: Subscriber> Layer<S> for ReportedUnresolved {
-        fn on_event(&self, event: &LogEvent<'_>, _: LayerContext<'_, S>) {
-            if *event.metadata().level() != Level::WARN {
-                return;
-            }
-            let mut field = UnresolvedField(None);
-            event.record(&mut field);
-            if let Some(value) = field.0 {
-                self.0.lock().unwrap().push(value);
-            }
-        }
-    }
-
-    /// Pulls the `unresolved = ...` field out of one event and ignores every other field. It is
-    /// recorded with `?`, so it arrives as a `Debug` rendering of the list.
-    struct UnresolvedField(Option<String>);
-
-    impl Visit for UnresolvedField {
-        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-            if field.name() == "unresolved" {
-                self.0 = Some(format!("{value:?}"));
-            }
-        }
+    /// **Arming says, in one line, what the send gate will do — or that it will do nothing.**
+    /// The config file is not evidence of it: every protective field is optional and off by
+    /// default, so a field the running build does not read (it predates it), or reads as
+    /// absent, arms an order path without the protection the file claims — and until this
+    /// line nothing in the log said which one the process had. Grep target: `send gate:`.
+    #[tokio::test]
+    async fn arming_the_order_path_logs_the_send_gate_it_runs_with() {
+        assert_eq!(
+            send_gate_logged(&format!(
+                "{ARMED}\ntx_budget_per_minute = 48\ntx_reserve = 12\nrate_limit_cooldown_ms = \
+                 60000\n"
+            )),
+            ["budget 48/min, reserve 12, cooldown 60000 ms"]
+        );
+        assert_eq!(send_gate_logged(ARMED), ["OFF"]);
+        assert_eq!(
+            send_gate_logged(&format!("{ARMED}\ntx_budget_per_minute = 48\n")),
+            ["budget 48/min, reserve 0, cooldown OFF"]
+        );
+        assert_eq!(
+            send_gate_logged(&format!("{ARMED}\nrate_limit_cooldown_ms = 60000\n")),
+            ["budget OFF, cooldown 60000 ms"]
+        );
+        assert!(
+            send_gate_logged(MARKET_DATA_ONLY).is_empty(),
+            "no order path, no send gate to speak of"
+        );
     }
 
     /// **A sweep that cannot cover a symbol names it.**
@@ -968,7 +964,8 @@ mod tests {
                 ..Default::default()
             });
 
-        let reported = ReportedUnresolved::default();
+        // The list is recorded with `?`, so it arrives as its `Debug` rendering.
+        let reported = CapturedField::new("unresolved", Level::WARN);
         let handle = {
             let _capturing = reported.capturing();
             connector.sweep(
@@ -980,7 +977,7 @@ mod tests {
         assert!(handle.is_some(), "the resolved market is still swept");
         connector.shutdown();
 
-        let reported = reported.reported();
+        let reported = reported.seen();
         assert_eq!(reported.len(), 1, "one report, naming what was missed");
         assert!(
             reported[0].contains("ETH"),
