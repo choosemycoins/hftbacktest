@@ -387,6 +387,14 @@ impl OrderManager {
     /// `transaction_time` (§4.12): a frame older than the last applied is dropped, never
     /// rewound. A terminal status (canceled/filled) takes the order out of tracking.
     pub fn apply_order_update(&mut self, update: &AccountOrder) -> Option<(String, Order)> {
+        // A status this connector cannot read moves nothing — not the status, not the fill, not
+        // the watermark. Read as `Unsupported` it is not `active()`, so the order would leave
+        // tracking and be published as gone while it may still rest: the bot frees the level
+        // and quotes over it. Kept, the next reconnect's snapshot settles it (`reconcile`); the
+        // caller pages.
+        if !status_is_known(&update.status) {
+            return None;
+        }
         let coi = update.client_order_index;
         let (active, symbol, order, order_id) = {
             // A COI this connector never minted — a human's order, or a previous run's — is
@@ -551,6 +559,12 @@ fn map_status(status: &str) -> Status {
         reason if reason.starts_with(CANCELED_WITH_REASON) => Status::Canceled,
         _ => Status::Unsupported,
     }
+}
+
+/// Whether `status` is one this connector can read. An unknown one must never move an
+/// order: see [`OrderManager::apply_order_update`].
+pub fn status_is_known(status: &str) -> bool {
+    map_status(status) != Status::Unsupported
 }
 
 /// What, beyond the order coming back terminal, the bot must be told about a venue cancel.
@@ -849,6 +863,46 @@ mod tests {
         assert_eq!(m.tracked(), 0);
         // The order_id can now be reused for a fresh order.
         assert!(m.new_order("BTC", &btc(), &bid(1, 58200.0, 0.001)).is_ok());
+    }
+
+    /// **A status this connector cannot read leaves the order exactly as it was.** Mapped to
+    /// `Unsupported` — which is not `active()` — it used to take the order out of tracking and
+    /// publish it as gone: the bot freed the level and quoted it again while the first order
+    /// might still rest, and a status the venue applied to every order would have stacked a
+    /// ghost per requote. Kept, it stays live to the bot and to every cap that counts it, and
+    /// the next reconnect's snapshot settles it (`reconcile`); the caller pages
+    /// ([`super::status_is_known`]).
+    #[test]
+    fn an_unrecognised_status_leaves_the_order_as_it_was() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        m.apply_order_update(&account_order(coi, 5, "open", 1_000));
+
+        assert!(
+            m.apply_order_update(&account_order(coi, 5, "frozen-by-venue", 2_000))
+                .is_none(),
+            "nothing is published for a status nobody can read"
+        );
+
+        assert_eq!(m.tracked(), 1, "the order is still tracked");
+        let live = m.orders(Some("BTC".to_string()));
+        assert_eq!(live.len(), 1, "and still reported live to the bot");
+        assert_eq!(live[0].status, Status::New);
+        assert!(
+            m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).is_err(),
+            "its id is not freed for a second order"
+        );
+        assert!(!super::status_is_known("frozen-by-venue"));
+        for known in [
+            "open",
+            "pending",
+            "in-progress",
+            "filled",
+            "canceled",
+            "canceled-post-only",
+        ] {
+            assert!(super::status_is_known(known), "{known}");
+        }
     }
 
     /// A frame for a COI this connector never minted — a human's order, or a previous run's —

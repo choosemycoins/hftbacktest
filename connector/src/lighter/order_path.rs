@@ -68,7 +68,7 @@ use crate::{
         LighterError,
         SharedSymbolSet,
         nonce::NonceOwner,
-        order::{CancelPlan, OrderManager, venue_refusal},
+        order::{CancelPlan, OrderManager, status_is_known, venue_refusal},
         private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
         public_stream::{
             BACKOFF_MAX,
@@ -1566,6 +1566,28 @@ impl PrivateStreamTask {
                         publish_order(&self.ev_tx, &symbol, order);
                     }
                 }
+                // A status nobody here can read moves nothing (`apply_order_update`) and pages,
+                // once per frame: the venue has started saying something about orders that this
+                // process cannot vouch for.
+                let unknown: Vec<&str> = orders
+                    .iter()
+                    .filter(|order| !status_is_known(&order.status))
+                    .map(|order| order.status.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    error!(
+                        ?unknown,
+                        "Lighter reported order statuses this connector cannot read; those orders \
+                         are left exactly as they were until a reconnect's snapshot settles them."
+                    );
+                    report_error(
+                        &self.ev_tx,
+                        ErrorKind::CriticalConnectionError,
+                        &format!(
+                            "unrecognised Lighter order status {unknown:?}; orders left as they were"
+                        ),
+                    );
+                }
                 for order in &orders {
                     let applied = self.order_manager.lock().unwrap().apply_order_update(order);
                     if let Some((symbol, published)) = applied {
@@ -2672,6 +2694,61 @@ mod tests {
             "a symbol registered after connect must be resolved and tracked by the wake arm — \
              without it every submit for ETH is expired before signing (the zero-fills bug)"
         );
+    }
+
+    // ---- an order status nobody can read ------------------------------------------------
+
+    /// **A status the connector cannot read pages and moves nothing.** The order stays as it
+    /// was (the manager's pin) and the bots hear a `CriticalConnectionError` naming the status,
+    /// because a venue that has started speaking a new word about orders is a venue whose
+    /// order state this process can no longer vouch for.
+    #[test]
+    fn an_unrecognised_order_status_pages_and_publishes_nothing() {
+        let (task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.order_manager.lock().unwrap().track_market(MarketInfo {
+            symbol: "BTC".to_string(),
+            market_id: 1,
+            price_decimals: 1,
+            size_decimals: 5,
+            ..Default::default()
+        });
+        let order = Order::new(
+            7,
+            583_000,
+            0.1,
+            0.001,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTX,
+        );
+        let market = task
+            .order_manager
+            .lock()
+            .unwrap()
+            .market_info("BTC")
+            .unwrap();
+        let (coi, _) = task
+            .order_manager
+            .lock()
+            .unwrap()
+            .new_order("BTC", &market, &order)
+            .unwrap();
+        let frame = PRIVATE_ORDERS_UPDATE_CANCELED
+            .replace("424242424242", &coi.to_string())
+            .replace(r#""status":"canceled""#, r#""status":"frozen-by-venue""#);
+
+        task.on_frame(&frame);
+
+        let Ok(PublishEvent::LiveEvent(LiveEvent::Error(error))) = ev_rx.try_recv() else {
+            panic!("an unreadable status must page");
+        };
+        assert_eq!(error.kind, ErrorKind::CriticalConnectionError);
+        let Value::String(message) = error.value else {
+            panic!("the reason rides as a string");
+        };
+        assert!(message.contains("frozen-by-venue"), "{message}");
+        assert!(ev_rx.try_recv().is_err(), "and nothing else is published");
+        assert_eq!(task.order_manager.lock().unwrap().tracked(), 1);
     }
 
     // ---- the account stream gates submits ---------------------------------------------
