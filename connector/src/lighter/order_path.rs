@@ -69,7 +69,7 @@ use crate::{
         SharedSymbolSet,
         gate::{LogThrottle, Refusal, SendGate, TxBudget, TxClass, admit_by},
         nonce::NonceOwner,
-        order::{CancelPlan, OrderManager, status_is_known, venue_refusal},
+        order::{CancelPlan, HeldCancel, OrderManager, status_is_known, venue_refusal},
         private_msg::{
             AccountOrder,
             PrivateFrame,
@@ -1057,7 +1057,15 @@ impl SlotTask {
                     CancelFollowUp::HandBack(reason) => self.clear_cancel_request(coi, &reason),
                     // Rate-limited under a cooldown: held, still pending, and sent again when the
                     // cooldown is over unless the channel has closed the order by then (§4.16).
-                    CancelFollowUp::AfterCooldown => held.hold(coi, plan.clone()),
+                    CancelFollowUp::AfterCooldown => {
+                        info!(
+                            coi,
+                            "A Lighter cancel the venue answered 429/405 is held. It stays \
+                             pending to the bot and goes out again when the cooldown is over \
+                             (§4.16)."
+                        );
+                        held.hold(coi, plan.clone());
+                    }
                 }
             }
             Err(error) => {
@@ -1186,9 +1194,13 @@ impl SlotTask {
         }
     }
 
-    /// Sends the cancels a cooldown held, once it is over (§4.16). A held cancel whose order
-    /// has gone meanwhile — filled, closed by the venue — is dropped: there is nothing left to
-    /// cancel, and the cancel would spend a send on a refusal.
+    /// Sends the cancels a cooldown held, once it is over (§4.16).
+    ///
+    /// What decides is whether the order still **rests** ([`OrderManager::resume_held_cancel`]):
+    /// one that has gone meanwhile — filled, closed by the venue — is dropped, there is nothing
+    /// left to cancel and the cancel would spend a send on a refusal; one that filled in part is
+    /// as stale a quote as before, smaller, and its cancel goes — after the bot is told it is in
+    /// flight again, because the fill's update cleared the request it had seen.
     async fn release_held_cancels(
         &self,
         signer: &mut SignerClient,
@@ -1200,12 +1212,27 @@ impl SlotTask {
             return;
         }
         for (coi, plan) in held.take() {
-            if !self.order_manager.lock().unwrap().cancel_pending(coi) {
-                info!(
-                    coi,
-                    "Dropping a Lighter cancel held through a cooldown: its order has gone."
-                );
-                continue;
+            let resumed = self.order_manager.lock().unwrap().resume_held_cancel(coi);
+            match resumed {
+                HeldCancel::Gone => {
+                    info!(
+                        coi,
+                        "Dropping a Lighter cancel held through a cooldown: its order has gone \
+                         (filled, or closed by the venue), so nothing is left to cancel."
+                    );
+                    continue;
+                }
+                HeldCancel::StillPending => {}
+                HeldCancel::Rerequested(symbol, order) => {
+                    info!(
+                        coi,
+                        %symbol,
+                        leaves_qty = order.leaves_qty,
+                        "A Lighter order filled in part while its cancel was held; it still \
+                         rests, so the cancel goes out now (§4.16)."
+                    );
+                    publish_order(&self.ev_tx, &symbol, order);
+                }
             }
             if self.admit_cancel(gate, held, coi, &plan) {
                 self.send_cancel(signer, nonce, gate, held, coi, &plan)
@@ -1373,7 +1400,17 @@ impl SlotTask {
         match gate.admit(Instant::now(), TxClass::RiskReducing) {
             Ok(()) => true,
             Err(refusal @ Refusal::Cooldown { .. }) => {
-                self.log_refusal(gate, &refusal, "cancel, held");
+                // Not `log_refusal`: that line says the send went back to the bot, and this one
+                // did not — it stays pending to the bot and goes out when the gate opens.
+                info!(
+                    coi,
+                    wait_ms = refusal
+                        .free_at()
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64,
+                    "A Lighter cancel is held: the venue rate-limited the account. It stays \
+                     pending to the bot and goes out when the cooldown is over (§4.16)."
+                );
                 held.hold(coi, plan.clone());
                 false
             }
@@ -3965,6 +4002,65 @@ mod tests {
             2,
             "the cancel of a filled order never went out"
         );
+    }
+
+    /// **A held cancel whose order filled in part meanwhile still goes out** — the order is
+    /// resting, smaller, and its quote is exactly as stale as before. The 2026-10-08 probe saw
+    /// it dropped instead ("its order has gone"): every account-stream update clears the
+    /// pending request (`apply_order_update` writes `req = None`), and the release asked for a
+    /// pending request rather than for a live order. The bot is told the cancel is in flight
+    /// again — the order republished with `req = Canceled` and no execution of its own (the
+    /// fill went out with the update that reported it).
+    #[tokio::test]
+    async fn a_held_cancel_whose_order_filled_in_part_meanwhile_goes_out_after_the_cooldown() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(1_500);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError, "the one rate-limit error");
+
+        slot.cancel(&resting);
+        // The account stream reports a partial fill before the cooldown is over.
+        {
+            let mut manager = slot.order_path.order_manager.lock().unwrap();
+            let coi = manager.coi_for("ETH", 1).unwrap();
+            let partial = manager.apply_order_update(&AccountOrder {
+                market_index: 42,
+                client_order_index: coi,
+                order_index: 900_000 + coi,
+                is_ask: false,
+                status: "open".to_string(),
+                price: 1_000.0,
+                initial_base_amount: 0.01,
+                remaining_base_amount: 0.006,
+                filled_base_amount: 0.004,
+                transaction_time_us: 2_000,
+            });
+            let (_, order) = partial.published().expect("a fill of ours");
+            assert_eq!(order.req, Status::None, "the update cleared the request");
+        }
+
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(
+            slot.venue.sent()[2].0,
+            "cancel_order",
+            "the cancel of a still-resting order went out once the cooldown was over"
+        );
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the bot is told the cancel is in flight again");
+        };
+        assert_eq!(order.order_id, 1);
+        assert_eq!(order.req, Status::Canceled);
+        assert_eq!(order.leaves_qty, 0.006, "the order as it now rests");
+        assert_eq!(order.exec_qty, 0.0, "a republish is not an execution");
     }
 
     /// **A sweep waits out a cooldown that ends before its deadline**, and goes out once it is

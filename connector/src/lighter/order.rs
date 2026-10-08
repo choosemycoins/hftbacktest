@@ -120,6 +120,19 @@ pub struct CancelPlan {
     pub order_index: i64,
 }
 
+/// What a cancel held through a cooldown finds when it is due ([`OrderManager::resume_held_cancel`]).
+#[derive(Debug)]
+pub enum HeldCancel {
+    /// Untracked or no longer active — filled, closed by the venue, expired: nothing is left to
+    /// cancel, and sending the cancel would spend a `sendTx` on a refusal.
+    Gone,
+    /// Still resting with its cancel still pending, as when it was held.
+    StillPending,
+    /// Still resting, but an update since — a partial fill — cleared the pending cancel. It is
+    /// pending again now; this `(symbol, order)` is to be republished so the bot sees it.
+    Rerequested(String, Order),
+}
+
 /// One tracked order: the bot-facing `Order`, plus the venue bookkeeping around it.
 struct Tracked {
     symbol: String,
@@ -531,13 +544,27 @@ impl OrderManager {
         Some((symbol, position.position, exch_ts_us))
     }
 
-    /// Whether order `coi` is still live and still waiting on a cancel this connector was
-    /// asked for — what a cancel held through a rate-limit cooldown checks before it goes out
-    /// (§4.16). Filled, closed by the venue, or untracked: there is nothing left to cancel.
-    pub fn cancel_pending(&self, coi: i64) -> bool {
-        self.orders
-            .get(&coi)
-            .is_some_and(|tracked| tracked.order.active() && tracked.order.req == Status::Canceled)
+    /// What a cancel held through a rate-limit cooldown finds when it is due to go out (§4.16).
+    ///
+    /// The question is whether the **order** still rests, not whether its cancel is still
+    /// marked pending: every account-stream update clears `req` ([`Self::apply_order_update`]),
+    /// so a partial fill during the cooldown left a resting order looking as if nobody had
+    /// asked to cancel it, and the held cancel was dropped (2026-10-08 probe). Such an order is
+    /// marked cancel-pending again here, and handed back to be republished, with no execution
+    /// of its own — the fill already went out with the update that reported it.
+    pub fn resume_held_cancel(&mut self, coi: i64) -> HeldCancel {
+        let Some(tracked) = self.orders.get_mut(&coi) else {
+            return HeldCancel::Gone;
+        };
+        if !tracked.order.active() {
+            return HeldCancel::Gone;
+        }
+        if tracked.order.req == Status::Canceled {
+            return HeldCancel::StillPending;
+        }
+        tracked.order.req = Status::Canceled;
+        tracked.order.exec_qty = 0.0;
+        HeldCancel::Rerequested(tracked.symbol.clone(), tracked.order.clone())
     }
 
     /// Whether the tracked submit `coi` gets the account out — the question the send budget's
