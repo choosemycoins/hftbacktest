@@ -56,7 +56,7 @@ from typing import Callable, Optional
 
 BASE_URL = "https://api.rh.lighter.xyz"
 PAGE_LIMIT = 100  # the documented maximum; 1000 is refused with code 20001
-PAGE_PAUSE_S = 3.0  # 36 pages a day; the REST budget is not published and
+PAGE_PAUSE_S = 3.0  # ~383 pages (38k accounts on 08.10), ~19 min a run; the REST budget is not published and
 # is shared per IP with the collectors — 0.5 s drew a 429 on the first deploy
 BACKOFF_S = (15, 60, 180)  # waits before each retry of a 429, then give up
 MAX_PAGES = 1000  # 100k accounts — a runaway guard, not an expectation
