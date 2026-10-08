@@ -227,6 +227,12 @@ timeout_ms = 10000
 # # order path reads nothing from the venue; the bots hear one rate-limit error per 429/405.
 # rate_limit_cooldown_ms = 60000
 #
+# # How soon into the cooldown a cancel, a sweep or a position-reducing IOC may probe it anyway,
+# # ms (§4.16); every refused probe doubles the wait, and none lengthens the cooldown or reaches
+# # the bots. Quotes always wait it out. Optional; needs rate_limit_cooldown_ms and must be
+# # shorter. Absent = cancels wait the whole cooldown. Not measured anywhere yet.
+# rate_limit_cancel_probe_ms = 5000
+#
 # # AUTH TOKEN: minted by the sidecar, clamped below the venue's 8 h server ceiling, and
 # # REFRESHED automatically before it expires by a clean reconnect (§3.4) — no config. The
 # # 8 h ceiling is enforced only by the server (a longer token mints without error and is

@@ -95,7 +95,8 @@ pub(crate) struct Seen {
 
 /// A local HTTP server playing the venue's order-path REST endpoints.
 ///
-/// * `GET /api/v1/nextNonce` — the venue's counter, which a `sendTx` answered 200 advances.
+/// * `GET /api/v1/nextNonce` — the venue's counter, which a `sendTx` answered 200 advances;
+///   or, while [`ScriptedRestVenue::answer_next_nonce_with`] has queued statuses, the next one.
 /// * `POST /api/v1/sendTx` — the next scripted answer, or a clean 200 ack once the script is
 ///   spent.
 /// * `GET /api/v1/accountActiveOrders` — an empty list (the venue holds nothing).
@@ -106,6 +107,7 @@ pub(crate) struct ScriptedRestVenue {
     pub(crate) url: String,
     seen: Arc<Mutex<Vec<Seen>>>,
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
+    next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
 }
 
 /// A clean `sendTx` 200, carrying the venue's rate-limit report the way it does (§2.7).
@@ -130,17 +132,22 @@ impl ScriptedRestVenue {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>> = Arc::default();
+        let next_nonce_answers: Arc<Mutex<VecDeque<u16>>> = Arc::default();
         let counter = Arc::new(Mutex::new(nonce));
         {
             let seen = seen.clone();
             let send_tx_answers = send_tx_answers.clone();
+            let next_nonce_answers = next_nonce_answers.clone();
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let seen = seen.clone();
-                    let send_tx_answers = send_tx_answers.clone();
-                    let counter = counter.clone();
+                    let script = Script {
+                        seen: seen.clone(),
+                        send_tx_answers: send_tx_answers.clone(),
+                        next_nonce_answers: next_nonce_answers.clone(),
+                        counter: counter.clone(),
+                    };
                     tokio::spawn(async move {
-                        serve_one(socket, seen, send_tx_answers, counter).await;
+                        serve_one(socket, script).await;
                     });
                 }
             });
@@ -149,12 +156,19 @@ impl ScriptedRestVenue {
             url,
             seen,
             send_tx_answers,
+            next_nonce_answers,
         }
     }
 
     /// Queues the answers the next `sendTx`s get, in order.
     pub(crate) fn answer_send_tx_with(&self, answers: impl IntoIterator<Item = (u16, String)>) {
         self.send_tx_answers.lock().unwrap().extend(answers);
+    }
+
+    /// Queues the statuses the next `nextNonce` reads get, in order; a status other than 200
+    /// is an error answer, and 200 the counter as usual.
+    pub(crate) fn answer_next_nonce_with(&self, statuses: impl IntoIterator<Item = u16>) {
+        self.next_nonce_answers.lock().unwrap().extend(statuses);
     }
 
     /// Everything that reached the venue so far.
@@ -177,12 +191,21 @@ impl ScriptedRestVenue {
     }
 }
 
-async fn serve_one(
-    mut socket: TcpStream,
+/// What one connection to the scripted venue answers from, and records into.
+struct Script {
     seen: Arc<Mutex<Vec<Seen>>>,
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
+    next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
     counter: Arc<Mutex<i64>>,
-) {
+}
+
+async fn serve_one(mut socket: TcpStream, script: Script) {
+    let Script {
+        seen,
+        send_tx_answers,
+        next_nonce_answers,
+        counter,
+    } = script;
     let Some((method, target, body)) = read_request(&mut socket).await else {
         return;
     };
@@ -206,10 +229,16 @@ async fn serve_one(
         nonce,
     });
     let (status, body) = match (method.as_str(), path.as_str()) {
-        ("GET", "/api/v1/nextNonce") => {
-            let next = *counter.lock().unwrap();
-            (200, json!({"code": 200, "nonce": next}).to_string())
-        }
+        ("GET", "/api/v1/nextNonce") => match next_nonce_answers.lock().unwrap().pop_front() {
+            Some(status) if status != 200 => (
+                status,
+                json!({"code": status, "message": "scripted"}).to_string(),
+            ),
+            _ => {
+                let next = *counter.lock().unwrap();
+                (200, json!({"code": 200, "nonce": next}).to_string())
+            }
+        },
         ("POST", "/api/v1/sendTx") => {
             let answer = send_tx_answers
                 .lock()

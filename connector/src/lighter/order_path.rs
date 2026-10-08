@@ -67,7 +67,7 @@ use crate::{
     lighter::{
         LighterError,
         SharedSymbolSet,
-        gate::{LogThrottle, Refusal, SendGate, TxBudget, TxClass, admit_by},
+        gate::{Admission, LogThrottle, Refusal, SendGate, TxBudget, TxClass, admit_by},
         nonce::NonceOwner,
         order::{CancelPlan, HeldCancel, OrderManager, status_is_known, venue_refusal},
         private_msg::{
@@ -240,6 +240,16 @@ pub struct OrderPathConfig {
     /// is handled as the ambiguous answer it was before.
     #[serde(default)]
     pub rate_limit_cooldown_ms: Option<u64>,
+    /// How soon into a 429/405 cooldown a **risk-reducing** send — a cancel, `CancelAllOrders`,
+    /// a reducing IOC — may try anyway, ms; each probe the venue refuses doubles the wait, up to
+    /// the end of the cooldown (§4.16). The docs' two cooldowns cannot be told apart from here
+    /// — the firewall's static 60 s, an API server's `weight / (total / 60)`, seconds — and a
+    /// cancel that waits a whole minute for the second kind leaves a stale quote resting all
+    /// that time. A refused probe does not extend the cooldown and tells the bots nothing new;
+    /// quotes always wait it out. Needs `rate_limit_cooldown_ms` and must be shorter than it.
+    /// Absent ⇒ cancels wait the whole cooldown, the behaviour before it existed.
+    #[serde(default)]
+    pub rate_limit_cancel_probe_ms: Option<u64>,
 }
 
 impl OrderPathConfig {
@@ -269,13 +279,34 @@ impl OrderPathConfig {
                  the behaviour without one"
                     .to_string(),
             ),
-            _ => Ok(()),
+            _ => match (self.rate_limit_cooldown_ms, self.rate_limit_cancel_probe_ms) {
+                (None, Some(_)) => Err(
+                    "[order_path] rate_limit_cancel_probe_ms needs rate_limit_cooldown_ms: there is \
+                     no cooldown to probe"
+                        .to_string(),
+                ),
+                (_, Some(0)) => Err(
+                    "[order_path] rate_limit_cancel_probe_ms = 0 would send into the cooldown at \
+                     once; leave the field out for cancels that wait it out"
+                        .to_string(),
+                ),
+                (Some(cooldown), Some(probe)) if probe >= cooldown => Err(format!(
+                    "[order_path] rate_limit_cancel_probe_ms = {probe} never probes a cooldown of \
+                     {cooldown} ms; it must be shorter"
+                )),
+                _ => Ok(()),
+            },
         }
     }
 
     /// The cooldown after a 429/405, if one is configured.
     pub fn rate_limit_cooldown(&self) -> Option<Duration> {
         self.rate_limit_cooldown_ms.map(Duration::from_millis)
+    }
+
+    /// How soon into a cooldown a risk-reducing send may probe it, if probes are configured.
+    pub fn rate_limit_cancel_probe(&self) -> Option<Duration> {
+        self.rate_limit_cancel_probe_ms.map(Duration::from_millis)
     }
 
     /// The client-side `sendTx` budget, if one is configured.
@@ -285,7 +316,8 @@ impl OrderPathConfig {
     }
 
     /// What the send gate this config arms will do, in one line — `"OFF"` when it does
-    /// nothing, otherwise e.g. `"budget 48/min, reserve 12, cooldown 60000 ms"`. Logged once
+    /// nothing, otherwise e.g. `"budget 48/min, reserve 12, cooldown 60000 ms, cancel probe
+    /// 5000 ms"`. Logged once
     /// at arming: the file is not the evidence of what the process runs with — a build that
     /// predates a field never read it, and a field read as absent turns its protection off.
     pub fn send_gate_summary(&self) -> String {
@@ -299,9 +331,12 @@ impl OrderPathConfig {
             ),
             None => "budget OFF".to_string(),
         };
-        let cooldown = match self.rate_limit_cooldown_ms {
-            Some(cooldown_ms) => format!("cooldown {cooldown_ms} ms"),
-            None => "cooldown OFF".to_string(),
+        let cooldown = match (self.rate_limit_cooldown_ms, self.rate_limit_cancel_probe_ms) {
+            (Some(cooldown_ms), Some(probe_ms)) => {
+                format!("cooldown {cooldown_ms} ms, cancel probe {probe_ms} ms")
+            }
+            (Some(cooldown_ms), None) => format!("cooldown {cooldown_ms} ms, cancel probe OFF"),
+            (None, _) => "cooldown OFF".to_string(),
         };
         format!("{budget}, {cooldown}")
     }
@@ -729,7 +764,11 @@ impl SlotTask {
         self.reseed(&mut nonce).await;
 
         // Asked before every `sendTx`, and before the nonce it would spend (§4.15, §4.16).
-        let mut gate = SendGate::new(self.config.send_budget(), self.config.rate_limit_cooldown());
+        let mut gate = SendGate::new(
+            self.config.send_budget(),
+            self.config.rate_limit_cooldown(),
+            self.config.rate_limit_cancel_probe(),
+        );
         // Cancels a cooldown kept from going out, sent when it is over (§4.16).
         let mut held = HeldCancels::default();
 
@@ -744,13 +783,13 @@ impl SlotTask {
                     self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
                     match command {
                         Some(Command::Submit { coi, order, outbound }) => {
-                            if self.admit_submit(&mut gate, coi) {
-                                self.send_order(&mut signer, &mut nonce, &mut gate, coi, &order, &outbound, &mut awaiting).await;
+                            if let Some(admission) = self.admit_submit(&mut gate, coi) {
+                                self.send_order(&mut signer, &mut nonce, &mut gate, admission, coi, &order, &outbound, &mut awaiting).await;
                             }
                         }
                         Some(Command::Cancel { coi, plan }) => {
-                            if self.admit_cancel(&mut gate, &mut held, coi, &plan) {
-                                self.send_cancel(&mut signer, &mut nonce, &mut gate, &mut held, coi, &plan).await;
+                            if let Some(admission) = self.admit_cancel(&mut gate, &mut held, coi, &plan) {
+                                self.send_cancel(&mut signer, &mut nonce, &mut gate, &mut held, admission, coi, &plan).await;
                             }
                         }
                         Some(Command::CancelAll { market_index, reply, deadline }) => {
@@ -761,6 +800,7 @@ impl SlotTask {
                                 gate: &mut gate,
                                 market_index,
                                 deadline,
+                                admission: Admission::Send,
                             };
                             sweep_market(&mut sender, &self.ev_tx, market_index, reply).await;
                         }
@@ -811,6 +851,7 @@ impl SlotTask {
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
         gate: &mut SendGate,
+        admission: Admission,
         coi: i64,
         order: &CreateOrder,
         outbound: &Outbound,
@@ -818,6 +859,7 @@ impl SlotTask {
     ) {
         let dequeued = StdInstant::now();
         let Some(reserved_nonce) = self.reserve(nonce).await else {
+            self.probe_failed(gate, admission, "the nonce could not be read");
             self.expire(coi, "the nonce slot could not be seeded");
             return;
         };
@@ -854,7 +896,7 @@ impl SlotTask {
 
         match sent {
             Ok(outcome) => {
-                let outcome = self.received(gate, outcome);
+                let outcome = self.received(gate, admission, outcome);
                 self.apply_nonce(nonce, &outcome).await;
                 match outcome {
                     SendOutcome::Accepted(ack) => {
@@ -1055,16 +1097,26 @@ impl SlotTask {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_cancel(
         &self,
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
         gate: &mut SendGate,
         held: &mut HeldCancels,
+        admission: Admission,
         coi: i64,
         plan: &CancelPlan,
     ) {
         let Some(reserved) = self.reserve(nonce).await else {
+            if admission == Admission::Probe {
+                // The cooldown's 429 left the nonce to be re-read, and a venue that is still
+                // refusing the account refuses that read too: a refused probe, not a cancel
+                // that failed. It stays held — and pending to the bot — for the next probe.
+                self.probe_failed(gate, admission, "the nonce could not be read");
+                held.hold(coi, plan.clone());
+                return;
+            }
             self.clear_cancel_request(coi, "the nonce slot could not be seeded");
             return;
         };
@@ -1087,7 +1139,7 @@ impl SlotTask {
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
-                let outcome = self.received(gate, outcome);
+                let outcome = self.received(gate, admission, outcome);
                 self.apply_nonce(nonce, &outcome).await;
                 match cancel_after_send(&outcome) {
                     CancelFollowUp::AwaitChannel => {}
@@ -1124,9 +1176,11 @@ impl SlotTask {
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
         gate: &mut SendGate,
+        admission: Admission,
         market_index: i32,
     ) -> Result<SendOutcome, String> {
         let Some(reserved) = self.reserve(nonce).await else {
+            self.probe_failed(gate, admission, "the nonce could not be read");
             return Err("couldn't seed the nonce for the sweep".to_string());
         };
         // CANCEL_ALL_TIF_IMMEDIATE requires time_ms = 0, or the .so refuses on the client (§3.4).
@@ -1142,7 +1196,7 @@ impl SlotTask {
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
-                let outcome = self.received(gate, outcome);
+                let outcome = self.received(gate, admission, outcome);
                 self.apply_nonce(nonce, &outcome).await;
                 Ok(outcome)
             }
@@ -1182,11 +1236,26 @@ impl SlotTask {
     /// * A 429/405 starts the cooldown and is told to the bots **once**, as an `OrderError`
     ///   (a rate limit to the myhft classifier), then handed on as
     ///   [`SendOutcome::RateLimited`].
+    /// * A 429/405 answering a **probe** ([`Admission::Probe`], §4.16) backs the probes off and
+    ///   leaves the cooldown as it was, and the bots are not told again: the 429 that started
+    ///   the cooldown was their one error for it. One that arrives after the cooldown has ended
+    ///   is a new rate limit, told as one.
     /// * Without a configured cooldown a 429/405 is handed on as `Ambiguous` — the answer it
     ///   was before `RateLimited` existed — so that path is unchanged by construction.
-    fn received(&self, gate: &mut SendGate, outcome: SendOutcome) -> SendOutcome {
+    fn received(
+        &self,
+        gate: &mut SendGate,
+        admission: Admission,
+        outcome: SendOutcome,
+    ) -> SendOutcome {
         let now = Instant::now();
         match outcome {
+            SendOutcome::RateLimited { status, detail }
+                if admission == Admission::Probe && gate.cooling(now).is_some() =>
+            {
+                self.probe_failed(gate, admission, &format!("HTTP {status}: {detail}"));
+                SendOutcome::RateLimited { status, detail }
+            }
             SendOutcome::Accepted(ack) => {
                 let ratelimit = ack.ratelimit.as_deref().unwrap_or("<none>");
                 debug!(ratelimit, "A Lighter sendTx was accepted.");
@@ -1217,13 +1286,19 @@ impl SlotTask {
                          until the cooldown is over — new orders are refused, cancels are held, \
                          a sweep waits if it can (§4.16)."
                     );
+                    let cancels = match self.config.rate_limit_cancel_probe_ms {
+                        None => "cancels wait for it".to_string(),
+                        Some(probe_ms) => {
+                            format!("cancels are held and probe it from {probe_ms} ms")
+                        }
+                    };
                     report_error(
                         &self.ev_tx,
                         ErrorKind::OrderError,
                         &format!(
                             "the venue rate-limited this account's sendTx (HTTP {status}); the \
                              connector sends nothing for {cooldown_ms} ms — new orders are \
-                             refused, cancels wait for it; rate-limited"
+                             refused, {cancels}; rate-limited"
                         ),
                     );
                     SendOutcome::RateLimited { status, detail }
@@ -1231,6 +1306,26 @@ impl SlotTask {
             },
             other => other,
         }
+    }
+
+    /// A probe could not get through — the venue answered it 429/405, or the nonce it needed
+    /// could not be read: the probes back off and the cooldown stands as it was (§4.16). Says
+    /// so in the log only; the bots heard the one error the cooldown's own 429 was worth. A
+    /// send that was not a probe is not touched.
+    fn probe_failed(&self, gate: &mut SendGate, admission: Admission, why: &str) {
+        if admission != Admission::Probe {
+            return;
+        }
+        let now = Instant::now();
+        let next_probe_in_ms = gate
+            .probe_refused(now)
+            .map(|at| at.saturating_duration_since(now).as_millis() as u64);
+        warn!(
+            why,
+            ?next_probe_in_ms,
+            "A Lighter send probing the cooldown did not get through; the cooldown stands as it \
+             was, the next probe waits longer, and the bots are not told again (§4.16)."
+        );
     }
 
     /// Sends the cancels a cooldown held, once it is over (§4.16).
@@ -1247,7 +1342,12 @@ impl SlotTask {
         gate: &mut SendGate,
         held: &mut HeldCancels,
     ) {
-        if held.is_empty() || gate.cooling(Instant::now()).is_some() {
+        // With probes configured a cancel may try before the cooldown is over (§4.16).
+        if held.is_empty()
+            || gate
+                .cooling_for(Instant::now(), TxClass::RiskReducing)
+                .is_some()
+        {
             return;
         }
         for (coi, plan) in held.take() {
@@ -1273,8 +1373,8 @@ impl SlotTask {
                     publish_order(&self.ev_tx, &symbol, order);
                 }
             }
-            if self.admit_cancel(gate, held, coi, &plan) {
-                self.send_cancel(signer, nonce, gate, held, coi, &plan)
+            if let Some(admission) = self.admit_cancel(gate, held, coi, &plan) {
+                self.send_cancel(signer, nonce, gate, held, admission, coi, &plan)
                     .await;
             }
         }
@@ -1407,18 +1507,18 @@ impl SlotTask {
     /// reduce-only) submit that shrinks |position| may take the reserve
     /// ([`OrderManager::reduces_position`]); a quote may not — a post-only one on the reducing
     /// side included.
-    fn admit_submit(&self, gate: &mut SendGate, coi: i64) -> bool {
+    fn admit_submit(&self, gate: &mut SendGate, coi: i64) -> Option<Admission> {
         let class = if self.order_manager.lock().unwrap().reduces_position(coi) {
             TxClass::RiskReducing
         } else {
             TxClass::Open
         };
         match gate.admit(Instant::now(), class) {
-            Ok(()) => true,
+            Ok(admission) => Some(admission),
             Err(refusal) => {
                 self.log_refusal(gate, &refusal, "submit");
                 self.hand_back_unsent(coi, &refusal.to_string());
-                false
+                None
             }
         }
     }
@@ -1427,17 +1527,18 @@ impl SlotTask {
     /// the budget refuses it only when it is spent through; then it goes back to the bot as a
     /// cancel that did not go — request cleared, order still live — and the bot may cancel
     /// again. A cooldown does not hand it back: it is held, still pending to the bot, and sent
-    /// the moment the cooldown is over ([`Self::release_held_cancels`]) — handed back, the bot
-    /// would only cancel again into the same cooldown.
+    /// the moment the cooldown is over — or, with probes, the moment the next probe is due
+    /// ([`Self::release_held_cancels`]) — handed back, the bot would only cancel again into the
+    /// same cooldown. Inside a cooldown it is let through as a probe ([`Admission::Probe`]).
     fn admit_cancel(
         &self,
         gate: &mut SendGate,
         held: &mut HeldCancels,
         coi: i64,
         plan: &CancelPlan,
-    ) -> bool {
+    ) -> Option<Admission> {
         match gate.admit(Instant::now(), TxClass::RiskReducing) {
-            Ok(()) => true,
+            Ok(admission) => Some(admission),
             Err(refusal @ Refusal::Cooldown { .. }) => {
                 // Not `log_refusal`: that line says the send went back to the bot, and this one
                 // did not — it stays pending to the bot and goes out when the gate opens.
@@ -1451,12 +1552,12 @@ impl SlotTask {
                      pending to the bot and goes out when the cooldown is over (§4.16)."
                 );
                 held.hold(coi, plan.clone());
-                false
+                None
             }
             Err(refusal) => {
                 self.log_refusal(gate, &refusal, "cancel");
                 self.hand_back_cancel(coi, &refusal.to_string());
-                false
+                None
             }
         }
     }
@@ -1482,7 +1583,8 @@ impl SlotTask {
 }
 
 /// Cancels a rate-limit cooldown kept from going out, in the order they were asked for, to be
-/// sent when it is over (§4.16). One per order: a cancel already held is not held twice.
+/// sent when it is over or the next probe is due (§4.16). One per order: a cancel already held
+/// is not held twice.
 #[derive(Default)]
 struct HeldCancels(Vec<(i64, CancelPlan)>);
 
@@ -1560,33 +1662,44 @@ struct CancelAllSender<'a> {
     market_index: i32,
     /// The command's [`Command::CancelAll`] deadline.
     deadline: Instant,
+    /// How the gate let the attempt about to be sent through — a probe inside a cooldown or an
+    /// ordinary send — set by [`SweepSend::admit`] and read with the answer.
+    admission: Admission,
 }
 
 impl SweepSend for CancelAllSender<'_> {
     async fn admit(&mut self) -> Result<(), String> {
         let now = Instant::now();
-        if let Err(refusal) = self.gate.admit(now, TxClass::RiskReducing) {
-            info!(
-                market_index = self.market_index,
-                wait_ms = refusal.free_at().saturating_duration_since(now).as_millis() as u64,
-                %refusal,
-                "A Lighter CancelAllOrders sweep finds the send gate shut; it waits if the gate \
-                 opens before the sweep's deadline."
-            );
-            admit_by(self.gate, TxClass::RiskReducing, self.deadline)
-                .await
-                .map_err(|refusal| {
-                    format!(
-                        "{refusal}, and the send gate does not open before the sweep's deadline"
-                    )
-                })?;
+        match self.gate.admit(now, TxClass::RiskReducing) {
+            Ok(admission) => self.admission = admission,
+            Err(refusal) => {
+                info!(
+                    market_index = self.market_index,
+                    wait_ms = refusal.free_at().saturating_duration_since(now).as_millis() as u64,
+                    %refusal,
+                    "A Lighter CancelAllOrders sweep finds the send gate shut; it waits if the gate \
+                     opens before the sweep's deadline."
+                );
+                self.admission = admit_by(self.gate, TxClass::RiskReducing, self.deadline)
+                    .await
+                    .map_err(|refusal| {
+                        format!(
+                            "{refusal}, and the send gate does not open before the sweep's deadline"
+                        )
+                    })?;
+            }
         }
         Ok(())
     }
 
     fn send_once(&mut self) -> impl Future<Output = Result<SendOutcome, String>> + Send {
-        self.slot
-            .cancel_all_once(self.signer, self.nonce, self.gate, self.market_index)
+        self.slot.cancel_all_once(
+            self.signer,
+            self.nonce,
+            self.gate,
+            self.admission,
+            self.market_index,
+        )
     }
 }
 
@@ -2445,6 +2558,7 @@ mod tests {
             tx_budget_per_minute: None,
             tx_reserve: None,
             rate_limit_cooldown_ms: None,
+            rate_limit_cancel_probe_ms: None,
         };
         let (symbol_tx, symbol_rx) = broadcast::channel(16);
         let task = PrivateStreamTask {
@@ -3511,6 +3625,7 @@ mod tests {
             tx_budget_per_minute: None,
             tx_reserve: None,
             rate_limit_cooldown_ms: None,
+            rate_limit_cancel_probe_ms: None,
         }
     }
 
@@ -4150,6 +4265,148 @@ mod tests {
         let (kind, message) = as_error(slot.next_event().await);
         assert_eq!(kind, ErrorKind::CriticalConnectionError);
         assert!(message.contains("cooldown"), "{message}");
+    }
+
+    // ---- probing the cooldown with what gets the account out (§4.16) -------------------
+
+    /// **With `rate_limit_cancel_probe_ms`, a held cancel tries one probe interval into the
+    /// cooldown instead of waiting it out — and so does a reducing IOC — while a quote is still
+    /// refused.** Which of the docs' two cooldowns answered cannot be told from here: the
+    /// firewall's static minute, or an API server's few seconds. Waiting the minute for the
+    /// second kind leaves a stale quote resting for nothing. The bots hear the one rate-limit
+    /// error, which now says the cancels probe, and nothing for the probe that worked.
+    #[tokio::test]
+    async fn a_held_cancel_probes_the_cooldown_and_goes_out_before_it_ends() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(10_000);
+            config.rate_limit_cancel_probe_ms = Some(300);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("probe it from 300 ms"), "{message}");
+        assert!(message.contains("rate-limited"), "{message}");
+        let told_at = time::Instant::now();
+
+        slot.cancel(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(slot.venue.sent()[2].0, "cancel_order");
+
+        slot.submit(&eth_order(3, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("a quote is still refused: the cooldown stands for it");
+        };
+        assert_eq!((order.order_id, order.status), (3, Status::Expired));
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("until its cooldown is over"), "{message}");
+
+        slot.state_position(0.05);
+        slot.submit(&eth_ioc(4, Side::Sell));
+        slot.venue_until(|venue| venue.sent().len() == 4).await;
+        assert_eq!(
+            slot.venue.sent()[3].0,
+            "create_order",
+            "an IOC that reduces the long probes like a cancel"
+        );
+        assert!(
+            told_at.elapsed() < Duration::from_secs(5),
+            "all of it well inside the 10 s cooldown"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "the probes that worked told the bots nothing"
+        );
+    }
+
+    /// **A probe the venue refuses neither lengthens the cooldown nor tells the bots again.**
+    /// The firewall's minute is static (docs): a probe into it buys only another refusal, and
+    /// read as a fresh rate limit it would push the quotes' cooldown out with every probe and
+    /// put one more error in the bots' storm window each time. Here the probe at 700 ms is
+    /// refused; a quote right after the original 1.5 s still goes out — a lengthened cooldown
+    /// would have held it to ~2.2 s — and the bots heard one error in all.
+    #[tokio::test]
+    async fn a_refused_probe_neither_lengthens_the_cooldown_nor_tells_the_bots_again() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(1_500);
+            config.rate_limit_cancel_probe_ms = Some(700);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue
+            .answer_send_tx_with([too_many_requests(), too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError, "the cooldown's one error");
+        let told_at = time::Instant::now();
+
+        slot.cancel(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(slot.venue.sent()[2].0, "cancel_order", "the probe, refused");
+
+        time::sleep_until(told_at + Duration::from_millis(1_650)).await;
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.venue_until(|venue| {
+            venue
+                .sent()
+                .iter()
+                .filter(|(op, _)| op == "create_order")
+                .count()
+                == 3
+        })
+        .await;
+        while let Ok(event) = slot.events.try_recv() {
+            assert!(
+                !matches!(event, PublishEvent::LiveEvent(LiveEvent::Error(_))),
+                "a refused probe told the bots again"
+            );
+        }
+    }
+
+    /// **A probe that cannot read its nonce is a refused probe, not a failed cancel.** The
+    /// cooldown's 429 left the nonce to be re-read, and a venue that is still refusing the
+    /// account refuses that read too. Handed back, the cancel would reach the bot as an error —
+    /// one more in its storm window — and its order would stand; held, it goes on the next
+    /// probe, and the bots hear nothing.
+    #[tokio::test]
+    async fn a_probe_that_cannot_read_its_nonce_stays_held_and_tells_the_bots_nothing() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(10_000);
+            config.rate_limit_cancel_probe_ms = Some(300);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let _ = as_error(slot.next_event().await);
+        let told_at = time::Instant::now();
+
+        slot.venue.answer_next_nonce_with([503]);
+        slot.cancel(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(slot.venue.sent()[2].0, "cancel_order");
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            3,
+            "seeded, refused once on the first probe, read on the next"
+        );
+        assert!(told_at.elapsed() < Duration::from_secs(5));
+        assert!(
+            slot.events.try_recv().is_err(),
+            "no hand-back and no error for a probe that could not be signed"
+        );
     }
 
     /// **Without `rate_limit_cooldown_ms` a 429 is handled exactly as before**: as an

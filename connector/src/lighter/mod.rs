@@ -907,9 +907,9 @@ mod tests {
         assert_eq!(
             send_gate_logged(&format!(
                 "{ARMED}\ntx_budget_per_minute = 48\ntx_reserve = 12\nrate_limit_cooldown_ms = \
-                 60000\n"
+                 60000\nrate_limit_cancel_probe_ms = 5000\n"
             )),
-            ["budget 48/min, reserve 12, cooldown 60000 ms"]
+            ["budget 48/min, reserve 12, cooldown 60000 ms, cancel probe 5000 ms"]
         );
         assert_eq!(send_gate_logged(ARMED), ["OFF"]);
         assert_eq!(
@@ -918,7 +918,7 @@ mod tests {
         );
         assert_eq!(
             send_gate_logged(&format!("{ARMED}\nrate_limit_cooldown_ms = 60000\n")),
-            ["budget OFF, cooldown 60000 ms"]
+            ["budget OFF, cooldown 60000 ms, cancel probe OFF"]
         );
         assert!(
             send_gate_logged(MARKET_DATA_ONLY).is_empty(),
@@ -1239,6 +1239,46 @@ mod tests {
         assert!(matches!(error, LighterError::Config(_)), "{error}");
     }
 
+    /// **The cancel probe is optional — absent, cancels wait the whole cooldown — and a probe
+    /// that cannot probe anything is refused at startup**: one without a cooldown has nothing
+    /// to probe, one of 0 would send straight into the cooldown, and one as long as the
+    /// cooldown never fires before it is over.
+    #[test]
+    fn the_cancel_probe_is_optional_needs_a_cooldown_and_is_shorter_than_it() {
+        let absent = armed_rh("rate_limit_cooldown_ms = 60000")
+            .unwrap()
+            .config
+            .order_path
+            .unwrap();
+        assert_eq!(absent.rate_limit_cancel_probe(), None);
+        let set = armed_rh("rate_limit_cooldown_ms = 60000\nrate_limit_cancel_probe_ms = 5000")
+            .unwrap()
+            .config
+            .order_path
+            .unwrap();
+        assert_eq!(
+            set.rate_limit_cancel_probe(),
+            Some(std::time::Duration::from_secs(5))
+        );
+        for broken in [
+            "rate_limit_cancel_probe_ms = 5000",
+            "rate_limit_cooldown_ms = 60000\nrate_limit_cancel_probe_ms = 0",
+            "rate_limit_cooldown_ms = 60000\nrate_limit_cancel_probe_ms = 60000",
+        ] {
+            let Err(error) = armed_rh(broken) else {
+                panic!("{broken:?} must be refused");
+            };
+            assert!(
+                matches!(error, LighterError::Config(_)),
+                "{broken:?}: {error}"
+            );
+            assert!(
+                error.to_string().contains("rate_limit_cancel_probe_ms"),
+                "{error}"
+            );
+        }
+    }
+
     /// The RH catalog maps symbols onto **its own** ids and decimals — the mainnet ones are
     /// different for most names, so this is the table the order path quantises onto.
     #[test]
@@ -1344,6 +1384,7 @@ mod tests {
         assert_eq!(order_path.tx_budget_per_minute, Some(48));
         assert_eq!(order_path.tx_reserve, Some(12));
         assert_eq!(order_path.rate_limit_cooldown_ms, Some(60_000));
+        assert_eq!(order_path.rate_limit_cancel_probe_ms, Some(5_000));
     }
 
     /// The shipped RH example builds as `lighter-rh` — no endpoint keys, so it is not
@@ -1386,7 +1427,12 @@ mod tests {
         // getting out (design note §4.15).
         assert_eq!(order_path.tx_budget_per_minute, Some(48));
         assert_eq!(order_path.tx_reserve, Some(12));
-        // The venue's firewall cooldown (§4.16).
+        // The venue's firewall cooldown (§4.16), and how soon a cancel may probe it.
         assert_eq!(order_path.rate_limit_cooldown_ms, Some(60_000));
+        assert_eq!(order_path.rate_limit_cancel_probe_ms, Some(5_000));
+        assert_eq!(
+            order_path.send_gate_summary(),
+            "budget 48/min, reserve 12, cooldown 60000 ms, cancel probe 5000 ms"
+        );
     }
 }

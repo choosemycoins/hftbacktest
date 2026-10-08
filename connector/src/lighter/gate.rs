@@ -20,7 +20,12 @@
 //!   unable to cancel them;
 //! * and when the venue answers 429/405 anyway, a **cooldown** of `rate_limit_cooldown_ms`
 //!   during which nothing is sent at all (§4.16): the venue's firewall holds a rate-limited
-//!   address for a static 60 s, and every send into that only earns another refusal.
+//!   address for a static 60 s, and every send into that only earns another refusal;
+//! * except, with `rate_limit_cancel_probe_ms`, a risk-reducing send **probing** it: the
+//!   first one probe interval in, each refused probe doubling the wait, none lengthening the
+//!   cooldown ([`Admission::Probe`]). An API server's cooldown is seconds, not the firewall's
+//!   minute, and this side cannot tell which one answered; a cancel that waits the minute out
+//!   for the shorter kind leaves a stale quote resting for nothing. Quotes never probe.
 //!
 //! Pure state with the clock passed in, owned by the one slot task (single writer,
 //! `AGENTS.md` §1.4), so all of it is unit-tested here without a socket.
@@ -125,8 +130,10 @@ pub enum Refusal {
         reserve: u32,
         free_at: Instant,
     },
-    /// The venue rate-limited the account (429/405) and nothing is sent until `until`.
-    Cooldown { until: Instant },
+    /// The venue rate-limited the account (429/405): the cooldown runs until `until`, and the
+    /// refused send's class may next try at `retry_at` — the end of it for a quote, the next
+    /// probe for a risk-reducing send when probes are configured (§4.16).
+    Cooldown { until: Instant, retry_at: Instant },
 }
 
 impl Refusal {
@@ -134,9 +141,20 @@ impl Refusal {
     pub fn free_at(&self) -> Instant {
         match self {
             Self::Budget { free_at, .. } => *free_at,
-            Self::Cooldown { until } => *until,
+            Self::Cooldown { retry_at, .. } => *retry_at,
         }
     }
+}
+
+/// How a send the gate let through is to be read when its answer comes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// An ordinary send: a 429/405 answering it starts the cooldown.
+    Send,
+    /// A risk-reducing send let through **inside** a cooldown (`rate_limit_cancel_probe_ms`,
+    /// §4.16): a 429/405 answering it — or a nonce that cannot be read for it — backs the probes
+    /// off and leaves the cooldown, and the bots, as they were ([`SendGate::probe_refused`]).
+    Probe,
 }
 
 /// The bot-facing prose. It never contains "no live order": the myhft classifier reads that
@@ -206,6 +224,17 @@ impl LogThrottle {
     }
 }
 
+/// A cooldown in progress.
+#[derive(Clone, Copy, Debug)]
+struct Cooling {
+    /// When it ends for everything.
+    until: Instant,
+    /// When a risk-reducing send may next try, if probes are configured.
+    next_probe: Option<Instant>,
+    /// How long the probes wait after the next one is refused; doubles with every refusal.
+    probe_backoff: Duration,
+}
+
 /// The gate the slot asks before every `sendTx`.
 #[derive(Debug)]
 pub struct SendGate {
@@ -213,40 +242,84 @@ pub struct SendGate {
     /// `[order_path] rate_limit_cooldown_ms`. `None`: a 429/405 starts nothing, and the slot
     /// treats it as the ambiguous answer it was before it had a name.
     cooldown: Option<Duration>,
-    /// When the running cooldown ends. Set by [`Self::rate_limited`].
-    cooling_until: Option<Instant>,
+    /// `[order_path] rate_limit_cancel_probe_ms`: how soon into a cooldown a risk-reducing send
+    /// may try — the first wait of the probes' back-off. `None`: they wait the cooldown out.
+    probe: Option<Duration>,
+    /// The running cooldown. Set by [`Self::rate_limited`].
+    cooling: Option<Cooling>,
     refusals: LogThrottle,
     near_limit: LogThrottle,
 }
 
 impl SendGate {
     /// `budget: None` and `cooldown: None` admit everything — the behaviour without
-    /// `tx_budget_per_minute` and `rate_limit_cooldown_ms`.
-    pub fn new(budget: Option<TxBudget>, cooldown: Option<Duration>) -> Self {
+    /// `tx_budget_per_minute` and `rate_limit_cooldown_ms`. `probe: None` holds every send for
+    /// the whole cooldown — the behaviour without `rate_limit_cancel_probe_ms`.
+    pub fn new(
+        budget: Option<TxBudget>,
+        cooldown: Option<Duration>,
+        probe: Option<Duration>,
+    ) -> Self {
         Self {
             budget,
             cooldown,
-            cooling_until: None,
+            probe,
+            cooling: None,
             refusals: LogThrottle::new(REFUSAL_LOG_EVERY),
             near_limit: LogThrottle::new(REFUSAL_LOG_EVERY),
         }
     }
 
-    /// The venue answered a send at `now` with 429/405: nothing goes out for the configured
-    /// cooldown. A second one inside it extends it; nothing shortens it. Returns when the
-    /// cooldown ends — `None` when none is configured, and then nothing changed.
+    /// The venue answered an ordinary send at `now` with 429/405: nothing goes out for the
+    /// configured cooldown, and — with probes configured — a risk-reducing send may first try
+    /// again one probe interval from now. A second one inside it extends it; nothing shortens
+    /// it. Returns when the cooldown ends — `None` when none is configured, and then nothing
+    /// changed.
     pub fn rate_limited(&mut self, now: Instant) -> Option<Instant> {
         let until = now + self.cooldown?;
         let until = self
-            .cooling_until
-            .map_or(until, |running| running.max(until));
-        self.cooling_until = Some(until);
+            .cooling
+            .map_or(until, |running| running.until.max(until));
+        self.cooling = Some(Cooling {
+            until,
+            next_probe: self.probe.map(|probe| now + probe),
+            probe_backoff: self.probe.unwrap_or_default() * 2,
+        });
         Some(until)
+    }
+
+    /// A probe let through at [`Admission::Probe`] was refused at `now` — answered 429/405, or
+    /// it could not even be signed for want of a nonce. The cooldown stands **as it was**: the
+    /// venue's firewall holds an address for a static minute (its docs), so a probe into it
+    /// buys nothing but another refusal and must not buy a longer cooldown for the quotes. The
+    /// next probe waits twice as long as the last. Returns when it may go — `None` when no
+    /// cooldown is running at `now` any more, and then nothing changed.
+    pub fn probe_refused(&mut self, now: Instant) -> Option<Instant> {
+        let cooling = self
+            .cooling
+            .as_mut()
+            .filter(|cooling| cooling.until > now)?;
+        cooling.next_probe = Some(now + cooling.probe_backoff);
+        cooling.probe_backoff *= 2;
+        cooling.next_probe.map(|at| at.min(cooling.until))
     }
 
     /// When the cooldown running at `now` ends, if one is.
     pub fn cooling(&self, now: Instant) -> Option<Instant> {
-        self.cooling_until.filter(|&until| until > now)
+        self.cooling
+            .map(|cooling| cooling.until)
+            .filter(|&until| until > now)
+    }
+
+    /// When the cooldown running at `now` next lets a `class` send through, if it does not now:
+    /// a quote at its end, a risk-reducing send at its next probe (at its end without probes).
+    pub fn cooling_for(&self, now: Instant, class: TxClass) -> Option<Instant> {
+        let cooling = self.cooling.filter(|cooling| cooling.until > now)?;
+        match (class, cooling.next_probe) {
+            (TxClass::RiskReducing, Some(probe)) if probe <= now => None,
+            (TxClass::RiskReducing, Some(probe)) => Some(probe.min(cooling.until)),
+            _ => Some(cooling.until),
+        }
     }
 
     /// Whether three quarters of the budget are spent at `now` — the point the venue's own
@@ -258,16 +331,22 @@ impl SendGate {
     }
 
     /// Admits a send of `class` at `now` — and counts it — or says why not. A cooldown is
-    /// asked about first, and a send it holds back spends no token.
-    pub fn admit(&mut self, now: Instant, class: TxClass) -> Result<(), Refusal> {
-        if let Some(until) = self.cooling(now) {
-            return Err(Refusal::Cooldown { until });
-        }
+    /// asked about first, and a send it holds back spends no token; a risk-reducing send it lets
+    /// through as a probe spends one like any other.
+    pub fn admit(&mut self, now: Instant, class: TxClass) -> Result<Admission, Refusal> {
+        let admission = match self.cooling(now) {
+            None => Admission::Send,
+            Some(until) => match self.cooling_for(now, class) {
+                None => Admission::Probe,
+                Some(retry_at) => return Err(Refusal::Cooldown { until, retry_at }),
+            },
+        };
         let Some(budget) = &mut self.budget else {
-            return Ok(());
+            return Ok(admission);
         };
         budget
             .try_spend(now, class)
+            .map(|()| admission)
             .map_err(|free_at| Refusal::Budget {
                 class,
                 per_minute: budget.per_minute(),
@@ -305,10 +384,10 @@ pub async fn admit_by(
     gate: &mut SendGate,
     class: TxClass,
     deadline: Instant,
-) -> Result<(), Refusal> {
+) -> Result<Admission, Refusal> {
     loop {
         match gate.admit(Instant::now(), class) {
-            Ok(()) => return Ok(()),
+            Ok(admission) => return Ok(admission),
             Err(refusal) if refusal.free_at() <= deadline => {
                 tokio::time::sleep_until(refusal.free_at()).await;
             }
@@ -323,7 +402,7 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use super::{LogThrottle, Refusal, SendGate, TxBudget, TxClass, WINDOW, admit_by};
+    use super::{Admission, LogThrottle, Refusal, SendGate, TxBudget, TxClass, WINDOW, admit_by};
 
     /// **No more than the budget in ANY rolling minute — the venue's own definition.** A
     /// continuously refilling bucket of the same size passes the first half of this and fails
@@ -435,7 +514,7 @@ mod tests {
     #[test]
     fn without_a_budget_the_gate_admits_everything() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(None, None);
+        let mut gate = SendGate::new(None, None, None);
         for _ in 0..1_000 {
             assert!(gate.admit(t0, TxClass::Open).is_ok());
         }
@@ -447,9 +526,9 @@ mod tests {
     #[test]
     fn a_refused_send_is_named_a_rate_limit_and_never_a_missing_order() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)), None);
+        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)), None, None);
         gate.admit(t0, TxClass::Open).unwrap();
-        let mut cooling = SendGate::new(None, Some(Duration::from_secs(60)));
+        let mut cooling = SendGate::new(None, Some(Duration::from_secs(60)), None);
         cooling.rate_limited(t0);
         for class in [TxClass::Open, TxClass::RiskReducing] {
             let refusal = gate.admit(t0, class).expect_err("spent");
@@ -472,21 +551,25 @@ mod tests {
     fn a_cooldown_holds_every_send_until_it_ends() {
         let t0 = Instant::now();
         let cooldown = Duration::from_secs(60);
-        let mut gate = SendGate::new(Some(TxBudget::new(2, 1)), Some(cooldown));
+        let mut gate = SendGate::new(Some(TxBudget::new(2, 1)), Some(cooldown), None);
         assert_eq!(gate.rate_limited(t0), Some(t0 + cooldown));
         let late = t0 + cooldown - Duration::from_millis(1);
         for class in [TxClass::Open, TxClass::RiskReducing] {
             assert_eq!(
                 gate.admit(late, class),
                 Err(Refusal::Cooldown {
-                    until: t0 + cooldown
+                    until: t0 + cooldown,
+                    retry_at: t0 + cooldown,
                 }),
-                "{class:?}"
+                "{class:?}: without probes everything waits the cooldown out"
             );
         }
         assert_eq!(gate.cooling(late), Some(t0 + cooldown));
         assert_eq!(gate.usage(late), Some((0, 2)), "nothing was counted");
-        assert!(gate.admit(t0 + cooldown, TxClass::Open).is_ok());
+        assert_eq!(
+            gate.admit(t0 + cooldown, TxClass::Open),
+            Ok(Admission::Send)
+        );
         assert_eq!(gate.cooling(t0 + cooldown), None);
     }
 
@@ -496,7 +579,7 @@ mod tests {
     fn a_rate_limit_inside_the_cooldown_extends_it_and_never_shortens_it() {
         let t0 = Instant::now();
         let cooldown = Duration::from_secs(60);
-        let mut gate = SendGate::new(None, Some(cooldown));
+        let mut gate = SendGate::new(None, Some(cooldown), None);
         gate.rate_limited(t0 + Duration::from_secs(10));
         assert_eq!(
             gate.rate_limited(t0),
@@ -514,7 +597,7 @@ mod tests {
     #[test]
     fn without_a_cooldown_a_rate_limit_starts_nothing() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(Some(TxBudget::new(48, 12)), None);
+        let mut gate = SendGate::new(Some(TxBudget::new(48, 12)), None, None);
         assert_eq!(gate.rate_limited(t0), None);
         assert_eq!(gate.cooling(t0), None);
         assert!(gate.admit(t0, TxClass::Open).is_ok());
@@ -526,7 +609,7 @@ mod tests {
     #[test]
     fn the_account_is_near_its_limit_at_three_quarters_of_the_budget() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(Some(TxBudget::new(48, 12)), None);
+        let mut gate = SendGate::new(Some(TxBudget::new(48, 12)), None, None);
         for _ in 0..35 {
             gate.admit(t0, TxClass::Open).unwrap();
         }
@@ -537,7 +620,7 @@ mod tests {
             !gate.near_limit(t0 + WINDOW),
             "and not once the window has moved on"
         );
-        assert!(!SendGate::new(None, None).near_limit(t0));
+        assert!(!SendGate::new(None, None, None).near_limit(t0));
     }
 
     /// The refusal log speaks at most once a period and says how much it held back.
@@ -563,7 +646,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_sweep_waits_for_the_gate_only_when_it_opens_before_the_deadline() {
         let t0 = Instant::now();
-        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)), None);
+        let mut gate = SendGate::new(Some(TxBudget::new(1, 0)), None, None);
         gate.admit(t0, TxClass::Open).unwrap();
 
         let short = admit_by(
@@ -582,6 +665,108 @@ mod tests {
         assert!(
             gate.admit(Instant::now(), TxClass::RiskReducing).is_err(),
             "and the send it waited for was counted"
+        );
+    }
+
+    /// **With probes, a risk-reducing send tries before the cooldown is over; a quote never
+    /// does.** The docs give two cooldowns and this side cannot tell which one answered: the
+    /// firewall's static 60 s, or an API server's `weight / (total / 60)` — seconds. A cancel
+    /// that waits the full minute for the second kind leaves a stale quote resting for a minute
+    /// it did not have to (§4.16). So a cancel, a sweep or a reducing IOC may probe one interval
+    /// in; quotes — the sends a cooldown exists to stop — still wait it out. A probe spends a
+    /// token like any other send.
+    #[test]
+    fn a_risk_reducing_send_probes_the_cooldown_and_a_quote_waits_it_out() {
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut gate = SendGate::new(
+            Some(TxBudget::new(48, 12)),
+            Some(60 * second),
+            Some(5 * second),
+        );
+        gate.rate_limited(t0);
+
+        let early = t0 + 5 * second - Duration::from_millis(1);
+        assert_eq!(
+            gate.admit(early, TxClass::RiskReducing),
+            Err(Refusal::Cooldown {
+                until: t0 + 60 * second,
+                retry_at: t0 + 5 * second,
+            }),
+            "not before the first probe is due"
+        );
+        assert_eq!(
+            gate.admit(t0 + 5 * second, TxClass::RiskReducing),
+            Ok(Admission::Probe)
+        );
+        assert_eq!(
+            gate.admit(t0 + 5 * second, TxClass::Open),
+            Err(Refusal::Cooldown {
+                until: t0 + 60 * second,
+                retry_at: t0 + 60 * second,
+            }),
+            "a quote waits the whole cooldown"
+        );
+        assert_eq!(gate.cooling(t0 + 5 * second), Some(t0 + 60 * second));
+        assert_eq!(
+            gate.usage(t0 + 5 * second),
+            Some((1, 48)),
+            "the probe was counted, the refused quote was not"
+        );
+    }
+
+    /// **A refused probe backs the probes off and leaves the cooldown exactly as it was.** The
+    /// firewall's minute is static (docs), so a probe into it buys only another refusal — it
+    /// must not buy the quotes a longer cooldown too. The waits double after each refusal (5 s,
+    /// then 10, 20, 40), and the end of the cooldown caps them: from then on everything goes.
+    #[test]
+    fn a_refused_probe_backs_off_and_leaves_the_cooldown_as_it_was() {
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut gate = SendGate::new(None, Some(60 * second), Some(5 * second));
+        gate.rate_limited(t0);
+
+        assert_eq!(gate.probe_refused(t0 + 5 * second), Some(t0 + 15 * second));
+        assert_eq!(
+            gate.cooling_for(t0 + 14 * second, TxClass::RiskReducing),
+            Some(t0 + 15 * second)
+        );
+        assert_eq!(
+            gate.cooling_for(t0 + 15 * second, TxClass::RiskReducing),
+            None
+        );
+        assert_eq!(gate.probe_refused(t0 + 15 * second), Some(t0 + 35 * second));
+        assert_eq!(
+            gate.probe_refused(t0 + 35 * second),
+            Some(t0 + 60 * second),
+            "the next would be at 75 s; the cooldown is over at 60"
+        );
+        assert_eq!(
+            gate.cooling(t0 + 35 * second),
+            Some(t0 + 60 * second),
+            "three refused probes and the cooldown ends where it always did"
+        );
+        assert_eq!(
+            gate.admit(t0 + 60 * second, TxClass::Open),
+            Ok(Admission::Send)
+        );
+        assert_eq!(
+            gate.probe_refused(t0 + 60 * second),
+            None,
+            "no cooldown running: nothing to back off"
+        );
+    }
+
+    /// Without `rate_limit_cancel_probe_ms` nothing probes: a cooldown holds every class to its
+    /// end, as before probes existed.
+    #[test]
+    fn without_a_probe_every_send_waits_the_cooldown_out() {
+        let t0 = Instant::now();
+        let mut gate = SendGate::new(None, Some(Duration::from_secs(60)), None);
+        gate.rate_limited(t0);
+        assert_eq!(
+            gate.cooling_for(t0 + Duration::from_secs(59), TxClass::RiskReducing),
+            Some(t0 + Duration::from_secs(60))
         );
     }
 }

@@ -146,8 +146,19 @@ timeout_ms = 10000
 # # Its docs: a firewall rate limit holds the address a static 60 s, an API server's
 # # weight/(total/60); the connector cannot tell which answered, so it waits the longer. NOT
 # # measured on RH — no 429 has been seen here yet. Meanwhile: new orders go back to the bot as
-# # rate-limited, cancels are held and sent when it ends, a sweep waits for it only if it ends
-# # within the sweep's 15 s (otherwise the sweep fails, loudly, and a stop exits non-zero), and
-# # nothing is read from the venue on the order path. The bots hear one rate-limit error per
-# # 429/405. Absent: a 429/405 is handled as the ambiguous answer it was before. §4.16.
+# # rate-limited, cancels are held and sent when it ends (or probe it — the next setting), a
+# # sweep waits for it only if it — or its next probe — comes within the sweep's 15 s (otherwise
+# # the sweep fails, loudly, and a stop exits non-zero), and nothing is read from the venue on
+# # the order path. The bots hear one rate-limit error per 429/405. Absent: a 429/405 is handled
+# # as the ambiguous answer it was before. §4.16.
 # rate_limit_cooldown_ms = 60000
+#
+# # How soon into that cooldown a cancel, a CancelAllOrders sweep or a position-reducing IOC may
+# # try anyway, ms. A probe the venue refuses doubles the wait (5, 10, 20, 40 s ... capped by the
+# # cooldown's end), does NOT lengthen the cooldown and tells the bots nothing new; quotes always
+# # wait the whole cooldown. Why: this side cannot tell the docs' firewall cooldown (static
+# # 60 s — a probe into it only costs one sendTx and one nextNonce read) from an API server's
+# # (seconds), and a cancel that waits a whole minute for the second kind leaves a stale quote
+# # resting all that time. 5000 is NOT measured on RH — no 429 has been seen here. Needs
+# # rate_limit_cooldown_ms and must be shorter than it. Absent: cancels wait the whole cooldown.
+# rate_limit_cancel_probe_ms = 5000
