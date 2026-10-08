@@ -59,6 +59,8 @@ use crate::{
 pub mod depth;
 #[cfg(test)]
 pub mod fixtures;
+/// Phase 2 order-path: the client-side `sendTx` budget the slot asks before every send (§4.15).
+pub mod gate;
 pub mod msg;
 /// Phase 2 order-path: the sequential tx-nonce owner for one api-key slot (§3.3).
 pub mod nonce;
@@ -315,6 +317,9 @@ impl Lighter {
     /// `lighter` (configured-endpoint) case of this.
     pub fn build_for(instance: Instance, config: &str) -> Result<Self, LighterError> {
         let config = parse_config(instance, config)?;
+        if let Some(order_path) = &config.order_path {
+            order_path.validate().map_err(LighterError::Config)?;
+        }
         let (symbol_tx, _) = broadcast::channel(500);
         let symbols: SharedSymbolSet = Default::default();
         {
@@ -1110,6 +1115,68 @@ mod tests {
         }
     }
 
+    /// An `[order_path]` with the given extra lines, on RH.
+    fn armed_rh(extra: &str) -> Result<Lighter, LighterError> {
+        Lighter::build_for(
+            Instance::RobinhoodChain,
+            &format!(
+                r#"
+                symbols = ["SPY"]
+                [order_path]
+                account_index = 42008
+                api_key_index = 4
+                signer_python = "python3"
+                signer_script = "sidecar.py"
+                signer_config = "signer.toml"
+                {extra}
+                "#
+            ),
+        )
+    }
+
+    /// **The sendTx budget is optional — absent, nothing changes — and a budget that cannot
+    /// work is refused at startup, not discovered at the first quote.** A reserve with no
+    /// budget would do nothing while looking like protection; a reserve as large as the budget
+    /// would refuse every quote for ever; a budget of 0 would refuse everything.
+    #[test]
+    fn the_send_budget_is_optional_and_a_budget_that_cannot_work_is_refused() {
+        let absent = armed_rh("").unwrap().config.order_path.unwrap();
+        assert_eq!(absent.tx_budget_per_minute, None, "no field, no budget");
+        assert!(absent.send_budget().is_none());
+
+        let budget = armed_rh("tx_budget_per_minute = 48\ntx_reserve = 12")
+            .unwrap()
+            .config
+            .order_path
+            .unwrap()
+            .send_budget()
+            .expect("a budget");
+        assert_eq!((budget.per_minute(), budget.reserve()), (48, 12));
+        let no_reserve = armed_rh("tx_budget_per_minute = 48")
+            .unwrap()
+            .config
+            .order_path
+            .unwrap()
+            .send_budget()
+            .expect("a budget");
+        assert_eq!(no_reserve.reserve(), 0, "the reserve defaults to none");
+
+        for broken in [
+            "tx_reserve = 12",
+            "tx_budget_per_minute = 0",
+            "tx_budget_per_minute = 12\ntx_reserve = 12",
+            "tx_budget_per_minute = 12\ntx_reserve = 13",
+        ] {
+            let Err(error) = armed_rh(broken) else {
+                panic!("{broken:?} must be refused");
+            };
+            assert!(
+                matches!(error, LighterError::Config(_)),
+                "{broken:?}: {error}"
+            );
+        }
+    }
+
     /// The RH catalog maps symbols onto **its own** ids and decimals — the mainnet ones are
     /// different for most names, so this is the table the order path quantises onto.
     #[test]
@@ -1177,6 +1244,45 @@ mod tests {
         }
     }
 
+    /// An example config with its commented `[order_path]` block uncommented exactly as an
+    /// operator would: `# key = value` lines become settings, `# # prose` lines are dropped.
+    fn uncomment_order_path(text: &str) -> String {
+        let mut armed = String::new();
+        let mut in_block = false;
+        for line in text.lines() {
+            if line.trim() == "# [order_path]" {
+                in_block = true;
+            }
+            if in_block {
+                if let Some(rest) = line.strip_prefix("# ")
+                    && !rest.starts_with('#')
+                {
+                    armed.push_str(rest);
+                    armed.push('\n');
+                }
+                continue;
+            }
+            armed.push_str(line);
+            armed.push('\n');
+        }
+        armed
+    }
+
+    /// The generic example's commented `[order_path]` block parses once uncommented, budget
+    /// included — an example that drifted from the struct would be copied verbatim into a
+    /// deployment and refused at startup there.
+    #[test]
+    fn the_shipped_example_order_path_parses_once_uncommented() {
+        let armed = uncomment_order_path(include_str!("../../examples/lighter.toml"));
+        let connector = Lighter::build_for(Instance::Configured, &armed).unwrap();
+        let order_path = connector
+            .config
+            .order_path
+            .expect("the block arms the path");
+        assert_eq!(order_path.tx_budget_per_minute, Some(48));
+        assert_eq!(order_path.tx_reserve, Some(12));
+    }
+
     /// The shipped RH example builds as `lighter-rh` — no endpoint keys, so it is not
     /// refused — ships DISARMED, names only perps that resolve on the RH catalog, parses as
     /// the generic supervision config, and its commented `[order_path]` block parses with
@@ -1202,26 +1308,7 @@ mod tests {
         assert!(supervision.shutdown.sweep_orders);
         assert!(supervision.bot_liveness.enabled);
 
-        // Uncomment the [order_path] block exactly as an operator would.
-        let mut armed = String::new();
-        let mut in_block = false;
-        for line in text.lines() {
-            if line.trim() == "# [order_path]" {
-                in_block = true;
-            }
-            if in_block {
-                if let Some(rest) = line.strip_prefix("# ") {
-                    if !rest.starts_with('#') {
-                        armed.push_str(rest);
-                        armed.push('\n');
-                        continue;
-                    }
-                }
-                continue;
-            }
-            armed.push_str(line);
-            armed.push('\n');
-        }
+        let armed = uncomment_order_path(text);
         let connector = Lighter::build_for(Instance::RobinhoodChain, &armed).unwrap();
         let order_path = connector
             .config
@@ -1232,5 +1319,9 @@ mod tests {
             order_path.connect_policy,
             crate::lighter::order_path::ConnectPolicy::CancelAll
         );
+        // The send budget the RH accounts run with: under the venue's 60, with a reserve for
+        // getting out (design note §4.15).
+        assert_eq!(order_path.tx_budget_per_minute, Some(48));
+        assert_eq!(order_path.tx_reserve, Some(12));
     }
 }

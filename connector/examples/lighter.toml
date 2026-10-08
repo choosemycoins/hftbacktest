@@ -201,6 +201,19 @@ timeout_ms = 10000
 # #     ACCOUNT holds there, so the isolation unit is a subaccount per bot.
 # connect_policy = "reconcile"
 #
+# # A client-side sendTx budget for the whole account, per ROLLING minute (§4.15). Optional;
+# # absent = no budget, the behaviour before it existed. The venue limits sendTx per L1 address
+# # (Standard: 60 a rolling minute; Plus/Premium: thousands) and answers more with 429/405 and a
+# # cooldown that stops cancels too. Every send counts — submits, cancels, each CancelAllOrders
+# # attempt — and one over the budget is refused before a nonce is spent and handed back to the
+# # bot as a rate-limit error. On Standard set it under 60, e.g. 48, to leave room for what it
+# # does not count (REST reads, other processes on the address).
+# tx_budget_per_minute = 48
+#
+# # Of the budget, how many only cancels, CancelAllOrders and position-reducing submits may take.
+# # Optional (default 0); needs tx_budget_per_minute and must be smaller than it.
+# tx_reserve = 12
+#
 # # AUTH TOKEN: minted by the sidecar, clamped below the venue's 8 h server ceiling, and
 # # REFRESHED automatically before it expires by a clean reconnect (§3.4) — no config. The
 # # 8 h ceiling is enforced only by the server (a longer token mints without error and is

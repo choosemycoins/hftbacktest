@@ -135,15 +135,27 @@ pub fn sweep_follow_up(outcome: Result<&SendOutcome, &str>, attempt: u32) -> Swe
 /// One reserve-sign-send round of a `CancelAllOrders` sweep: the slot's, or a scripted venue
 /// in a test. `Err` is why nothing was sent or nothing came back.
 pub trait SweepSend {
+    /// Waits until the send gate admits this sweep's next attempt (`crate::lighter::gate`), or
+    /// says why it will not before the sweep's deadline — a reason that ends the sweep unsent.
+    fn admit(&mut self) -> impl Future<Output = Result<(), String>> + Send;
     fn send_once(&mut self) -> impl Future<Output = Result<SendOutcome, String>> + Send;
 }
 
 /// Sends one market's sweep until it takes or [`SWEEP_ATTEMPTS`] are spent, as
 /// [`sweep_follow_up`] decides. `Ok` carries the attempts it took; `Err` is the failure, to
 /// be reported loudly by the caller.
+///
+/// Every attempt is admitted by the send gate first ([`SweepSend::admit`]). One the gate will
+/// not admit before the sweep's deadline ends the sweep there, unsent: waiting longer would
+/// answer a waiter who has already given up, and retrying sooner would only be refused again.
 pub async fn sweep_with_retries(sender: &mut impl SweepSend) -> Result<u32, String> {
     let mut attempt = 1;
     loop {
+        if let Err(reason) = sender.admit().await {
+            return Err(format!(
+                "{reason}; attempt {attempt} not sent — orders may still be resting on this market"
+            ));
+        }
         let outcome = sender.send_once().await;
         match sweep_follow_up(outcome.as_ref().map_err(String::as_str), attempt) {
             SweepFollowUp::Done => return Ok(attempt),
@@ -343,8 +355,10 @@ pub(crate) mod testing {
     use crate::lighter::rest::SendOutcome;
 
     /// A venue that answers each sweep attempt from a script, in order, and counts the sends.
+    /// Its gate admits every attempt unless `admissions` says otherwise, one entry an attempt.
     pub(crate) struct ScriptedVenue {
         pub(crate) answers: VecDeque<Result<SendOutcome, String>>,
+        pub(crate) admissions: VecDeque<Result<(), String>>,
         pub(crate) sends: u32,
     }
 
@@ -352,12 +366,17 @@ pub(crate) mod testing {
         pub(crate) fn new(answers: Vec<Result<SendOutcome, String>>) -> Self {
             Self {
                 answers: answers.into(),
+                admissions: VecDeque::new(),
                 sends: 0,
             }
         }
     }
 
     impl SweepSend for ScriptedVenue {
+        async fn admit(&mut self) -> Result<(), String> {
+            self.admissions.pop_front().unwrap_or(Ok(()))
+        }
+
         async fn send_once(&mut self) -> Result<SendOutcome, String> {
             self.sends += 1;
             self.answers
@@ -484,6 +503,30 @@ mod tests {
             started.elapsed() >= Duration::from_secs(3),
             "waited 1 s + 2 s"
         );
+    }
+
+    /// **An attempt the send gate will not admit before the sweep's deadline ends the sweep,
+    /// unsent** — at once, not after the retries' waits, and naming why. Here the first attempt
+    /// is throttled and retried, and the gate then stays shut past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_the_gate_will_not_admit_in_time_fails_unsent() {
+        let mut venue = ScriptedVenue::new(vec![Ok(throttled()), Ok(throttled())]);
+        venue.admissions = vec![
+            Ok(()),
+            Err("the send gate is shut past the sweep's deadline".to_string()),
+        ]
+        .into();
+        let result = sweep_with_retries(&mut venue).await;
+        assert_eq!(
+            venue.sends, 1,
+            "the refused attempt never reached the venue"
+        );
+        let Err(reason) = result else {
+            panic!("a sweep that could not be sent has failed");
+        };
+        assert!(reason.contains("send gate"), "{reason}");
+        assert!(reason.contains("not sent"), "{reason}");
+        assert!(reason.contains("resting"), "{reason}");
     }
 
     /// ...and a venue that never takes it is a failed sweep after exactly

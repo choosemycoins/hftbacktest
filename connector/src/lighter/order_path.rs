@@ -67,6 +67,7 @@ use crate::{
     lighter::{
         LighterError,
         SharedSymbolSet,
+        gate::{Refusal, SendGate, TxBudget, TxClass, admit_by},
         nonce::NonceOwner,
         order::{CancelPlan, OrderManager, status_is_known, venue_refusal},
         private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
@@ -130,6 +131,17 @@ fn default_confirm_deadline_ms() -> u64 {
     5_000
 }
 
+/// How long a `CancelAllOrders` command may wait for the send gate after it was asked for.
+///
+/// [`OrderPath::sweep`] waits [`SWEEP_REPLY_WAIT`] for each verdict and counts a late one as a
+/// failure, so a sweep must start its attempt early enough to be answered inside that: this
+/// leaves the send itself five seconds. Both sit under the stop's own `shutdown.sweep_timeout_ms`
+/// (30 s in every shipped config).
+const SWEEP_GATE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// How long [`OrderPath::sweep`] waits for each market's verdict before counting it unconfirmed.
+const SWEEP_REPLY_WAIT: Duration = Duration::from_secs(20);
+
 /// How the order path treats orders already resting on the venue when it (re)connects (§3.4).
 ///
 /// The account channels re-snapshot on every (re)connect, and on this venue orders outlive
@@ -183,6 +195,48 @@ pub struct OrderPathConfig {
     /// for the clean-slate discipline that makes a restart duplicate-free.
     #[serde(default)]
     pub connect_policy: ConnectPolicy,
+    /// The connector's own ceiling on `sendTx` in any rolling minute, for the **whole L1
+    /// account** — every bot this connector serves shares it, as they share the venue's limit
+    /// (Standard: 60, §2.5). Every send counts: submits, cancels, `CancelAllOrders`. A send
+    /// over it is refused before a nonce is spent ([`crate::lighter::gate`], §4.15). Absent ⇒
+    /// no client-side budget, the behaviour before it existed.
+    #[serde(default)]
+    pub tx_budget_per_minute: Option<u32>,
+    /// Of `tx_budget_per_minute`, how many only **risk-reducing** sends may take — cancels,
+    /// `CancelAllOrders`, and submits that shrink the position — so a burst of quotes cannot
+    /// leave the account unable to cancel them. Absent ⇒ 0. Needs `tx_budget_per_minute`, and
+    /// must leave at least one token for quotes; anything else is refused at startup.
+    #[serde(default)]
+    pub tx_reserve: Option<u32>,
+}
+
+impl OrderPathConfig {
+    /// Refuses a combination that cannot do what it says, so it is found at startup rather
+    /// than at the first quote it would refuse.
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.tx_budget_per_minute, self.tx_reserve) {
+            (None, Some(_)) => Err(
+                "[order_path] tx_reserve needs tx_budget_per_minute: a reserve of no budget \
+                 holds nothing back"
+                    .to_string(),
+            ),
+            (Some(0), _) => Err(
+                "[order_path] tx_budget_per_minute = 0 would refuse every send, cancels included"
+                    .to_string(),
+            ),
+            (Some(per_minute), Some(reserve)) if reserve >= per_minute => Err(format!(
+                "[order_path] tx_reserve = {reserve} leaves no token of tx_budget_per_minute = \
+                 {per_minute} for a new order"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The client-side `sendTx` budget, if one is configured.
+    pub fn send_budget(&self) -> Option<TxBudget> {
+        self.tx_budget_per_minute
+            .map(|per_minute| TxBudget::new(per_minute, self.tx_reserve.unwrap_or(0)))
+    }
 }
 
 /// Clamps a requested auth-token lifetime (seconds) below the 8 h server ceiling, minus the
@@ -267,6 +321,9 @@ enum Command {
     CancelAll {
         market_index: i32,
         reply: Option<oneshot::Sender<bool>>,
+        /// The last moment an attempt may still be started: the send gate is waited for until
+        /// then and no longer ([`crate::lighter::gate::admit_by`]).
+        deadline: Instant,
     },
     /// Mint a WS auth token expiring at `deadline` (absolute unix seconds). The private stream
     /// asks the slot because the slot owns the one signer.
@@ -451,6 +508,7 @@ impl OrderPath {
     /// still be resting. An empty market list is [`SweepOutcome::Cancelled`]: nothing to do.
     pub fn sweep(&self, market_indices: Vec<i32>) -> JoinHandle<SweepOutcome> {
         let command_tx = self.command_tx.clone();
+        let deadline = Instant::now() + SWEEP_GATE_DEADLINE;
         tokio::spawn(async move {
             let mut replies = Vec::new();
             let mut confirmations: Vec<bool> = Vec::new();
@@ -460,6 +518,7 @@ impl OrderPath {
                     .send(Command::CancelAll {
                         market_index,
                         reply: Some(reply_tx),
+                        deadline,
                     })
                     .is_ok()
                 {
@@ -472,10 +531,8 @@ impl OrderPath {
             for reply in replies {
                 // A dropped sender (slot gone) or a timeout is an unconfirmed cancel; the bound
                 // keeps a slow one from hanging the stop. Only an explicit `true` confirms.
-                let confirmed = matches!(
-                    time::timeout(Duration::from_secs(20), reply).await,
-                    Ok(Ok(true))
-                );
+                let confirmed =
+                    matches!(time::timeout(SWEEP_REPLY_WAIT, reply).await, Ok(Ok(true)));
                 confirmations.push(confirmed);
             }
             SweepOutcome::from_confirmations(confirmations)
@@ -602,6 +659,9 @@ impl SlotTask {
         let mut nonce = NonceOwner::new(self.config.api_key_index);
         self.reseed(&mut nonce).await;
 
+        // Asked before every `sendTx`, and before the nonce it would spend (§4.15).
+        let mut gate = SendGate::new(self.config.send_budget());
+
         let mut awaiting: HashMap<i64, Awaiting> = HashMap::new();
         let mut deadline_tick = time::interval(Duration::from_millis(250));
 
@@ -610,17 +670,23 @@ impl SlotTask {
                 command = command_rx.recv() => {
                     match command {
                         Some(Command::Submit { coi, order, outbound }) => {
-                            self.send_order(&mut signer, &mut nonce, coi, &order, &outbound, &mut awaiting).await;
+                            if self.admit_submit(&mut gate, coi) {
+                                self.send_order(&mut signer, &mut nonce, coi, &order, &outbound, &mut awaiting).await;
+                            }
                         }
                         Some(Command::Cancel { coi, plan }) => {
-                            self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
+                            if self.admit_cancel(&mut gate, coi) {
+                                self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
+                            }
                         }
-                        Some(Command::CancelAll { market_index, reply }) => {
+                        Some(Command::CancelAll { market_index, reply, deadline }) => {
                             let mut sender = CancelAllSender {
                                 slot: &self,
                                 signer: &mut signer,
                                 nonce: &mut nonce,
+                                gate: &mut gate,
                                 market_index,
+                                deadline,
                             };
                             sweep_market(&mut sender, &self.ev_tx, market_index, reply).await;
                         }
@@ -1066,27 +1132,94 @@ impl SlotTask {
     }
 
     fn expire(&self, coi: i64, reason: &str) {
-        let expired = self.order_manager.lock().unwrap().submit_failed(coi);
-        if let Some((symbol, order)) = expired {
+        if let Some(symbol) = self.hand_back_unsent(coi, reason) {
             warn!(coi, reason, %symbol, "Expiring a Lighter order back to the bot (§4.11).");
-            publish_order(&self.ev_tx, &symbol, order);
-            report_error(
-                &self.ev_tx,
-                ErrorKind::OrderError,
-                &format!("{symbol}: {reason}"),
-            );
         }
     }
 
+    /// Takes a submit that produced no order out of tracking and hands it back to the bot:
+    /// the order as `Expired` first, then the error — the order `reject_order` keeps, so the
+    /// bot's state is clean before its handler runs. Returns the symbol; logs nothing.
+    fn hand_back_unsent(&self, coi: i64, reason: &str) -> Option<String> {
+        let (symbol, order) = self.order_manager.lock().unwrap().submit_failed(coi)?;
+        publish_order(&self.ev_tx, &symbol, order);
+        report_error(
+            &self.ev_tx,
+            ErrorKind::OrderError,
+            &format!("{symbol}: {reason}"),
+        );
+        Some(symbol)
+    }
+
     fn clear_cancel_request(&self, coi: i64, reason: &str) {
-        let republished = self.order_manager.lock().unwrap().cancel_failed(coi);
-        if let Some((symbol, order)) = republished {
+        if let Some(symbol) = self.hand_back_cancel(coi, reason) {
             warn!(coi, reason, %symbol, "A Lighter cancel did not send; leaving the order live.");
-            publish_order(&self.ev_tx, &symbol, order);
-            report_error(
-                &self.ev_tx,
-                ErrorKind::OrderError,
-                &format!("{symbol}: {reason}"),
+        }
+    }
+
+    /// Clears the pending cancel on a still-live order and tells the bot why — the order first,
+    /// its request cleared, then the error — so it can cancel again instead of waiting on an
+    /// answer that will never come. Returns the symbol; logs nothing.
+    fn hand_back_cancel(&self, coi: i64, reason: &str) -> Option<String> {
+        let (symbol, order) = self.order_manager.lock().unwrap().cancel_failed(coi)?;
+        publish_order(&self.ev_tx, &symbol, order);
+        report_error(
+            &self.ev_tx,
+            ErrorKind::OrderError,
+            &format!("{symbol}: {reason}"),
+        );
+        Some(symbol)
+    }
+
+    /// Whether submit `coi` may go out now (§4.15). A refused one is handed back to the bot
+    /// exactly as a submit refused while the account stream is down — `Expired`, then an
+    /// `OrderError` — before a nonce is reserved, so nothing is spent on it. A submit that
+    /// shrinks the position may take the reserve; a quote may not.
+    fn admit_submit(&self, gate: &mut SendGate, coi: i64) -> bool {
+        let class = if self.order_manager.lock().unwrap().reduces_position(coi) {
+            TxClass::RiskReducing
+        } else {
+            TxClass::Open
+        };
+        match gate.admit(Instant::now(), class) {
+            Ok(()) => true,
+            Err(refusal) => {
+                self.log_refusal(gate, &refusal, "submit");
+                self.hand_back_unsent(coi, &refusal.to_string());
+                false
+            }
+        }
+    }
+
+    /// Whether cancel `coi` may go out now (§4.15). A cancel may take the reserve, so it is
+    /// refused only when the whole budget is spent; then it goes back to the bot as a cancel
+    /// that did not go — request cleared, order still live — and the bot may cancel again.
+    fn admit_cancel(&self, gate: &mut SendGate, coi: i64) -> bool {
+        match gate.admit(Instant::now(), TxClass::RiskReducing) {
+            Ok(()) => true,
+            Err(refusal) => {
+                self.log_refusal(gate, &refusal, "cancel");
+                self.hand_back_cancel(coi, &refusal.to_string());
+                false
+            }
+        }
+    }
+
+    /// One line for a closed gate, at most every [`crate::lighter::gate::REFUSAL_LOG_EVERY`]:
+    /// every refused order already reaches the bot with its own error, so the log only has to
+    /// say that the gate is shut, why, and for how many it stayed quiet.
+    fn log_refusal(&self, gate: &mut SendGate, refusal: &Refusal, what: &str) {
+        let now = Instant::now();
+        if let Some(held_back) = gate.log_refusal(now) {
+            let (used, per_minute) = gate.usage(now).unwrap_or_default();
+            warn!(
+                what,
+                held_back,
+                used,
+                per_minute,
+                free_in_ms = refusal.free_at().saturating_duration_since(now).as_millis() as u64,
+                %refusal,
+                "The Lighter send gate refused a send; it went back to the bot unsent."
             );
         }
     }
@@ -1146,10 +1279,34 @@ struct CancelAllSender<'a> {
     slot: &'a SlotTask,
     signer: &'a mut SignerClient,
     nonce: &'a mut NonceOwner,
+    gate: &'a mut SendGate,
     market_index: i32,
+    /// The command's [`Command::CancelAll`] deadline.
+    deadline: Instant,
 }
 
 impl SweepSend for CancelAllSender<'_> {
+    async fn admit(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if let Err(refusal) = self.gate.admit(now, TxClass::RiskReducing) {
+            info!(
+                market_index = self.market_index,
+                wait_ms = refusal.free_at().saturating_duration_since(now).as_millis() as u64,
+                %refusal,
+                "A Lighter CancelAllOrders sweep finds the send gate shut; it waits if the gate \
+                 opens before the sweep's deadline."
+            );
+            admit_by(self.gate, TxClass::RiskReducing, self.deadline)
+                .await
+                .map_err(|refusal| {
+                    format!(
+                        "{refusal}, and the send gate does not open before the sweep's deadline"
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     fn send_once(&mut self) -> impl Future<Output = Result<SendOutcome, String>> + Send {
         self.slot
             .cancel_all_once(self.signer, self.nonce, self.market_index)
@@ -1602,6 +1759,7 @@ impl PrivateStreamTask {
                         let _ = self.command_tx.send(Command::CancelAll {
                             market_index,
                             reply: None,
+                            deadline: Instant::now() + SWEEP_GATE_DEADLINE,
                         });
                     }
                     // Reconnect reconciliation: expire our orders the venue no longer lists,
@@ -1787,7 +1945,7 @@ mod tests {
                 PRIVATE_POSITIONS_UPDATE_FLAT,
             },
             order::OrderManager,
-            private_msg::AccountOrder,
+            private_msg::{AccountOrder, AccountPosition},
             rest::{MarketInfo, SendOutcome, SendTxAck},
             signer::SignerNetwork,
             slot::{
@@ -1961,6 +2119,8 @@ mod tests {
             signer_config: String::new(),
             confirm_deadline_ms: 5_000,
             connect_policy: policy,
+            tx_budget_per_minute: None,
+            tx_reserve: None,
         };
         let (symbol_tx, symbol_rx) = broadcast::channel(16);
         let task = PrivateStreamTask {
@@ -2160,6 +2320,7 @@ mod tests {
             Ok(Command::CancelAll {
                 market_index,
                 reply,
+                ..
             }) => {
                 assert_eq!(market_index, 1, "the market the snapshot lists (BTC)");
                 assert!(reply.is_none(), "the connect sweep is fire-and-forget");
@@ -2935,6 +3096,7 @@ mod tests {
         let Some(Command::CancelAll {
             market_index,
             reply,
+            ..
         }) = command_rx.recv().await
         else {
             panic!("a sweep asks the slot for one CancelAllOrders per market");
@@ -3021,6 +3183,8 @@ mod tests {
             signer_config: String::new(),
             confirm_deadline_ms: 60_000,
             connect_policy: ConnectPolicy::Reconcile,
+            tx_budget_per_minute: None,
+            tx_reserve: None,
         }
     }
 
@@ -3077,6 +3241,47 @@ mod tests {
             self.order_path.submit("ETH", order, &self.ev_tx);
         }
 
+        fn cancel(&self, order: &Order) {
+            self.order_path.cancel("ETH", order, &self.ev_tx);
+        }
+
+        /// What the account stream would do once the venue listed `order_id` as resting: the
+        /// order is confirmed and has the venue index a cancel is addressed by.
+        fn confirm(&self, order_id: u64) {
+            let mut manager = self.order_path.order_manager.lock().unwrap();
+            let coi = manager.coi_for("ETH", order_id).expect("tracked");
+            let applied = manager.apply_order_update(&AccountOrder {
+                market_index: 42,
+                client_order_index: coi,
+                order_index: 900_000 + coi,
+                is_ask: false,
+                status: "open".to_string(),
+                price: 1_000.0,
+                initial_base_amount: 0.01,
+                remaining_base_amount: 0.01,
+                filled_base_amount: 0.0,
+                transaction_time_us: 1_000,
+            });
+            assert!(applied.published().is_some(), "confirmed");
+        }
+
+        /// What the account stream would do on an `account_all_positions` frame.
+        fn state_position(&self, position: f64) {
+            self.order_path
+                .order_manager
+                .lock()
+                .unwrap()
+                .apply_position(
+                    &AccountPosition {
+                        market_index: 42,
+                        symbol: "ETH".to_string(),
+                        position,
+                        open_order_count: 0,
+                    },
+                    0,
+                );
+        }
+
         /// Waits for the next event the bots would receive.
         async fn next_event(&mut self) -> PublishEvent {
             time::timeout(Duration::from_secs(5), self.events.recv())
@@ -3099,7 +3304,7 @@ mod tests {
         }
     }
 
-    fn order(order_id: u64, side: Side) -> Order {
+    fn eth_order(order_id: u64, side: Side) -> Order {
         Order::new(
             order_id,
             100_000,
@@ -3131,7 +3336,7 @@ mod tests {
     async fn the_scripted_slot_sends_with_the_seeded_nonce_and_resyncs_on_21104() {
         let mut slot = slot_on_scripted_venue(|_| {}).await;
 
-        slot.submit(&order(1, Side::Buy));
+        slot.submit(&eth_order(1, Side::Buy));
         slot.venue_until(|venue| venue.sent().len() == 1).await;
         assert_eq!(slot.venue.sent(), [("create_order".to_string(), 7)]);
         assert_eq!(slot.venue.count("/api/v1/nextNonce"), 1, "seeded once");
@@ -3140,7 +3345,7 @@ mod tests {
             400,
             r#"{"code":21104,"message":"invalid nonce"}"#.to_string(),
         )]);
-        slot.submit(&order(2, Side::Buy));
+        slot.submit(&eth_order(2, Side::Buy));
         let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
         else {
             panic!("the refused order comes back first");
@@ -3155,5 +3360,149 @@ mod tests {
             "a 21104 re-reads the counter"
         );
         assert_eq!(slot.venue.sent()[1], ("create_order".to_string(), 8));
+    }
+
+    // ---- the client-side sendTx budget (§4.15) -----------------------------------------
+
+    /// **A quote over the send budget is handed back unsent — exactly as one refused while the
+    /// account stream is down — and spends no nonce.** The order comes back `Expired` first, then
+    /// an `OrderError` that the bot's classifier counts toward its rate-limit breaker (any
+    /// `OrderError` but "no live order" is `Soft`, myhft `classifiers/lighter.rs`). Nothing
+    /// reaches the venue for it: no `sendTx`, no `nextNonce`; the nonce it did not take is the
+    /// one the next admitted send goes out with.
+    #[tokio::test]
+    async fn a_quote_over_the_send_budget_is_handed_back_unsent_and_spends_no_nonce() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.tx_budget_per_minute = Some(2);
+            config.tx_reserve = Some(1);
+        })
+        .await;
+        slot.submit(&eth_order(1, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+
+        slot.submit(&eth_order(2, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the refused order comes back first");
+        };
+        assert_eq!((order.order_id, order.status), (2, Status::Expired));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("rate-limited"), "{message}");
+        assert!(message.contains("budget"), "{message}");
+        assert!(!message.contains("no live order"), "{message}");
+        assert!(
+            message.starts_with("Frame: ETH: "),
+            "names its symbol: {message}"
+        );
+
+        // The witness that it reserved no nonce: the next admitted send — a sell that shrinks a
+        // long, so it may take the reserve — goes out with the very next nonce.
+        slot.state_position(0.05);
+        slot.submit(&eth_order(3, Side::Sell));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        assert_eq!(
+            slot.venue.sent(),
+            [
+                ("create_order".to_string(), 7),
+                ("create_order".to_string(), 8)
+            ]
+        );
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            1,
+            "and read no nonce"
+        );
+    }
+
+    /// **The reserve is for getting out.** With 3 a minute and 1 held back: two quotes spend the
+    /// open part; a third quote is refused while a position-reducing sell still goes, on the
+    /// reserve; then the budget is spent through, and a cancel is handed back to the bot as a
+    /// cancel that did not go — its request cleared, the order still live — with the reason.
+    #[tokio::test]
+    async fn the_reserve_is_kept_for_what_gets_the_account_out() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.tx_budget_per_minute = Some(3);
+            config.tx_reserve = Some(1);
+        })
+        .await;
+        let first = eth_order(1, Side::Buy);
+        slot.submit(&first);
+        slot.submit(&eth_order(2, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+
+        slot.state_position(0.05);
+        slot.submit(&eth_order(3, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("a quote into the reserve is refused");
+        };
+        assert_eq!((order.order_id, order.status), (3, Status::Expired));
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+
+        slot.submit(&eth_order(4, Side::Sell));
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+
+        // Spent through, reserve included: a cancel goes back to the bot as one that did not go.
+        slot.confirm(1);
+        slot.cancel(&first);
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the cancel comes back first");
+        };
+        assert_eq!(order.order_id, 1);
+        assert_eq!(order.status, Status::New, "the order is still live");
+        assert_eq!(order.req, Status::None, "and no cancel is pending on it");
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("reserve"), "{message}");
+        assert_eq!(slot.venue.sent().len(), 3, "the cancel never went out");
+    }
+
+    /// **Every `sendTx` spends the budget: cancels and sweeps too.** Unmeasured whether the venue
+    /// counts cancels (§6.Б.1), so the connector does — the conservative reading. With 3 a
+    /// minute: a quote, its cancel and a sweep spend it, and the next quote is refused.
+    #[tokio::test]
+    async fn every_send_spends_the_budget_cancels_and_sweeps_included() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.tx_budget_per_minute = Some(3);
+        })
+        .await;
+        let quote = eth_order(1, Side::Buy);
+        slot.submit(&quote);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.cancel(&quote);
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        let sweep = slot.order_path.sweep(vec![42]);
+        assert_eq!(sweep.await.unwrap(), SweepOutcome::Cancelled);
+        assert_eq!(
+            slot.venue
+                .sent()
+                .into_iter()
+                .map(|(op, _)| op)
+                .collect::<Vec<_>>(),
+            ["create_order", "cancel_order", "cancel_all"]
+        );
+
+        slot.submit(&eth_order(2, Side::Buy));
+        loop {
+            if let PublishEvent::LiveEvent(LiveEvent::Error(error)) = slot.next_event().await {
+                assert_eq!(error.kind, ErrorKind::OrderError);
+                break;
+            }
+        }
+        assert_eq!(slot.venue.sent().len(), 3, "the fourth send was refused");
+    }
+
+    /// Without `tx_budget_per_minute` nothing is refused — the behaviour before the budget.
+    #[tokio::test]
+    async fn without_a_send_budget_nothing_is_refused() {
+        let slot = slot_on_scripted_venue(|_| {}).await;
+        for order_id in 1..=5 {
+            slot.submit(&eth_order(order_id, Side::Buy));
+        }
+        slot.venue_until(|venue| venue.sent().len() == 5).await;
     }
 }

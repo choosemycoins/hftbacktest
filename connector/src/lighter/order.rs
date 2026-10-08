@@ -150,6 +150,10 @@ pub struct OrderManager {
     /// `market_index` → the symbol the bot registered, so a private frame (which carries only
     /// `market_index`) is published under the name the bot keys its own book by (§3.5).
     symbol_by_market: HashMap<i64, String>,
+    /// The last signed position `account_all_positions` stated per registered symbol (§3.4) —
+    /// what the send budget's reserve asks to tell a submit that gets the account out from one
+    /// that adds to it ([`Self::reduces_position`]).
+    positions: HashMap<String, f64>,
 }
 
 impl OrderManager {
@@ -164,6 +168,7 @@ impl OrderManager {
             by_order_id: HashMap::new(),
             markets: HashMap::new(),
             symbol_by_market: HashMap::new(),
+            positions: HashMap::new(),
         }
     }
 
@@ -505,16 +510,39 @@ impl OrderManager {
         Some((tracked.symbol.clone(), tracked.order.clone()))
     }
 
-    /// Maps a position frame onto the registered symbol and returns `(symbol, qty, exch_ts)`
-    /// to publish. The position is the venue's stated signed size (§3.4), never inferred; a
-    /// market this connector never registered is ignored (it is some other bot's).
+    /// Maps a position frame onto the registered symbol, remembers it as that symbol's last
+    /// stated position, and returns `(symbol, qty, exch_ts)` to publish. The position is the
+    /// venue's stated signed size (§3.4), never inferred; a market this connector never
+    /// registered is ignored (it is some other bot's).
     pub fn apply_position(
-        &self,
+        &mut self,
         position: &AccountPosition,
         exch_ts_us: i64,
     ) -> Option<(String, f64, i64)> {
         let symbol = self.symbol_by_market.get(&position.market_index)?.clone();
+        self.positions.insert(symbol.clone(), position.position);
         Some((symbol, position.position, exch_ts_us))
+    }
+
+    /// Whether the tracked submit `coi` would shrink |position| on its symbol — a sell against
+    /// a long, a buy against a short, no larger than the position — judged against the last
+    /// position the account stream stated. No statement yet, or an order this manager does not
+    /// track, is not reducing: nothing can be shown to be.
+    pub fn reduces_position(&self, coi: i64) -> bool {
+        let Some(tracked) = self.orders.get(&coi) else {
+            return false;
+        };
+        let Some(&position) = self.positions.get(&tracked.symbol) else {
+            return false;
+        };
+        let against = match tracked.order.side {
+            Side::Sell => position > 0.0,
+            Side::Buy => position < 0.0,
+            _ => false,
+        };
+        // The order's size is the quantised one the venue would see; the slack forgives float
+        // rounding between two decimal strings, never a lot.
+        against && tracked.order.qty <= position.abs() * (1.0 + 1e-9)
     }
 
     /// Reconciles against the venue's open-order snapshot on (re)connect.
@@ -1062,7 +1090,7 @@ mod tests {
     /// the registered symbol. A market this connector never registered is ignored.
     #[test]
     fn the_position_is_the_venues_signed_size_on_the_registered_symbol() {
-        let m = manager();
+        let mut m = manager();
         let short = AccountPosition {
             market_index: 1,
             symbol: "BTC".to_string(),
@@ -1082,6 +1110,60 @@ mod tests {
             open_order_count: 0,
         };
         assert!(m.apply_position(&foreign, 1).is_none());
+    }
+
+    /// **A submit counts as position-reducing only against the last position the account
+    /// stream stated, and only if it cannot overshoot it** — the test the send budget's reserve
+    /// is spent on (`gate.rs`). Long 0.003: a sell of 0.002 or 0.003 shrinks it; a sell of
+    /// 0.004 would flip it; a buy grows it. No position stated yet: nothing is reducing, because
+    /// nothing can be shown to be.
+    #[test]
+    fn a_submit_reduces_the_position_only_against_the_last_stated_one() {
+        let mut m = manager();
+        let order = |id: u64, side: Side, qty: f64| {
+            let mut order = bid(id, 58300.0, qty);
+            order.side = side;
+            order
+        };
+        let (sell_two, _) = m
+            .new_order("BTC", &btc(), &order(1, Side::Sell, 0.002))
+            .unwrap();
+        assert!(
+            !m.reduces_position(sell_two),
+            "no position stated yet: not reducing"
+        );
+
+        let long = |position: f64| AccountPosition {
+            market_index: 1,
+            symbol: "BTC".to_string(),
+            position,
+            open_order_count: 0,
+        };
+        m.apply_position(&long(0.003), 1);
+        let (sell_three, _) = m
+            .new_order("BTC", &btc(), &order(2, Side::Sell, 0.003))
+            .unwrap();
+        let (sell_four, _) = m
+            .new_order("BTC", &btc(), &order(3, Side::Sell, 0.004))
+            .unwrap();
+        let (buy_one, _) = m
+            .new_order("BTC", &btc(), &order(4, Side::Buy, 0.001))
+            .unwrap();
+        assert!(m.reduces_position(sell_two));
+        assert!(m.reduces_position(sell_three), "down to flat, not past it");
+        assert!(!m.reduces_position(sell_four), "past flat it opens a short");
+        assert!(!m.reduces_position(buy_one), "a buy grows a long");
+
+        // The LAST statement counts: the same orders against a short.
+        m.apply_position(&long(-0.003), 2);
+        assert!(m.reduces_position(buy_one));
+        assert!(!m.reduces_position(sell_two));
+        // Flat: nothing reduces.
+        m.apply_position(&long(0.0), 3);
+        assert!(!m.reduces_position(buy_one));
+        assert!(!m.reduces_position(sell_two));
+        // An order this manager does not track is not reducing.
+        assert!(!m.reduces_position(999_999));
     }
 
     /// **Reconciliation expires an order the venue no longer lists** (§3.4, §5.10) — the

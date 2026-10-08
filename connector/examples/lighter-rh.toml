@@ -110,3 +110,18 @@ timeout_ms = 10000
 # # venue, which is what makes a restart free of duplicates. Each sweep is one sendTx per
 # # market — Standard allows ~60 requests a minute in total, so a reconnect storm spends it.
 # connect_policy = "cancel_all"
+#
+# # The connector's own sendTx ceiling, per ROLLING minute, for the WHOLE account: both bots
+# # draw on it, as they draw on the venue's. The venue allows a Standard L1 address 60 sendTx a
+# # rolling minute (docs; NOT measured on RH) and answers more with 429/405 and a cooldown in
+# # which cancels do not get through either. Whether it counts cancels is unknown, so the
+# # connector counts every send: submits, cancels, each CancelAllOrders attempt. 48 leaves 12
+# # under the venue for what the connector does not count — its own REST reads, which the docs
+# # do not say are a separate bucket on Standard, and the poller on the same host. A send over
+# # it is refused before a nonce is spent and goes back to the bot as a rate-limit error.
+# # Absent: no budget (the behaviour before it existed). design note §4.15.
+# tx_budget_per_minute = 48
+#
+# # Of those 48, the last 12 only cancels, CancelAllOrders and position-reducing submits may
+# # take, so a burst of quotes can never leave the account unable to cancel them.
+# tx_reserve = 12
