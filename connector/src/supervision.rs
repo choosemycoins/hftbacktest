@@ -18,12 +18,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hftbacktest::live::ipc::iceoryx::ChannelError;
+use hftbacktest::{
+    live::ipc::iceoryx::ChannelError,
+    types::{ErrorKind, LiveError, LiveEvent, Value},
+};
 use serde::Deserialize;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tracing::error;
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+};
+use tracing::{error, info, warn};
 
-use crate::connector::{PublishEvent, SweepOutcome};
+use crate::connector::{PublishEvent, SweepOutcome, SweepReason};
 
 /// How long the publish task waits for every [`PublishEvent`] sender to be dropped before it
 /// stops anyway.
@@ -271,12 +277,7 @@ impl BotRegistry {
         // account's open orders by coin, and it cannot do better, because no venue order
         // carries the id of the bot that asked for it. So cancelling "the dead bot's BTC"
         // cancels the live bot's BTC too, and that is a healthy market maker flattened.
-        let live: BTreeSet<String> = self
-            .bots
-            .values()
-            .filter(|state| !Self::is_silent(state, now, timeout))
-            .flat_map(|state| state.symbols.iter().cloned())
-            .collect();
+        let live = self.live_symbols(now, timeout);
 
         let mut dead: Vec<DeadBot> = self
             .bots
@@ -307,6 +308,17 @@ impl BotRegistry {
         dead
     }
 
+    /// Every symbol a bot that is not silent registered — a bot that never armed liveness
+    /// included, because it is quoting and is never swept itself. What a sweep on behalf of a
+    /// dead bot must leave alone: a venue cancel reaches every order the account holds there.
+    pub fn live_symbols(&self, now: Instant, timeout: Duration) -> BTreeSet<String> {
+        self.bots
+            .values()
+            .filter(|state| !Self::is_silent(state, now, timeout))
+            .flat_map(|state| state.symbols.iter().cloned())
+            .collect()
+    }
+
     /// Every symbol any bot registered, for the sweep an orderly stop performs.
     pub fn registered_symbols(&self) -> Vec<String> {
         let symbols: BTreeSet<&String> = self
@@ -324,6 +336,289 @@ impl BotRegistry {
             .filter(|state| state.last_seen.is_some())
             .count()
     }
+}
+
+/// The waits before a dead bot's failed sweep is tried again — one per retry, so a sweep is
+/// tried at most five times over about four minutes.
+///
+/// Why a ladder, and why these rungs: the failure this exists for is a sweep refused by a send
+/// gate it cannot outwait — on Lighter a 429/405 cooldown (60 s on RH) against a sweep that may
+/// wait 15 s for the gate. The second retry lands 45 s after the first failure with another
+/// 15 s to wait, so a minute-long cooldown that was already running is outlasted by then; the
+/// longer rungs cover a venue that keeps refusing. Sooner would only be refused again; never
+/// would leave a dead bot's quotes trading until it came back.
+pub const DEAD_BOT_SWEEP_RETRY_WAITS: [Duration; 4] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
+
+/// How long one dead bot's sweep task is waited for before it counts as failed. Above what
+/// either backend with a real sweep gives itself for a bot's one or two symbols (Lighter: 20 s
+/// a market for the verdict; Hyperliquid: 20 s a symbol).
+pub const DEAD_BOT_SWEEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One attempt at sweeping a dead bot's symbols.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepAttempt {
+    pub id: u64,
+    pub symbols: Vec<String>,
+    /// 1 for the sweep that followed the death, then one more per retry.
+    pub attempt: u32,
+}
+
+/// Follows every dead bot's sweep to its end, which a dropped `JoinHandle` never did.
+///
+/// A sweep that failed — on Lighter, most often one that could not outwait a 429/405 cooldown —
+/// used to be the last word: the handle was dropped, the dead bot's orders kept trading until
+/// it came back, and nothing said so but the backend's own line. Now:
+///
+/// * a sweep's verdict is waited for ([`await_sweep`], bounded by [`DEAD_BOT_SWEEP_TIMEOUT`]);
+/// * a `Failed` one is tried again after [`DEAD_BOT_SWEEP_RETRY_WAITS`];
+/// * **every retry first asks the registry** which of its symbols a live bot quotes again — a
+///   restarted bot arrives under a new id and re-registers the same symbol — and leaves those
+///   alone: a venue cancel reaches every order the account holds on a symbol, the restarted
+///   bot's grid included;
+/// * the last failure is an `error!` and a `CriticalConnectionError` to every bot.
+///
+/// Owned by the receive loop, which also owns the registry; the verdicts come back from the
+/// watcher tasks over a plain channel, read without blocking on each liveness poll.
+pub struct DeadBotSweeper {
+    /// Retries waiting for their time, with when it is.
+    waiting: Vec<(Instant, SweepAttempt)>,
+    /// Sweeps started whose verdict has not come back yet.
+    in_flight: usize,
+    done_tx: std::sync::mpsc::Sender<(SweepAttempt, Option<SweepOutcome>)>,
+    done_rx: std::sync::mpsc::Receiver<(SweepAttempt, Option<SweepOutcome>)>,
+}
+
+impl Default for DeadBotSweeper {
+    fn default() -> Self {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        Self {
+            waiting: Vec::new(),
+            in_flight: 0,
+            done_tx,
+            done_rx,
+        }
+    }
+}
+
+impl DeadBotSweeper {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sweeps started whose verdict has not come back yet.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Retries waiting for their time.
+    pub fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// One liveness poll at `now`: settles the sweeps whose verdict came back, starts the
+    /// retries that are due — minus the symbols a live bot quotes again — and sweeps the bots
+    /// that went silent since the last poll. `sweep` asks the backend
+    /// (`Connector::sweep(symbols, reason, tx)`); `tx` carries the give-up to the bots.
+    pub fn poll<F>(
+        &mut self,
+        now: Instant,
+        registry: &mut BotRegistry,
+        timeout: Duration,
+        tx: &UnboundedSender<PublishEvent>,
+        mut sweep: F,
+    ) where
+        F: FnMut(Vec<String>, SweepReason) -> Option<JoinHandle<SweepOutcome>>,
+    {
+        self.settle(now, tx);
+        // New deaths before due retries: a new death of a bot drops the retry of its old one,
+        // which must not go out in the same poll.
+        for dead in registry.take_dead(now, timeout) {
+            // Named separately because they are two different situations for whoever reads
+            // this at 3am, and because three of the four backends implement `sweep` as a
+            // documented no-op: this says what was asked for, and the backend says what it did
+            // about it.
+            if !dead.shared.is_empty() {
+                error!(
+                    bot_id = dead.id,
+                    shared = ?dead.shared,
+                    "A bot stopped heartbeating, but another live bot is quoting the same \
+                     instruments. Its orders there are LEFT RESTING: a cancel reaches every order \
+                     the account holds on a symbol, so clearing them would flatten the live bot's \
+                     grid too. They are cleared when the last bot on those instruments goes, or \
+                     when this connector stops."
+                );
+            }
+            if dead.symbols.is_empty() {
+                continue;
+            }
+            error!(
+                bot_id = dead.id,
+                symbols = ?dead.symbols,
+                liveness_timeout = ?timeout,
+                "A bot stopped heartbeating. Asking the backend to cancel the orders it left \
+                 resting: until it is restarted nothing is managing them, and a fill would move a \
+                 position no one is watching. The connector stays up for it to reconnect to."
+            );
+            // A new death supersedes whatever retry of an earlier one was waiting.
+            self.waiting.retain(|(_, waiting)| waiting.id != dead.id);
+            self.start(
+                SweepAttempt {
+                    id: dead.id,
+                    symbols: dead.symbols,
+                    attempt: 1,
+                },
+                &mut sweep,
+            );
+        }
+        self.retry_due(now, registry, timeout, &mut sweep);
+    }
+
+    /// Reads every verdict that came back, and schedules or gives up on the failed ones.
+    fn settle(&mut self, now: Instant, tx: &UnboundedSender<PublishEvent>) {
+        while let Ok((attempt, outcome)) = self.done_rx.try_recv() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            if outcome != Some(SweepOutcome::Failed) {
+                if attempt.attempt > 1 {
+                    info!(
+                        bot_id = attempt.id,
+                        symbols = ?attempt.symbols,
+                        attempt = attempt.attempt,
+                        ?outcome,
+                        "A dead bot's sweep took on a retry."
+                    );
+                }
+                continue;
+            }
+            let retry = retry_wait(attempt.attempt);
+            match retry {
+                Some(wait) => {
+                    warn!(
+                        bot_id = attempt.id,
+                        symbols = ?attempt.symbols,
+                        attempt = attempt.attempt,
+                        retry_in = ?wait,
+                        "A dead bot's sweep did not take; it is tried again then, minus any \
+                         symbol a live bot quotes by that time."
+                    );
+                    self.waiting.push((
+                        now + wait,
+                        SweepAttempt {
+                            attempt: attempt.attempt + 1,
+                            ..attempt
+                        },
+                    ));
+                }
+                None => {
+                    error!(
+                        bot_id = attempt.id,
+                        symbols = ?attempt.symbols,
+                        attempts = attempt.attempt,
+                        "A dead bot's sweep FAILED on every attempt; its orders may still be \
+                         resting with nothing managing them. Check the venue."
+                    );
+                    tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                        ErrorKind::CriticalConnectionError,
+                        Value::String(gave_up_message(&attempt)),
+                    ))))
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    /// Starts the retries whose time has come, each without the symbols a live bot quotes again.
+    fn retry_due<F>(
+        &mut self,
+        now: Instant,
+        registry: &BotRegistry,
+        timeout: Duration,
+        sweep: &mut F,
+    ) where
+        F: FnMut(Vec<String>, SweepReason) -> Option<JoinHandle<SweepOutcome>>,
+    {
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|(at, _)| *at <= now);
+        self.waiting = waiting;
+        if due.is_empty() {
+            return;
+        }
+        let live = registry.live_symbols(now, timeout);
+        for (_, attempt) in due {
+            let (quoted, symbols): (Vec<String>, Vec<String>) = attempt
+                .symbols
+                .iter()
+                .cloned()
+                .partition(|symbol| quoted_again(&live, symbol));
+            if !quoted.is_empty() {
+                info!(
+                    bot_id = attempt.id,
+                    ?quoted,
+                    "A dead bot's sweep retry leaves these alone: a live bot quotes them again, \
+                     and a cancel would take its orders with the dead bot's."
+                );
+            }
+            if symbols.is_empty() {
+                continue;
+            }
+            self.start(SweepAttempt { symbols, ..attempt }, sweep);
+        }
+    }
+
+    /// Asks the backend for the sweep, and has its verdict waited for and sent back.
+    fn start<F>(&mut self, attempt: SweepAttempt, sweep: &mut F)
+    where
+        F: FnMut(Vec<String>, SweepReason) -> Option<JoinHandle<SweepOutcome>>,
+    {
+        let handle = sweep(
+            attempt.symbols.clone(),
+            SweepReason::BotDied { id: attempt.id },
+        );
+        self.in_flight += 1;
+        let done = self.done_tx.clone();
+        tokio::spawn(async move {
+            let outcome = await_sweep(handle, DEAD_BOT_SWEEP_TIMEOUT).await;
+            // The receiver lives as long as the receive loop that owns it.
+            let _ = done.send((attempt, outcome));
+        });
+    }
+}
+
+/// The wait before the retry that follows failed attempt `attempt` (1-based), or `None` when
+/// that was the last one.
+fn retry_wait(attempt: u32) -> Option<Duration> {
+    let retry = usize::try_from(attempt).ok()?.checked_sub(1)?;
+    DEAD_BOT_SWEEP_RETRY_WAITS.get(retry).copied()
+}
+
+/// Whether a live bot quotes `symbol`.
+fn quoted_again(live: &BTreeSet<String>, symbol: &str) -> bool {
+    live.contains(symbol)
+}
+
+/// What the bots are told when a dead bot's sweep has failed every attempt. Bounded: an error
+/// is bincode-encoded into a 512-byte IPC slice, and one that does not fit kills the connector
+/// (`AGENTS.md` §2).
+fn gave_up_message(attempt: &SweepAttempt) -> String {
+    let mut message = format!(
+        "the orders a dead bot ({}) left on {:?} could not be cancelled in {} attempts; they may \
+         still be resting",
+        attempt.id, attempt.symbols, attempt.attempt
+    );
+    if message.len() > 300 {
+        let mut end = 300;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push('…');
+    }
+    message
 }
 
 /// How the orderly drain ended.
@@ -779,6 +1074,315 @@ mod tests {
         assert!(registry.take_dead(at(t0, 400_000), timeout).is_empty());
         assert_eq!(registry.watched(), 0);
         assert!(registry.registered_symbols().is_empty());
+    }
+
+    // ---- a dead bot's sweep, followed to its end ---------------------------------------
+
+    /// A backend whose sweeps answer `outcome`, recording what it was asked to sweep and for
+    /// whom.
+    fn sweeps_answering(
+        outcome: Option<SweepOutcome>,
+        asked: &mut Vec<(Vec<String>, Option<u64>)>,
+    ) -> impl FnMut(Vec<String>, SweepReason) -> Option<JoinHandle<SweepOutcome>> + '_ {
+        move |symbols, reason| {
+            asked.push((symbols, reason.bot_id()));
+            outcome.map(|outcome| tokio::spawn(async move { outcome }))
+        }
+    }
+
+    /// Lets the watcher tasks the sweeper spawned deliver their verdicts.
+    async fn let_the_verdicts_come_back() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn spy(bot: u64) -> (Vec<String>, Option<u64>) {
+        (vec!["SPY".to_string()], Some(bot))
+    }
+
+    /// **A dead bot's sweep that failed is tried again — 15, 30, 60, 120 s on — and the last
+    /// failure is said out loud.** The handle used to be dropped: on Lighter a sweep refused by
+    /// a 60 s cooldown it could not outwait was the last word, and the dead bot's quotes kept
+    /// trading until it came back. Five attempts in all, then an `error!` and a
+    /// `CriticalConnectionError` to every bot naming the bot and its symbols.
+    #[tokio::test]
+    async fn a_dead_bots_failed_sweep_is_tried_again_then_given_up_loudly() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut registry = BotRegistry::new();
+        registry.register(7, "SPY".into());
+        registry.heartbeat(7, t0);
+        let (tx, mut rx) = unbounded_channel();
+        let mut sweeper = DeadBotSweeper::new();
+        let mut asked = Vec::new();
+        let failed = Some(SweepOutcome::Failed);
+
+        let mut now = at(t0, 11_000);
+        sweeper.poll(
+            now,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        assert_eq!(asked, [spy(7)], "the death is swept at once");
+        for (retry, wait) in DEAD_BOT_SWEEP_RETRY_WAITS.iter().enumerate() {
+            let_the_verdicts_come_back().await;
+            sweeper.poll(
+                now,
+                &mut registry,
+                timeout,
+                &tx,
+                sweeps_answering(failed, &mut asked),
+            );
+            sweeper.poll(
+                now + *wait - Duration::from_millis(1),
+                &mut registry,
+                timeout,
+                &tx,
+                sweeps_answering(failed, &mut asked),
+            );
+            assert_eq!(asked.len(), retry + 1, "not before its wait is up");
+            now += *wait;
+            sweeper.poll(
+                now,
+                &mut registry,
+                timeout,
+                &tx,
+                sweeps_answering(failed, &mut asked),
+            );
+            assert_eq!(asked.len(), retry + 2, "retry {} after {wait:?}", retry + 1);
+        }
+        assert!(asked.iter().all(|asked| *asked == spy(7)));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing to the bots while it is still being tried"
+        );
+
+        let_the_verdicts_come_back().await;
+        sweeper.poll(
+            now,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        let Ok(PublishEvent::LiveEvent(LiveEvent::Error(error))) = rx.try_recv() else {
+            panic!("the last failure reaches the bots");
+        };
+        assert_eq!(error.kind, ErrorKind::CriticalConnectionError);
+        let Value::String(message) = error.value() else {
+            panic!("prose");
+        };
+        assert!(message.contains("SPY"), "{message}");
+        assert!(message.contains("5 attempts"), "{message}");
+        assert_eq!((sweeper.waiting(), sweeper.in_flight()), (0, 0));
+        sweeper.poll(
+            now + Duration::from_secs(3_600),
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        assert_eq!(asked.len(), 5, "and then it is left to the operator");
+    }
+
+    /// **A retry never sweeps a symbol a live bot quotes again.** A restarted bot comes back
+    /// under a new id and registers the same symbol — before its first heartbeat it is already
+    /// quoting — and a venue cancel reaches every order the account holds there: retrying the
+    /// dead bot's sweep over it would flatten the restarted bot's grid. Each retry asks the
+    /// registry first, and one with nothing left to sweep is not sent at all.
+    #[tokio::test]
+    async fn a_retry_never_sweeps_a_symbol_a_live_bot_quotes_again() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut registry = BotRegistry::new();
+        registry.register(7, "SPY".into());
+        registry.register(7, "XAU".into());
+        registry.heartbeat(7, t0);
+        let (tx, _rx) = unbounded_channel();
+        let mut sweeper = DeadBotSweeper::new();
+        let mut asked = Vec::new();
+        let failed = Some(SweepOutcome::Failed);
+
+        let first = at(t0, 11_000);
+        sweeper.poll(
+            first,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        let_the_verdicts_come_back().await;
+        sweeper.poll(
+            first,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+
+        // The bot is back under a new id, quoting SPY.
+        registry.register(9, "SPY".into());
+        let second = first + DEAD_BOT_SWEEP_RETRY_WAITS[0];
+        sweeper.poll(
+            second,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        let_the_verdicts_come_back().await;
+        sweeper.poll(
+            second,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+
+        // ...and XAU too: nothing of the dead bot's is left to sweep.
+        registry.register(9, "XAU".into());
+        sweeper.poll(
+            second + DEAD_BOT_SWEEP_RETRY_WAITS[1],
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        assert_eq!(
+            asked,
+            [
+                (vec!["SPY".to_string(), "XAU".to_string()], Some(7)),
+                (vec!["XAU".to_string()], Some(7)),
+            ]
+        );
+        assert_eq!(sweeper.waiting(), 0);
+    }
+
+    /// A sweep that took is done, and so is one with nothing to report: a documented no-op
+    /// (`NotImplemented`) or a backend with no order path (`None`) — none is tried again.
+    #[tokio::test]
+    async fn a_dead_bots_sweep_that_did_not_fail_is_not_tried_again() {
+        for outcome in [
+            Some(SweepOutcome::Cancelled),
+            Some(SweepOutcome::NotImplemented),
+            None,
+        ] {
+            let t0 = Instant::now();
+            let timeout = Duration::from_secs(10);
+            let mut registry = BotRegistry::new();
+            registry.register(7, "SPY".into());
+            registry.heartbeat(7, t0);
+            let (tx, mut rx) = unbounded_channel();
+            let mut sweeper = DeadBotSweeper::new();
+            let mut asked = Vec::new();
+            let now = at(t0, 11_000);
+            sweeper.poll(
+                now,
+                &mut registry,
+                timeout,
+                &tx,
+                sweeps_answering(outcome, &mut asked),
+            );
+            let_the_verdicts_come_back().await;
+            sweeper.poll(
+                now,
+                &mut registry,
+                timeout,
+                &tx,
+                sweeps_answering(outcome, &mut asked),
+            );
+            sweeper.poll(
+                now + Duration::from_secs(3_600),
+                &mut registry,
+                timeout,
+                &tx,
+                sweeps_answering(outcome, &mut asked),
+            );
+            assert_eq!(asked.len(), 1, "{outcome:?}");
+            assert_eq!(
+                (sweeper.waiting(), sweeper.in_flight()),
+                (0, 0),
+                "{outcome:?}"
+            );
+            assert!(rx.try_recv().is_err(), "{outcome:?}");
+        }
+    }
+
+    /// The give-up is bounded whatever the bot registered: an error rides a 512-byte IPC
+    /// slice, and one that does not fit kills the connector (`AGENTS.md` §2).
+    #[test]
+    fn a_dead_bots_give_up_always_fits_the_ipc_payload() {
+        let attempt = SweepAttempt {
+            id: u64::MAX,
+            symbols: (0..200).map(|n| format!("SYMBOL{n}")).collect(),
+            attempt: 5,
+        };
+        let message = gave_up_message(&attempt);
+        assert!(message.len() <= 303, "{} bytes", message.len());
+        let event = LiveEvent::Error(LiveError::with(
+            ErrorKind::CriticalConnectionError,
+            Value::String(message),
+        ));
+        let mut buffer = [0u8; 512];
+        bincode::encode_into_slice(&event, &mut buffer, bincode::config::standard())
+            .expect("fits the IPC payload");
+    }
+
+    /// A bot that comes back and dies again is swept for its new death, and the retry of the
+    /// old one is dropped rather than sent as well.
+    #[tokio::test]
+    async fn a_new_death_supersedes_the_retry_of_an_old_one() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut registry = BotRegistry::new();
+        registry.register(7, "SPY".into());
+        registry.heartbeat(7, t0);
+        let (tx, _rx) = unbounded_channel();
+        let mut sweeper = DeadBotSweeper::new();
+        let mut asked = Vec::new();
+        let failed = Some(SweepOutcome::Failed);
+
+        let died = at(t0, 11_000);
+        sweeper.poll(
+            died,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        let_the_verdicts_come_back().await;
+        sweeper.poll(
+            died,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        assert_eq!(sweeper.waiting(), 1);
+
+        registry.heartbeat(7, died + Duration::from_secs(1));
+        let died_again = died + Duration::from_secs(12);
+        sweeper.poll(
+            died_again,
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        assert_eq!(asked.len(), 2, "the new death is swept");
+        assert_eq!(sweeper.waiting(), 0, "and the old retry is gone");
+        let_the_verdicts_come_back().await;
+        sweeper.poll(
+            died + DEAD_BOT_SWEEP_RETRY_WAITS[0],
+            &mut registry,
+            timeout,
+            &tx,
+            sweeps_answering(failed, &mut asked),
+        );
+        assert_eq!(asked.len(), 2, "the old retry's time came and nothing went");
     }
 
     /// The drain's good ending: everything queued is published, and the task only stops once

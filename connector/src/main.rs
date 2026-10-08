@@ -60,6 +60,13 @@
 //! So the bot says so itself, and the connector arms a bot only once it has heard from it —
 //! which is what keeps a bot too old to know the variant from ever being swept.
 //!
+//! **A dead bot's sweep is followed to its verdict** (`supervision::DeadBotSweeper`). It used to
+//! be fire-and-forget, and a sweep the venue refused — on Lighter, one that could not outwait a
+//! 429/405 cooldown — left the dead bot's quotes trading until it came back. A `Failed` one is
+//! tried again 15, 30, 60 and 120 s on, each retry first leaving out every symbol a live bot
+//! quotes by then (a restarted bot registers under a new id), and the fifth failure is an
+//! `error!` and a `CriticalConnectionError` to the bots.
+//!
 //! **What the sweep can and cannot be scoped to.** A venue cancel reaches every order the
 //! *account* holds on a symbol; nothing on the venue records which bot asked for an order,
 //! because [`Connector::submit`] is never told. So "cancel the dead bot's orders" only
@@ -117,6 +124,7 @@ use crate::{
     lighter::{Instance, Lighter},
     supervision::{
         BotRegistry,
+        DeadBotSweeper,
         DrainOutcome,
         LIVENESS_POLL_INTERVAL,
         StopKind,
@@ -174,6 +182,7 @@ fn run_receive_task(
     let bot_rx = IceoryxBuilder::new(name).bot(false).receiver()?;
     let liveness_timeout = supervision.bot_liveness.timeout();
     let mut last_liveness_poll = Instant::now();
+    let mut dead_bot_sweeps = DeadBotSweeper::new();
     loop {
         // Checked before receiving, not after: once the stop has begun, a request that is
         // already on the queue must not be acted on. Submitting an order into a connector
@@ -242,44 +251,16 @@ fn run_receive_task(
                     && last_liveness_poll.elapsed() >= LIVENESS_POLL_INTERVAL
                 {
                     last_liveness_poll = Instant::now();
-                    for dead in registry.take_dead(last_liveness_poll, liveness_timeout) {
-                        // Named separately because they are two different situations for
-                        // whoever reads this at 3am, and because three of the four backends
-                        // implement `sweep` as a documented no-op: this says what was asked
-                        // for, and the backend says what it did about it.
-                        if !dead.shared.is_empty() {
-                            error!(
-                                bot_id = dead.id,
-                                shared = ?dead.shared,
-                                "A bot stopped heartbeating, but another live bot is quoting \
-                                 the same instruments. Its orders there are LEFT RESTING: a \
-                                 cancel reaches every order the account holds on a symbol, \
-                                 so clearing them would flatten the live bot's grid too. \
-                                 They are cleared when the last bot on those instruments \
-                                 goes, or when this connector stops."
-                            );
-                        }
-                        if dead.symbols.is_empty() {
-                            continue;
-                        }
-                        error!(
-                            bot_id = dead.id,
-                            symbols = ?dead.symbols,
-                            ?liveness_timeout,
-                            "A bot stopped heartbeating. Asking the backend to cancel the \
-                             orders it left resting: until it is restarted nothing is \
-                             managing them, and a fill would move a position no one is \
-                             watching. The connector stays up for it to reconnect to."
-                        );
-                        // Detached on purpose, unlike the shutdown sweep: nothing is waiting
-                        // on this one, the connector keeps running, and dropping a
-                        // `JoinHandle` does not cancel its task.
-                        drop(connector.sweep(
-                            dead.symbols,
-                            SweepReason::BotDied { id: dead.id },
-                            tx.clone(),
-                        ));
-                    }
+                    // Sweeps the bots that went silent, and follows each sweep to its verdict:
+                    // a failed one is tried again, never over a symbol a live bot quotes by
+                    // then, and the last failure is told to the bots (`DeadBotSweeper`).
+                    dead_bot_sweeps.poll(
+                        last_liveness_poll,
+                        registry,
+                        liveness_timeout,
+                        &tx,
+                        |symbols, reason| connector.sweep(symbols, reason, tx.clone()),
+                    );
                 }
             }
             Err(error) => {
@@ -295,6 +276,14 @@ fn run_receive_task(
                 break;
             }
         }
+    }
+    if dead_bot_sweeps.in_flight() + dead_bot_sweeps.waiting() > 0 {
+        info!(
+            in_flight = dead_bot_sweeps.in_flight(),
+            waiting = dead_bot_sweeps.waiting(),
+            "Leaving dead bots' sweeps unfinished or unretried; the stop's own sweep, when it is \
+             on, covers every registered symbol."
+        );
     }
     Ok(())
 }
