@@ -64,7 +64,7 @@ use crate::{
         LighterError,
         SharedSymbolSet,
         nonce::NonceOwner,
-        order::{CancelPlan, OrderManager},
+        order::{CancelPlan, OrderManager, venue_refusal},
         private_msg::{AccountOrder, PrivateFrame, parse_private_frame},
         public_stream::{
             BACKOFF_MAX,
@@ -1440,6 +1440,17 @@ impl PrivateStreamTask {
                     let applied = self.order_manager.lock().unwrap().apply_order_update(order);
                     if let Some((symbol, published)) = applied {
                         publish_order(&self.ev_tx, &symbol, published);
+                        // The order went terminal for a reason the bot must hear about (a
+                        // margin refusal, a liquidation): after the order, so its state is
+                        // clean before the handler runs — the same order `reject_order` keeps.
+                        if let Some((kind, message)) = venue_refusal(&order.status) {
+                            warn!(
+                                %symbol,
+                                status = %order.status,
+                                "Lighter refused an order of ours."
+                            );
+                            report_error(&self.ev_tx, kind, &format!("{symbol}: {message}"));
+                        }
                     }
                 }
             }
@@ -1556,6 +1567,7 @@ mod tests {
             fixtures::{
                 PRIVATE_ORDERS_SNAPSHOT,
                 PRIVATE_ORDERS_SNAPSHOT_EMPTY,
+                PRIVATE_ORDERS_UPDATE_CANCELED,
                 PRIVATE_POSITIONS_UPDATE_FLAT,
             },
             order::OrderManager,
@@ -1984,6 +1996,86 @@ mod tests {
             }
             _ => panic!("the positions snapshot must publish a LiveEvent::Position (§3.4)"),
         }
+    }
+
+    /// One of our orders, resting on BTC, as the private stream knows it — and the venue's
+    /// real `canceled` frame for it, rewritten to `status`.
+    fn our_order_canceled_as(
+        status: &str,
+    ) -> (
+        PrivateStreamTask,
+        tokio::sync::mpsc::UnboundedReceiver<PublishEvent>,
+        String,
+    ) {
+        let (task, _symbol_tx, _command_rx, ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let market = MarketInfo {
+            symbol: "BTC".to_string(),
+            market_id: 1,
+            price_decimals: 1,
+            size_decimals: 5,
+        };
+        let coi = {
+            let mut manager = task.order_manager.lock().unwrap();
+            manager.track_market(market.clone());
+            let order = Order::new(
+                7,
+                583_000,
+                0.1,
+                0.001,
+                Side::Buy,
+                OrdType::Limit,
+                TimeInForce::GTX,
+            );
+            manager.new_order("BTC", &market, &order).unwrap().0
+        };
+        let frame = PRIVATE_ORDERS_UPDATE_CANCELED
+            .replace("424242424242", &coi.to_string())
+            .replace(r#""status":"canceled""#, &format!(r#""status":"{status}""#));
+        (task, ev_rx, frame)
+    }
+
+    /// **A refusal the next quote will meet again reaches the bot as an error** — after the
+    /// order, so the bot's state is clean when its handler runs. Before, a
+    /// `canceled-margin-not-allowed` came back as `Status::Unsupported` and nothing else: the
+    /// bot freed the level and re-quoted into the same refusal every tick, and its breaker
+    /// never saw one error.
+    #[test]
+    fn a_margin_refusal_is_published_as_a_cancel_and_then_an_order_error() {
+        let (task, mut ev_rx, frame) = our_order_canceled_as("canceled-margin-not-allowed");
+        task.on_frame(&frame);
+        match ev_rx.try_recv() {
+            Ok(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order })) => {
+                assert_eq!(symbol, "BTC");
+                assert_eq!(order.order_id, 7);
+                assert_eq!(order.status, Status::Canceled);
+            }
+            _ => panic!("the order comes back first"),
+        }
+        match ev_rx.try_recv() {
+            Ok(PublishEvent::LiveEvent(LiveEvent::Error(error))) => {
+                assert_eq!(error.kind, ErrorKind::OrderError);
+                let Value::String(message) = error.value() else {
+                    panic!("prose");
+                };
+                assert!(message.contains("canceled-margin-not-allowed"), "{message}");
+            }
+            _ => panic!("then the refusal is reported"),
+        }
+    }
+
+    /// A post-only bounce comes back as a cancel and nothing more: it is what post-only
+    /// means, and an error per bounce would trip a maker's own breaker.
+    #[test]
+    fn a_post_only_bounce_is_published_as_a_cancel_and_nothing_else() {
+        let (task, mut ev_rx, frame) = our_order_canceled_as("canceled-post-only");
+        task.on_frame(&frame);
+        match ev_rx.try_recv() {
+            Ok(PublishEvent::LiveEvent(LiveEvent::Order { order, .. })) => {
+                assert_eq!(order.status, Status::Canceled);
+            }
+            _ => panic!("the order comes back"),
+        }
+        assert!(ev_rx.try_recv().is_err(), "and no error follows a bounce");
     }
 
     /// **`LiveEvent::Position.exch_ts` is nanoseconds**, the unit every other backend writes:

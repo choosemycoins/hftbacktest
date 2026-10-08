@@ -477,14 +477,56 @@ fn tif_of(tif: TimeInForce) -> Result<u8, OrderError> {
     }
 }
 
+/// The prefix of every venue cancel reason (`canceled-post-only`, `canceled-margin-not-allowed`,
+/// … — the documented Order JSON vocabulary). Whatever follows it, the venue is saying the order
+/// is gone.
+const CANCELED_WITH_REASON: &str = "canceled-";
+
 /// Maps a Lighter order status string onto the wire `Status`.
+///
+/// Every `canceled-<reason>` is a terminal [`Status::Canceled`] — including a reason not seen
+/// yet, because the prefix already says what happened. Reading them as `Unsupported` ("cannot
+/// read this") was wrong about a documented status; what the bot should additionally be told
+/// is [`venue_refusal`]'s job.
 fn map_status(status: &str) -> Status {
     match status {
         "open" | "pending" | "in-progress" => Status::New,
         "canceled" | "cancelled" => Status::Canceled,
         "filled" => Status::Filled,
         "partially-filled" | "partially_filled" | "partial" => Status::PartiallyFilled,
+        reason if reason.starts_with(CANCELED_WITH_REASON) => Status::Canceled,
         _ => Status::Unsupported,
+    }
+}
+
+/// What, beyond the order coming back terminal, the bot must be told about a venue cancel.
+///
+/// * **Nothing** for a cancel that heals itself: `canceled-post-only` is the venue doing what
+///   post-only means (on a 200 ms maker speed bump a quote at the touch can be crossed before
+///   it lands), and the next quote is priced off the book that crossed it; `expired`, `oco`,
+///   `child` are lifecycle, not refusal. Reporting a bounce would trip a maker's own breaker.
+/// * **`OrderError`** for a refusal the next quote will meet again — margin, balance,
+///   position limit, reduce-only — and for a self-trade or a taker order that found no
+///   liquidity, and for any reason this table has not seen: the bot's breaker can then count
+///   it instead of re-quoting into the same refusal every tick.
+/// * **`CriticalConnectionError`** for `canceled-liquidation`: the account is being closed
+///   out, and no bot should keep quoting into it.
+///
+/// The message names the venue's own status word and never contains "no live order" (the
+/// myhft classifier downgrades that string to benign).
+pub fn venue_refusal(status: &str) -> Option<(hftbacktest::types::ErrorKind, String)> {
+    use hftbacktest::types::ErrorKind;
+    let reason = status.strip_prefix(CANCELED_WITH_REASON)?;
+    match reason {
+        "post-only" | "expired" | "oco" | "child" => None,
+        "liquidation" => Some((
+            ErrorKind::CriticalConnectionError,
+            format!("the venue canceled the order for a liquidation ({status})"),
+        )),
+        _ => Some((
+            ErrorKind::OrderError,
+            format!("the venue refused the order ({status})"),
+        )),
     }
 }
 
@@ -508,7 +550,7 @@ impl GetOrders for OrderManager {
 mod tests {
     use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
 
-    use super::{MAX_COI, OrderError, OrderManager, map_status};
+    use super::{MAX_COI, OrderError, OrderManager, map_status, venue_refusal};
     use crate::{
         connector::GetOrders,
         lighter::{
@@ -956,5 +998,104 @@ mod tests {
         assert_eq!(map_status("canceled"), Status::Canceled);
         assert_eq!(map_status("filled"), Status::Filled);
         assert_eq!(map_status("what"), Status::Unsupported);
+    }
+
+    /// The venue's documented order statuses (RH apidocs, WebSocket "Order JSON",
+    /// 2026-10-08) — every `canceled-<reason>` is the venue saying the order is GONE.
+    const VENUE_CANCEL_REASONS: [&str; 12] = [
+        "canceled-post-only",
+        "canceled-reduce-only",
+        "canceled-position-not-allowed",
+        "canceled-margin-not-allowed",
+        "canceled-too-much-slippage",
+        "canceled-not-enough-liquidity",
+        "canceled-self-trade",
+        "canceled-expired",
+        "canceled-oco",
+        "canceled-child",
+        "canceled-liquidation",
+        "canceled-invalid-balance",
+    ];
+
+    /// **Every `canceled-<reason>` is a terminal cancel, not an unknown status.** A post-only
+    /// bounce on a 200 ms maker speed bump, a margin refusal on a small account — before this
+    /// they mapped to `Status::Unsupported`, which says "I cannot read this" about a status
+    /// the venue documents. Terminal means the order is taken out of tracking and its id freed,
+    /// exactly as a plain `canceled` is — and a reason this table has not seen yet is still
+    /// read as the cancel its prefix says it is.
+    #[test]
+    fn every_venue_cancel_reason_is_a_terminal_cancel() {
+        for status in VENUE_CANCEL_REASONS
+            .iter()
+            .copied()
+            .chain(["canceled-something-new"])
+        {
+            assert_eq!(map_status(status), Status::Canceled, "{status}");
+        }
+        // Prefixes that are not the venue's spelling stay unknown.
+        for status in ["cancel", "canceledd", "post-only"] {
+            assert_eq!(map_status(status), Status::Unsupported, "{status}");
+        }
+    }
+
+    /// A refused order leaves tracking and frees its id, like any terminal update.
+    #[test]
+    fn a_post_only_bounce_takes_the_order_out_of_tracking() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(3, 58300.0, 0.001)).unwrap();
+        let (_, order) = m
+            .apply_order_update(&account_order(coi, 9, "canceled-post-only", 1_000))
+            .expect("our order");
+        assert_eq!(order.status, Status::Canceled);
+        assert!(!order.active());
+        assert_eq!(m.tracked(), 0);
+        assert!(
+            m.new_order("BTC", &btc(), &bid(3, 58300.0, 0.001)).is_ok(),
+            "id freed"
+        );
+    }
+
+    /// **Which refusals the bot is told about.** A post-only bounce is the venue doing what
+    /// post-only means and heals on the next quote, so it is NOT an error — a maker at the
+    /// touch would otherwise trip its own rate-limit breaker. A refusal that the next quote
+    /// will meet again (margin, balance, position limits, reduce-only) IS an `OrderError`, so
+    /// the bot's breaker can count it; a self-trade or an unfilled taker order is reported
+    /// too; and a cancel for LIQUIDATION is a `CriticalConnectionError` — the account is being
+    /// closed out and no bot should keep quoting into it.
+    #[test]
+    fn a_refusal_that_will_repeat_is_reported_and_a_bounce_is_not() {
+        use hftbacktest::types::ErrorKind;
+
+        for benign in [
+            "open",
+            "canceled",
+            "filled",
+            "canceled-post-only",
+            "canceled-expired",
+            "canceled-oco",
+            "canceled-child",
+        ] {
+            assert_eq!(venue_refusal(benign), None, "{benign}");
+        }
+        for repeating in [
+            "canceled-margin-not-allowed",
+            "canceled-invalid-balance",
+            "canceled-position-not-allowed",
+            "canceled-reduce-only",
+            "canceled-self-trade",
+            "canceled-too-much-slippage",
+            "canceled-not-enough-liquidity",
+            "canceled-something-new",
+        ] {
+            let (kind, message) = venue_refusal(repeating).unwrap_or_else(|| panic!("{repeating}"));
+            assert_eq!(kind, ErrorKind::OrderError, "{repeating}");
+            assert!(message.contains(repeating), "{message}");
+            assert!(
+                !message.contains("no live order"),
+                "the myhft classifier downgrades that string to benign"
+            );
+        }
+        let (kind, _) = venue_refusal("canceled-liquidation").unwrap();
+        assert_eq!(kind, ErrorKind::CriticalConnectionError);
     }
 }
