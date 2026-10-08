@@ -18,7 +18,9 @@
 //!    then expire the order and report the error to the bot — never leave it believing a
 //!    one-sided quote is resting (`AGENTS.md` §1.1).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tracing::warn;
 
 use crate::lighter::{
     private_msg::AccountOrder,
@@ -74,6 +76,89 @@ pub fn cancel_after_send(outcome: &SendOutcome) -> CancelFollowUp {
             "the cancel's sendTx was ambiguous (HTTP {status}: {detail}); it may not have \
              taken — cancel again"
         )),
+    }
+}
+
+/// How many times one market's `CancelAllOrders` is sent before the sweep is declared failed.
+pub const SWEEP_ATTEMPTS: u32 = 3;
+
+/// The wait before the second attempt; the third waits twice as long.
+pub const SWEEP_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// What one `CancelAllOrders` attempt leaves for the slot (§3.4).
+///
+/// A sweep is what stands between a dead or stopping bot and its quotes trading on
+/// unattended — on this venue orders outlive the process (§2.7). It used to be sent once and
+/// logged "Sent" whatever came back, so a `21104` or a 429 — the answer most likely exactly
+/// when a rate-limit storm is what killed the bot — left the market's orders resting under a
+/// line that said they had been swept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepFollowUp {
+    /// HTTP 200: the venue took the sweep; its `canceled` deltas arrive on the channel.
+    Done,
+    /// It did not take (`21104`), or may not have (ambiguous, no answer, not even built):
+    /// send it again after `after`. A sweep is idempotent — it cancels whatever rests on the
+    /// market when it executes — so a second one behind a first that did take costs one
+    /// `sendTx` and nothing else.
+    Retry { after: Duration },
+    /// Out of attempts: the sweep FAILED and orders may still rest on that market.
+    Failed(String),
+}
+
+/// The follow-up to a sweep's `attempt`-th try (1-based). `outcome` is the venue's answer,
+/// or — `Err` — why there was none: the nonce could not be seeded, the signer refused, the
+/// transport failed.
+pub fn sweep_follow_up(outcome: Result<&SendOutcome, &str>, attempt: u32) -> SweepFollowUp {
+    let (reason, after) = match outcome {
+        Ok(SendOutcome::Accepted(_)) => return SweepFollowUp::Done,
+        // Refused before it executed, and `apply_nonce` has already resynced the counter:
+        // nothing to wait for.
+        Ok(SendOutcome::InvalidNonce { message }) => (
+            format!("the venue rejected the sweep's nonce (21104: {message})"),
+            Duration::ZERO,
+        ),
+        Ok(SendOutcome::Ambiguous { status, detail }) => (
+            format!("the sweep's sendTx was ambiguous (HTTP {status}: {detail})"),
+            SWEEP_RETRY_BACKOFF * attempt,
+        ),
+        Err(reason) => (reason.to_string(), SWEEP_RETRY_BACKOFF * attempt),
+    };
+    if attempt >= SWEEP_ATTEMPTS {
+        return SweepFollowUp::Failed(format!(
+            "{reason}; gave up after {attempt} attempts — orders may still be resting on this \
+             market"
+        ));
+    }
+    SweepFollowUp::Retry { after }
+}
+
+/// One reserve-sign-send round of a `CancelAllOrders` sweep: the slot's, or a scripted venue
+/// in a test. `Err` is why nothing was sent or nothing came back.
+pub trait SweepSend {
+    fn send_once(&mut self) -> impl Future<Output = Result<SendOutcome, String>> + Send;
+}
+
+/// Sends one market's sweep until it takes or [`SWEEP_ATTEMPTS`] are spent, as
+/// [`sweep_follow_up`] decides. `Ok` carries the attempts it took; `Err` is the failure, to
+/// be reported loudly by the caller.
+pub async fn sweep_with_retries(sender: &mut impl SweepSend) -> Result<u32, String> {
+    let mut attempt = 1;
+    loop {
+        let outcome = sender.send_once().await;
+        match sweep_follow_up(outcome.as_ref().map_err(String::as_str), attempt) {
+            SweepFollowUp::Done => return Ok(attempt),
+            SweepFollowUp::Retry { after } => {
+                warn!(
+                    attempt,
+                    ?after,
+                    outcome = ?outcome,
+                    "A Lighter CancelAllOrders sweep did not take; sending it again."
+                );
+                tokio::time::sleep(after).await;
+                attempt += 1;
+            }
+            SweepFollowUp::Failed(reason) => return Err(reason),
+        }
     }
 }
 
@@ -261,11 +346,16 @@ mod tests {
         Outbound,
         OutboundSpans,
         Placement,
+        SWEEP_ATTEMPTS,
+        SweepFollowUp,
+        SweepSend,
         cancel_after_send,
         deadline_action,
         fate_of_ambiguous,
         nonce_action,
         placement_after_deadline,
+        sweep_follow_up,
+        sweep_with_retries,
     };
     use crate::lighter::{
         private_msg::AccountOrder,
@@ -278,6 +368,125 @@ mod tests {
             ratelimit: Some("Ratelimit is off".to_string()),
             predicted_execution_time_ms: None,
         }
+    }
+
+    /// A venue that answers each sweep from a script, in order.
+    struct ScriptedVenue {
+        answers: std::collections::VecDeque<Result<SendOutcome, String>>,
+        sends: u32,
+    }
+
+    impl ScriptedVenue {
+        fn new(answers: Vec<Result<SendOutcome, String>>) -> Self {
+            Self {
+                answers: answers.into(),
+                sends: 0,
+            }
+        }
+    }
+
+    impl SweepSend for ScriptedVenue {
+        async fn send_once(&mut self) -> Result<SendOutcome, String> {
+            self.sends += 1;
+            self.answers
+                .pop_front()
+                .unwrap_or_else(|| Err("the script ran out".to_string()))
+        }
+    }
+
+    fn throttled() -> SendOutcome {
+        SendOutcome::Ambiguous {
+            status: 429,
+            detail: "Too Many Requests".to_string(),
+        }
+    }
+
+    // ---- the CancelAllOrders sweep ----------------------------------------------------
+
+    /// A sweep the venue took is done, on whichever attempt it took.
+    #[test]
+    fn a_sweep_the_venue_took_is_done() {
+        for attempt in 1..=SWEEP_ATTEMPTS {
+            assert_eq!(
+                sweep_follow_up(Ok(&SendOutcome::Accepted(ack())), attempt),
+                SweepFollowUp::Done
+            );
+        }
+    }
+
+    /// **A sweep that did not take is sent again, and then declared failed — never "sent".**
+    /// A `21104` was refused before it executed and the nonce is already resynced, so it goes
+    /// again at once; a 429, any other ambiguous answer, and no answer at all wait 1 s then
+    /// 2 s. The last attempt's failure names what came back and that orders may be resting.
+    #[test]
+    fn a_sweep_that_did_not_take_is_retried_then_declared_failed() {
+        assert_eq!(
+            sweep_follow_up(
+                Ok(&SendOutcome::InvalidNonce {
+                    message: "invalid nonce".to_string()
+                }),
+                1
+            ),
+            SweepFollowUp::Retry {
+                after: Duration::ZERO
+            }
+        );
+        assert_eq!(
+            sweep_follow_up(Ok(&throttled()), 1),
+            SweepFollowUp::Retry {
+                after: Duration::from_secs(1)
+            }
+        );
+        assert_eq!(
+            sweep_follow_up(Err("the cancel-all sendTx failed: timed out"), 2),
+            SweepFollowUp::Retry {
+                after: Duration::from_secs(2)
+            }
+        );
+        let SweepFollowUp::Failed(reason) = sweep_follow_up(Ok(&throttled()), SWEEP_ATTEMPTS)
+        else {
+            panic!("the last attempt's failure is a failed sweep");
+        };
+        assert!(reason.contains("429"), "{reason}");
+        assert!(reason.contains("resting"), "{reason}");
+        let SweepFollowUp::Failed(reason) =
+            sweep_follow_up(Err("couldn't seed the nonce"), SWEEP_ATTEMPTS)
+        else {
+            panic!("no answer on the last attempt is a failed sweep");
+        };
+        assert!(reason.contains("couldn't seed the nonce"), "{reason}");
+    }
+
+    /// The driver, against a scripted venue: two 429s and then a 200 is a sweep that took on
+    /// the third attempt, after the 1 s and 2 s waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_sweep_takes_on_a_later_attempt() {
+        let mut venue = ScriptedVenue::new(vec![
+            Ok(throttled()),
+            Ok(throttled()),
+            Ok(SendOutcome::Accepted(ack())),
+        ]);
+        let started = tokio::time::Instant::now();
+        let result = sweep_with_retries(&mut venue).await;
+        assert_eq!(result, Ok(3));
+        assert_eq!(venue.sends, 3);
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "waited 1 s + 2 s"
+        );
+    }
+
+    /// ...and a venue that never takes it is a failed sweep after exactly
+    /// [`SWEEP_ATTEMPTS`] sends, not a silent success and not a loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_the_venue_never_takes_fails_after_the_last_attempt() {
+        let mut venue = ScriptedVenue::new((0..10).map(|_| Ok(throttled())).collect());
+        let result = sweep_with_retries(&mut venue).await;
+        assert_eq!(venue.sends, SWEEP_ATTEMPTS);
+        let Err(reason) = result else {
+            panic!("a sweep that never took must fail");
+        };
+        assert!(reason.contains("429"), "{reason}");
     }
 
     /// **A cancel the venue did not take is handed back to the bot.** Before, a cancel that got

@@ -90,11 +90,13 @@ use crate::{
             NonceAction,
             Outbound,
             Placement,
+            SweepSend,
             cancel_after_send,
             deadline_action,
             fate_of_ambiguous,
             nonce_action,
             placement_after_deadline,
+            sweep_with_retries,
         },
     },
     utils::{BackoffStrategy, ExponentialBackoff},
@@ -571,7 +573,12 @@ impl SlotTask {
                             self.send_cancel(&mut signer, &mut nonce, coi, &plan).await;
                         }
                         Some(Command::CancelAll { market_index, reply }) => {
-                            self.send_cancel_all(&mut signer, &mut nonce, market_index).await;
+                            // Whether it took is reported by `send_cancel_all` itself (an
+                            // `error!` and a critical to the bots). The reply only says the
+                            // sweep is over: `Connector::sweep`'s handle carries no outcome
+                            // yet, so a failed shutdown sweep still exits 0 — the open item
+                            // a `SweepOutcome` (connector `feat/connector-failclosed`) closes.
+                            let _took = self.send_cancel_all(&mut signer, &mut nonce, market_index).await;
                             if let Some(reply) = reply {
                                 let _ = reply.send(());
                             }
@@ -875,15 +882,62 @@ impl SlotTask {
         // here reports it, so a refused transport does not look like a cancel that took.
     }
 
+    /// One market's `CancelAllOrders` (§3.4), sent until the venue takes it or
+    /// [`crate::lighter::slot::SWEEP_ATTEMPTS`] are spent ([`sweep_with_retries`]). Returns
+    /// whether it took.
+    ///
+    /// A sweep that did not take is an `error!` and a `CriticalConnectionError` to every bot.
+    /// It used to be one send and an `info!` "Sent a Lighter CancelAllOrders sweep." whatever
+    /// came back — a `21104` or a 429 included — so the one line an operator reads after a
+    /// bot's death or a stop said the market had been swept while its orders kept resting.
     async fn send_cancel_all(
         &self,
         signer: &mut SignerClient,
         nonce: &mut NonceOwner,
         market_index: i32,
-    ) {
+    ) -> bool {
+        let result = sweep_with_retries(&mut CancelAllSender {
+            slot: self,
+            signer,
+            nonce,
+            market_index,
+        })
+        .await;
+        match result {
+            Ok(attempts) => {
+                info!(
+                    market_index,
+                    attempts, "Sent a Lighter CancelAllOrders sweep; the venue took it."
+                );
+                true
+            }
+            Err(reason) => {
+                error!(
+                    market_index,
+                    %reason,
+                    "A Lighter CancelAllOrders sweep FAILED; orders may still be resting on this \
+                     market."
+                );
+                report_error(
+                    &self.ev_tx,
+                    ErrorKind::CriticalConnectionError,
+                    &format!("CancelAllOrders on market {market_index} failed: {reason}"),
+                );
+                false
+            }
+        }
+    }
+
+    /// One reserve-sign-send round of a sweep. `Err` is why nothing was sent, or why no answer
+    /// came back; the nonce is left exactly as the order path leaves it for any other send.
+    async fn cancel_all_once(
+        &self,
+        signer: &mut SignerClient,
+        nonce: &mut NonceOwner,
+        market_index: i32,
+    ) -> Result<SendOutcome, String> {
         let Some(reserved) = self.reserve(nonce).await else {
-            warn!("Couldn't seed the nonce for a Lighter cancel-all sweep.");
-            return;
+            return Err("couldn't seed the nonce for the sweep".to_string());
         };
         // CANCEL_ALL_TIF_IMMEDIATE requires time_ms = 0, or the .so refuses on the client (§3.4).
         let signed = match signer
@@ -893,19 +947,18 @@ impl SlotTask {
             Ok(signed) => signed,
             Err(error) => {
                 nonce.released();
-                warn!(?error, "The signer refused the Lighter cancel-all.");
-                return;
+                return Err(format!("the signer refused the sweep: {error}"));
             }
         };
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
                 self.apply_nonce(nonce, &outcome).await;
-                info!(market_index, "Sent a Lighter CancelAllOrders sweep.");
+                Ok(outcome)
             }
             Err(error) => {
                 nonce.invalidated();
                 self.reseed(nonce).await;
-                warn!(?error, "The Lighter cancel-all sendTx failed.");
+                Err(format!("the sweep's sendTx failed: {error}"))
             }
         }
     }
@@ -1021,6 +1074,22 @@ impl SlotTask {
                 &format!("{symbol}: {reason}"),
             );
         }
+    }
+}
+
+/// The slot's [`SweepSend`]: one market's `CancelAllOrders`, one reserve-sign-send round at a
+/// time ([`SlotTask::cancel_all_once`]).
+struct CancelAllSender<'a> {
+    slot: &'a SlotTask,
+    signer: &'a mut SignerClient,
+    nonce: &'a mut NonceOwner,
+    market_index: i32,
+}
+
+impl SweepSend for CancelAllSender<'_> {
+    fn send_once(&mut self) -> impl Future<Output = Result<SendOutcome, String>> + Send {
+        self.slot
+            .cancel_all_once(self.signer, self.nonce, self.market_index)
     }
 }
 
