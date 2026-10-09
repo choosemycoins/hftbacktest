@@ -29,7 +29,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::connector::{PublishEvent, SweepOutcome, SweepReason};
+use crate::connector::{Connector, PublishEvent, SweepOutcome, SweepReason};
 
 /// How long the publish task waits for every [`PublishEvent`] sender to be dropped before it
 /// stops anyway.
@@ -590,6 +590,95 @@ impl DeadBotSweeper {
             let _ = done.send((attempt, outcome));
         });
     }
+}
+
+/// The receive loop's bot-liveness step: at most once every [`LIVENESS_POLL_INTERVAL`], and only
+/// with `bot_liveness.enabled`, sweep the bots that went silent **through the backend**, and
+/// follow every sweep to its verdict ([`DeadBotSweeper`]).
+///
+/// Lifted out of `main.rs` so that the wiring is what the tests drive: the handle
+/// `Connector::sweep` returns is what the sweeper waits on, and there nothing pinned it — a closure
+/// that dropped it and answered `None`, fire-and-forget again, passed the whole suite (review of
+/// stage 2).
+pub struct LivenessWatch {
+    enabled: bool,
+    timeout: Duration,
+    last_poll: Instant,
+    sweeps: DeadBotSweeper,
+}
+
+impl LivenessWatch {
+    /// A watch whose first poll is one [`LIVENESS_POLL_INTERVAL`] after `now`.
+    pub fn new(config: &BotLivenessConfig, now: Instant) -> Self {
+        Self {
+            enabled: config.enabled,
+            timeout: config.timeout(),
+            last_poll: now,
+            sweeps: DeadBotSweeper::new(),
+        }
+    }
+
+    /// One turn of the receive loop at `now`. `tx` carries the sweeps' reports and the give-up
+    /// to the bots.
+    pub fn tick(
+        &mut self,
+        now: Instant,
+        registry: &mut BotRegistry,
+        tx: &UnboundedSender<PublishEvent>,
+        connector: &dyn Connector,
+    ) {
+        if !self.enabled || now.saturating_duration_since(self.last_poll) < LIVENESS_POLL_INTERVAL {
+            return;
+        }
+        self.last_poll = now;
+        self.sweeps
+            .poll(now, registry, self.timeout, tx, |symbols, reason| {
+                connector.sweep(symbols, reason, tx.clone())
+            });
+    }
+
+    /// Sweeps started whose verdict has not come back yet.
+    pub fn in_flight(&self) -> usize {
+        self.sweeps.in_flight()
+    }
+
+    /// Retries waiting for their time.
+    pub fn waiting(&self) -> usize {
+        self.sweeps.waiting()
+    }
+}
+
+/// The orderly stop's sweep (`main.rs` module docs): every symbol any bot registered, through the
+/// backend, when `shutdown.sweep_orders` says so — and **waited for**, bounded by
+/// `shutdown.sweep_timeout_ms` ([`await_sweep`]), so a sweep that did not take reaches the exit
+/// code ([`exit_code`]: `Failed` is a non-zero stop). `None`: no sweep ran — switched off,
+/// nothing registered, or a backend with no order path. `tx` goes to the sweep, which holds it
+/// until its cancels have landed (`Connector::sweep`).
+///
+/// Lifted out of `main.rs` for the same reason as [`LivenessWatch`]: a stop that let go of the
+/// handle there exited 0 over a failed sweep, and no test noticed.
+pub async fn stop_sweep(
+    connector: &dyn Connector,
+    registry: &BotRegistry,
+    config: &ShutdownConfig,
+    tx: UnboundedSender<PublishEvent>,
+) -> Option<SweepOutcome> {
+    let symbols = registry.registered_symbols();
+    let sweep = if config.sweep_orders && !symbols.is_empty() {
+        info!(
+            ?symbols,
+            watched_bots = registry.watched(),
+            sweep_timeout = ?config.sweep_timeout(),
+            "Cancelling the registered instruments' orders before stopping; a connector that is \
+             going away cannot manage a resting order. Set `shutdown.sweep_orders = false` to \
+             leave them."
+        );
+        connector.sweep(symbols, SweepReason::ConnectorStopping, tx)
+    } else {
+        drop(tx);
+        None
+    };
+    await_sweep(sweep, config.sweep_timeout()).await
 }
 
 /// The wait before the retry that follows failed attempt `attempt` (1-based), or `None` when
@@ -1440,6 +1529,234 @@ mod tests {
             sweeps_answering(failed, &mut asked),
         );
         assert_eq!(asked.len(), 2, "the old retry's time came and nothing went");
+    }
+
+    // ---- the receive loop's liveness step and the stop's sweep, through a backend ------------
+
+    /// What a backend's `GetOrders` reports: nothing.
+    struct NoOrders;
+
+    impl crate::connector::GetOrders for NoOrders {
+        fn orders(&self, _symbol: Option<String>) -> Vec<hftbacktest::types::Order> {
+            Vec::new()
+        }
+    }
+
+    /// One sweep a backend was asked for: `(symbols, bot, attempt)` — `(None, 0)` for a stop.
+    type SweepAsked = (Vec<String>, Option<u64>, u32);
+
+    /// A backend whose every sweep resolves to `outcome` (`None`: it has no order path), and that
+    /// records what it was asked to sweep.
+    struct SweepingConnector {
+        outcome: Option<SweepOutcome>,
+        asked: std::sync::Mutex<Vec<SweepAsked>>,
+    }
+
+    impl SweepingConnector {
+        fn answering(outcome: Option<SweepOutcome>) -> Self {
+            Self {
+                outcome,
+                asked: Default::default(),
+            }
+        }
+
+        fn asked(&self) -> Vec<SweepAsked> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl Connector for SweepingConnector {
+        fn register(&mut self, _symbol: String) {}
+
+        fn order_manager(
+            &self,
+        ) -> std::sync::Arc<std::sync::Mutex<dyn crate::connector::GetOrders + Send + 'static>>
+        {
+            std::sync::Arc::new(std::sync::Mutex::new(NoOrders))
+        }
+
+        fn run(&mut self, _tx: UnboundedSender<PublishEvent>) {}
+
+        fn submit(
+            &self,
+            _symbol: String,
+            _order: hftbacktest::types::Order,
+            _tx: UnboundedSender<PublishEvent>,
+        ) {
+        }
+
+        fn cancel(
+            &self,
+            _symbol: String,
+            _order: hftbacktest::types::Order,
+            _tx: UnboundedSender<PublishEvent>,
+        ) {
+        }
+
+        fn sweep(
+            &self,
+            symbols: Vec<String>,
+            reason: SweepReason,
+            tx: UnboundedSender<PublishEvent>,
+        ) -> Option<JoinHandle<SweepOutcome>> {
+            let (bot, attempt) = match reason {
+                SweepReason::BotDied { id, attempt } => (Some(id), attempt),
+                SweepReason::ConnectorStopping => (None, 0),
+            };
+            self.asked.lock().unwrap().push((symbols, bot, attempt));
+            let outcome = self.outcome;
+            outcome.map(|outcome| {
+                tokio::spawn(async move {
+                    drop(tx);
+                    outcome
+                })
+            })
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    fn spy_by(bot: u64, attempt: u32) -> SweepAsked {
+        (vec!["SPY".to_string()], Some(bot), attempt)
+    }
+
+    /// **The receive loop's liveness step hands the backend's sweep to the sweeper**, which then
+    /// tries a `Failed` one again. `main.rs` polled the sweeper through a closure nothing drove:
+    /// one that dropped the backend's handle and answered `None` passed the whole suite (review
+    /// of stage 2, M8), and a dead bot's failed sweep was then never tried again nor given up on
+    /// loudly — the C3 fix undone by one line.
+    #[tokio::test]
+    async fn the_liveness_step_follows_a_dead_bots_sweep_through_the_backend() {
+        let t0 = Instant::now();
+        let connector = SweepingConnector::answering(Some(SweepOutcome::Failed));
+        let config = BotLivenessConfig {
+            enabled: true,
+            timeout_ms: 10_000,
+        };
+        let mut watch = LivenessWatch::new(&config, t0);
+        let mut registry = BotRegistry::new();
+        registry.register(7, "SPY".into());
+        registry.heartbeat(7, t0);
+        let (tx, _rx) = unbounded_channel();
+
+        let died = at(t0, 11_000);
+        watch.tick(died, &mut registry, &tx, &connector);
+        assert_eq!(connector.asked(), [spy_by(7, 1)], "the death is swept");
+        let_the_verdicts_come_back().await;
+        let settled = died + LIVENESS_POLL_INTERVAL;
+        watch.tick(settled, &mut registry, &tx, &connector);
+        assert_eq!(
+            (watch.in_flight(), watch.waiting()),
+            (0, 1),
+            "the backend's Failed reached the sweeper: it is to be tried again"
+        );
+        watch.tick(
+            settled + DEAD_BOT_SWEEP_RETRY_WAITS[0],
+            &mut registry,
+            &tx,
+            &connector,
+        );
+        assert_eq!(
+            connector.asked(),
+            [spy_by(7, 1), spy_by(7, 2)],
+            "and is, through the backend, as the second attempt"
+        );
+    }
+
+    /// **...only with `bot_liveness.enabled`, and at most once every
+    /// [`LIVENESS_POLL_INTERVAL`]**: the receive loop turns every microsecond, and asking the
+    /// registry that often would burn a core answering "no".
+    #[tokio::test]
+    async fn the_liveness_step_polls_only_when_on_and_at_most_once_an_interval() {
+        let t0 = Instant::now();
+        let connector = SweepingConnector::answering(Some(SweepOutcome::Cancelled));
+        let (tx, _rx) = unbounded_channel();
+        let dead_by = |registry: &mut BotRegistry| {
+            registry.register(7, "SPY".into());
+            registry.heartbeat(7, t0);
+        };
+        let started = at(t0, 11_000);
+
+        let mut registry = BotRegistry::new();
+        dead_by(&mut registry);
+        let off = BotLivenessConfig {
+            enabled: false,
+            timeout_ms: 10_000,
+        };
+        let mut watch = LivenessWatch::new(&off, started);
+        watch.tick(at(t0, 3_600_000), &mut registry, &tx, &connector);
+        assert!(connector.asked().is_empty(), "switched off: never");
+
+        let on = BotLivenessConfig {
+            enabled: true,
+            timeout_ms: 10_000,
+        };
+        let mut watch = LivenessWatch::new(&on, started);
+        watch.tick(
+            started + LIVENESS_POLL_INTERVAL - Duration::from_millis(1),
+            &mut registry,
+            &tx,
+            &connector,
+        );
+        assert!(
+            connector.asked().is_empty(),
+            "not before the interval is up"
+        );
+        watch.tick(
+            started + LIVENESS_POLL_INTERVAL,
+            &mut registry,
+            &tx,
+            &connector,
+        );
+        assert_eq!(connector.asked(), [spy_by(7, 1)]);
+    }
+
+    /// **The orderly stop sweeps every registered symbol through the backend, waits for the
+    /// verdict, and a sweep that failed exits non-zero.** `main.rs` did this inline; letting go
+    /// of the handle there — `None` in place of the backend's task — made a failed stop sweep an
+    /// exit 0 and passed the whole suite (review of stage 2, M11). Switched off, or with nothing
+    /// registered, no sweep is asked for and none is waited for.
+    #[tokio::test]
+    async fn the_stop_sweeps_through_the_backend_and_a_failed_sweep_exits_non_zero() {
+        let mut registry = BotRegistry::new();
+        registry.register(7, "SPY".into());
+        registry.register(9, "XAU".into());
+        for (outcome, code) in [(SweepOutcome::Failed, 1), (SweepOutcome::Cancelled, 0)] {
+            let connector = SweepingConnector::answering(Some(outcome));
+            let (tx, _rx) = unbounded_channel();
+            let sweep = stop_sweep(&connector, &registry, &ShutdownConfig::default(), tx).await;
+            assert_eq!(sweep, Some(outcome), "the backend's verdict is the stop's");
+            assert_eq!(
+                connector.asked(),
+                [(vec!["SPY".to_string(), "XAU".to_string()], None, 0)]
+            );
+            let report = StopReport {
+                kind: StopKind::Orderly,
+                sweep,
+                drain: Some(DrainOutcome::SendersDropped { published: 0 }),
+            };
+            assert_eq!(exit_code(&report), code, "{outcome:?}");
+        }
+
+        let connector = SweepingConnector::answering(Some(SweepOutcome::Failed));
+        let off = ShutdownConfig {
+            sweep_orders: false,
+            ..ShutdownConfig::default()
+        };
+        let (tx, _rx) = unbounded_channel();
+        assert_eq!(stop_sweep(&connector, &registry, &off, tx).await, None);
+        let (tx, _rx) = unbounded_channel();
+        assert_eq!(
+            stop_sweep(
+                &connector,
+                &BotRegistry::new(),
+                &ShutdownConfig::default(),
+                tx
+            )
+            .await,
+            None
+        );
+        assert!(connector.asked().is_empty(), "nothing asked of the backend");
     }
 
     /// The drain's good ending: everything queued is published, and the task only stops once

@@ -13,8 +13,9 @@
 //!    either ([`supervision::publishable_while_stopping`]).
 //! 2. The registered instruments are swept, if configured to be — a stopping connector
 //!    leaves no unattended maker — and the stop **waits for that sweep**, bounded by
-//!    `shutdown.sweep_timeout_ms`. The publish task is still in its steady-state loop
-//!    throughout, so the cancels it confirms reach whichever bots are still listening.
+//!    `shutdown.sweep_timeout_ms` ([`supervision::stop_sweep`]). The publish task is still in
+//!    its steady-state loop throughout, so the cancels it confirms reach whichever bots are
+//!    still listening.
 //! 3. `Connector::shutdown` winds the backend's stream tasks down, dropping theirs.
 //! 4. Only then is the publish task told to stop, and it stops only once **every** sender is
 //!    gone ([`supervision::drain_publish`]) or `shutdown.grace_ms` has passed.
@@ -66,6 +67,13 @@
 //! tried again 15, 30, 60 and 120 s on, each retry first leaving out every symbol a live bot
 //! quotes by then (a restarted bot registers under a new id), and the fifth failure is an
 //! `error!` and a `CriticalConnectionError` to the bots.
+//!
+//! **The wiring lives in `supervision`, where tests drive it** — the receive loop's liveness step
+//! ([`supervision::LivenessWatch::tick`]) and the stop's sweep ([`supervision::stop_sweep`]),
+//! each against a stand-in backend that answers `Failed`. Written inline here, a closure that
+//! dropped the backend's handle (the dead bot's sweep fire-and-forget again) and a stop that let
+//! go of its own (a failed stop sweep exiting 0) both passed every test. What is left here is
+//! one call to each.
 //!
 //! **What the sweep can and cannot be scoped to.** A venue cancel reaches every order the
 //! *account* holds on a symbol; nothing on the venue records which bot asked for an order,
@@ -119,21 +127,20 @@ use crate::{
     binancefutures::BinanceFutures,
     binancespot::BinanceSpot,
     bybit::Bybit,
-    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent, SweepReason},
+    connector::{Connector, ConnectorBuilder, GetOrders, PublishEvent},
     hyperliquid::Hyperliquid,
     lighter::{Instance, Lighter},
     supervision::{
         BotRegistry,
-        DeadBotSweeper,
         DrainOutcome,
-        LIVENESS_POLL_INTERVAL,
+        LivenessWatch,
         StopKind,
         StopReport,
         SupervisionConfig,
-        await_sweep,
         drain_publish,
         exit_code,
         publishable_while_stopping,
+        stop_sweep,
     },
 };
 
@@ -180,9 +187,10 @@ fn run_receive_task(
         .create::<ipc::Service>()
         .map_err(|error| ChannelError::BuildError(error.to_string()))?;
     let bot_rx = IceoryxBuilder::new(name).bot(false).receiver()?;
-    let liveness_timeout = supervision.bot_liveness.timeout();
-    let mut last_liveness_poll = Instant::now();
-    let mut dead_bot_sweeps = DeadBotSweeper::new();
+    // Sweeps the bots that went silent, and follows each sweep to its verdict: a failed one is
+    // tried again, never over a symbol a live bot quotes by then, and the last failure is told
+    // to the bots (`LivenessWatch`, `DeadBotSweeper`).
+    let mut liveness = LivenessWatch::new(&supervision.bot_liveness, Instant::now());
     loop {
         // Checked before receiving, not after: once the stop has begun, a request that is
         // already on the queue must not be acted on. Submitting an order into a connector
@@ -247,21 +255,7 @@ fn run_receive_task(
                     }
                 }
 
-                if supervision.bot_liveness.enabled
-                    && last_liveness_poll.elapsed() >= LIVENESS_POLL_INTERVAL
-                {
-                    last_liveness_poll = Instant::now();
-                    // Sweeps the bots that went silent, and follows each sweep to its verdict:
-                    // a failed one is tried again, never over a symbol a live bot quotes by
-                    // then, and the last failure is told to the bots (`DeadBotSweeper`).
-                    dead_bot_sweeps.poll(
-                        last_liveness_poll,
-                        registry,
-                        liveness_timeout,
-                        &tx,
-                        |symbols, reason| connector.sweep(symbols, reason, tx.clone()),
-                    );
-                }
+                liveness.tick(Instant::now(), registry, &tx, &**connector);
             }
             Err(error) => {
                 // The one thing that ends this loop without anybody asking, and the sole
@@ -277,10 +271,10 @@ fn run_receive_task(
             }
         }
     }
-    if dead_bot_sweeps.in_flight() + dead_bot_sweeps.waiting() > 0 {
+    if liveness.in_flight() + liveness.waiting() > 0 {
         info!(
-            in_flight = dead_bot_sweeps.in_flight(),
-            waiting = dead_bot_sweeps.waiting(),
+            in_flight = liveness.in_flight(),
+            waiting = liveness.waiting(),
             "Leaving dead bots' sweeps unfinished or unretried; the stop's own sweep, when it is \
              on, covers every registered symbol."
         );
@@ -895,33 +889,16 @@ async fn run() {
     };
 
     // From here on this is the orderly stop, in order. See the module docs.
-    let symbols = registry.registered_symbols();
-    let sweep_timeout = supervision.shutdown.sweep_timeout();
-    let sweep = if supervision.shutdown.sweep_orders && !symbols.is_empty() {
-        info!(
-            ?symbols,
-            watched_bots = registry.watched(),
-            ?sweep_timeout,
-            "Cancelling the registered instruments' orders before stopping; a connector \
-             that is going away cannot manage a resting order. Set `shutdown.sweep_orders \
-             = false` to leave them."
-        );
-        connector.sweep(symbols, SweepReason::ConnectorStopping, sweep_tx)
-    } else {
-        drop(sweep_tx);
-        None
-    };
-
-    // **Waited for, not merely started.** The publish task is still in its steady-state loop
-    // while this runs, so the cancels it confirms reach whichever bots are still listening;
-    // and nothing is counting down a deadline that was never meant to bound a sweep. A stop
-    // that gives up here has left orders resting, which is the failure the sweep exists to
-    // prevent, so it is loud and it is not exit 0.
-    // Finding 2: fold the task into a `SweepOutcome`, so the exit code can tell "cancelled"
-    // from "ran but may have left orders resting". A panic (`Ok(Err(_))`) or a timeout is
-    // `Failed` — orders may be on the venue — not a silent success. `None` here means no sweep
-    // task ran at all (disabled, nothing registered, or a backend with no order path).
-    let sweep = await_sweep(sweep, sweep_timeout).await;
+    //
+    // **Waited for, not merely started** (`stop_sweep`). The publish task is still in its
+    // steady-state loop while this runs, so the cancels it confirms reach whichever bots are
+    // still listening; and nothing is counting down a deadline that was never meant to bound a
+    // sweep. A stop that gives up here has left orders resting, which is the failure the sweep
+    // exists to prevent, so it is loud and it is not exit 0: the task's verdict is folded into
+    // a `SweepOutcome` (Finding 2) — a panic or a timeout is `Failed`, orders may be on the
+    // venue — and `None` means no sweep ran at all (disabled, nothing registered, or a backend
+    // with no order path).
+    let sweep = stop_sweep(&*connector, &registry, &supervision.shutdown, sweep_tx).await;
 
     // After the sweep, so a sweep in flight is not aborted along with the streams.
     connector.shutdown();

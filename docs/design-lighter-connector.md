@@ -1215,6 +1215,23 @@ an_old_one`, `a_dead_bots_sweep_says_which_attempt_it_is` (`supervision.rs`),
 `only_a_dead_bots_second_attempt_onwards_is_a_retry` (`connector.rs`),
 `a_retry_sweeps_failure_is_logged_and_not_told_to_the_bots_again` (`order_path.rs`).
 
+**Проводка в `main.rs` закреплена тестами [2026-10-09].** Шаг живости цикла приёма и стоп-свип
+были написаны прямо в `main.rs`, где их не гонял ни один тест: замыкание, которое дропает хэндл
+бэкенда и отвечает `None` (свип мёртвого бота снова fire-and-forget), и стоп, отпускающий свой
+хэндл (проваленный стоп-свип выходит с 0), проходили весь набор (ревью этапа 2, мутации M8 и
+M11). Теперь это `supervision::LivenessWatch::tick` (интервал `LIVENESS_POLL_INTERVAL`,
+`bot_liveness.enabled`, `Connector::sweep` → `DeadBotSweeper`) и `supervision::stop_sweep`
+(`shutdown.sweep_orders`, `Connector::sweep(ConnectorStopping)` → `await_sweep` с
+`sweep_timeout_ms`); в `main.rs` осталось по одному вызову. Пины на подставном бэкенде,
+отвечающем `Failed`: `the_liveness_step_follows_a_dead_bots_sweep_through_the_backend` (хэндл
+доходит до сборщика, повтор — вторая попытка через бэкенд),
+`the_liveness_step_polls_only_when_on_and_at_most_once_an_interval`,
+`the_stop_sweeps_through_the_backend_and_a_failed_sweep_exits_non_zero` (вердикт бэкенда —
+вердикт стопа, `exit_code` = 1 на `Failed`, 0 на `Cancelled`; выключенный свип и пустой реестр
+бэкенд не трогают). Чего это не закрывает: сами два вызова в `main.rs` (`run()` тестом не
+гоняется) — удалить вызов всё ещё можно незаметно, но это уже не «одна строчка внутри
+замыкания», а исчезнувший шаг.
+
 Чего кулдаун не покрывает: приватный стрим (реконнект: `accountLimits`, каталог) живёт вне слота и в
 кулдаун читает как раньше; запросы, уже стоящие в очереди слота за ожидающим свипом, уходят после
 него.
