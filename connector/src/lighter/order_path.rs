@@ -63,7 +63,7 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    connector::{ApplyOutcome, PublishEvent, SweepOutcome},
+    connector::{ApplyOutcome, PublishEvent, SweepOutcome, SweepReason},
     lighter::{
         LighterError,
         SharedSymbolSet,
@@ -428,6 +428,8 @@ enum Command {
         /// The last moment an attempt may still be started: the send gate is waited for until
         /// then and no longer ([`crate::lighter::gate::admit_by`]).
         deadline: Instant,
+        /// Whether a failure is told to the bots or only logged ([`SweepFailure`]).
+        on_failure: SweepFailure,
     },
     /// Mint a WS auth token expiring at `deadline` (absolute unix seconds). The private stream
     /// asks the slot because the slot owns the one signer.
@@ -435,6 +437,22 @@ enum Command {
         deadline: i64,
         reply: oneshot::Sender<Option<String>>,
     },
+}
+
+/// What a `CancelAllOrders` sweep that failed does besides answering its waiter: tell the bots,
+/// or only log it.
+///
+/// One condition is one `CriticalConnectionError` to the bots, not one per attempt at it. A
+/// sweep tried again after a failure they have already heard about — a dead bot's retry
+/// (`SweepReason::is_retry`, §4.16) — fails with an `error!` only: five attempts in about four
+/// minutes, each with its own Critical, could take a healthy bot sharing the connector past its
+/// breaker (8 a minute on the RH bots). The supervision layer tells the bots when it gives up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepFailure {
+    /// A `CriticalConnectionError` to every bot, and the `error!`.
+    TellBots,
+    /// The `error!` only.
+    LogOnly,
 }
 
 /// The armed order path: the handle the [`crate::lighter::Lighter`] connector holds.
@@ -612,7 +630,15 @@ impl OrderPath {
     /// even be queued (the slot task is gone), whose reply was dropped, or which timed out
     /// counts as an unconfirmed cancel — [`SweepOutcome::Failed`] — because its orders may
     /// still be resting. An empty market list is [`SweepOutcome::Cancelled`]: nothing to do.
-    pub fn sweep(&self, market_indices: Vec<i32>) -> JoinHandle<SweepOutcome> {
+    ///
+    /// `reason` decides whether a failure is told to the bots ([`SweepFailure`]): a dead bot's
+    /// retry ([`SweepReason::is_retry`]) only logs its own.
+    pub fn sweep(&self, market_indices: Vec<i32>, reason: SweepReason) -> JoinHandle<SweepOutcome> {
+        let on_failure = if reason.is_retry() {
+            SweepFailure::LogOnly
+        } else {
+            SweepFailure::TellBots
+        };
         let command_tx = self.command_tx.clone();
         let deadline = Instant::now() + SWEEP_GATE_DEADLINE;
         tokio::spawn(async move {
@@ -625,6 +651,7 @@ impl OrderPath {
                         market_index,
                         reply: Some(reply_tx),
                         deadline,
+                        on_failure,
                     })
                     .is_ok()
                 {
@@ -806,7 +833,7 @@ impl SlotTask {
                                 self.send_cancel(&mut signer, &mut nonce, &mut gate, &mut held, admission, coi, &plan).await;
                             }
                         }
-                        Some(Command::CancelAll { market_index, reply, deadline }) => {
+                        Some(Command::CancelAll { market_index, reply, deadline, on_failure }) => {
                             let mut sender = CancelAllSender {
                                 slot: &self,
                                 signer: &mut signer,
@@ -816,7 +843,7 @@ impl SlotTask {
                                 deadline,
                                 admission: Admission::Send,
                             };
-                            sweep_market(&mut sender, &self.ev_tx, market_index, reply).await;
+                            sweep_market(&mut sender, &self.ev_tx, market_index, reply, on_failure).await;
                         }
                         Some(Command::MintAuth { deadline, reply }) => {
                             let token = signer
@@ -1691,15 +1718,17 @@ impl HeldCancels {
 /// [`OrderPath::sweep`] folds it into the `SweepOutcome` an orderly stop exits on, so a sweep
 /// that never took is a non-zero stop rather than the exit 0 a bare "done" reply gave.
 ///
-/// A sweep that did not take is an `error!` and a `CriticalConnectionError` to every bot. It
-/// used to be one send and an `info!` "Sent a Lighter CancelAllOrders sweep." whatever came back
-/// — a `21104` or a 429 included — so the one line an operator reads after a bot's death or a
-/// stop said the market had been swept while its orders kept resting.
+/// A sweep that did not take is an `error!` and — unless it is a retry the bots have already
+/// heard about ([`SweepFailure::LogOnly`]) — a `CriticalConnectionError` to every bot. It used to
+/// be one send and an `info!` "Sent a Lighter CancelAllOrders sweep." whatever came back — a
+/// `21104` or a 429 included — so the one line an operator reads after a bot's death or a stop
+/// said the market had been swept while its orders kept resting.
 async fn sweep_market(
     sender: &mut impl SweepSend,
     ev_tx: &UnboundedSender<PublishEvent>,
     market_index: i32,
     reply: Option<oneshot::Sender<bool>>,
+    on_failure: SweepFailure,
 ) -> bool {
     let took = match sweep_with_retries(sender).await {
         Ok(attempts) => {
@@ -1713,14 +1742,19 @@ async fn sweep_market(
             error!(
                 market_index,
                 %reason,
+                ?on_failure,
                 "A Lighter CancelAllOrders sweep FAILED; orders may still be resting on this \
                  market."
             );
-            report_error(
-                ev_tx,
-                ErrorKind::CriticalConnectionError,
-                &format!("CancelAllOrders on market {market_index} failed: {reason}"),
-            );
+            // A retry's failure repeats what the bots were told when the first attempt failed
+            // ([`SweepFailure`]).
+            if on_failure == SweepFailure::TellBots {
+                report_error(
+                    ev_tx,
+                    ErrorKind::CriticalConnectionError,
+                    &format!("CancelAllOrders on market {market_index} failed: {reason}"),
+                );
+            }
             false
         }
     };
@@ -2249,6 +2283,7 @@ impl PrivateStreamTask {
                             market_index,
                             reply: None,
                             deadline: Instant::now() + SWEEP_GATE_DEADLINE,
+                            on_failure: SweepFailure::TellBots,
                         });
                     }
                     // Reconnect reconciliation: expire our orders the venue no longer lists,
@@ -2480,6 +2515,7 @@ mod tests {
         SWEEP_GATE_DEADLINE,
         SWEEP_REPLY_WAIT,
         SlotTask,
+        SweepFailure,
         auth_refresh_after,
         clamp_auth_lifetime,
         markets_to_sweep_on_connect,
@@ -2487,7 +2523,7 @@ mod tests {
         sweep_market,
     };
     use crate::{
-        connector::{PublishEvent, SweepOutcome},
+        connector::{PublishEvent, SweepOutcome, SweepReason},
         lighter::{
             LighterError,
             fixtures::{
@@ -3650,10 +3686,11 @@ mod tests {
         venue: &mut ScriptedVenue,
     ) -> (SweepOutcome, i32, Vec<PublishEvent>) {
         let (order_path, mut command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
-        let sweep = order_path.sweep(vec![42]);
+        let sweep = order_path.sweep(vec![42], SweepReason::ConnectorStopping);
         let Some(Command::CancelAll {
             market_index,
             reply,
+            on_failure,
             ..
         }) = command_rx.recv().await
         else {
@@ -3662,7 +3699,7 @@ mod tests {
         assert_eq!(market_index, 42);
 
         let (ev_tx, mut ev_rx) = unbounded_channel();
-        sweep_market(venue, &ev_tx, market_index, reply).await;
+        sweep_market(venue, &ev_tx, market_index, reply, on_failure).await;
         let outcome = sweep.await.expect("the sweep task does not panic");
         let code = exit_code(&StopReport {
             kind: StopKind::Orderly,
@@ -3712,6 +3749,57 @@ mod tests {
         assert_eq!(code, 0, "witness: a sweep the venue took is a clean stop");
     }
 
+    /// **A dead bot's retry sweep that fails is logged, not told to the bots again — the first
+    /// attempt and a stopping connector's sweep are.** Every failed attempt used to publish its
+    /// own `CriticalConnectionError` (review of stage 2): a bot that stays dead for a minute
+    /// cost 3 of them in that minute, plus the give-up — 7-10 a minute with a maintenance
+    /// window's own, against the RH bots' breaker of 8, so a healthy bot on the same connector
+    /// exited too. The retry is still answered as failed, so it is still tried again.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_sweeps_failure_is_logged_and_not_told_to_the_bots_again() {
+        let (order_path, mut command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
+        for (reason, expected) in [
+            (
+                SweepReason::BotDied { id: 7, attempt: 1 },
+                SweepFailure::TellBots,
+            ),
+            (
+                SweepReason::BotDied { id: 7, attempt: 2 },
+                SweepFailure::LogOnly,
+            ),
+            (SweepReason::ConnectorStopping, SweepFailure::TellBots),
+        ] {
+            let _sweep = order_path.sweep(vec![42], reason);
+            let Some(Command::CancelAll { on_failure, .. }) = command_rx.recv().await else {
+                panic!("a sweep asks the slot for its CancelAllOrders");
+            };
+            assert_eq!(on_failure, expected, "{reason:?}");
+        }
+
+        for (on_failure, told) in [(SweepFailure::LogOnly, 0), (SweepFailure::TellBots, 1)] {
+            let mut venue = ScriptedVenue::new((0..10).map(|_| Ok(throttled())).collect());
+            let (ev_tx, mut ev_rx) = unbounded_channel();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            assert!(!sweep_market(&mut venue, &ev_tx, 42, Some(reply_tx), on_failure).await);
+            assert_eq!(
+                reply_rx.await,
+                Ok(false),
+                "{on_failure:?}: answered as failed"
+            );
+            let mut criticals = 0;
+            while let Ok(event) = ev_rx.try_recv() {
+                if matches!(
+                    event,
+                    PublishEvent::LiveEvent(LiveEvent::Error(error))
+                        if error.kind == ErrorKind::CriticalConnectionError
+                ) {
+                    criticals += 1;
+                }
+            }
+            assert_eq!(criticals, told, "{on_failure:?}");
+        }
+    }
+
     /// **A sweep the slot cannot even be asked for is a failed sweep** — the slot task is gone
     /// (its command channel closed), so nothing will cancel that market's orders; a stop that
     /// read it as done would exit 0 over a resting grid. Nothing to sweep is done, though.
@@ -3720,11 +3808,17 @@ mod tests {
         let (order_path, command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
         drop(command_rx);
         assert_eq!(
-            order_path.sweep(vec![42]).await.unwrap(),
+            order_path
+                .sweep(vec![42], SweepReason::ConnectorStopping)
+                .await
+                .unwrap(),
             SweepOutcome::Failed
         );
         assert_eq!(
-            order_path.sweep(Vec::new()).await.unwrap(),
+            order_path
+                .sweep(Vec::new(), SweepReason::ConnectorStopping)
+                .await
+                .unwrap(),
             SweepOutcome::Cancelled,
             "no market to sweep is nothing left resting"
         );
@@ -3736,7 +3830,7 @@ mod tests {
     async fn a_sweep_the_slot_never_answers_is_failed_after_its_wait() {
         let (order_path, mut command_rx, _ev_tx, _ev_rx) = order_path_over_eth(true);
         let started = time::Instant::now();
-        let sweep = order_path.sweep(vec![42]);
+        let sweep = order_path.sweep(vec![42], SweepReason::ConnectorStopping);
         let Some(Command::CancelAll { reply, .. }) = command_rx.recv().await else {
             panic!("the sweep asks the slot");
         };
@@ -4147,7 +4241,9 @@ mod tests {
         slot.confirm(1);
         slot.cancel(&quote);
         slot.venue_until(|venue| venue.sent().len() == 2).await;
-        let sweep = slot.order_path.sweep(vec![42]);
+        let sweep = slot
+            .order_path
+            .sweep(vec![42], SweepReason::ConnectorStopping);
         assert_eq!(sweep.await.unwrap(), SweepOutcome::Cancelled);
         assert_eq!(
             slot.venue
@@ -4183,7 +4279,10 @@ mod tests {
         slot.venue_until(|venue| venue.sent().len() == 2).await;
         let started = time::Instant::now();
         assert_eq!(
-            slot.order_path.sweep(vec![42]).await.unwrap(),
+            slot.order_path
+                .sweep(vec![42], SweepReason::ConnectorStopping)
+                .await
+                .unwrap(),
             SweepOutcome::Cancelled
         );
         assert!(
@@ -4533,7 +4632,11 @@ mod tests {
         let _ = slot.next_event().await;
         let told_at = time::Instant::now();
 
-        let outcome = slot.order_path.sweep(vec![42]).await.unwrap();
+        let outcome = slot
+            .order_path
+            .sweep(vec![42], SweepReason::ConnectorStopping)
+            .await
+            .unwrap();
         assert_eq!(outcome, SweepOutcome::Cancelled);
         assert!(told_at.elapsed() >= Duration::from_millis(1_000));
         assert_eq!(
@@ -4557,7 +4660,11 @@ mod tests {
         let _ = slot.next_event().await;
 
         let asked = time::Instant::now();
-        let outcome = slot.order_path.sweep(vec![42]).await.unwrap();
+        let outcome = slot
+            .order_path
+            .sweep(vec![42], SweepReason::ConnectorStopping)
+            .await
+            .unwrap();
         assert_eq!(outcome, SweepOutcome::Failed);
         assert!(
             asked.elapsed() < Duration::from_secs(2),
@@ -5013,7 +5120,10 @@ mod tests {
         let _ = as_error(slot.next_event().await);
 
         assert_eq!(
-            slot.order_path.sweep(vec![42]).await.unwrap(),
+            slot.order_path
+                .sweep(vec![42], SweepReason::ConnectorStopping)
+                .await
+                .unwrap(),
             SweepOutcome::Cancelled
         );
         let sent = slot.venue.sent_at();
@@ -5040,7 +5150,10 @@ mod tests {
         slot.venue.answer_send_tx_with([too_many_requests()]);
         let started = time::Instant::now();
         assert_eq!(
-            slot.order_path.sweep(vec![42]).await.unwrap(),
+            slot.order_path
+                .sweep(vec![42], SweepReason::ConnectorStopping)
+                .await
+                .unwrap(),
             SweepOutcome::Failed
         );
         assert!(started.elapsed() < Duration::from_secs(5), "failed at once");
@@ -5078,7 +5191,10 @@ mod tests {
         slot.venue.answer_send_tx_with([too_many_requests()]);
         let started = time::Instant::now();
         assert_eq!(
-            slot.order_path.sweep(vec![42]).await.unwrap(),
+            slot.order_path
+                .sweep(vec![42], SweepReason::ConnectorStopping)
+                .await
+                .unwrap(),
             SweepOutcome::Cancelled
         );
         let elapsed = started.elapsed();

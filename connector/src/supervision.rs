@@ -577,7 +577,10 @@ impl DeadBotSweeper {
     {
         let handle = sweep(
             attempt.symbols.clone(),
-            SweepReason::BotDied { id: attempt.id },
+            SweepReason::BotDied {
+                id: attempt.id,
+                attempt: attempt.attempt,
+            },
         );
         self.in_flight += 1;
         let done = self.done_tx.clone();
@@ -1259,6 +1262,60 @@ mod tests {
             ]
         );
         assert_eq!(sweeper.waiting(), 0);
+    }
+
+    /// **Every sweep says which attempt it is: the first after a death is not a retry, the four
+    /// after it are.** That is what lets a backend tell the bots about a failed sweep once per
+    /// death rather than once per attempt — Lighter's `sweep_market` published a Critical on
+    /// every failed attempt, and five of them in about four minutes, on top of a maintenance
+    /// window's own, could take a healthy bot on the same connector past its 8-a-minute breaker.
+    #[tokio::test]
+    async fn a_dead_bots_sweep_says_which_attempt_it_is() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut registry = BotRegistry::new();
+        registry.register(7, "SPY".into());
+        registry.heartbeat(7, t0);
+        let (tx, _rx) = unbounded_channel();
+        let mut sweeper = DeadBotSweeper::new();
+        let reasons = std::cell::RefCell::new(Vec::new());
+        let failing = |_: Vec<String>, reason: SweepReason| {
+            reasons.borrow_mut().push(reason);
+            Some(tokio::spawn(async { SweepOutcome::Failed }))
+        };
+
+        let mut now = at(t0, 11_000);
+        sweeper.poll(now, &mut registry, timeout, &tx, failing);
+        for wait in DEAD_BOT_SWEEP_RETRY_WAITS {
+            let_the_verdicts_come_back().await;
+            sweeper.poll(now, &mut registry, timeout, &tx, failing);
+            now += wait;
+            sweeper.poll(now, &mut registry, timeout, &tx, failing);
+        }
+
+        let reasons = reasons.into_inner();
+        let attempts: Vec<(Option<u64>, u32)> = reasons
+            .iter()
+            .map(|reason| match reason {
+                SweepReason::BotDied { id, attempt } => (Some(*id), *attempt),
+                SweepReason::ConnectorStopping => (None, 0),
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            [
+                (Some(7), 1),
+                (Some(7), 2),
+                (Some(7), 3),
+                (Some(7), 4),
+                (Some(7), 5)
+            ]
+        );
+        assert!(!reasons[0].is_retry(), "the first is told to the bots");
+        assert!(
+            reasons[1..].iter().all(SweepReason::is_retry),
+            "the retries only log their own failures"
+        );
     }
 
     /// A sweep that took is done, and so is one with nothing to report: a documented no-op

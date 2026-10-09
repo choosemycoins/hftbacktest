@@ -553,7 +553,7 @@ impl Connector for Lighter {
         // The private stream holds its own publish sender and reports the cancel confirmations;
         // this sender is not needed to carry them, so it is dropped rather than parked.
         drop(ev_tx);
-        Some(order_path.sweep(market_indices))
+        Some(order_path.sweep(market_indices, reason))
     }
 
     /// Ends the stream task, so its sender is dropped and the publish task can see the

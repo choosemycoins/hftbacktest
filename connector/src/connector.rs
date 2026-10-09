@@ -37,7 +37,12 @@ pub trait ConnectorBuilder {
 pub enum SweepReason {
     /// A bot that had been heartbeating went silent for longer than the configured window.
     /// Its orders are still resting on the venue and nothing is managing them.
-    BotDied { id: u64 },
+    BotDied {
+        id: u64,
+        /// 1 for the sweep that followed the death, then one more per retry of a sweep that
+        /// failed (`crate::supervision::DeadBotSweeper`).
+        attempt: u32,
+    },
     /// This connector is stopping. Anything it leaves resting is unattended until whatever
     /// replaces it has connected and reconciled.
     ConnectorStopping,
@@ -51,9 +56,17 @@ impl SweepReason {
     /// after a restart, and it is not answerable from a formatted blob.
     pub fn bot_id(&self) -> Option<u64> {
         match self {
-            Self::BotDied { id } => Some(*id),
+            Self::BotDied { id, .. } => Some(*id),
             Self::ConnectorStopping => None,
         }
+    }
+
+    /// Whether this sweep tries again after one that failed, whose failure the bots have already
+    /// been told. A backend tells the bots about a failed sweep once per death, not once per
+    /// attempt: a retry's own failure is only logged, and the supervision layer tells the bots
+    /// when it gives up (`crate::supervision::DeadBotSweeper`).
+    pub fn is_retry(&self) -> bool {
+        matches!(self, Self::BotDied { attempt, .. } if *attempt > 1)
     }
 }
 
@@ -214,7 +227,22 @@ pub trait GetOrders {
 
 #[cfg(test)]
 mod tests {
-    use super::SweepOutcome;
+    use super::{SweepOutcome, SweepReason};
+
+    /// **Only a dead bot's second attempt onwards is a retry.** The first sweep after a death,
+    /// and a stopping connector's sweep, are the ones whose failure the bots must hear; a retry's
+    /// failure repeats news they already have.
+    #[test]
+    fn only_a_dead_bots_second_attempt_onwards_is_a_retry() {
+        assert!(!SweepReason::BotDied { id: 7, attempt: 1 }.is_retry());
+        for attempt in 2..=5 {
+            assert!(
+                SweepReason::BotDied { id: 7, attempt }.is_retry(),
+                "{attempt}"
+            );
+        }
+        assert!(!SweepReason::ConnectorStopping.is_retry());
+    }
 
     /// **Every asked cancel confirmed — or nothing to cancel — is the only success.** A sweep
     /// aggregates one boolean per unit it tried to cancel; `from_confirmations` folds them, and
