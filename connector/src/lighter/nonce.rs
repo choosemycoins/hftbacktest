@@ -7,7 +7,9 @@
 //! window** — a repeat and a skip are both refused with the same `21104 invalid nonce`, and
 //! neither moves the counter (§2.7). Parallelism comes from provisioning more key slots, not
 //! from pipelining one, so a slot serialises: **one transaction in flight at a time** (§4.12,
-//! the real constraint, not the 350 ms folklore in the SDK docstring).
+//! the real constraint, not the 350 ms folklore in the SDK docstring) — or one **run** of
+//! consecutive nonces, which the venue takes in a single `sendTxBatch` (§3.7,
+//! [`NonceOwner::reserve_run`]); the run is still one request in flight.
 //!
 //! This type owns that counter for a single slot. It is pure state — no I/O, no clock — so
 //! the whole of the measured semantics is unit-tested here without a socket. The async slot
@@ -54,8 +56,9 @@ pub struct NonceOwner {
     api_key_index: u8,
     /// The value [`Self::reserve`] hands out next, or `None` when the counter is not trusted.
     next: Option<i64>,
-    /// The value currently in flight, `Some` between [`Self::reserve`] and its resolution.
-    reserved: Option<i64>,
+    /// The run currently in flight as `(first, len)` — `len` is 1 for [`Self::reserve`] —
+    /// `Some` between the reservation and its resolution.
+    reserved: Option<(i64, i64)>,
 }
 
 impl NonceOwner {
@@ -107,20 +110,45 @@ impl NonceOwner {
     /// [`NonceError::NotSeeded`] if the counter is not trusted. On success the slot is
     /// in flight until [`Self::consumed`], [`Self::released`] or [`Self::invalidated`].
     pub fn reserve(&mut self) -> Result<i64, NonceError> {
+        self.reserve_run(1)
+    }
+
+    /// Reserves a **run** of `len` consecutive nonces, `first..first + len`, for a
+    /// `sendTxBatch` (design note §3.7: the venue wants a batch's nonces consecutive), and
+    /// returns `first`. The `i`-th transaction of the batch signs with `first + i`.
+    ///
+    /// The same rules as [`Self::reserve`] — which is the run of one — hold for the run as a
+    /// whole: one run in flight per slot, none while unseeded, and it is resolved by
+    /// [`Self::consumed`] (advances past the whole run), [`Self::released`] or
+    /// [`Self::invalidated`]. A `len` of 0 reserves a run of one: there is no empty send.
+    pub fn reserve_run(&mut self, len: usize) -> Result<i64, NonceError> {
         if self.reserved.is_some() {
             return Err(NonceError::InFlight);
         }
-        let n = self.next.ok_or(NonceError::NotSeeded)?;
-        self.reserved = Some(n);
-        Ok(n)
+        let first = self.next.ok_or(NonceError::NotSeeded)?;
+        self.reserved = Some((first, len.max(1) as i64));
+        Ok(first)
+    }
+
+    /// Shrinks the run in flight to its first `len` nonces — the transactions the signer
+    /// actually signed; one it refused took no number (§3.7). Never grows the run. `0` leaves
+    /// nothing in flight and nothing spent, as [`Self::released`].
+    pub fn truncate_run(&mut self, len: usize) {
+        if let Some((first, reserved)) = self.reserved {
+            self.reserved = match (len as i64).min(reserved) {
+                0 => None,
+                kept => Some((first, kept)),
+            };
+        }
     }
 
     /// The sequencer consumed the reserved nonce (HTTP 200, whatever the *order*'s fate — see
-    /// outcomes 1 and 2 above). Advances the counter by exactly one and clears the in-flight
-    /// reservation. A no-op if nothing was reserved.
+    /// outcomes 1 and 2 above). Advances the counter by exactly one — past the whole run, for a
+    /// run ([`Self::reserve_run`]) — and clears the in-flight reservation. A no-op if nothing was
+    /// reserved.
     pub fn consumed(&mut self) {
-        if let Some(reserved) = self.reserved.take() {
-            self.next = Some(reserved + 1);
+        if let Some((first, len)) = self.reserved.take() {
+            self.next = Some(first + len);
         }
     }
 
@@ -218,6 +246,73 @@ mod tests {
         // The hard-refresh from GET /nextNonce puts it back in business.
         slot.seed(9);
         assert_eq!(slot.reserve().unwrap(), 9);
+    }
+
+    /// **A batch reserves a run of consecutive nonces, and consuming it advances the counter
+    /// by the run's length** — `sendTxBatch` wants `n, n+1, …` on one slot (design note §3.7),
+    /// and the venue's counter, after a clean 200, stands one past the last of them.
+    #[test]
+    fn a_run_reserves_consecutive_nonces_and_consuming_it_advances_by_its_length() {
+        let mut slot = NonceOwner::new(5);
+        slot.seed(10);
+        assert_eq!(slot.reserve_run(3).unwrap(), 10, "the run starts at next");
+        assert!(slot.in_flight());
+        assert_eq!(
+            slot.reserve(),
+            Err(NonceError::InFlight),
+            "one run in flight"
+        );
+        assert_eq!(slot.reserve_run(2), Err(NonceError::InFlight));
+        slot.consumed();
+        assert_eq!(slot.peek(), Some(13), "one past the run's last nonce");
+        assert_eq!(slot.reserve().unwrap(), 13);
+    }
+
+    /// **A run shrinks to what was actually signed**: a transaction the signer refused takes no
+    /// number, so the next one signs with it and the run stays unbroken; consuming then
+    /// advances by the signed length only, and a run shrunk to nothing is released.
+    #[test]
+    fn a_run_shrinks_to_what_was_signed() {
+        let mut slot = NonceOwner::new(5);
+        slot.seed(10);
+        assert_eq!(slot.reserve_run(3).unwrap(), 10);
+        slot.truncate_run(2);
+        slot.consumed();
+        assert_eq!(slot.peek(), Some(12));
+
+        assert_eq!(slot.reserve_run(2).unwrap(), 12);
+        slot.truncate_run(0);
+        assert!(!slot.in_flight(), "nothing signed, nothing in flight");
+        assert_eq!(slot.peek(), Some(12), "and nothing spent");
+
+        assert_eq!(slot.reserve_run(2).unwrap(), 12);
+        slot.truncate_run(5);
+        slot.consumed();
+        assert_eq!(
+            slot.peek(),
+            Some(14),
+            "a run never grows past what was reserved"
+        );
+    }
+
+    /// A run of one is exactly [`NonceOwner::reserve`]; and a run is dropped by the same
+    /// `released`/`invalidated` as a single nonce.
+    #[test]
+    fn a_run_of_one_is_a_reserve_and_resolves_the_same_ways() {
+        let mut slot = NonceOwner::new(5);
+        slot.seed(3);
+        assert_eq!(slot.reserve_run(1).unwrap(), 3);
+        slot.consumed();
+        assert_eq!(slot.peek(), Some(4));
+
+        assert_eq!(slot.reserve_run(4).unwrap(), 4);
+        slot.released();
+        assert_eq!(slot.peek(), Some(4));
+        assert!(!slot.in_flight());
+
+        assert_eq!(slot.reserve_run(4).unwrap(), 4);
+        slot.invalidated();
+        assert_eq!(slot.reserve_run(2), Err(NonceError::NotSeeded));
     }
 
     /// Reserving before the first `nextNonce` fetch is refused — the counter has no trusted
