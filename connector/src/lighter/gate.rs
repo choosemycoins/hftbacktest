@@ -100,23 +100,35 @@ impl TxBudget {
         }
     }
 
-    /// Takes a token for a send of `class` at `now`, or says when one is next free for it.
-    pub fn try_spend(&mut self, now: Instant, class: TxClass) -> Result<(), Instant> {
+    /// When a send of `class` next gets a token — `None` when one is free at `now`. Counts
+    /// nothing.
+    pub fn free_at(&mut self, now: Instant, class: TxClass) -> Option<Instant> {
         let used = self.used(now);
         let floor = self.floor(class);
         if used + floor < self.per_minute {
-            self.spent.push_back(now);
-            return Ok(());
+            return None;
         }
         // `class` needs the window down to `per_minute - floor - 1` sends: the oldest
         // `used - that` must age out first, and the last of them sets the time. A config that
         // leaves `class` nothing at all (`floor >= per_minute`, refused at startup) is never
         // free; one window on is as honest an answer as any.
         let may_stay = self.per_minute.checked_sub(floor + 1);
-        let free_at = may_stay
-            .and_then(|may_stay| self.spent.get((used - may_stay) as usize - 1))
-            .map_or(now + WINDOW, |&sent| sent + WINDOW);
-        Err(free_at)
+        Some(
+            may_stay
+                .and_then(|may_stay| self.spent.get((used - may_stay) as usize - 1))
+                .map_or(now + WINDOW, |&sent| sent + WINDOW),
+        )
+    }
+
+    /// Takes a token for a send of `class` at `now`, or says when one is next free for it.
+    pub fn try_spend(&mut self, now: Instant, class: TxClass) -> Result<(), Instant> {
+        match self.free_at(now, class) {
+            None => {
+                self.spent.push_back(now);
+                Ok(())
+            }
+            Some(free_at) => Err(free_at),
+        }
     }
 }
 
@@ -320,6 +332,23 @@ impl SendGate {
             (TxClass::RiskReducing, Some(probe)) => Some(probe.min(cooling.until)),
             _ => Some(cooling.until),
         }
+    }
+
+    /// When a `class` send would next be admitted — the later of what the cooldown and the
+    /// budget say — or `None` when [`Self::admit`] would let it through at `now`. Counts nothing.
+    ///
+    /// What a held cancel waits on (§4.16). A probe that is due is no use to a cancel the budget
+    /// has no token for — with probes configured, the probes themselves spend it — and a release
+    /// that asked only the cooldown met the shut budget again on every tick.
+    pub fn next_admission(&mut self, now: Instant, class: TxClass) -> Option<Instant> {
+        let cooling = self.cooling_for(now, class);
+        let budget = self
+            .budget
+            .as_mut()
+            .and_then(|budget| budget.free_at(now, class));
+        // `None` (free now) sorts below any `Some`, so this is the later of two times, and
+        // `None` only when neither holds the send back.
+        cooling.max(budget)
     }
 
     /// Whether three quarters of the budget are spent at `now` — the point the venue's own
@@ -754,6 +783,64 @@ mod tests {
             gate.probe_refused(t0 + 60 * second),
             None,
             "no cooldown running: nothing to back off"
+        );
+    }
+
+    /// **When a send would next go out counts the budget as well as the cooldown, and asking
+    /// counts nothing.** It is what a held cancel waits on (§4.16): a probe that is due is no use
+    /// to a cancel the budget has no token for — with probes, the probes themselves spend it —
+    /// and a release that only asked the cooldown found the budget shut on every tick.
+    #[test]
+    fn the_next_admission_is_the_later_of_the_cooldown_and_the_budget() {
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut gate = SendGate::new(Some(TxBudget::new(2, 0)), Some(10 * second), Some(second));
+        assert_eq!(gate.next_admission(t0, TxClass::RiskReducing), None);
+        gate.admit(t0, TxClass::RiskReducing).unwrap();
+        gate.admit(t0, TxClass::RiskReducing).unwrap();
+        assert_eq!(
+            gate.next_admission(t0, TxClass::RiskReducing),
+            Some(t0 + WINDOW),
+            "spent through: when the first token comes back"
+        );
+
+        gate.rate_limited(t0 + 2 * second);
+        assert_eq!(
+            gate.next_admission(t0 + 4 * second, TxClass::RiskReducing),
+            Some(t0 + WINDOW),
+            "the probe is due, the budget is not: the budget decides"
+        );
+        assert_eq!(
+            gate.next_admission(t0 + 4 * second, TxClass::Open),
+            Some(t0 + WINDOW),
+            "and for a quote the later of its cooldown and the budget"
+        );
+
+        let mut gate = SendGate::new(Some(TxBudget::new(2, 1)), Some(10 * second), Some(second));
+        gate.rate_limited(t0);
+        assert_eq!(
+            gate.next_admission(t0, TxClass::RiskReducing),
+            Some(t0 + second),
+            "a token is there, the probe is not due: the probe decides"
+        );
+        assert_eq!(
+            gate.next_admission(t0 + second, TxClass::RiskReducing),
+            None
+        );
+        assert_eq!(
+            gate.next_admission(t0 + second, TxClass::Open),
+            Some(t0 + 10 * second),
+            "a quote waits the cooldown out"
+        );
+        assert_eq!(
+            gate.usage(t0 + second),
+            Some((0, 2)),
+            "asking spent nothing"
+        );
+        assert_eq!(
+            gate.admit(t0 + second, TxClass::RiskReducing),
+            Ok(Admission::Probe),
+            "and what it said is what admit does"
         );
     }
 

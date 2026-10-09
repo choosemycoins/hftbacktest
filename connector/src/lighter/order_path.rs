@@ -723,7 +723,25 @@ impl SlotTask {
     /// Split from [`Self::run`] so a test can hand it an in-process signer
     /// ([`SignerClient::over`]) and drive the whole money path — admission, nonce, sign,
     /// `sendTx`, the answer — against a scripted venue, with no subprocess and no key.
-    async fn serve(self, mut signer: SignerClient, mut command_rx: UnboundedReceiver<Command>) {
+    async fn serve(self, signer: SignerClient, command_rx: UnboundedReceiver<Command>) {
+        // Asked before every `sendTx`, and before the nonce it would spend (§4.15, §4.16).
+        let gate = SendGate::new(
+            self.config.send_budget(),
+            self.config.rate_limit_cooldown(),
+            self.config.rate_limit_cancel_probe(),
+        );
+        self.serve_with(signer, command_rx, gate).await;
+    }
+
+    /// [`Self::serve`] on a send gate built by the caller. Split so a test can start the slot on
+    /// a gate whose clock has already moved — tokens spent most of a minute ago, a cooldown
+    /// already running — instead of waiting a real minute for the budget's window to turn.
+    async fn serve_with(
+        self,
+        mut signer: SignerClient,
+        mut command_rx: UnboundedReceiver<Command>,
+        mut gate: SendGate,
+    ) {
         // Before anything is signed: does the sidecar sign for the network, account and slot
         // this connector serves? A sidecar that resolved another chain exits on its own (its
         // stderr says why, and `identity` sees the pipe close); one that started on the wrong
@@ -765,12 +783,6 @@ impl SlotTask {
         let mut nonce = NonceOwner::new(self.config.api_key_index);
         self.reseed(&mut nonce).await;
 
-        // Asked before every `sendTx`, and before the nonce it would spend (§4.15, §4.16).
-        let mut gate = SendGate::new(
-            self.config.send_budget(),
-            self.config.rate_limit_cooldown(),
-            self.config.rate_limit_cancel_probe(),
-        );
         // Cancels a cooldown kept from going out, sent when it is over (§4.16).
         let mut held = HeldCancels::default();
 
@@ -953,7 +965,9 @@ impl SlotTask {
                 // A transport error (e.g. the 10 s ORDER_REST_TIMEOUT firing after the sequencer
                 // has already processed the tx) is the same unknown fate as Ambiguous. Hard-
                 // refresh the nonce and keep the order tracked for the fate check — do not
-                // orphan a possibly-resting order (§3.3, §1.1).
+                // orphan a possibly-resting order (§3.3, §1.1). A probe that got no answer did
+                // not get through: the probes back off (§4.16).
+                self.probe_failed(gate, admission, &format!("the sendTx failed: {error}"));
                 nonce.invalidated();
                 self.reseed(nonce).await;
                 warn!(
@@ -1145,6 +1159,22 @@ impl SlotTask {
                 self.apply_nonce(nonce, &outcome).await;
                 match cancel_after_send(&outcome) {
                     CancelFollowUp::AwaitChannel => {}
+                    // An ambiguous answer to a probe is a refused probe (`received` backed the
+                    // probes off): the cancel stays held — pending to the bot — for the next one,
+                    // as after a 429 (§4.16). Handed back, the bot would only cancel again into
+                    // the cooldown, and a dead bot's quote would stand.
+                    CancelFollowUp::HandBack(reason)
+                        if admission == Admission::Probe
+                            && matches!(outcome, SendOutcome::Ambiguous { .. }) =>
+                    {
+                        info!(
+                            coi,
+                            %reason,
+                            "A Lighter cancel probing the cooldown got no clear answer; it stays \
+                             held, pending to the bot, for the next probe (§4.16)."
+                        );
+                        held.hold(coi, plan.clone());
+                    }
                     // A `21104` or an ambiguous answer must not leave the order looking
                     // cancel-pending to the bot while it stands on the venue (§3.3).
                     CancelFollowUp::HandBack(reason) => self.clear_cancel_request(coi, &reason),
@@ -1164,7 +1194,15 @@ impl SlotTask {
             Err(error) => {
                 nonce.invalidated();
                 self.reseed(nonce).await;
-                self.clear_cancel_request(coi, &format!("the cancel sendTx failed: {error}"));
+                let reason = format!("the cancel sendTx failed: {error}");
+                if admission == Admission::Probe {
+                    // A probe that got no answer did not get through: a refused probe, held for
+                    // the next one, exactly as a 429 or an unreadable nonce (§4.16).
+                    self.probe_failed(gate, admission, &reason);
+                    held.hold(coi, plan.clone());
+                } else {
+                    self.clear_cancel_request(coi, &reason);
+                }
             }
         }
         // The confirmed cancel arrives on the private channel as `status: canceled`; nothing
@@ -1203,9 +1241,13 @@ impl SlotTask {
                 Ok(outcome)
             }
             Err(error) => {
+                let reason = format!("the sweep's sendTx failed: {error}");
+                // A probe that got no answer did not get through: the probes back off, and the
+                // next attempt waits for the next one (§4.16).
+                self.probe_failed(gate, admission, &reason);
                 nonce.invalidated();
                 self.reseed(nonce).await;
-                Err(format!("the sweep's sendTx failed: {error}"))
+                Err(reason)
             }
         }
     }
@@ -1241,7 +1283,8 @@ impl SlotTask {
     /// * A 429/405 answering a **probe** ([`Admission::Probe`], §4.16) backs the probes off and
     ///   leaves the cooldown as it was, and the bots are not told again: the 429 that started
     ///   the cooldown was their one error for it. One that arrives after the cooldown has ended
-    ///   is a new rate limit, told as one.
+    ///   is a new rate limit, told as one. An **ambiguous** answer to a probe (a 5xx, a body that
+    ///   cannot be read) backs the probes off the same way and is handed on as it came.
     /// * Without a configured cooldown a 429/405 is handed on as `Ambiguous` — the answer it
     ///   was before `RateLimited` existed — so that path is unchanged by construction.
     fn received(
@@ -1257,6 +1300,13 @@ impl SlotTask {
             {
                 self.probe_failed(gate, admission, &format!("HTTP {status}: {detail}"));
                 SendOutcome::RateLimited { status, detail }
+            }
+            // A 5xx, or an answer that cannot be read, did not get the probe through either.
+            SendOutcome::Ambiguous { status, detail }
+                if admission == Admission::Probe && gate.cooling(now).is_some() =>
+            {
+                self.probe_failed(gate, admission, &format!("HTTP {status}: {detail}"));
+                SendOutcome::Ambiguous { status, detail }
             }
             SendOutcome::Accepted(ack) => {
                 let ratelimit = ack.ratelimit.as_deref().unwrap_or("<none>");
@@ -1330,13 +1380,18 @@ impl SlotTask {
         );
     }
 
-    /// Sends the cancels a cooldown held, once it is over (§4.16).
+    /// Sends the cancels a cooldown held, once the gate will let them through (§4.16).
     ///
     /// What decides is whether the order still **rests** ([`OrderManager::resume_held_cancel`]):
     /// one that has gone meanwhile — filled, closed by the venue — is dropped, there is nothing
     /// left to cancel and the cancel would spend a send on a refusal; one that filled in part is
     /// as stale a quote as before, smaller, and its cancel goes — after the bot is told it is in
     /// flight again, because the fill's update cleared the request it had seen.
+    ///
+    /// **A held cancel never goes back to the bot unsent.** The bot sees it pending and waits
+    /// for it — a dead bot waits for ever — so whatever still shuts the gate when its turn comes
+    /// (the cooldown, a probe not yet due, a budget with no token: with probes the probes
+    /// themselves spend it) holds it again, and it goes out the moment the gate opens.
     async fn release_held_cancels(
         &self,
         signer: &mut SignerClient,
@@ -1344,10 +1399,11 @@ impl SlotTask {
         gate: &mut SendGate,
         held: &mut HeldCancels,
     ) {
-        // With probes configured a cancel may try before the cooldown is over (§4.16).
+        // Not before the gate would admit a cancel — the cooldown's end or next probe, and a
+        // budget token (§4.15, §4.16): asking sooner only meets the same refusal every tick.
         if held.is_empty()
             || gate
-                .cooling_for(Instant::now(), TxClass::RiskReducing)
+                .next_admission(Instant::now(), TxClass::RiskReducing)
                 .is_some()
         {
             return;
@@ -1375,9 +1431,25 @@ impl SlotTask {
                     publish_order(&self.ev_tx, &symbol, order);
                 }
             }
-            if let Some(admission) = self.admit_cancel(gate, held, coi, &plan) {
-                self.send_cancel(signer, nonce, gate, held, admission, coi, &plan)
-                    .await;
+            let now = Instant::now();
+            match gate.admit(now, TxClass::RiskReducing) {
+                Ok(admission) => {
+                    self.send_cancel(signer, nonce, gate, held, admission, coi, &plan)
+                        .await;
+                }
+                // An earlier one in this batch took what the gate had (a probe answered 429,
+                // the last token): held again, never handed back.
+                Err(refusal) => {
+                    info!(
+                        coi,
+                        wait_ms = refusal.free_at().saturating_duration_since(now).as_millis() as u64,
+                        %refusal,
+                        "A Lighter cancel held through a cooldown is held again: the send gate has \
+                         nothing for it yet. It stays pending to the bot and goes out when the gate \
+                         opens (§4.16)."
+                    );
+                    held.hold(coi, plan);
+                }
             }
         }
     }
@@ -1525,13 +1597,15 @@ impl SlotTask {
         }
     }
 
-    /// Whether cancel `coi` may go out now (§4.15, §4.16). A cancel may take the reserve, so
-    /// the budget refuses it only when it is spent through; then it goes back to the bot as a
-    /// cancel that did not go — request cleared, order still live — and the bot may cancel
-    /// again. A cooldown does not hand it back: it is held, still pending to the bot, and sent
-    /// the moment the cooldown is over — or, with probes, the moment the next probe is due
-    /// ([`Self::release_held_cancels`]) — handed back, the bot would only cancel again into the
-    /// same cooldown. Inside a cooldown it is let through as a probe ([`Admission::Probe`]).
+    /// Whether a bot's cancel `coi` may go out now (§4.15, §4.16). A cancel may take the
+    /// reserve, so the budget refuses it only when it is spent through; outside a cooldown it
+    /// then goes back to the bot as a cancel that did not go — request cleared, order still
+    /// live — and the bot may cancel again. **Inside a cooldown nothing hands it back**, whatever
+    /// shut the gate — the cooldown itself, a probe not due yet, or a budget the probes spent:
+    /// it is held, still pending to the bot, and sent the moment the gate opens
+    /// ([`Self::release_held_cancels`]). Handed back, the bot would only cancel again into the
+    /// same cooldown, and a dead bot never would. Inside a cooldown it is let through as a probe
+    /// ([`Admission::Probe`]).
     fn admit_cancel(
         &self,
         gate: &mut SendGate,
@@ -1539,19 +1613,20 @@ impl SlotTask {
         coi: i64,
         plan: &CancelPlan,
     ) -> Option<Admission> {
-        match gate.admit(Instant::now(), TxClass::RiskReducing) {
+        let now = Instant::now();
+        match gate.admit(now, TxClass::RiskReducing) {
             Ok(admission) => Some(admission),
-            Err(refusal @ Refusal::Cooldown { .. }) => {
+            Err(refusal)
+                if matches!(refusal, Refusal::Cooldown { .. }) || gate.cooling(now).is_some() =>
+            {
                 // Not `log_refusal`: that line says the send went back to the bot, and this one
                 // did not — it stays pending to the bot and goes out when the gate opens.
                 info!(
                     coi,
-                    wait_ms = refusal
-                        .free_at()
-                        .saturating_duration_since(Instant::now())
-                        .as_millis() as u64,
+                    wait_ms = refusal.free_at().saturating_duration_since(now).as_millis() as u64,
+                    %refusal,
                     "A Lighter cancel is held: the venue rate-limited the account. It stays \
-                     pending to the bot and goes out when the cooldown is over (§4.16)."
+                     pending to the bot and goes out when the gate opens (§4.16)."
                 );
                 held.hold(coi, plan.clone());
                 None
@@ -1585,8 +1660,9 @@ impl SlotTask {
 }
 
 /// Cancels a rate-limit cooldown kept from going out, in the order they were asked for, to be
-/// sent when it is over or the next probe is due (§4.16). One per order: a cancel already held
-/// is not held twice.
+/// sent when the gate next admits one — the cooldown over or its next probe due, and a budget
+/// token there (§4.16). Nothing in here goes back to the bot unsent. One per order: a cancel
+/// already held is not held twice.
 #[derive(Default)]
 struct HeldCancels(Vec<(i64, CancelPlan)>);
 
@@ -2391,6 +2467,7 @@ mod tests {
         time,
     };
     use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+    use tracing::Level;
 
     use super::{
         AUTH_MAX_LIFETIME_S,
@@ -2420,6 +2497,7 @@ mod tests {
                 PRIVATE_ORDERS_UPDATE_CANCELED,
                 PRIVATE_POSITIONS_UPDATE_FLAT,
             },
+            gate::{SendGate, TxBudget, TxClass},
             order::OrderManager,
             private_msg::{AccountOrder, AccountPosition},
             rest::{MarketInfo, SendOutcome, SendTxAck},
@@ -2428,10 +2506,10 @@ mod tests {
                 SWEEP_ATTEMPTS,
                 testing::{ScriptedVenue, throttled},
             },
-            test_venue::{ScriptedRestVenue, SidecarIdentity, fake_signer},
+            test_venue::{DROP_CONNECTION, ScriptedRestVenue, SidecarIdentity, fake_signer},
         },
         supervision::{DrainOutcome, StopKind, StopReport, exit_code},
-        utils::testing::{RecordingSink, closed_read, read_after_connect},
+        utils::testing::{CapturedField, RecordingSink, closed_read, read_after_connect},
     };
 
     /// **The 8 h auth ceiling is server-only (§3.4): a 9 h token mints without error and is
@@ -3727,6 +3805,32 @@ mod tests {
     async fn slot_on_scripted_venue(
         tweak: impl FnOnce(&mut OrderPathConfig),
     ) -> SlotOnScriptedVenue {
+        let (slot, signer, command_rx, harness) = scripted_slot(tweak).await;
+        tokio::spawn(slot.serve(signer, command_rx));
+        harness
+    }
+
+    /// The same slot, started on `gate` instead of the one its config builds — a gate whose
+    /// clock has already moved, so a test of what a minute-long budget window does need not
+    /// wait the minute.
+    async fn slot_through_gate(
+        tweak: impl FnOnce(&mut OrderPathConfig),
+        gate: SendGate,
+    ) -> SlotOnScriptedVenue {
+        let (slot, signer, command_rx, harness) = scripted_slot(tweak).await;
+        tokio::spawn(slot.serve_with(signer, command_rx, gate));
+        harness
+    }
+
+    /// A slot and the harness in front of it, not yet started.
+    async fn scripted_slot(
+        tweak: impl FnOnce(&mut OrderPathConfig),
+    ) -> (
+        SlotTask,
+        crate::lighter::signer::SignerClient,
+        tokio::sync::mpsc::UnboundedReceiver<Command>,
+        SlotOnScriptedVenue,
+    ) {
         crate::install_crypto_provider();
         let venue = ScriptedRestVenue::start(7).await;
         let mut config = scripted_config();
@@ -3757,24 +3861,43 @@ mod tests {
             order_manager: order_manager.clone(),
             ev_tx: ev_tx.clone(),
         };
-        tokio::spawn(slot.serve(signer, command_rx));
         let order_path = OrderPath {
             order_manager,
             command_tx,
             tasks: Vec::new(),
             account_stream_live: Arc::new(AtomicBool::new(true)),
         };
-        SlotOnScriptedVenue {
-            order_path,
-            ev_tx,
-            events,
-            venue,
-        }
+        (
+            slot,
+            signer,
+            command_rx,
+            SlotOnScriptedVenue {
+                order_path,
+                ev_tx,
+                events,
+                venue,
+            },
+        )
     }
 
     impl SlotOnScriptedVenue {
         fn submit(&self, order: &Order) {
             self.order_path.submit("ETH", order, &self.ev_tx);
+        }
+
+        /// A buy resting on ETH as if placed and confirmed earlier — tracked, with the venue
+        /// index a cancel is addressed by — at no send of its own.
+        fn resting(&self, order_id: u64) -> Order {
+            let order = eth_order(order_id, Side::Buy);
+            {
+                let mut manager = self.order_path.order_manager.lock().unwrap();
+                let market = manager.market_info("ETH").expect("ETH is tracked");
+                manager
+                    .new_order("ETH", &market, &order)
+                    .expect("a valid order");
+            }
+            self.confirm(order_id);
+            order
         }
 
         fn cancel(&self, order: &Order) {
@@ -4585,6 +4708,321 @@ mod tests {
         assert!(
             slot.events.try_recv().is_err(),
             "no hand-back and no error for a probe that could not be signed"
+        );
+    }
+
+    // ---- a held cancel stays held, whatever refuses it (§4.16) -------------------------
+
+    /// ADV-P1's account (review of stage 2): 3 sendTx a minute with 1 held back, a 10 s cooldown
+    /// probed from 300 ms.
+    fn adv_p1(config: &mut OrderPathConfig) {
+        config.tx_budget_per_minute = Some(3);
+        config.tx_reserve = Some(1);
+        config.rate_limit_cooldown_ms = Some(10_000);
+        config.rate_limit_cancel_probe_ms = Some(300);
+    }
+
+    /// The gate of a 3/1 account with a 10 s cooldown, whose three tokens went out `spent_ago`
+    /// before now — each comes back a minute after it went — and whose cooldown began
+    /// `cooling_since` before now.
+    fn spent_and_cooling(
+        spent_ago: [Duration; 3],
+        cooling_since: Duration,
+        probe: Option<Duration>,
+    ) -> SendGate {
+        let now = time::Instant::now();
+        let mut gate = SendGate::new(
+            Some(TxBudget::new(3, 1)),
+            Some(Duration::from_secs(10)),
+            probe,
+        );
+        for ago in spent_ago {
+            let spent = now.checked_sub(ago).expect("a host up for over a minute");
+            gate.admit(spent, TxClass::RiskReducing).unwrap();
+        }
+        gate.rate_limited(now.checked_sub(cooling_since).unwrap());
+        gate
+    }
+
+    /// **A held cancel whose due probe finds the budget spent stays held, and goes out on the
+    /// token that comes back — inside the cooldown, as a probe.** ADV-P1: the probes spend the
+    /// reserve themselves, and the next due probe met a budget with no token; the cancel went
+    /// back to the bot as "budget is spent, its reserve included", breaking §4.16's promise
+    /// that a held cancel goes out the moment the venue will take it, even if its bot has died.
+    /// Here every token went out 59 s ago, so the first is back in about a second; the probe was
+    /// due at 300 ms. Nor is it asked about on every tick meanwhile: the slot waits for the
+    /// moment the gate opens — the later of the probe and the token — and logs its hold once.
+    #[tokio::test]
+    async fn a_held_cancel_whose_probe_finds_the_budget_spent_stays_held_until_a_token_returns() {
+        let holds = CapturedField::new("wait_ms", Level::INFO);
+        let _capturing = holds.capturing();
+        let started = time::Instant::now();
+        let gate = spent_and_cooling(
+            [Duration::from_secs(59); 3],
+            Duration::ZERO,
+            Some(Duration::from_millis(300)),
+        );
+        let mut slot = slot_through_gate(adv_p1, gate).await;
+        let resting = slot.resting(1);
+        slot.cancel(&resting);
+
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent()[0].0, "cancel_order");
+        let sent_after = started.elapsed();
+        assert!(
+            sent_after >= Duration::from_millis(950),
+            "not before the token came back: {sent_after:?}"
+        );
+        assert!(
+            sent_after < Duration::from_secs(10),
+            "inside the cooldown: {sent_after:?}"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "never handed back: no order, no error"
+        );
+        assert_eq!(
+            holds.seen().len(),
+            1,
+            "held once, when it was asked for — not again on every tick the budget was spent"
+        );
+    }
+
+    /// **Two cancels held for one token: the first goes, the second is held again — not handed
+    /// back — and goes on the next token.** It meets the gate its batch-mate has just shut,
+    /// and a held cancel never goes back to the bot unsent (§4.16).
+    #[tokio::test]
+    async fn of_two_held_cancels_and_one_token_the_second_is_held_again_not_handed_back() {
+        // One token back in a second, the other two in two.
+        let gate = spent_and_cooling(
+            [
+                Duration::from_secs(59),
+                Duration::from_secs(58),
+                Duration::from_secs(58),
+            ],
+            Duration::ZERO,
+            Some(Duration::from_millis(300)),
+        );
+        let mut slot = slot_through_gate(adv_p1, gate).await;
+        let first = slot.resting(1);
+        let second = slot.resting(2);
+        slot.cancel(&first);
+        slot.cancel(&second);
+
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        let sent = slot.venue.sent_at();
+        assert_eq!(
+            sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+            ["cancel_order", "cancel_order"]
+        );
+        let gap = sent[1].1.saturating_duration_since(sent[0].1);
+        assert!(
+            gap >= Duration::from_millis(700),
+            "the second on the next token: {gap:?}"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "neither handed back: no order, no error"
+        );
+    }
+
+    /// **A cancel asked for inside the cooldown, its probe due and the budget spent, is held —
+    /// not handed back.** Inside a cooldown a cancel is held whatever shut the gate: handed
+    /// back, the bot only cancels again into the same cooldown, and a dead bot never does.
+    #[tokio::test]
+    async fn a_cancel_asked_for_inside_the_cooldown_with_the_budget_spent_is_held() {
+        let started = time::Instant::now();
+        // The cooldown began a second ago: its first probe (300 ms) is long due.
+        let gate = spent_and_cooling(
+            [Duration::from_secs(59); 3],
+            Duration::from_secs(1),
+            Some(Duration::from_millis(300)),
+        );
+        let mut slot = slot_through_gate(adv_p1, gate).await;
+        let resting = slot.resting(1);
+        slot.cancel(&resting);
+
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent()[0].0, "cancel_order");
+        assert!(started.elapsed() >= Duration::from_millis(950));
+        assert!(
+            slot.events.try_recv().is_err(),
+            "never handed back: no order, no error"
+        );
+    }
+
+    /// **A held cancel stays held past the end of the cooldown while the budget is still spent,
+    /// and goes out on the token** — not back to the bot. A *new* cancel over a spent budget
+    /// outside a cooldown goes back to the bot (§4.15); one the slot already holds is pending
+    /// to a bot that is waiting on it, not cancelling again. No probes here: the cooldown ends
+    /// in half a second, the first token is back in one and a half.
+    #[tokio::test]
+    async fn a_held_cancel_stays_held_past_the_cooldown_until_the_budget_has_a_token() {
+        let started = time::Instant::now();
+        let gate = spent_and_cooling(
+            [Duration::from_millis(58_500); 3],
+            Duration::from_millis(9_500),
+            None,
+        );
+        let mut slot = slot_through_gate(
+            |config| {
+                config.tx_budget_per_minute = Some(3);
+                config.tx_reserve = Some(1);
+                config.rate_limit_cooldown_ms = Some(10_000);
+            },
+            gate,
+        )
+        .await;
+        let resting = slot.resting(1);
+        slot.cancel(&resting);
+
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent()[0].0, "cancel_order");
+        let sent_after = started.elapsed();
+        assert!(
+            sent_after >= Duration::from_millis(1_450),
+            "on the token, not when the cooldown ended: {sent_after:?}"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "never handed back: no order, no error"
+        );
+    }
+
+    /// A slot over a resting ETH buy (order 1) inside a 10 s cooldown probed from 300 ms, whose
+    /// cancel's first probe the venue answers `probe_answer`. Returns the slot once the probe
+    /// and the probe after it have both reached the venue.
+    async fn a_cancel_whose_first_probe_is_answered(
+        probe_answer: (u16, String),
+    ) -> SlotOnScriptedVenue {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(10_000);
+            config.rate_limit_cancel_probe_ms = Some(300);
+        })
+        .await;
+        let resting = eth_order(1, Side::Buy);
+        slot.submit(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        slot.confirm(1);
+        slot.venue
+            .answer_send_tx_with([too_many_requests(), probe_answer]);
+        slot.submit(&eth_order(2, Side::Buy));
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError, "the cooldown's one error");
+
+        slot.cancel(&resting);
+        slot.venue_until(|venue| venue.sent().len() == 4).await;
+        slot
+    }
+
+    /// **A probe the venue answers 5xx is a refused probe: the cancel stays held, the probes back
+    /// off, and the bots hear nothing.** `cancel_after_send` handed it back as "ambiguous —
+    /// cancel again": one more error in the bot's storm window, and a dead bot's quote left
+    /// standing. Backed off as after a 429 — the next probe waits the doubled 600 ms, not the
+    /// next 250 ms tick.
+    #[tokio::test]
+    async fn a_probe_answered_5xx_is_a_refused_probe_and_the_cancel_stays_held() {
+        let mut slot = a_cancel_whose_first_probe_is_answered((
+            503,
+            r#"{"code":503,"message":"upstream"}"#.to_string(),
+        ))
+        .await;
+        let sent = slot.venue.sent_at();
+        let ops: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "create_order",
+                "create_order",
+                "cancel_order",
+                "cancel_order"
+            ]
+        );
+        let gap = sent[3].1.saturating_duration_since(sent[2].1);
+        assert!(
+            gap >= Duration::from_millis(550),
+            "the refused probe backed the probes off: {gap:?}"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "nothing handed back and nothing told"
+        );
+    }
+
+    /// **...and so is a probe whose send fails in transport** — the cancel held, the probes
+    /// backed off, the bots told nothing. It was handed back as "the cancel sendTx failed".
+    #[tokio::test]
+    async fn a_probe_that_fails_in_transport_is_a_refused_probe_and_the_cancel_stays_held() {
+        let mut slot =
+            a_cancel_whose_first_probe_is_answered((DROP_CONNECTION, String::new())).await;
+        let sent = slot.venue.sent_at();
+        assert_eq!(sent[3].0, "cancel_order");
+        let gap = sent[3].1.saturating_duration_since(sent[2].1);
+        assert!(
+            gap >= Duration::from_millis(550),
+            "the refused probe backed the probes off: {gap:?}"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "nothing handed back and nothing told"
+        );
+    }
+
+    /// **A reducing IOC's probe that fails in transport backs the probes off too**: the next
+    /// reducing IOC waits for the next probe instead of going straight into the cooldown again.
+    #[tokio::test]
+    async fn a_reducing_ioc_probe_that_fails_in_transport_backs_the_probes_off() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(10_000);
+            config.rate_limit_cancel_probe_ms = Some(300);
+        })
+        .await;
+        slot.state_position(0.05);
+        slot.venue
+            .answer_send_tx_with([too_many_requests(), (DROP_CONNECTION, String::new())]);
+        slot.submit(&eth_order(1, Side::Buy));
+        let (kind, _) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError, "the cooldown's one error");
+        time::sleep(Duration::from_millis(400)).await;
+
+        slot.submit(&eth_ioc(2, Side::Sell));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        slot.submit(&eth_ioc(3, Side::Sell));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the next reducing IOC waits for the next probe");
+        };
+        assert_eq!((order.order_id, order.status), (3, Status::Expired));
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("until its cooldown is over"), "{message}");
+        assert_eq!(slot.venue.sent().len(), 2, "not sent into the cooldown");
+    }
+
+    /// **...and a sweep's**: its next attempt waits for the next, doubled probe (2 s), not just
+    /// the retry's own 1 s.
+    #[tokio::test]
+    async fn a_sweep_probe_that_fails_in_transport_backs_the_probes_off() {
+        let mut slot = slot_on_scripted_venue(|config| {
+            config.rate_limit_cooldown_ms = Some(60_000);
+            config.rate_limit_cancel_probe_ms = Some(1_000);
+        })
+        .await;
+        slot.venue
+            .answer_send_tx_with([too_many_requests(), (DROP_CONNECTION, String::new())]);
+        slot.submit(&eth_order(1, Side::Buy));
+        let _ = as_error(slot.next_event().await);
+
+        assert_eq!(
+            slot.order_path.sweep(vec![42]).await.unwrap(),
+            SweepOutcome::Cancelled
+        );
+        let sent = slot.venue.sent_at();
+        let ops: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(ops, ["create_order", "cancel_all", "cancel_all"]);
+        let gap = sent[2].1.saturating_duration_since(sent[1].1);
+        assert!(
+            gap >= Duration::from_millis(1_800),
+            "the next attempt waited for the next probe: {gap:?}"
         );
     }
 

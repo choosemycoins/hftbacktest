@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    time::Instant,
 };
 
 use crate::lighter::signer::SignerClient;
@@ -91,6 +92,8 @@ pub(crate) struct Seen {
     /// For a `sendTx`: the `op` and `nonce` the stand-in signer wrote into `tx_info`.
     pub(crate) op: Option<String>,
     pub(crate) nonce: Option<i64>,
+    /// When it arrived.
+    pub(crate) at: Instant,
 }
 
 /// A local HTTP server playing the venue's order-path REST endpoints.
@@ -98,7 +101,8 @@ pub(crate) struct Seen {
 /// * `GET /api/v1/nextNonce` — the venue's counter, which a `sendTx` answered 200 advances;
 ///   or, while [`ScriptedRestVenue::answer_next_nonce_with`] has queued statuses, the next one.
 /// * `POST /api/v1/sendTx` — the next scripted answer, or a clean 200 ack once the script is
-///   spent.
+///   spent. A scripted status of [`DROP_CONNECTION`] answers nothing and closes the socket: a
+///   transport error on the client's side.
 /// * `GET /api/v1/accountActiveOrders` — an empty list (the venue holds nothing).
 /// * `GET /api/v1/tx` — no verdict yet.
 ///
@@ -109,6 +113,10 @@ pub(crate) struct ScriptedRestVenue {
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
 }
+
+/// The scripted "status" that answers a `sendTx` with no response at all: the socket is closed
+/// once the request has been read, so the client sees a transport error.
+pub(crate) const DROP_CONNECTION: u16 = 0;
 
 /// A clean `sendTx` 200, carrying the venue's rate-limit report the way it does (§2.7).
 pub(crate) fn send_tx_ack(ratelimit: &str) -> (u16, String) {
@@ -185,6 +193,15 @@ impl ScriptedRestVenue {
             .collect()
     }
 
+    /// The `sendTx`s that reached the venue so far, as `(op, when it arrived)`.
+    pub(crate) fn sent_at(&self) -> Vec<(String, Instant)> {
+        self.seen()
+            .into_iter()
+            .filter(|seen| seen.path == "/api/v1/sendTx")
+            .map(|seen| (seen.op.unwrap_or_default(), seen.at))
+            .collect()
+    }
+
     /// How many times `path` was asked for.
     pub(crate) fn count(&self, path: &str) -> usize {
         self.seen().iter().filter(|seen| seen.path == path).count()
@@ -227,6 +244,7 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
         path: path.clone(),
         op,
         nonce,
+        at: Instant::now(),
     });
     let (status, body) = match (method.as_str(), path.as_str()) {
         ("GET", "/api/v1/nextNonce") => match next_nonce_answers.lock().unwrap().pop_front() {
@@ -245,6 +263,10 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| send_tx_ack("Ratelimit is off"));
+            if answer.0 == DROP_CONNECTION {
+                // Read and recorded, never answered.
+                return;
+            }
             if answer.0 == 200 {
                 *counter.lock().unwrap() += 1;
             }
