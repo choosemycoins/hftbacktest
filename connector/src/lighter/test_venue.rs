@@ -7,7 +7,7 @@
 //! reached it and in what order — which is the observable every slot pin is about.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -39,9 +39,15 @@ fn tx_type_of(op: &str) -> u8 {
 }
 
 /// A [`SignerClient`] whose other end is a task in this process: it answers `ping` with
-/// `identity`, "signs" a create/cancel/cancel-all as a JSON note of the op and the nonce it was
-/// given, and mints a dummy auth token. No key exists anywhere.
-pub(crate) fn fake_signer(identity: SidecarIdentity) -> SignerClient {
+/// `identity`, "signs" a create/cancel/cancel-all as a JSON note of the op, the nonce it was
+/// given and the hash it reports, and mints a dummy auth token. No key exists anywhere.
+///
+/// A `create_order` whose client order index is in `refuse` is refused, as a sidecar that could
+/// not sign it would.
+pub(crate) fn fake_signer(
+    identity: SidecarIdentity,
+    refuse: Arc<Mutex<HashSet<i64>>>,
+) -> SignerClient {
     let (client_stdin, sidecar_stdin) = tokio::io::duplex(64 * 1024);
     let (mut sidecar_stdout, client_stdout) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -50,7 +56,12 @@ pub(crate) fn fake_signer(identity: SidecarIdentity) -> SignerClient {
             let request: Value = serde_json::from_str(&line).expect("the client sends JSON lines");
             let id = request["id"].as_u64().expect("every request has an id");
             let op = request["op"].as_str().unwrap_or_default().to_string();
+            let refused = op == "create_order"
+                && request["client_order_index"]
+                    .as_i64()
+                    .is_some_and(|coi| refuse.lock().unwrap().contains(&coi));
             let answer = match op.as_str() {
+                _ if refused => json!({"id": id, "ok": false, "error": "scripted refusal"}),
                 "ping" => json!({
                     "id": id,
                     "ok": true,
@@ -68,6 +79,7 @@ pub(crate) fn fake_signer(identity: SidecarIdentity) -> SignerClient {
                         "nonce": request["nonce"],
                         "client_order_index": request["client_order_index"],
                         "market_index": request["market_index"],
+                        "hash": format!("hash-{id}"),
                     })
                     .to_string(),
                     "tx_hash": format!("hash-{id}"),
@@ -92,6 +104,8 @@ pub(crate) struct Seen {
     /// For a `sendTx`: the `op` and `nonce` the stand-in signer wrote into `tx_info`.
     pub(crate) op: Option<String>,
     pub(crate) nonce: Option<i64>,
+    /// For a `sendTxBatch`: the `(op, nonce)` of each transaction in it, in order.
+    pub(crate) batch: Vec<(String, i64)>,
     /// When it arrived.
     pub(crate) at: Instant,
 }
@@ -103,6 +117,8 @@ pub(crate) struct Seen {
 /// * `POST /api/v1/sendTx` — the next scripted answer, or a clean 200 ack once the script is
 ///   spent. A scripted status of [`DROP_CONNECTION`] answers nothing and closes the socket: a
 ///   transport error on the client's side.
+/// * `POST /api/v1/sendTxBatch` — the next scripted [`BatchAnswer`], or [`BatchAnswer::Echo`]
+///   once the script is spent.
 /// * `GET /api/v1/accountActiveOrders` — an empty list (the venue holds nothing).
 /// * `GET /api/v1/tx` — no verdict yet.
 ///
@@ -111,7 +127,20 @@ pub(crate) struct ScriptedRestVenue {
     pub(crate) url: String,
     seen: Arc<Mutex<Vec<Seen>>>,
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
+    batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
+}
+
+/// How the scripted venue answers one `sendTxBatch`.
+#[derive(Clone, Debug)]
+pub(crate) enum BatchAnswer {
+    /// A clean 200 echoing every transaction's hash; the counter moves past all of them.
+    Echo,
+    /// A 200 echoing the first transaction's hash only, as if the venue took that one and not
+    /// the rest; the counter moves past the first.
+    EchoFirst,
+    /// This status and body; the counter does not move. [`DROP_CONNECTION`] answers nothing.
+    Fixed(u16, String),
 }
 
 /// The scripted "status" that answers a `sendTx` with no response at all: the socket is closed
@@ -140,17 +169,20 @@ impl ScriptedRestVenue {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>> = Arc::default();
+        let batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>> = Arc::default();
         let next_nonce_answers: Arc<Mutex<VecDeque<u16>>> = Arc::default();
         let counter = Arc::new(Mutex::new(nonce));
         {
             let seen = seen.clone();
             let send_tx_answers = send_tx_answers.clone();
+            let batch_answers = batch_answers.clone();
             let next_nonce_answers = next_nonce_answers.clone();
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     let script = Script {
                         seen: seen.clone(),
                         send_tx_answers: send_tx_answers.clone(),
+                        batch_answers: batch_answers.clone(),
                         next_nonce_answers: next_nonce_answers.clone(),
                         counter: counter.clone(),
                     };
@@ -164,8 +196,23 @@ impl ScriptedRestVenue {
             url,
             seen,
             send_tx_answers,
+            batch_answers,
             next_nonce_answers,
         }
+    }
+
+    /// Queues the answers the next `sendTxBatch`s get, in order.
+    pub(crate) fn answer_batch_with(&self, answers: impl IntoIterator<Item = BatchAnswer>) {
+        self.batch_answers.lock().unwrap().extend(answers);
+    }
+
+    /// The `sendTxBatch`es that reached the venue so far, each as its `(op, nonce)`s.
+    pub(crate) fn sent_batches(&self) -> Vec<Vec<(String, i64)>> {
+        self.seen()
+            .into_iter()
+            .filter(|seen| seen.path == "/api/v1/sendTxBatch")
+            .map(|seen| seen.batch)
+            .collect()
     }
 
     /// Queues the answers the next `sendTx`s get, in order.
@@ -212,6 +259,7 @@ impl ScriptedRestVenue {
 struct Script {
     seen: Arc<Mutex<Vec<Seen>>>,
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
+    batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
     counter: Arc<Mutex<i64>>,
 }
@@ -220,6 +268,7 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
     let Script {
         seen,
         send_tx_answers,
+        batch_answers,
         next_nonce_answers,
         counter,
     } = script;
@@ -240,10 +289,31 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
     } else {
         (None, None)
     };
+    // A batch's `tx_infos` is a JSON array of strings, each a `tx_info` (design note §3.7).
+    let batch_infos: Vec<Value> = if path == "/api/v1/sendTxBatch" {
+        let form: HashMap<String, String> = serde_qs::from_str(&body).unwrap_or_default();
+        form.get("tx_infos")
+            .and_then(|infos| serde_json::from_str::<Vec<String>>(infos).ok())
+            .unwrap_or_default()
+            .iter()
+            .map(|info| serde_json::from_str(info).unwrap_or(Value::Null))
+            .collect()
+    } else {
+        Vec::new()
+    };
     seen.lock().unwrap().push(Seen {
         path: path.clone(),
         op,
         nonce,
+        batch: batch_infos
+            .iter()
+            .map(|info| {
+                (
+                    info["op"].as_str().unwrap_or_default().to_string(),
+                    info["nonce"].as_i64().unwrap_or(-1),
+                )
+            })
+            .collect(),
         at: Instant::now(),
     });
     let (status, body) = match (method.as_str(), path.as_str()) {
@@ -271,6 +341,39 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
                 *counter.lock().unwrap() += 1;
             }
             answer
+        }
+        ("POST", "/api/v1/sendTxBatch") => {
+            let answer = batch_answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(BatchAnswer::Echo);
+            let hashes: Vec<&str> = batch_infos
+                .iter()
+                .map(|info| info["hash"].as_str().unwrap_or_default())
+                .collect();
+            let echo = |hashes: &[&str]| {
+                json!({
+                    "code": 200,
+                    "message": json!({ "ratelimit": "Ratelimit is off" }).to_string(),
+                    "tx_hash": hashes,
+                    "predicted_execution_time_ms": 1_785_431_671_831_i64,
+                    "volume_quota_remaining": 100,
+                })
+                .to_string()
+            };
+            match answer {
+                BatchAnswer::Echo => {
+                    *counter.lock().unwrap() += hashes.len() as i64;
+                    (200, echo(&hashes))
+                }
+                BatchAnswer::EchoFirst => {
+                    *counter.lock().unwrap() += 1;
+                    (200, echo(&hashes[..1.min(hashes.len())]))
+                }
+                BatchAnswer::Fixed(DROP_CONNECTION, _) => return,
+                BatchAnswer::Fixed(status, body) => (status, body),
+            }
         }
         ("GET", "/api/v1/accountActiveOrders") => {
             (200, json!({"code": 200, "orders": []}).to_string())

@@ -90,9 +90,10 @@ use crate::{
             local_now,
         },
         publish_error,
-        rest::{self, MarketInfo, Resolution, SendOutcome},
+        rest::{self, BatchOutcome, MarketInfo, Resolution, SendOutcome},
         signer::{
             CreateOrder,
+            Signed,
             SignerClient,
             SignerNetwork,
             python_sidecar_command,
@@ -869,51 +870,96 @@ impl SlotTask {
 
         let mut awaiting: HashMap<i64, Awaiting> = HashMap::new();
         let mut deadline_tick = time::interval(Duration::from_millis(250));
+        // A command taken off the queue while a batch was gathered that could not join it
+        // (§3.7): served next, before anything newer, so the queue's order holds.
+        let mut lookahead: Option<Command> = None;
 
         loop {
-            select! {
-                command = command_rx.recv() => {
-                    // Held cancels go before anything newer, so a requote cannot overtake the
-                    // cancel of the quote it replaces.
-                    self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
-                    match command {
-                        Some(Command::Submit { coi, order, outbound }) => {
-                            if let Some(admission) = self.admit_submit(&mut gate, coi) {
-                                self.send_order(&mut signer, &mut nonce, &mut gate, admission, coi, &order, &outbound, &mut awaiting).await;
-                            }
-                        }
-                        Some(Command::Cancel { coi, plan }) => {
-                            if let Some(admission) = self.admit_cancel(&mut gate, &mut held, coi, &plan) {
-                                self.send_cancel(&mut signer, &mut nonce, &mut gate, &mut held, admission, coi, &plan).await;
-                            }
-                        }
-                        Some(Command::CancelAll { market_index, reply, deadline, on_failure }) => {
-                            let mut sender = CancelAllSender {
-                                slot: &self,
-                                signer: &mut signer,
-                                nonce: &mut nonce,
-                                gate: &mut gate,
-                                market_index,
-                                deadline,
-                                admission: Admission::Send,
-                            };
-                            sweep_market(&mut sender, &self.ev_tx, market_index, reply, on_failure).await;
-                        }
-                        Some(Command::MintAuth { deadline, reply }) => {
-                            let token = signer
-                                .auth_token(deadline, self.config.api_key_index)
-                                .await
-                                .map_err(|error| warn!(?error, "Couldn't mint a Lighter auth token."))
-                                .ok();
-                            let _ = reply.send(token);
-                        }
-                        None => break,
+            let command = match lookahead.take() {
+                Some(command) => Some(command),
+                None => select! {
+                    command = command_rx.recv() => command,
+                    _ = deadline_tick.tick() => {
+                        self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
+                        self.check_deadlines(&mut signer, &gate, &mut awaiting).await;
+                        continue;
+                    }
+                },
+            };
+            // Held cancels go before anything newer, so a requote cannot overtake the cancel of
+            // the quote it replaces.
+            self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held)
+                .await;
+            match command {
+                Some(Command::Submit {
+                    coi,
+                    order,
+                    outbound,
+                }) => {
+                    if let Some(admission) = self.admit_submit(&mut gate, coi) {
+                        let first = Batched::Submit {
+                            coi,
+                            order,
+                            outbound,
+                            dequeued: StdInstant::now(),
+                        };
+                        self.send_admitted(
+                            &mut signer,
+                            &mut nonce,
+                            &mut gate,
+                            &mut held,
+                            admission,
+                            first,
+                            &mut command_rx,
+                            &mut lookahead,
+                            &mut awaiting,
+                        )
+                        .await;
                     }
                 }
-                _ = deadline_tick.tick() => {
-                    self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
-                    self.check_deadlines(&mut signer, &gate, &mut awaiting).await;
+                Some(Command::Cancel { coi, plan }) => {
+                    if let Some(admission) = self.admit_cancel(&mut gate, &mut held, coi, &plan) {
+                        let first = Batched::Cancel { coi, plan };
+                        self.send_admitted(
+                            &mut signer,
+                            &mut nonce,
+                            &mut gate,
+                            &mut held,
+                            admission,
+                            first,
+                            &mut command_rx,
+                            &mut lookahead,
+                            &mut awaiting,
+                        )
+                        .await;
+                    }
                 }
+                Some(Command::CancelAll {
+                    market_index,
+                    reply,
+                    deadline,
+                    on_failure,
+                }) => {
+                    let mut sender = CancelAllSender {
+                        slot: &self,
+                        signer: &mut signer,
+                        nonce: &mut nonce,
+                        gate: &mut gate,
+                        market_index,
+                        deadline,
+                        admission: Admission::Send,
+                    };
+                    sweep_market(&mut sender, &self.ev_tx, market_index, reply, on_failure).await;
+                }
+                Some(Command::MintAuth { deadline, reply }) => {
+                    let token = signer
+                        .auth_token(deadline, self.config.api_key_index)
+                        .await
+                        .map_err(|error| warn!(?error, "Couldn't mint a Lighter auth token."))
+                        .ok();
+                    let _ = reply.send(token);
+                }
+                None => break,
             }
         }
         let _ = signer.shutdown().await;
@@ -940,6 +986,7 @@ impl SlotTask {
         }
     }
 
+    /// Reserves a nonce for submit `coi`, signs it and sends it alone through `sendTx`.
     #[allow(clippy::too_many_arguments)]
     async fn send_order(
         &self,
@@ -950,9 +997,9 @@ impl SlotTask {
         coi: i64,
         order: &CreateOrder,
         outbound: &Outbound,
+        dequeued: StdInstant,
         awaiting: &mut HashMap<i64, Awaiting>,
     ) {
-        let dequeued = StdInstant::now();
         let Some(reserved_nonce) = self.reserve(nonce).await else {
             self.probe_failed(gate, admission, "the nonce could not be read");
             self.expire(coi, "the nonce slot could not be seeded");
@@ -971,51 +1018,54 @@ impl SlotTask {
             }
         };
         let signed_at = StdInstant::now();
-        let market_index = order.market_index as i32;
+        let marks = SignMarks {
+            dequeued,
+            reserved: reserved_at,
+            signed: signed_at,
+        };
+        self.dispatch_order(
+            nonce,
+            gate,
+            admission,
+            coi,
+            order.market_index as i32,
+            &signed,
+            outbound,
+            marks,
+            awaiting,
+        )
+        .await;
+    }
+
+    /// Sends one signed submit through `sendTx` and acts on the answer. The nonce it was signed
+    /// with is the one in flight on `nonce`.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_order(
+        &self,
+        nonce: &mut NonceOwner,
+        gate: &mut SendGate,
+        admission: Admission,
+        coi: i64,
+        market_index: i32,
+        signed: &Signed,
+        outbound: &Outbound,
+        marks: SignMarks,
+        awaiting: &mut HashMap<i64, Awaiting>,
+    ) {
         let sent = rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await;
 
         // One line per placement, whatever the venue answered — the outbound leg cost what it
         // cost even when the send failed. `info!`, not `debug!`: the running unit has no
         // `RUST_LOG` and emits INFO only, so a `debug!` here would be invisible in exactly the
         // deployment this measures. MEASURED: ~0.23 placements/s, so the volume is nothing.
-        let spans = outbound.spans(dequeued, reserved_at, signed_at, StdInstant::now());
-        info!(
-            coi,
-            ipc_us = spans.ipc_us,
-            queue_us = spans.queue_us,
-            nonce_us = spans.nonce_us,
-            sign_us = spans.sign_us,
-            send_us = spans.send_us,
-            "Lighter placement timing."
-        );
+        log_placement_timing(coi, outbound, marks, StdInstant::now(), 1, 0);
 
         match sent {
             Ok(outcome) => {
                 let outcome = self.received(gate, admission, outcome);
                 self.apply_nonce(nonce, &outcome).await;
-                match outcome {
-                    SendOutcome::Accepted(ack) => {
-                        // 200 is not acceptance (§4.11): arm the confirmation deadline. The
-                        // tx_hash routes the deadline to `GET /tx` for the `event_info.ae`
-                        // verdict if `account_all_orders` has not listed the order by then.
-                        self.arm_deadline(awaiting, coi, ack.tx_hash, market_index);
-                    }
-                    SendOutcome::InvalidNonce { .. } => {
-                        // `21104`: the sequencer rejected THIS tx on nonce grounds, so no order
-                        // was created for this COI, and `apply_nonce` has already resynced the
-                        // counter. Nothing rests on the venue, so expiring cannot orphan.
-                        self.expire(
-                            coi,
-                            "the venue rejected the nonce (21104); the order did not take",
-                        );
-                    }
+                match &outcome {
                     SendOutcome::Ambiguous { status, detail } => {
-                        // Unknown fate — the tx MAY already rest on the venue (§4.11). §3.3: the
-                        // nonce is hard-refreshed (`apply_nonce` → Resync above), and the order
-                        // is KEPT TRACKED with the deadline armed but NO tx_hash, so the
-                        // deadline reads its fate off `accountActiveOrders` before the bot is
-                        // told anything. NEVER expire here: that orphans a resting order into a
-                        // silent one-sided quote (`AGENTS.md` §1.1) — the bug this path fixes.
                         warn!(
                             coi,
                             status,
@@ -1023,14 +1073,8 @@ impl SlotTask {
                             "An ambiguous Lighter sendTx; keeping the order tracked and \
                              resolving its fate against accountActiveOrders at the deadline (§3.3)."
                         );
-                        self.arm_deadline(awaiting, coi, String::new(), market_index);
                     }
                     SendOutcome::RateLimited { status, detail } => {
-                        // The venue's docs promise a cooldown, not that a 429 went unprocessed
-                        // (§4.16): the order may rest. Kept tracked with no tx_hash, exactly as
-                        // an ambiguous send, so its fate is read off accountActiveOrders — once
-                        // the cooldown is over (`check_deadlines`); the nonce was invalidated,
-                        // not re-read. Never expired blind (§1.1).
                         warn!(
                             coi,
                             status,
@@ -1038,9 +1082,10 @@ impl SlotTask {
                             "A Lighter sendTx was rate-limited; keeping the order tracked until \
                              its fate can be read after the cooldown (§4.16)."
                         );
-                        self.arm_deadline(awaiting, coi, String::new(), market_index);
                     }
+                    SendOutcome::Accepted(_) | SendOutcome::InvalidNonce { .. } => {}
                 }
+                self.settle_submit(awaiting, coi, market_index, outcome);
             }
             Err(error) => {
                 // A transport error (e.g. the 10 s ORDER_REST_TIMEOUT firing after the sequencer
@@ -1057,6 +1102,49 @@ impl SlotTask {
                     "A Lighter sendTx transport error; keeping the order tracked and resolving \
                      its fate against accountActiveOrders at the deadline (§3.3)."
                 );
+                self.arm_deadline(awaiting, coi, String::new(), market_index);
+            }
+        }
+    }
+
+    /// What a submit's answer — already read by [`Self::received`], the nonce already settled —
+    /// leaves for the order (§4.11, §3.3, §4.16). Shared by a lone `sendTx` and every
+    /// transaction of a batch.
+    fn settle_submit(
+        &self,
+        awaiting: &mut HashMap<i64, Awaiting>,
+        coi: i64,
+        market_index: i32,
+        outcome: SendOutcome,
+    ) {
+        match outcome {
+            SendOutcome::Accepted(ack) => {
+                // 200 is not acceptance (§4.11): arm the confirmation deadline. The tx_hash
+                // routes the deadline to `GET /tx` for the `event_info.ae` verdict if
+                // `account_all_orders` has not listed the order by then.
+                self.arm_deadline(awaiting, coi, ack.tx_hash, market_index);
+            }
+            SendOutcome::InvalidNonce { .. } => {
+                // `21104` on a lone sendTx: the sequencer rejected THIS tx on nonce grounds, so
+                // no order was created for this COI, and the counter has already been resynced.
+                // Nothing rests on the venue, so expiring cannot orphan. (A batch never reads a
+                // `21104` this way — `rest::classify_batch_outcome`, §3.7.)
+                self.expire(
+                    coi,
+                    "the venue rejected the nonce (21104); the order did not take",
+                );
+            }
+            // Unknown fate — the tx MAY already rest on the venue (§4.11). §3.3: the nonce is
+            // hard-refreshed, and the order is KEPT TRACKED with the deadline armed but NO
+            // tx_hash, so the deadline reads its fate off `accountActiveOrders` before the bot
+            // is told anything. NEVER expire here: that orphans a resting order into a silent
+            // one-sided quote (`AGENTS.md` §1.1) — the bug this path fixes.
+            //
+            // Rate-limited: the venue's docs promise a cooldown, not that a 429 went unprocessed
+            // (§4.16): the order may rest. Kept tracked with no tx_hash, exactly as an ambiguous
+            // send, so its fate is read off accountActiveOrders — once the cooldown is over
+            // (`check_deadlines`); the nonce was invalidated, not re-read. Never expired blind.
+            SendOutcome::Ambiguous { .. } | SendOutcome::RateLimited { .. } => {
                 self.arm_deadline(awaiting, coi, String::new(), market_index);
             }
         }
@@ -1194,6 +1282,7 @@ impl SlotTask {
         }
     }
 
+    /// Reserves a nonce for cancel `coi`, signs it and sends it alone through `sendTx`.
     #[allow(clippy::too_many_arguments)]
     async fn send_cancel(
         &self,
@@ -1217,10 +1306,9 @@ impl SlotTask {
             self.clear_cancel_request(coi, "the nonce slot could not be seeded");
             return;
         };
-        let market_index = plan.market_index as i16;
         let signed = match signer
             .cancel_order(
-                market_index,
+                plan.market_index as i16,
                 plan.order_index,
                 reserved,
                 self.config.api_key_index,
@@ -1234,43 +1322,27 @@ impl SlotTask {
                 return;
             }
         };
+        self.dispatch_cancel(nonce, gate, held, admission, coi, plan, &signed)
+            .await;
+    }
+
+    /// Sends one signed cancel through `sendTx` and acts on the answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_cancel(
+        &self,
+        nonce: &mut NonceOwner,
+        gate: &mut SendGate,
+        held: &mut HeldCancels,
+        admission: Admission,
+        coi: i64,
+        plan: &CancelPlan,
+        signed: &Signed,
+    ) {
         match rest::send_tx(&self.rest_url, signed.tx_type, &signed.tx_info).await {
             Ok(outcome) => {
                 let outcome = self.received(gate, admission, outcome);
                 self.apply_nonce(nonce, &outcome).await;
-                match cancel_after_send(&outcome) {
-                    CancelFollowUp::AwaitChannel => {}
-                    // An ambiguous answer to a probe is a refused probe (`received` backed the
-                    // probes off): the cancel stays held — pending to the bot — for the next one,
-                    // as after a 429 (§4.16). Handed back, the bot would only cancel again into
-                    // the cooldown, and a dead bot's quote would stand.
-                    CancelFollowUp::HandBack(reason)
-                        if admission == Admission::Probe
-                            && matches!(outcome, SendOutcome::Ambiguous { .. }) =>
-                    {
-                        info!(
-                            coi,
-                            %reason,
-                            "A Lighter cancel probing the cooldown got no clear answer; it stays \
-                             held, pending to the bot, for the next probe (§4.16)."
-                        );
-                        held.hold(coi, plan.clone());
-                    }
-                    // A `21104` or an ambiguous answer must not leave the order looking
-                    // cancel-pending to the bot while it stands on the venue (§3.3).
-                    CancelFollowUp::HandBack(reason) => self.clear_cancel_request(coi, &reason),
-                    // Rate-limited under a cooldown: held, still pending, and sent again when the
-                    // cooldown is over unless the channel has closed the order by then (§4.16).
-                    CancelFollowUp::AfterCooldown => {
-                        info!(
-                            coi,
-                            "A Lighter cancel the venue answered 429/405 is held. It stays \
-                             pending to the bot and goes out again when the cooldown is over \
-                             (§4.16)."
-                        );
-                        held.hold(coi, plan.clone());
-                    }
-                }
+                self.settle_cancel(held, admission, coi, plan, &outcome);
             }
             Err(error) => {
                 nonce.invalidated();
@@ -1288,6 +1360,364 @@ impl SlotTask {
         }
         // The confirmed cancel arrives on the private channel as `status: canceled`; nothing
         // here reports it, so a refused transport does not look like a cancel that took.
+    }
+
+    /// What a cancel's answer — already read by [`Self::received`], the nonce already settled —
+    /// leaves for it (§3.3, §4.16). Shared by a lone `sendTx` and every transaction of a batch.
+    fn settle_cancel(
+        &self,
+        held: &mut HeldCancels,
+        admission: Admission,
+        coi: i64,
+        plan: &CancelPlan,
+        outcome: &SendOutcome,
+    ) {
+        match cancel_after_send(outcome) {
+            CancelFollowUp::AwaitChannel => {}
+            // An ambiguous answer to a probe is a refused probe (`received` backed the probes
+            // off): the cancel stays held — pending to the bot — for the next one, as after a
+            // 429 (§4.16). Handed back, the bot would only cancel again into the cooldown, and a
+            // dead bot's quote would stand.
+            CancelFollowUp::HandBack(reason)
+                if admission == Admission::Probe
+                    && matches!(outcome, SendOutcome::Ambiguous { .. }) =>
+            {
+                info!(
+                    coi,
+                    %reason,
+                    "A Lighter cancel probing the cooldown got no clear answer; it stays \
+                     held, pending to the bot, for the next probe (§4.16)."
+                );
+                held.hold(coi, plan.clone());
+            }
+            // A `21104` or an ambiguous answer must not leave the order looking cancel-pending
+            // to the bot while it stands on the venue (§3.3).
+            CancelFollowUp::HandBack(reason) => self.clear_cancel_request(coi, &reason),
+            // Rate-limited under a cooldown: held, still pending, and sent again when the
+            // cooldown is over unless the channel has closed the order by then (§4.16).
+            CancelFollowUp::AfterCooldown => {
+                info!(
+                    coi,
+                    "A Lighter cancel the venue answered 429/405 is held. It stays pending to \
+                     the bot and goes out again when the cooldown is over (§4.16)."
+                );
+                held.hold(coi, plan.clone());
+            }
+        }
+    }
+
+    /// Sends what the gate admitted — `first` — together with whatever else is already
+    /// waiting in the queue and may go with it, up to `max_batch` (§3.7). Only an ordinary send
+    /// gathers company: a probe of a cooldown always goes alone.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_admitted(
+        &self,
+        signer: &mut SignerClient,
+        nonce: &mut NonceOwner,
+        gate: &mut SendGate,
+        held: &mut HeldCancels,
+        admission: Admission,
+        first: Batched,
+        command_rx: &mut UnboundedReceiver<Command>,
+        lookahead: &mut Option<Command>,
+        awaiting: &mut HashMap<i64, Awaiting>,
+    ) {
+        let mut batch = vec![first];
+        if admission == Admission::Send {
+            self.gather_batch(gate, held, command_rx, lookahead, &mut batch);
+        }
+        if batch.len() > 1 {
+            self.send_batch(signer, nonce, gate, held, batch, awaiting)
+                .await;
+            return;
+        }
+        match batch.pop() {
+            Some(Batched::Submit {
+                coi,
+                order,
+                outbound,
+                dequeued,
+            }) => {
+                self.send_order(
+                    signer, nonce, gate, admission, coi, &order, &outbound, dequeued, awaiting,
+                )
+                .await;
+            }
+            Some(Batched::Cancel { coi, plan }) => {
+                self.send_cancel(signer, nonce, gate, held, admission, coi, &plan)
+                    .await;
+            }
+            None => {}
+        }
+    }
+
+    /// Adds to `batch`, without waiting, the submits and cancels already queued behind it, up to
+    /// `max_batch` (§3.7) — each admitted by the gate on its own, one token a transaction, as if
+    /// it were sent alone.
+    ///
+    /// The batch ends — and the command that ended it waits in `lookahead`, to be served next,
+    /// on its own and in its turn — at the first command that is not a submit or a cancel (a
+    /// sweep, an auth mint), at the first the gate would not let through as an ordinary send
+    /// (no token for it, a cooldown), and whenever a cancel is held: a held cancel goes before
+    /// anything newer, never behind a batch it is not in. So a batch never spends a token the
+    /// same sends one by one would not have, and anything it leaves out meets exactly the path
+    /// it met before batching existed.
+    fn gather_batch(
+        &self,
+        gate: &mut SendGate,
+        held: &HeldCancels,
+        command_rx: &mut UnboundedReceiver<Command>,
+        lookahead: &mut Option<Command>,
+        batch: &mut Vec<Batched>,
+    ) {
+        while batch.len() < self.config.max_batch as usize && held.is_empty() {
+            let Ok(command) = command_rx.try_recv() else {
+                return;
+            };
+            let (candidate, class) = match command {
+                Command::Submit {
+                    coi,
+                    order,
+                    outbound,
+                } => (
+                    Batched::Submit {
+                        coi,
+                        order,
+                        outbound,
+                        dequeued: StdInstant::now(),
+                    },
+                    self.submit_class(coi),
+                ),
+                Command::Cancel { coi, plan } => {
+                    (Batched::Cancel { coi, plan }, TxClass::RiskReducing)
+                }
+                other => {
+                    *lookahead = Some(other);
+                    return;
+                }
+            };
+            let now = Instant::now();
+            let admitted = gate.cooling(now).is_none()
+                && gate.next_admission(now, class).is_none()
+                && gate.admit(now, class) == Ok(Admission::Send);
+            if !admitted {
+                // Served next on its own path, which refuses, holds or hands it back exactly as
+                // it would have without batching. (`admit` cannot answer a probe or a refusal
+                // here — no cooldown and a free token were just seen at the same `now` — so no
+                // token is spent on it twice.)
+                *lookahead = Some(candidate.into_command());
+                return;
+            }
+            batch.push(candidate);
+        }
+    }
+
+    /// Signs `batch` on one run of consecutive nonces and sends it as one `sendTxBatch`
+    /// (design note §3.7); what the signer leaves of it as a single transaction goes through
+    /// `sendTx` instead, exactly as a lone order.
+    ///
+    /// Every transaction's fate is read off the one answer ([`rest::classify_batch_outcome`]):
+    /// a clean echo is an ack each; a 429/405 is one rate limit for all; anything else leaves
+    /// each one's fate unknown — submits settled off `accountActiveOrders` at their deadline,
+    /// cancels handed back — and the nonce re-read.
+    async fn send_batch(
+        &self,
+        signer: &mut SignerClient,
+        nonce: &mut NonceOwner,
+        gate: &mut SendGate,
+        held: &mut HeldCancels,
+        batch: Vec<Batched>,
+        awaiting: &mut HashMap<i64, Awaiting>,
+    ) {
+        let Some(first) = self.reserve_run(nonce, batch.len()).await else {
+            for entry in batch {
+                self.unsent(entry, "the nonce slot could not be seeded");
+            }
+            return;
+        };
+        let reserved_at = StdInstant::now();
+        let mut signed: Vec<(Batched, Signed, SignMarks)> = Vec::with_capacity(batch.len());
+        for entry in batch {
+            // A transaction the signer refused took no number, so the run stays unbroken.
+            let tx_nonce = first + signed.len() as i64;
+            let started = StdInstant::now();
+            let result = match &entry {
+                Batched::Submit { order, .. } => signer
+                    .create_order(order, tx_nonce, self.config.api_key_index)
+                    .await
+                    .map_err(|error| format!("the signer refused the order: {error}")),
+                Batched::Cancel { plan, .. } => signer
+                    .cancel_order(
+                        plan.market_index as i16,
+                        plan.order_index,
+                        tx_nonce,
+                        self.config.api_key_index,
+                    )
+                    .await
+                    .map_err(|error| format!("the signer refused the cancel: {error}")),
+            };
+            match result {
+                Ok(tx) => {
+                    let marks = SignMarks {
+                        dequeued: entry.dequeued().unwrap_or(reserved_at),
+                        reserved: started,
+                        signed: StdInstant::now(),
+                    };
+                    signed.push((entry, tx, marks));
+                }
+                Err(reason) => self.unsent(entry, &reason),
+            }
+        }
+        nonce.truncate_run(signed.len());
+        if signed.len() < 2 {
+            // Nothing, or one: a lone transaction goes the way a lone order always has.
+            if let Some((entry, tx, marks)) = signed.pop() {
+                match entry {
+                    Batched::Submit {
+                        coi,
+                        order,
+                        outbound,
+                        ..
+                    } => {
+                        self.dispatch_order(
+                            nonce,
+                            gate,
+                            Admission::Send,
+                            coi,
+                            order.market_index as i32,
+                            &tx,
+                            &outbound,
+                            marks,
+                            awaiting,
+                        )
+                        .await;
+                    }
+                    Batched::Cancel { coi, plan } => {
+                        self.dispatch_cancel(nonce, gate, held, Admission::Send, coi, &plan, &tx)
+                            .await;
+                    }
+                }
+            }
+            return;
+        }
+
+        let size = signed.len();
+        let txs: Vec<(u8, String)> = signed
+            .iter()
+            .map(|(_, tx, _)| (tx.tx_type, tx.tx_info.clone()))
+            .collect();
+        let hashes: Vec<String> = signed.iter().map(|(_, tx, _)| tx.tx_hash.clone()).collect();
+        let answered = rest::send_tx_batch(&self.rest_url, &txs, &hashes).await;
+        let sent_at = StdInstant::now();
+        for (position, (entry, _, marks)) in signed.iter().enumerate() {
+            if let Batched::Submit { coi, outbound, .. } = entry {
+                log_placement_timing(*coi, outbound, *marks, sent_at, size, position);
+            }
+        }
+
+        // A transport failure is as unknown a fate as any other answer short of a clean echo.
+        let answer = answered.unwrap_or_else(|error| BatchOutcome::Ambiguous {
+            status: 0,
+            code: None,
+            detail: format!("the sendTxBatch failed: {error}"),
+        });
+        let last = first + size as i64 - 1;
+        let (representative, code) = match &answer {
+            BatchOutcome::Accepted(acks) => match acks.first() {
+                Some(ack) => (SendOutcome::Accepted(ack.clone()), None),
+                // Unreachable — an echo of no hash is not a clean echo of two — but read as
+                // what it would be: nothing known.
+                None => (
+                    SendOutcome::Ambiguous {
+                        status: 200,
+                        detail: "a sendTxBatch 200 with no hashes".to_string(),
+                    },
+                    None,
+                ),
+            },
+            BatchOutcome::RateLimited { status, detail } => (
+                SendOutcome::RateLimited {
+                    status: *status,
+                    detail: format!("sendTxBatch of {size}, nonces {first}..={last}: {detail}"),
+                },
+                None,
+            ),
+            BatchOutcome::Ambiguous {
+                status,
+                code,
+                detail,
+            } => (
+                SendOutcome::Ambiguous {
+                    status: *status,
+                    detail: format!("sendTxBatch of {size}, nonces {first}..={last}: {detail}"),
+                },
+                *code,
+            ),
+        };
+        // One read of the answer for the whole batch: one cooldown and one error to the bots
+        // for a 429, one near-the-limit warning — and one settlement of the run's nonces.
+        let read = self.received(gate, Admission::Send, representative);
+        self.apply_nonce(nonce, &read).await;
+        let per_transaction: Vec<SendOutcome> = match (&read, answer) {
+            (SendOutcome::Accepted(_), BatchOutcome::Accepted(acks)) => {
+                acks.into_iter().map(SendOutcome::Accepted).collect()
+            }
+            _ => vec![read.clone(); size],
+        };
+        if let SendOutcome::Ambiguous { status, detail } = &read {
+            // How many of the run the venue kept — nextNonce, just re-read, past `first`. A
+            // clue to what the venue does with a batch it refuses (§3.7, unknown No. 1), NOT a
+            // verdict: a spent nonce is not a resting order, and the fates are read off the
+            // venue order by order.
+            let consumed = nonce.peek().map(|next| next - first);
+            let cois: Vec<i64> = signed.iter().map(|(entry, _, _)| entry.coi()).collect();
+            if matches!(code, Some(21105 | 21121 | 21513 | 21514)) {
+                error!(
+                    ?code,
+                    status,
+                    batch = size,
+                    first_nonce = first,
+                    ?consumed,
+                    ?cois,
+                    %detail,
+                    "The venue refused a Lighter sendTxBatch as malformed — a bug in how the \
+                     connector builds batches, not the weather. Every transaction in it is \
+                     settled as an ambiguous send (§3.7)."
+                );
+            } else {
+                warn!(
+                    ?code,
+                    status,
+                    batch = size,
+                    first_nonce = first,
+                    ?consumed,
+                    ?cois,
+                    %detail,
+                    "An ambiguous Lighter sendTxBatch; every order in it is kept tracked and \
+                     settled off accountActiveOrders at its deadline, every cancel goes back to \
+                     the bot (§3.7)."
+                );
+            }
+        }
+        for ((entry, _, _), outcome) in signed.into_iter().zip(per_transaction) {
+            match entry {
+                Batched::Submit { coi, order, .. } => {
+                    self.settle_submit(awaiting, coi, order.market_index as i32, outcome);
+                }
+                Batched::Cancel { coi, plan } => {
+                    self.settle_cancel(held, Admission::Send, coi, &plan, &outcome);
+                }
+            }
+        }
+    }
+
+    /// Hands a batched transaction that was never sent back to the bot, as its lone send would
+    /// have been: a submit expired, a cancel's request cleared.
+    fn unsent(&self, entry: Batched, reason: &str) {
+        match entry {
+            Batched::Submit { coi, .. } => self.expire(coi, reason),
+            Batched::Cancel { coi, .. } => self.clear_cancel_request(coi, reason),
+        }
     }
 
     /// One reserve-sign-send round of a sweep. `Err` is why nothing was sent, or why no answer
@@ -1335,10 +1765,16 @@ impl SlotTask {
 
     /// Reserves a nonce, seeding first if the slot is unseeded. `None` if it cannot be seeded.
     async fn reserve(&self, nonce: &mut NonceOwner) -> Option<i64> {
+        self.reserve_run(nonce, 1).await
+    }
+
+    /// Reserves a run of `len` consecutive nonces for a batch (§3.7), seeding first if the slot
+    /// is unseeded, and returns the first. `None` if it cannot be seeded.
+    async fn reserve_run(&self, nonce: &mut NonceOwner, len: usize) -> Option<i64> {
         if !nonce.is_seeded() {
             self.reseed(nonce).await;
         }
-        nonce.reserve().ok()
+        nonce.reserve_run(len).ok()
     }
 
     async fn apply_nonce(&self, nonce: &mut NonceOwner, outcome: &SendOutcome) {
@@ -1663,18 +2099,23 @@ impl SlotTask {
     /// ([`OrderManager::reduces_position`]); a quote may not — a post-only one on the reducing
     /// side included.
     fn admit_submit(&self, gate: &mut SendGate, coi: i64) -> Option<Admission> {
-        let class = if self.order_manager.lock().unwrap().reduces_position(coi) {
-            TxClass::RiskReducing
-        } else {
-            TxClass::Open
-        };
-        match gate.admit(Instant::now(), class) {
+        match gate.admit(Instant::now(), self.submit_class(coi)) {
             Ok(admission) => Some(admission),
             Err(refusal) => {
                 self.log_refusal(gate, &refusal, "submit");
                 self.hand_back_unsent(coi, &refusal.to_string());
                 None
             }
+        }
+    }
+
+    /// What the gate counts submit `coi` as: risk-reducing if it is an IOC (or reduce-only)
+    /// that shrinks |position| ([`OrderManager::reduces_position`]), a quote otherwise.
+    fn submit_class(&self, coi: i64) -> TxClass {
+        if self.order_manager.lock().unwrap().reduces_position(coi) {
+            TxClass::RiskReducing
+        } else {
+            TxClass::Open
         }
     }
 
@@ -1738,6 +2179,89 @@ impl SlotTask {
             );
         }
     }
+}
+
+/// A submit or a cancel the gate let through, on its way out alone or in a batch (§3.7).
+enum Batched {
+    Submit {
+        coi: i64,
+        order: Box<CreateOrder>,
+        outbound: Outbound,
+        /// When the slot took it off the queue.
+        dequeued: StdInstant,
+    },
+    Cancel {
+        coi: i64,
+        plan: CancelPlan,
+    },
+}
+
+impl Batched {
+    fn coi(&self) -> i64 {
+        match self {
+            Self::Submit { coi, .. } | Self::Cancel { coi, .. } => *coi,
+        }
+    }
+
+    fn dequeued(&self) -> Option<StdInstant> {
+        match self {
+            Self::Submit { dequeued, .. } => Some(*dequeued),
+            Self::Cancel { .. } => None,
+        }
+    }
+
+    /// The command it came as, to be served on its own.
+    fn into_command(self) -> Command {
+        match self {
+            Self::Submit {
+                coi,
+                order,
+                outbound,
+                ..
+            } => Command::Submit {
+                coi,
+                order,
+                outbound,
+            },
+            Self::Cancel { coi, plan } => Command::Cancel { coi, plan },
+        }
+    }
+}
+
+/// The marks a placement collects in the slot before its send ([`Outbound::spans`]).
+#[derive(Clone, Copy)]
+struct SignMarks {
+    dequeued: StdInstant,
+    /// When its nonce was in hand and its signing began.
+    reserved: StdInstant,
+    signed: StdInstant,
+}
+
+/// One `Lighter placement timing.` line. `batch` is how many transactions went in the request
+/// that carried this one (1 for `sendTx`), `batch_pos` its place there (§3.7). In a batch,
+/// `nonce_us` runs to the start of this transaction's own signing — so it includes the signing
+/// of those before it — and `send_us` from its end, including the signing of those after it:
+/// the spans still add up to the whole outbound leg.
+fn log_placement_timing(
+    coi: i64,
+    outbound: &Outbound,
+    marks: SignMarks,
+    sent: StdInstant,
+    batch: usize,
+    batch_pos: usize,
+) {
+    let spans = outbound.spans(marks.dequeued, marks.reserved, marks.signed, sent);
+    info!(
+        coi,
+        ipc_us = spans.ipc_us,
+        queue_us = spans.queue_us,
+        nonce_us = spans.nonce_us,
+        sign_us = spans.sign_us,
+        send_us = spans.send_us,
+        batch,
+        batch_pos,
+        "Lighter placement timing."
+    );
 }
 
 /// Cancels a rate-limit cooldown kept from going out, in the order they were asked for, to be
@@ -2823,7 +3347,13 @@ mod tests {
                 SWEEP_ATTEMPTS,
                 testing::{ScriptedVenue, throttled},
             },
-            test_venue::{DROP_CONNECTION, ScriptedRestVenue, SidecarIdentity, fake_signer},
+            test_venue::{
+                BatchAnswer,
+                DROP_CONNECTION,
+                ScriptedRestVenue,
+                SidecarIdentity,
+                fake_signer,
+            },
         },
         supervision::{DrainOutcome, StopKind, StopReport, exit_code},
         utils::testing::{CapturedField, RecordingSink, closed_read, read_after_connect},
@@ -4373,6 +4903,8 @@ mod tests {
         ev_tx: tokio::sync::mpsc::UnboundedSender<PublishEvent>,
         events: tokio::sync::mpsc::UnboundedReceiver<PublishEvent>,
         venue: ScriptedRestVenue,
+        /// The client order indices the stand-in signer refuses to sign.
+        refuse_signing: Arc<Mutex<HashSet<i64>>>,
     }
 
     /// The `[order_path]` the scripted slot runs with before a test tweaks it: no budget, no
@@ -4437,12 +4969,16 @@ mod tests {
         });
         let (ev_tx, events) = unbounded_channel();
         let (command_tx, command_rx) = unbounded_channel();
-        let signer = fake_signer(SidecarIdentity {
-            url: venue.url.clone(),
-            chain_id: 466_324,
-            account_index: config.account_index,
-            api_key_index: config.api_key_index,
-        });
+        let refuse_signing: Arc<Mutex<HashSet<i64>>> = Arc::default();
+        let signer = fake_signer(
+            SidecarIdentity {
+                url: venue.url.clone(),
+                chain_id: 466_324,
+                account_index: config.account_index,
+                api_key_index: config.api_key_index,
+            },
+            refuse_signing.clone(),
+        );
         let slot = SlotTask {
             config,
             network: SignerNetwork {
@@ -4468,8 +5004,21 @@ mod tests {
                 ev_tx,
                 events,
                 venue,
+                refuse_signing,
             },
         )
+    }
+
+    /// The slot, started only once `queue` has put its commands in the channel — so they are
+    /// all waiting when the slot first looks, as the bid and the ask of one tick are.
+    async fn slot_with_queued(
+        tweak: impl FnOnce(&mut OrderPathConfig),
+        queue: impl AsyncFnOnce(&SlotOnScriptedVenue),
+    ) -> SlotOnScriptedVenue {
+        let (slot, signer, command_rx, harness) = scripted_slot(tweak).await;
+        queue(&harness).await;
+        tokio::spawn(slot.serve(signer, command_rx));
+        harness
     }
 
     impl SlotOnScriptedVenue {
@@ -4618,6 +5167,431 @@ mod tests {
             "a 21104 re-reads the counter"
         );
         assert_eq!(slot.venue.sent()[1], ("create_order".to_string(), 8));
+    }
+
+    // ---- sendTxBatch: what is queued together goes together (§3.7) ----------------------
+
+    fn ops(txs: &[(String, i64)]) -> Vec<(&str, i64)> {
+        txs.iter()
+            .map(|(op, nonce)| (op.as_str(), *nonce))
+            .collect()
+    }
+
+    fn with_batch(max_batch: u32) -> impl FnOnce(&mut OrderPathConfig) {
+        move |config| config.max_batch = max_batch
+    }
+
+    /// **The bid and the ask of one tick go as one `sendTxBatch`, on consecutive nonces** — the
+    /// second no longer waits out the first's round trip (measured 2026-10-09: 350–460 ms apart
+    /// at the venue). The run spends its nonces as a whole: the next lone order goes through
+    /// `sendTx` with the nonce after the run, without a re-read. Each line of the placement
+    /// timing names its place in the batch.
+    #[tokio::test]
+    async fn two_orders_queued_together_go_as_one_batch_on_consecutive_nonces() {
+        let positions = CapturedField::new("batch_pos", Level::INFO);
+        let _capturing = positions.capturing();
+        let slot = slot_with_queued(with_batch(2), async |slot| {
+            slot.submit(&eth_order(1, Side::Buy));
+            slot.submit(&eth_order(2, Side::Sell));
+        })
+        .await;
+        slot.venue_until(|venue| venue.sent_batches().len() == 1)
+            .await;
+        assert_eq!(
+            ops(&slot.venue.sent_batches()[0]),
+            [("create_order", 7), ("create_order", 8)]
+        );
+        assert!(slot.venue.sent().is_empty(), "no sendTx for either");
+        assert_eq!(
+            positions.seen(),
+            ["0", "1"],
+            "one timing line each, by position"
+        );
+
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent(), [("create_order".to_string(), 9)]);
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            1,
+            "the run was spent, not re-read"
+        );
+        assert_eq!(
+            slot.venue.sent_batches().len(),
+            1,
+            "a lone order goes alone"
+        );
+    }
+
+    /// **`max_batch = 1` — the default — is the slot as it was: one `sendTx` per transaction,
+    /// and no `sendTxBatch` at any load.**
+    #[tokio::test]
+    async fn with_max_batch_one_nothing_is_batched() {
+        let sizes = CapturedField::new("batch", Level::INFO);
+        let _capturing = sizes.capturing();
+        let slot = slot_with_queued(
+            |_| {},
+            async |slot| {
+                for order_id in 1..=3 {
+                    slot.submit(&eth_order(order_id, Side::Buy));
+                }
+            },
+        )
+        .await;
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(
+            ops(&slot.venue.sent()),
+            [
+                ("create_order", 7),
+                ("create_order", 8),
+                ("create_order", 9)
+            ]
+        );
+        assert_eq!(slot.venue.count("/api/v1/sendTxBatch"), 0);
+        assert_eq!(sizes.seen(), ["1", "1", "1"]);
+    }
+
+    /// **A batch is never larger than `max_batch`**: the rest waits for the next send.
+    #[tokio::test]
+    async fn a_batch_is_never_larger_than_max_batch() {
+        let slot = slot_with_queued(with_batch(2), async |slot| {
+            for order_id in 1..=3 {
+                slot.submit(&eth_order(order_id, Side::Buy));
+            }
+        })
+        .await;
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(
+            slot.venue
+                .sent_batches()
+                .iter()
+                .map(|batch| ops(batch))
+                .collect::<Vec<_>>(),
+            [vec![("create_order", 7), ("create_order", 8)]]
+        );
+        assert_eq!(slot.venue.sent(), [("create_order".to_string(), 9)]);
+    }
+
+    /// **Inside a batch the order is the queue's: a cancel asked for before a quote signs —
+    /// and executes — before it**, so a requote never overtakes the cancel of the quote it
+    /// replaces. A clean echo leaves the cancel to the channel and the quote to its deadline.
+    #[tokio::test]
+    async fn a_cancel_queued_before_a_quote_goes_first_in_the_batch() {
+        let mut slot = slot_with_queued(with_batch(4), async |slot| {
+            let resting = slot.resting(1);
+            slot.cancel(&resting);
+            slot.submit(&eth_order(2, Side::Buy));
+        })
+        .await;
+        slot.venue_until(|venue| venue.sent_batches().len() == 1)
+            .await;
+        assert_eq!(
+            ops(&slot.venue.sent_batches()[0]),
+            [("cancel_order", 7), ("create_order", 8)]
+        );
+        time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            slot.events.try_recv().is_err(),
+            "nothing to tell the bot yet"
+        );
+    }
+
+    /// **The budget counts transactions, not requests: a batch is cut where the tokens run
+    /// out, never sent past them.** With 2 a minute and three orders queued, two go as one batch
+    /// and the third is refused unsent — exactly what three single sends would have met.
+    #[tokio::test]
+    async fn a_batch_is_cut_where_the_send_budget_runs_out() {
+        let mut slot = slot_with_queued(
+            |config| {
+                config.max_batch = 3;
+                config.tx_budget_per_minute = Some(2);
+            },
+            async |slot| {
+                for order_id in 1..=3 {
+                    slot.submit(&eth_order(order_id, Side::Buy));
+                }
+            },
+        )
+        .await;
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the order over the budget comes back");
+        };
+        assert_eq!((order.order_id, order.status), (3, Status::Expired));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("rate-limited"), "{message}");
+        assert!(message.contains("budget"), "{message}");
+        assert!(message.starts_with("Frame: ETH: "), "{message}");
+        slot.venue_until(|venue| venue.sent_batches().len() == 1)
+            .await;
+        assert_eq!(
+            ops(&slot.venue.sent_batches()[0]),
+            [("create_order", 7), ("create_order", 8)]
+        );
+        assert!(slot.venue.sent().is_empty(), "the third never went out");
+    }
+
+    /// **A batch refused `21104` is NOT "the orders did not take"** (§3.7): for one transaction
+    /// that reading is measured, for a batch nothing says the venue checks it all-or-nothing.
+    /// So the nonce is re-read, the cancel goes back to the bot at once — order still live, its
+    /// request cleared, so it can cancel again — and the quote is kept tracked and settled off
+    /// `accountActiveOrders` at its deadline, never expired on the batch's word.
+    #[tokio::test]
+    async fn an_ambiguous_batch_settles_its_quote_off_the_venue_and_hands_its_cancel_back() {
+        let mut slot = slot_with_queued(
+            |config| {
+                config.max_batch = 2;
+                config.confirm_deadline_ms = 300;
+            },
+            async |slot| {
+                slot.venue.answer_batch_with([BatchAnswer::Fixed(
+                    400,
+                    r#"{"code":21104,"message":"invalid nonce"}"#.to_string(),
+                )]);
+                let resting = slot.resting(1);
+                slot.cancel(&resting);
+                slot.submit(&eth_order(2, Side::Buy));
+            },
+        )
+        .await;
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the cancel comes back first");
+        };
+        assert_eq!(order.order_id, 1);
+        assert_eq!(order.status, Status::New, "still live");
+        assert_eq!(order.req, Status::None, "no cancel pending on it");
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.starts_with("Frame: ETH: "), "{message}");
+        assert!(message.contains("ambiguous"), "{message}");
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            2,
+            "the nonce is re-read"
+        );
+        assert_eq!(
+            slot.venue.count("/api/v1/accountActiveOrders"),
+            0,
+            "the quote is not judged before its deadline"
+        );
+
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the quote is settled at its deadline");
+        };
+        assert_eq!((order.order_id, order.status), (2, Status::Expired));
+        assert_eq!(slot.venue.count("/api/v1/accountActiveOrders"), 1);
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("accountActiveOrders"), "{message}");
+        assert!(
+            !message.contains("21104"),
+            "not on the batch's word: {message}"
+        );
+    }
+
+    /// **A 200 that echoes only part of the batch is a doubt about all of it**: nothing
+    /// documents a partial success, so neither order is believed, both are settled off the
+    /// venue, and the nonce is re-read — here the venue kept one of the two, and the next send
+    /// goes out with the nonce after it.
+    #[tokio::test]
+    async fn a_partial_echo_is_a_doubt_about_every_transaction() {
+        let mut slot = slot_with_queued(
+            |config| {
+                config.max_batch = 2;
+                config.confirm_deadline_ms = 300;
+            },
+            async |slot| {
+                slot.venue.answer_batch_with([BatchAnswer::EchoFirst]);
+                slot.submit(&eth_order(1, Side::Buy));
+                slot.submit(&eth_order(2, Side::Sell));
+            },
+        )
+        .await;
+        let mut expired = Vec::new();
+        while expired.len() < 2 {
+            if let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+            {
+                assert_eq!(order.status, Status::Expired);
+                expired.push(order.order_id);
+            }
+        }
+        expired.sort_unstable();
+        assert_eq!(expired, [1, 2]);
+        assert!(slot.venue.count("/api/v1/accountActiveOrders") >= 1);
+        assert_eq!(slot.venue.count("/api/v1/nextNonce"), 2, "re-read once");
+
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent(), [("create_order".to_string(), 8)]);
+    }
+
+    /// **A batch answered 429 is one rate limit: one cooldown, one error to the bots, its cancel
+    /// held — not handed back — and sent on its own when the cooldown is over.** The quote in it
+    /// is kept tracked and read off the venue only after the cooldown; nothing is read inside it.
+    #[tokio::test]
+    async fn a_batch_answered_429_is_one_cooldown_and_its_cancel_is_held() {
+        let mut slot = slot_with_queued(
+            |config| {
+                config.max_batch = 2;
+                config.rate_limit_cooldown_ms = Some(1_500);
+                config.confirm_deadline_ms = 100;
+            },
+            async |slot| {
+                slot.venue.answer_batch_with([BatchAnswer::Fixed(
+                    too_many_requests().0,
+                    too_many_requests().1,
+                )]);
+                let resting = slot.resting(1);
+                slot.cancel(&resting);
+                slot.submit(&eth_order(2, Side::Buy));
+            },
+        )
+        .await;
+        let started = time::Instant::now();
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(message.contains("rate-limited"), "{message}");
+        assert!(message.contains("429"), "{message}");
+
+        time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            slot.events.try_recv().is_err(),
+            "one error for the batch, and the cancel is not handed back"
+        );
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            1,
+            "nothing read inside it"
+        );
+        assert_eq!(slot.venue.count("/api/v1/accountActiveOrders"), 0);
+
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(
+            slot.venue.sent()[0].0,
+            "cancel_order",
+            "held, then sent alone"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_000),
+            "after the cooldown"
+        );
+        assert_eq!(slot.venue.sent_batches().len(), 1);
+    }
+
+    /// **Inside a cooldown nothing is batched: a cancel probing it goes alone** (§3.7) — one
+    /// cheap question "is it over", not a batch of them at a token each — even when two are let
+    /// through as probes together.
+    #[tokio::test]
+    async fn inside_a_cooldown_cancels_go_one_by_one() {
+        let slot = slot_on_scripted_venue(|config| {
+            config.max_batch = 3;
+            config.rate_limit_cooldown_ms = Some(1_500);
+            config.rate_limit_cancel_probe_ms = Some(200);
+        })
+        .await;
+        let first = slot.resting(1);
+        let second = slot.resting(2);
+        slot.venue.answer_send_tx_with([too_many_requests()]);
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+
+        // The first probe is due: both cancels are let through as probes the moment they
+        // arrive — together, in one wake of the slot — and still go one by one.
+        time::sleep(Duration::from_millis(300)).await;
+        slot.cancel(&first);
+        slot.cancel(&second);
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(
+            slot.venue.sent()[1..]
+                .iter()
+                .map(|(op, _)| op.as_str())
+                .collect::<Vec<_>>(),
+            ["cancel_order", "cancel_order"]
+        );
+        assert_eq!(slot.venue.count("/api/v1/sendTxBatch"), 0);
+    }
+
+    /// **A sweep is never batched, and keeps its place in the queue**: the order before it goes
+    /// alone, the sweep after it, the order behind it after that.
+    #[tokio::test]
+    async fn a_sweep_in_the_queue_is_not_batched_and_keeps_its_place() {
+        let slot = slot_with_queued(with_batch(3), async |slot| {
+            slot.submit(&eth_order(1, Side::Buy));
+            let _sweep = slot
+                .order_path
+                .sweep(vec![42], SweepReason::ConnectorStopping);
+            tokio::task::yield_now().await;
+            slot.submit(&eth_order(2, Side::Buy));
+        })
+        .await;
+        slot.venue_until(|venue| venue.sent().len() == 3).await;
+        assert_eq!(
+            ops(&slot.venue.sent()),
+            [("create_order", 7), ("cancel_all", 8), ("create_order", 9)]
+        );
+        assert_eq!(slot.venue.count("/api/v1/sendTxBatch"), 0);
+    }
+
+    /// **A transaction the signer refuses takes no nonce, so the run stays unbroken**: the next
+    /// one signs with the number it would have had, and the order refused goes back to the bot.
+    #[tokio::test]
+    async fn a_signer_refusal_inside_a_batch_leaves_the_run_unbroken() {
+        let mut slot = slot_with_queued(with_batch(3), async |slot| {
+            for order_id in 1..=3 {
+                slot.submit(&eth_order(order_id, Side::Buy));
+            }
+            let middle = slot
+                .order_path
+                .order_manager
+                .lock()
+                .unwrap()
+                .coi_for("ETH", 2)
+                .unwrap();
+            slot.refuse_signing.lock().unwrap().insert(middle);
+        })
+        .await;
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the refused order comes back");
+        };
+        assert_eq!((order.order_id, order.status), (2, Status::Expired));
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("signer refused"), "{message}");
+        slot.venue_until(|venue| venue.sent_batches().len() == 1)
+            .await;
+        assert_eq!(
+            ops(&slot.venue.sent_batches()[0]),
+            [("create_order", 7), ("create_order", 8)]
+        );
+
+        // The run was spent as signed — two, not the three reserved: the next goes with 9.
+        slot.submit(&eth_order(4, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent(), [("create_order".to_string(), 9)]);
+    }
+
+    /// **A batch the signer leaves with one transaction goes as a plain `sendTx`** — the very
+    /// path a lone order takes — never as a batch of one.
+    #[tokio::test]
+    async fn a_batch_signed_down_to_one_goes_as_a_plain_send_tx() {
+        let slot = slot_with_queued(with_batch(2), async |slot| {
+            slot.submit(&eth_order(1, Side::Buy));
+            slot.submit(&eth_order(2, Side::Sell));
+            let first = slot
+                .order_path
+                .order_manager
+                .lock()
+                .unwrap()
+                .coi_for("ETH", 1)
+                .unwrap();
+            slot.refuse_signing.lock().unwrap().insert(first);
+        })
+        .await;
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(slot.venue.sent(), [("create_order".to_string(), 7)]);
+        assert_eq!(slot.venue.count("/api/v1/sendTxBatch"), 0);
     }
 
     // ---- the client-side sendTx budget (§4.15) -----------------------------------------
