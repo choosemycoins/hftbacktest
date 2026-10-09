@@ -120,7 +120,10 @@ pub(crate) struct Seen {
 /// * `POST /api/v1/sendTxBatch` — the next scripted [`BatchAnswer`], or [`BatchAnswer::Echo`]
 ///   once the script is spent.
 /// * `GET /api/v1/accountActiveOrders` — an empty list (the venue holds nothing).
-/// * `GET /api/v1/tx` — no verdict yet.
+/// * `GET /api/v1/tx` — no verdict yet; or, for a transaction whose client order index
+///   [`ScriptedRestVenue::reject_tx_of`] names, the application error `21733` — told apart by
+///   the hash the stand-in signer wrote into its `tx_info`, so a verdict asked for under the
+///   wrong hash is the wrong verdict.
 ///
 /// Every request is recorded, in arrival order.
 pub(crate) struct ScriptedRestVenue {
@@ -129,6 +132,7 @@ pub(crate) struct ScriptedRestVenue {
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
     batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
+    rejected_cois: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// How the scripted venue answers one `sendTxBatch`.
@@ -171,12 +175,15 @@ impl ScriptedRestVenue {
         let send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>> = Arc::default();
         let batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>> = Arc::default();
         let next_nonce_answers: Arc<Mutex<VecDeque<u16>>> = Arc::default();
+        let rejected_cois: Arc<Mutex<HashSet<i64>>> = Arc::default();
+        let hash_cois: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
         let counter = Arc::new(Mutex::new(nonce));
         {
             let seen = seen.clone();
             let send_tx_answers = send_tx_answers.clone();
             let batch_answers = batch_answers.clone();
             let next_nonce_answers = next_nonce_answers.clone();
+            let rejected_cois = rejected_cois.clone();
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     let script = Script {
@@ -184,6 +191,8 @@ impl ScriptedRestVenue {
                         send_tx_answers: send_tx_answers.clone(),
                         batch_answers: batch_answers.clone(),
                         next_nonce_answers: next_nonce_answers.clone(),
+                        rejected_cois: rejected_cois.clone(),
+                        hash_cois: hash_cois.clone(),
                         counter: counter.clone(),
                     };
                     tokio::spawn(async move {
@@ -198,7 +207,14 @@ impl ScriptedRestVenue {
             send_tx_answers,
             batch_answers,
             next_nonce_answers,
+            rejected_cois,
         }
+    }
+
+    /// From now on `GET /tx` answers the transaction that carried client order index `coi`
+    /// with the application error `21733` (a post-only order that would have crossed).
+    pub(crate) fn reject_tx_of(&self, coi: i64) {
+        self.rejected_cois.lock().unwrap().insert(coi);
     }
 
     /// Queues the answers the next `sendTxBatch`s get, in order.
@@ -261,6 +277,10 @@ struct Script {
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
     batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
+    rejected_cois: Arc<Mutex<HashSet<i64>>>,
+    /// Each transaction's hash, as the stand-in signer wrote it into `tx_info`, to the client
+    /// order index it carried.
+    hash_cois: Arc<Mutex<HashMap<String, i64>>>,
     counter: Arc<Mutex<i64>>,
 }
 
@@ -270,18 +290,28 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
         send_tx_answers,
         batch_answers,
         next_nonce_answers,
+        rejected_cois,
+        hash_cois,
         counter,
     } = script;
     let Some((method, target, body)) = read_request(&mut socket).await else {
         return;
     };
     let path = target.split('?').next().unwrap_or_default().to_string();
+    let remember = |info: &Value| {
+        if let (Some(hash), Some(coi)) =
+            (info["hash"].as_str(), info["client_order_index"].as_i64())
+        {
+            hash_cois.lock().unwrap().insert(hash.to_string(), coi);
+        }
+    };
     let (op, nonce) = if path == "/api/v1/sendTx" {
         let form: HashMap<String, String> = serde_qs::from_str(&body).unwrap_or_default();
         let info: Value = form
             .get("tx_info")
             .and_then(|info| serde_json::from_str(info).ok())
             .unwrap_or(Value::Null);
+        remember(&info);
         (
             info["op"].as_str().map(str::to_string),
             info["nonce"].as_i64(),
@@ -301,6 +331,7 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
     } else {
         Vec::new()
     };
+    batch_infos.iter().for_each(remember);
     seen.lock().unwrap().push(Seen {
         path: path.clone(),
         op,
@@ -378,7 +409,24 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
         ("GET", "/api/v1/accountActiveOrders") => {
             (200, json!({"code": 200, "orders": []}).to_string())
         }
-        ("GET", "/api/v1/tx") => (200, json!({"event_info": ""}).to_string()),
+        ("GET", "/api/v1/tx") => {
+            let query: HashMap<String, String> =
+                serde_qs::from_str(target.split_once('?').map_or("", |(_, query)| query))
+                    .unwrap_or_default();
+            let coi = query
+                .get("value")
+                .and_then(|hash| hash_cois.lock().unwrap().get(hash).copied());
+            if coi.is_some_and(|coi| rejected_cois.lock().unwrap().contains(&coi)) {
+                let ae = json!({"code": 21733, "message": "post-only order would cross"});
+                let event_info = json!({"ae": ae.to_string()}).to_string();
+                (
+                    200,
+                    json!({"code": 200, "event_info": event_info}).to_string(),
+                )
+            } else {
+                (200, json!({"event_info": ""}).to_string())
+            }
+        }
         _ => (404, json!({"code": 404, "message": "not here"}).to_string()),
     };
     let response = format!(

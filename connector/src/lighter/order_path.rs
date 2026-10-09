@@ -557,6 +557,7 @@ impl OrderPath {
             rest_url: rest_url.clone(),
             order_manager: order_manager.clone(),
             ev_tx: ev_tx.clone(),
+            batching_off: AtomicBool::new(false),
         };
         tasks.push(tokio::spawn(slot.run(command_rx)));
 
@@ -758,6 +759,23 @@ struct SlotTask {
     rest_url: String,
     order_manager: Arc<Mutex<OrderManager>>,
     ev_tx: UnboundedSender<PublishEvent>,
+    /// Set — once, never cleared — by the first `sendTxBatch` answered with anything but a
+    /// clean echo or a 429 ([`batch_answer_turns_batching_off`], §3.7). From then on the slot
+    /// gathers nothing: every transaction goes alone through `sendTx`, as at `max_batch = 1`.
+    batching_off: AtomicBool,
+}
+
+/// Whether a `sendTxBatch` answer is a doubt about the batch path itself, which turns
+/// batching off for the life of the slot (design note §3.7). Only a clean echo and a 429 — the
+/// venue's rate limit, the weather a lone `sendTx` meets too — leave it on. Everything else —
+/// a 404 (no such route on this host), a 405, a 200 whose hashes are not the signer's, any 4xx
+/// or 5xx, no answer — is not something the next tick's batch outgrows; without the latch
+/// every two-sided tick would walk into the same doubt again.
+fn batch_answer_turns_batching_off(answer: &BatchOutcome) -> bool {
+    !matches!(
+        answer,
+        BatchOutcome::Accepted(_) | BatchOutcome::RateLimited { status: 429, .. }
+    )
 }
 
 /// A placement awaiting confirmation, and when its deadline is up (§4.11).
@@ -1423,7 +1441,7 @@ impl SlotTask {
         awaiting: &mut HashMap<i64, Awaiting>,
     ) {
         let mut batch = vec![first];
-        if admission == Admission::Send {
+        if admission == Admission::Send && !self.batching_off.load(Ordering::Relaxed) {
             self.gather_batch(gate, held, command_rx, lookahead, &mut batch);
         }
         if batch.len() > 1 {
@@ -1622,6 +1640,25 @@ impl SlotTask {
             detail: format!("the sendTxBatch failed: {error}"),
         });
         let last = first + size as i64 - 1;
+        if batch_answer_turns_batching_off(&answer)
+            && !self.batching_off.swap(true, Ordering::Relaxed)
+        {
+            let (status, code) = match &answer {
+                BatchOutcome::RateLimited { status, .. } => (*status, None),
+                BatchOutcome::Ambiguous { status, code, .. } => (*status, *code),
+                BatchOutcome::Accepted(_) => (200, None),
+            };
+            error!(
+                status,
+                ?code,
+                batch = size,
+                first_nonce = first,
+                "A Lighter sendTxBatch was answered with neither a clean echo nor a 429; batching \
+                 is OFF for the rest of this run — every transaction goes alone through sendTx \
+                 (§3.7). Check that the host serves sendTxBatch and echoes the signer's hashes \
+                 before arming max_batch again."
+            );
+        }
         let (representative, code) = match &answer {
             BatchOutcome::Accepted(acks) => match acks.first() {
                 Some(ack) => (SendOutcome::Accepted(ack.clone()), None),
@@ -4988,6 +5025,7 @@ mod tests {
             rest_url: venue.url.clone(),
             order_manager: order_manager.clone(),
             ev_tx: ev_tx.clone(),
+            batching_off: AtomicBool::new(false),
         };
         let order_path = OrderPath {
             order_manager,
@@ -5591,6 +5629,225 @@ mod tests {
         .await;
         slot.venue_until(|venue| venue.sent().len() == 1).await;
         assert_eq!(slot.venue.sent(), [("create_order".to_string(), 7)]);
+        assert_eq!(slot.venue.count("/api/v1/sendTxBatch"), 0);
+    }
+
+    /// Two orders go as one batch answered `answer`; once whatever it started is over (a
+    /// cooldown, a nonce re-read), two more are queued together. Returns when the venue has
+    /// seen the second pair go out, either way.
+    async fn the_pair_after_a_batch_answered(answer: BatchAnswer) -> SlotOnScriptedVenue {
+        let slot = slot_with_queued(
+            |config| {
+                config.max_batch = 2;
+                config.rate_limit_cooldown_ms = Some(200);
+            },
+            async |slot| {
+                slot.venue.answer_batch_with([answer]);
+                slot.submit(&eth_order(1, Side::Buy));
+                slot.submit(&eth_order(2, Side::Sell));
+            },
+        )
+        .await;
+        slot.venue_until(|venue| venue.sent_batches().len() == 1)
+            .await;
+        // Past the cooldown a 429/405 starts, and the nonce re-read an ambiguous answer makes.
+        time::sleep(Duration::from_millis(500)).await;
+        slot.submit(&eth_order(3, Side::Buy));
+        slot.submit(&eth_order(4, Side::Sell));
+        slot.venue_until(|venue| venue.sent().len() == 2 || venue.sent_batches().len() == 2)
+            .await;
+        slot
+    }
+
+    /// **A batch answered anything but a clean echo or a 429 turns batching off for good**
+    /// (§3.7): the answer is a doubt about the batch path itself — no such route on this host
+    /// (404), the method refused (405), a 200 whose hashes are not the signer's, a malformed
+    /// refusal, no answer at all — and none of those is weather that a retry outgrows. Without
+    /// the latch every two-sided tick would go into the same doubt again: both quotes left "in
+    /// flight" to their deadline, a cooldown per tick on a 405, every batched cancel handed back.
+    /// So the slot goes back to what it did before batching existed: one `sendTx` a transaction.
+    #[tokio::test]
+    async fn after_an_unclean_batch_answer_nothing_is_batched_again() {
+        let not_the_signers = serde_json::json!({
+            "code": 200,
+            "message": serde_json::json!({ "ratelimit": "Ratelimit is off" }).to_string(),
+            "tx_hash": ["aa", "bb"],
+        })
+        .to_string();
+        for answer in [
+            BatchAnswer::Fixed(404, r#"{"code":404,"message":"not found"}"#.to_string()),
+            BatchAnswer::Fixed(405, "Method Not Allowed".to_string()),
+            BatchAnswer::Fixed(200, not_the_signers),
+            BatchAnswer::Fixed(
+                400,
+                r#"{"code":21104,"message":"invalid nonce"}"#.to_string(),
+            ),
+            BatchAnswer::Fixed(DROP_CONNECTION, String::new()),
+        ] {
+            let slot = the_pair_after_a_batch_answered(answer.clone()).await;
+            assert_eq!(
+                slot.venue.sent_batches().len(),
+                1,
+                "{answer:?}: the next pair goes one by one"
+            );
+            assert_eq!(
+                slot.venue
+                    .sent()
+                    .iter()
+                    .map(|(op, _)| op.as_str())
+                    .collect::<Vec<_>>(),
+                ["create_order", "create_order"],
+                "{answer:?}"
+            );
+        }
+    }
+
+    /// **A 429 is the one unclean answer that leaves batching on**: it is the venue's rate
+    /// limit, the same weather a lone `sendTx` meets, and it says nothing about the batch path.
+    /// Once the cooldown is over, two orders queued together go as one batch again.
+    #[tokio::test]
+    async fn a_batch_answered_429_leaves_batching_on() {
+        let slot = the_pair_after_a_batch_answered(BatchAnswer::Fixed(
+            too_many_requests().0,
+            too_many_requests().1,
+        ))
+        .await;
+        assert_eq!(slot.venue.sent_batches().len(), 2);
+        assert!(slot.venue.sent().is_empty());
+    }
+
+    /// **Each submit of an accepted batch is judged by its own hash.** The venue echoes one
+    /// hash per transaction; the one each order waits on must be its own, or a lapsed deadline
+    /// asks `GET /tx` about the neighbour — and expires an order resting on the venue because
+    /// its neighbour was refused (an orphan, and a double order on the requote). Here the venue
+    /// refuses the second (`21733`): that one comes back, the first stays tracked.
+    #[tokio::test]
+    async fn each_batched_submit_is_judged_by_its_own_hash() {
+        let mut slot = slot_with_queued(
+            |config| {
+                config.max_batch = 2;
+                config.confirm_deadline_ms = 300;
+            },
+            async |slot| {
+                slot.submit(&eth_order(1, Side::Buy));
+                slot.submit(&eth_order(2, Side::Sell));
+                let second = slot
+                    .order_path
+                    .order_manager
+                    .lock()
+                    .unwrap()
+                    .coi_for("ETH", 2)
+                    .unwrap();
+                slot.venue.reject_tx_of(second);
+            },
+        )
+        .await;
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the refused order comes back");
+        };
+        assert_eq!((order.order_id, order.status), (2, Status::Expired));
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("21733"), "{message}");
+        assert_eq!(slot.venue.sent_batches().len(), 1, "they went as one batch");
+
+        // Two more deadlines pass: the first is asked about again and never expired.
+        time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            slot.events.try_recv().is_err(),
+            "the order the venue took is left alone"
+        );
+        assert!(slot.venue.count("/api/v1/tx") >= 3);
+    }
+
+    /// **A quote gathered into a batch is a quote: it never takes the reserve.** With 3 a
+    /// minute and 1 held back, three quotes queued together: two go as one batch on the open
+    /// part, the third is refused as it would be alone — the reserve stays for getting out.
+    #[tokio::test]
+    async fn a_batched_quote_never_takes_the_reserve() {
+        let mut slot = slot_with_queued(
+            |config| {
+                config.max_batch = 3;
+                config.tx_budget_per_minute = Some(3);
+                config.tx_reserve = Some(1);
+            },
+            async |slot| {
+                for order_id in 1..=3 {
+                    slot.submit(&eth_order(order_id, Side::Buy));
+                }
+            },
+        )
+        .await;
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the quote over the open part comes back");
+        };
+        assert_eq!((order.order_id, order.status), (3, Status::Expired));
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("budget"), "{message}");
+        slot.venue_until(|venue| venue.sent_batches().len() == 1)
+            .await;
+        assert_eq!(
+            ops(&slot.venue.sent_batches()[0]),
+            [("create_order", 7), ("create_order", 8)]
+        );
+        assert!(slot.venue.sent().is_empty());
+    }
+
+    /// **A cancel queued behind a batch cut short by the reserve still goes, in its turn, on
+    /// the reserve** — the token a gathered quote did not take is the one it needs.
+    #[tokio::test]
+    async fn a_cancel_behind_a_cut_batch_still_goes_in_turn() {
+        let slot = slot_with_queued(
+            |config| {
+                config.max_batch = 3;
+                config.tx_budget_per_minute = Some(3);
+                config.tx_reserve = Some(1);
+            },
+            async |slot| {
+                let resting = slot.resting(1);
+                for order_id in 2..=4 {
+                    slot.submit(&eth_order(order_id, Side::Buy));
+                }
+                slot.cancel(&resting);
+            },
+        )
+        .await;
+        slot.venue_until(|venue| venue.sent().len() == 1).await;
+        assert_eq!(
+            ops(&slot.venue.sent_batches()[0]),
+            [("create_order", 7), ("create_order", 8)]
+        );
+        assert_eq!(slot.venue.sent(), [("cancel_order".to_string(), 9)]);
+        assert_eq!(slot.venue.sent_batches().len(), 1);
+    }
+
+    /// **A batch with no nonce to sign on hands every transaction back**: nothing was sent, so
+    /// each order comes back `Expired` with the reason — none is left "in flight" forever, its
+    /// side unquoted without a word.
+    #[tokio::test]
+    async fn a_batch_with_no_nonce_hands_each_back() {
+        let mut slot = slot_with_queued(with_batch(2), async |slot| {
+            // The seed at start and the re-read before the batch both fail.
+            slot.venue.answer_next_nonce_with([503, 503]);
+            slot.submit(&eth_order(1, Side::Buy));
+            slot.submit(&eth_order(2, Side::Sell));
+        })
+        .await;
+        let mut expired = Vec::new();
+        for _ in 0..2 {
+            let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+            else {
+                panic!("each order comes back");
+            };
+            assert_eq!(order.status, Status::Expired);
+            expired.push(order.order_id);
+            let (kind, message) = as_error(slot.next_event().await);
+            assert_eq!(kind, ErrorKind::OrderError);
+            assert!(message.contains("nonce"), "{message}");
+        }
+        assert_eq!(expired, [1, 2]);
+        assert_eq!(slot.venue.count("/api/v1/sendTx"), 0);
         assert_eq!(slot.venue.count("/api/v1/sendTxBatch"), 0);
     }
 
