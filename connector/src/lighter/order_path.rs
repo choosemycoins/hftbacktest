@@ -173,6 +173,11 @@ const VENUE_ERROR_EVERY: Duration = Duration::from_secs(10);
 /// account can reach while asking for gigabytes at startup.
 const MAX_TX_BUDGET_PER_MINUTE: u32 = 100_000;
 
+/// The largest `max_batch` a config may name (design note §3.7). The API's own ceiling is 50
+/// (`21514`), but the docs warn in the same breath that a REST body that large may be cut at the
+/// CDN edge and call ~15 safe, and the websocket reference says "up to 15". RH is unmeasured.
+const MAX_BATCH: u32 = 15;
+
 /// How the order path treats orders already resting on the venue when it (re)connects (§3.4).
 ///
 /// The account channels re-snapshot on every (re)connect, and on this venue orders outlive
@@ -266,12 +271,33 @@ pub struct OrderPathConfig {
     /// Absent ⇒ cancels wait the whole cooldown, the behaviour before it existed.
     #[serde(default)]
     pub rate_limit_cancel_probe_ms: Option<u64>,
+    /// At most how many transactions the slot sends in **one** request (design note §3.7).
+    /// Above 1, what is already waiting in the slot's queue when it is free — the bid and the
+    /// ask of one tick — is signed on consecutive nonces and goes as one `sendTxBatch`, so the
+    /// second does not wait out the first's round trip. Nothing waits for a batch to fill: a
+    /// lone order goes alone, through `sendTx`. Inside a 429/405 cooldown nothing is batched,
+    /// and sweeps never are. Absent ⇒ 1: every transaction its own `sendTx`, the behaviour
+    /// before it existed. 1..=15, else refused at startup.
+    #[serde(default = "default_max_batch")]
+    pub max_batch: u32,
+}
+
+fn default_max_batch() -> u32 {
+    1
 }
 
 impl OrderPathConfig {
     /// Refuses a combination that cannot do what it says, so it is found at startup rather
     /// than at the first quote it would refuse.
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_BATCH).contains(&self.max_batch) {
+            return Err(format!(
+                "[order_path] max_batch = {} is outside 1..={MAX_BATCH}: 0 sends nothing, and a \
+                 larger REST batch may be cut at the venue's CDN edge (design note §3.7); leave \
+                 the field out for one transaction a send",
+                self.max_batch
+            ));
+        }
         match (self.tx_budget_per_minute, self.tx_reserve) {
             (None, Some(_)) => Err(
                 "[order_path] tx_reserve needs tx_budget_per_minute: a reserve of no budget \
@@ -333,12 +359,22 @@ impl OrderPathConfig {
 
     /// What the send gate this config arms will do, in one line — `"OFF"` when it does
     /// nothing, otherwise e.g. `"budget 48/min, reserve 12, cooldown 60000 ms, cancel probe
-    /// 5000 ms"`. Logged once
+    /// 5000 ms, batch ≤ 2"` (`batch OFF` at `max_batch = 1`; `"OFF, batch ≤ 2"` when only
+    /// batching is on). Logged once
     /// at arming: the file is not the evidence of what the process runs with — a build that
     /// predates a field never read it, and a field read as absent turns its protection off.
     pub fn send_gate_summary(&self) -> String {
+        let batch = if self.max_batch > 1 {
+            format!("batch ≤ {}", self.max_batch)
+        } else {
+            "batch OFF".to_string()
+        };
         if self.tx_budget_per_minute.is_none() && self.rate_limit_cooldown_ms.is_none() {
-            return "OFF".to_string();
+            // A process with nothing armed says exactly that, as it always has.
+            return match self.max_batch {
+                1 => "OFF".to_string(),
+                _ => format!("OFF, {batch}"),
+            };
         }
         let budget = match self.tx_budget_per_minute {
             Some(per_minute) => format!(
@@ -354,7 +390,7 @@ impl OrderPathConfig {
             (Some(cooldown_ms), None) => format!("cooldown {cooldown_ms} ms, cancel probe OFF"),
             (None, _) => "cooldown OFF".to_string(),
         };
-        format!("{budget}, {cooldown}")
+        format!("{budget}, {cooldown}, {batch}")
     }
 }
 
@@ -2958,6 +2994,7 @@ mod tests {
             tx_reserve: None,
             rate_limit_cooldown_ms: None,
             rate_limit_cancel_probe_ms: None,
+            max_batch: 1,
         };
         let (symbol_tx, symbol_rx) = broadcast::channel(16);
         let task = PrivateStreamTask {
@@ -4353,6 +4390,7 @@ mod tests {
             tx_reserve: None,
             rate_limit_cooldown_ms: None,
             rate_limit_cancel_probe_ms: None,
+            max_batch: 1,
         }
     }
 

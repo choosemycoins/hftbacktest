@@ -233,6 +233,20 @@ timeout_ms = 10000
 # # shorter. Absent = cancels wait the whole cooldown. Not measured anywhere yet.
 # rate_limit_cancel_probe_ms = 5000
 #
+# # At most how many transactions go out in ONE request (§3.7). Above 1, whatever is already
+# # queued for the slot when it is free — the bid and the ask of one tick — is signed on
+# # consecutive nonces and sent as one sendTxBatch, so the second does not wait out the first's
+# # round trip; nothing waits for a batch to fill, a lone order goes through sendTx as before.
+# # The budget above still counts every transaction (a batch of 2 takes 2 tokens), nothing is
+# # batched inside a 429/405 cooldown, and sweeps never are. Any answer to a batch but a clean
+# # 200 that echoes every hash is read as "fate unknown" for EACH of its transactions: orders are
+# # settled off accountActiveOrders at the confirmation deadline, cancels go back to the bot.
+# # Optional; absent = 1, one sendTx per transaction, the behaviour before it existed. 1..=15
+# # (the docs: larger REST bodies may be cut at the CDN edge), else refused at startup. NOT
+# # measured: atomicity of a batch, its answer on a partial failure, how the venue's per-minute
+# # limit counts it.
+# max_batch = 1
+#
 # # AUTH TOKEN: minted by the sidecar, clamped below the venue's 8 h server ceiling, and
 # # REFRESHED automatically before it expires by a clean reconnect (§3.4) — no config. The
 # # 8 h ceiling is enforced only by the server (a longer token mints without error and is

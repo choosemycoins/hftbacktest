@@ -165,3 +165,19 @@ timeout_ms = 10000
 # # resting all that time. 5000 is NOT measured on RH — no 429 has been seen here. Needs
 # # rate_limit_cooldown_ms and must be shorter than it. Absent: cancels wait the whole cooldown.
 # rate_limit_cancel_probe_ms = 5000
+#
+# # Up to this many transactions in ONE request: what is already queued for the slot when it is
+# # free — the bid and the ask of one tick — is signed on consecutive nonces and sent as one
+# # sendTxBatch (design note §3.7). Why: measured 2026-10-09 (SPY bot), the second of two orders
+# # sent in one tick reached the venue 350-460 ms after the first, confirmed at ~1.0 s against
+# # ~0.6 s — one whole sendTx round trip spent waiting. Nothing waits for a batch to fill; a lone
+# # order goes through sendTx as before. The budget above counts every TRANSACTION (a batch of 2
+# # takes 2 tokens; one the budget has no token for is cut from the batch and refused as
+# # before); nothing is batched inside a 429/405 cooldown; sweeps never are. A batch answered
+# # anything but a clean 200 echoing every hash is "fate unknown" for EACH transaction in it:
+# # orders are settled off accountActiveOrders at the confirmation deadline, cancels go back to
+# # the bot — a 21104 on a batch included. NOT MEASURED ON RH: whether a batch is atomic, what a
+# # partial failure looks like, whether "40 requests / minute" counts a batch as 1 or as 2, the
+# # CDN's body limit. The first ambiguous batch logs `consumed` (nonces the venue kept of it) —
+# # the first evidence. Absent: 1 — one sendTx per transaction. 1..=15, else refused at startup.
+# max_batch = 2

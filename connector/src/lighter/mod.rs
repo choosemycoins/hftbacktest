@@ -909,16 +909,27 @@ mod tests {
                 "{ARMED}\ntx_budget_per_minute = 48\ntx_reserve = 12\nrate_limit_cooldown_ms = \
                  60000\nrate_limit_cancel_probe_ms = 5000\n"
             )),
-            ["budget 48/min, reserve 12, cooldown 60000 ms, cancel probe 5000 ms"]
+            ["budget 48/min, reserve 12, cooldown 60000 ms, cancel probe 5000 ms, batch OFF"]
         );
         assert_eq!(send_gate_logged(ARMED), ["OFF"]);
         assert_eq!(
             send_gate_logged(&format!("{ARMED}\ntx_budget_per_minute = 48\n")),
-            ["budget 48/min, reserve 0, cooldown OFF"]
+            ["budget 48/min, reserve 0, cooldown OFF, batch OFF"]
         );
         assert_eq!(
             send_gate_logged(&format!("{ARMED}\nrate_limit_cooldown_ms = 60000\n")),
-            ["budget OFF, cooldown 60000 ms, cancel probe OFF"]
+            ["budget OFF, cooldown 60000 ms, cancel probe OFF, batch OFF"]
+        );
+        // Batching is what the process runs with too: the line says so, gate or no gate.
+        assert_eq!(
+            send_gate_logged(&format!("{ARMED}\nmax_batch = 2\n")),
+            ["OFF, batch ≤ 2"]
+        );
+        assert_eq!(
+            send_gate_logged(&format!(
+                "{ARMED}\ntx_budget_per_minute = 48\nmax_batch = 15\n"
+            )),
+            ["budget 48/min, reserve 0, cooldown OFF, batch ≤ 15"]
         );
         assert!(
             send_gate_logged(MARKET_DATA_ONLY).is_empty(),
@@ -1279,6 +1290,35 @@ mod tests {
         }
     }
 
+    /// **`max_batch` is optional — absent, one transaction per send, the behaviour before
+    /// `sendTxBatch` existed — and a size the venue cannot be trusted with is refused at
+    /// startup.** 0 would send nothing; past 15 the docs' own CDN warning and the websocket
+    /// reference's "up to 15" both say the request may be cut at the edge (design note §3.7;
+    /// `21514`'s 50 is the API's ceiling, not the transport's, and RH has not been measured).
+    #[test]
+    fn the_batch_size_defaults_to_one_and_is_bounded() {
+        let absent = armed_rh("").unwrap().config.order_path.unwrap();
+        assert_eq!(absent.max_batch, 1, "no field, no batching");
+        for accepted in [1, 2, 15] {
+            let config = armed_rh(&format!("max_batch = {accepted}"))
+                .unwrap()
+                .config
+                .order_path
+                .unwrap();
+            assert_eq!(config.max_batch, accepted);
+        }
+        for broken in ["max_batch = 0", "max_batch = 16", "max_batch = 50"] {
+            let Err(error) = armed_rh(broken) else {
+                panic!("{broken:?} must be refused");
+            };
+            assert!(
+                matches!(error, LighterError::Config(_)),
+                "{broken:?}: {error}"
+            );
+            assert!(error.to_string().contains("max_batch"), "{error}");
+        }
+    }
+
     /// The RH catalog maps symbols onto **its own** ids and decimals — the mainnet ones are
     /// different for most names, so this is the table the order path quantises onto.
     #[test]
@@ -1442,9 +1482,13 @@ mod tests {
         // The venue's firewall cooldown (§4.16), and how soon a cancel may probe it.
         assert_eq!(order_path.rate_limit_cooldown_ms, Some(60_000));
         assert_eq!(order_path.rate_limit_cancel_probe_ms, Some(5_000));
+        // Two transactions a send: the bid and the ask of one tick (design note §3.7). NOT
+        // measured on RH — the example says so, and the gate's arithmetic above is per
+        // transaction, so it holds whatever the batch size.
+        assert_eq!(order_path.max_batch, 2);
         assert_eq!(
             order_path.send_gate_summary(),
-            "budget 40/min, reserve 10, cooldown 60000 ms, cancel probe 5000 ms"
+            "budget 40/min, reserve 10, cooldown 60000 ms, cancel probe 5000 ms, batch ≤ 2"
         );
     }
 }
