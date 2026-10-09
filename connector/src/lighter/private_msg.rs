@@ -191,6 +191,37 @@ pub fn venue_error_scope(code: i64) -> VenueErrorScope {
     }
 }
 
+/// `20001` auth required: a subscription was refused for want of a token.
+pub const AUTH_REQUIRED: i64 = 20001;
+/// `20013` invalid auth: the token was refused — a bad deadline, a revoked key.
+pub const INVALID_AUTH: i64 = 20013;
+/// `30003` already subscribed: the subscription it answers is in place.
+pub const ALREADY_SUBSCRIBED: i64 = 30003;
+
+/// Whether an error frame leaves the private socket serving nothing, so that only a reconnect —
+/// a fresh token, fresh subscriptions — recovers it (§4.17). `snapshotted` is whether this
+/// connection's `account_all_orders` snapshot has arrived: the evidence its subscriptions took.
+///
+/// * [`AUTH_REQUIRED`] / [`INVALID_AUTH`] — the subscription or the token was refused, and the
+///   socket answers pings while carrying no fill, cancel or position: always.
+/// * [`ALREADY_SUBSCRIBED`], and every `21xxx` ([`VenueErrorScope::Order`]) — never: the
+///   subscription is in place; one transaction's business.
+/// * Anything else, unknown codes included — only **before** the snapshot. Until then nothing
+///   shows the subscriptions took, and a socket that never snapshots refuses every order until
+///   the ~7.5 h token refresh. After it the account stream is demonstrably serving, and a
+///   reconnect on a code the venue repeats costs, every time, a token mint and a catalog read,
+///   a `ConnectionInterrupted` to every bot and — under `connect_policy = "cancel_all"` — a
+///   sweep of every market with orders: about every 30 s, for as long as the venue says it.
+///   The bots are told such a code either way (it is [`VenueErrorScope::Account`]).
+pub fn venue_error_ends_connection(code: i64, snapshotted: bool) -> bool {
+    match code {
+        AUTH_REQUIRED | INVALID_AUTH => true,
+        ALREADY_SUBSCRIBED => false,
+        _ if venue_error_scope(code) == VenueErrorScope::Order => false,
+        _ => !snapshotted,
+    }
+}
+
 /// Parses one frame off the private socket.
 ///
 /// Like the public parser, every well-formed JSON object is a [`PrivateFrame`]; only bytes
@@ -522,6 +553,45 @@ mod tests {
         }
         for code in [20001, 20013, 30003, 30005, 0, -1, 22000, 99_999, 429] {
             assert_eq!(venue_error_scope(code), VenueErrorScope::Account, "{code}");
+        }
+    }
+
+    /// **Only an error that kills the session ends the connection — and before the snapshot,
+    /// anything about the account does** (§4.17). A refused subscription (`20001`) or token
+    /// (`20013`) leaves a socket that answers pings and carries nothing: always a reconnect.
+    /// `30003` already subscribed says the subscription is in place, and a `21xxx` is one
+    /// transaction's business: never. Any other code — unknown ones included — ends the
+    /// connection only while nothing has shown the subscriptions took; once this connection's
+    /// `account_all_orders` snapshot has arrived the account stream is demonstrably serving, and
+    /// a reconnect on a code the venue repeats would cost a token mint and catalog read, a
+    /// `ConnectionInterrupted` to every bot and, under `cancel_all`, a sweep of every market
+    /// with orders — about every 30 s, for as long as the venue keeps saying it.
+    #[test]
+    fn only_a_refused_token_or_subscription_ends_a_connection_that_has_snapshotted() {
+        use super::venue_error_ends_connection;
+        for snapshotted in [false, true] {
+            for code in [20001, 20013] {
+                assert!(
+                    venue_error_ends_connection(code, snapshotted),
+                    "{code}, snapshotted: {snapshotted}"
+                );
+            }
+            for code in [30003, 21104, 21728] {
+                assert!(
+                    !venue_error_ends_connection(code, snapshotted),
+                    "{code}, snapshotted: {snapshotted}"
+                );
+            }
+        }
+        for code in [50000, 30005, 20002, 0, -1, 99_999] {
+            assert!(
+                venue_error_ends_connection(code, false),
+                "{code} before the snapshot: nothing says the subscriptions took"
+            );
+            assert!(
+                !venue_error_ends_connection(code, true),
+                "{code} after the snapshot: the account stream is serving"
+            );
         }
     }
 

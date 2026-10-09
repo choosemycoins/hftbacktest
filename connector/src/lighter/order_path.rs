@@ -75,6 +75,7 @@ use crate::{
             PrivateFrame,
             VenueErrorScope,
             parse_private_frame,
+            venue_error_ends_connection,
             venue_error_scope,
         },
         public_stream::{
@@ -500,6 +501,7 @@ impl OrderPath {
             command_tx: command_tx.clone(),
             ev_tx,
             account_stream_live: account_stream_live.clone(),
+            snapshotted: false,
             venue_errors: HashMap::new(),
         };
         tasks.push(tokio::spawn(stream.run()));
@@ -1745,6 +1747,11 @@ struct PrivateStreamTask {
     /// Shared with [`OrderPath`]: set on this connection's `account_all_orders` snapshot,
     /// cleared the moment the connection ends ([`Self::serve`]).
     account_stream_live: Arc<AtomicBool>,
+    /// Whether **this** connection's `account_all_orders` snapshot has arrived — the evidence
+    /// that its subscriptions took. Cleared when a connection starts
+    /// ([`Self::serve_connection`]); what an error frame of unknown meaning is weighed against
+    /// ([`venue_error_ends_connection`]).
+    snapshotted: bool,
     /// When each venue error code was last told to the bots ([`Self::on_venue_error`]).
     venue_errors: HashMap<i64, LogThrottle>,
 }
@@ -1908,6 +1915,8 @@ impl PrivateStreamTask {
         // go, because the next connect re-reads the whole catalog anyway.
         let (catalog_tx, mut catalog_rx) = unbounded_channel::<Resolution>();
         self.awaiting_catalog = false;
+        // Nothing has shown this connection's subscriptions took until its snapshot arrives.
+        self.snapshotted = false;
 
         // The first tick fires immediately (`time::interval`), which is on purpose: it sends the
         // keepalive at once and, if the connect-time resolve left anything unresolved, retries
@@ -1976,7 +1985,7 @@ impl PrivateStreamTask {
                 message = read.next() => {
                     match message {
                         Some(Ok(Message::Text(text))) => {
-                            // An error frame about the account (§4.17) leaves this socket
+                            // An error frame that kills the session (§4.17) leaves this socket
                             // serving nothing: drop it, and the next connect mints a fresh token
                             // and subscribes again, behind the stream's backoff.
                             if let Some(error) = self.on_frame(&text) {
@@ -2143,6 +2152,9 @@ impl PrivateStreamTask {
         match frame {
             PrivateFrame::Orders { snapshot, orders } => {
                 if snapshot {
+                    // The subscriptions took: from here an error frame the venue does not say
+                    // kills the session is told to the bots and leaves the connection serving.
+                    self.snapshotted = true;
                     // Policy first, then truth (mirrors `hyperliquid/private_stream.rs`). Under
                     // `cancel_all` the clean-slate sweep is built from THIS snapshot — the
                     // venue's own open-order list — so it cancels a previous incarnation's
@@ -2276,12 +2288,14 @@ impl PrivateStreamTask {
     /// not trip a bot's breaker on one condition many times over. A different code is new
     /// information and goes straight through.
     ///
-    /// An error about the account also **ends the connection** — returned as the reason, every
-    /// time, told or not: a refused subscription or token leaves the socket serving nothing
-    /// while it answers pings, and only a reconnect, with a fresh token, recovers it.
+    /// An error that kills the session also **ends the connection** — returned as the reason,
+    /// every time, told or not: a refused subscription or token leaves the socket serving
+    /// nothing while it answers pings, and only a reconnect, with a fresh token, recovers it.
+    /// Which ones do is [`venue_error_ends_connection`]: `20001`/`20013` always, any other
+    /// account-level code only before this connection has snapshotted.
     fn on_venue_error(&mut self, code: i64, message: &str) -> Option<LighterError> {
         let scope = venue_error_scope(code);
-        let ends = (scope == VenueErrorScope::Account).then(|| {
+        let ends = venue_error_ends_connection(code, self.snapshotted).then(|| {
             LighterError::ConnectionAbort(format!(
                 "the Lighter private stream reported an account-level error {code}: {message}; \
                  reconnecting with a fresh token"
@@ -2599,6 +2613,7 @@ mod tests {
             command_tx,
             ev_tx,
             account_stream_live: Arc::new(AtomicBool::new(false)),
+            snapshotted: false,
             venue_errors: Default::default(),
         };
         (task, symbol_tx, command_rx, ev_rx)
@@ -4809,6 +4824,102 @@ mod tests {
         .expect("the repeat ends its connection too");
         assert!(ended.is_err());
         assert!(next_error(&mut ev_rx).is_none(), "and is not told twice");
+    }
+
+    /// Drives one connection that reads `frames` in order, for up to 500 ms. `true` when it
+    /// ended inside that — on a frame — and `false` when it was still serving; with every error
+    /// the bots were told.
+    async fn connection_ends_on(frames: &[&str]) -> (bool, Vec<(ErrorKind, String)>) {
+        let (mut task, _symbol_tx, _command_rx, mut ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        let ended = serve_ends_on(&mut task, frames).await;
+        let mut told = Vec::new();
+        while let Some(error) = next_error(&mut ev_rx) {
+            told.push(error);
+        }
+        (ended, told)
+    }
+
+    /// One more connection of `task`, reading `frames`: whether it ended on them within 500 ms.
+    async fn serve_ends_on(task: &mut PrivateStreamTask, frames: &[&str]) -> bool {
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = read_after_the_first_poll(
+            || {},
+            frames.iter().map(|frame| frame.to_string()).collect(),
+        );
+        time::timeout(
+            Duration::from_millis(500),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// **Once the connection has snapshotted, an error the venue does not say kills the session
+    /// leaves it serving** — `30003` already subscribed, or a code nobody has seen. Reconnecting
+    /// on any account-level code cost, for a code the venue repeats after every snapshot, a
+    /// token mint and a catalog read, a `ConnectionInterrupted` to every bot, a flap of
+    /// `account_stream_live` refusing their quotes and — under `connect_policy = "cancel_all"`
+    /// — a sweep of every market with orders, about every 30 s. The bots are still told: it is
+    /// a `CriticalConnectionError`, as before. A refused token or subscription still ends it.
+    #[tokio::test]
+    async fn after_the_snapshot_only_a_refused_token_or_subscription_ends_the_connection() {
+        for (frame, ends) in [
+            (
+                r#"{"error":{"code":30003,"message":"Already Subscribed"}}"#,
+                false,
+            ),
+            (
+                r#"{"error":{"code":50000,"message":"internal error"}}"#,
+                false,
+            ),
+            (
+                r#"{"error":{"code":20013,"message":"invalid auth: invalid deadline"}}"#,
+                true,
+            ),
+            (PRIVATE_ERROR_AUTH_REQUIRED, true),
+        ] {
+            let (ended, told) = connection_ends_on(&[PRIVATE_ORDERS_SNAPSHOT_EMPTY, frame]).await;
+            assert_eq!(ended, ends, "after the snapshot: {frame}");
+            assert_eq!(
+                told.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+                [ErrorKind::CriticalConnectionError],
+                "the bots are told either way: {frame}"
+            );
+        }
+    }
+
+    /// **Before the snapshot an unknown code still ends the connection** — nothing yet says the
+    /// subscriptions took, and a socket that never snapshots refuses every order until the
+    /// ~7.5 h token refresh. `30003` does not: the subscription it answers is in place.
+    #[tokio::test]
+    async fn before_the_snapshot_an_unknown_error_ends_the_connection_and_already_subscribed_does_not()
+     {
+        let (ended, _) =
+            connection_ends_on(&[r#"{"error":{"code":50000,"message":"internal error"}}"#]).await;
+        assert!(ended, "an unknown code before the snapshot");
+        let (ended, _) =
+            connection_ends_on(&[r#"{"error":{"code":30003,"message":"Already Subscribed"}}"#])
+                .await;
+        assert!(!ended, "already subscribed is not a dead socket");
+
+        // A snapshot vouches for its own connection only: the next one starts unproven.
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        assert!(
+            serve_ends_on(
+                &mut task,
+                &[PRIVATE_ORDERS_SNAPSHOT_EMPTY, PRIVATE_ERROR_AUTH_REQUIRED]
+            )
+            .await,
+            "precondition: a connection that snapshotted, then lost its subscription"
+        );
+        assert!(
+            serve_ends_on(
+                &mut task,
+                &[r#"{"error":{"code":50000,"message":"internal error"}}"#]
+            )
+            .await,
+            "the reconnect has not snapshotted yet, whatever the last connection did"
+        );
     }
 
     /// ...while one about a transaction (`21xxx`) leaves the connection serving: it is one
