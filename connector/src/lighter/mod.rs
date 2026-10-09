@@ -1423,16 +1423,28 @@ mod tests {
             order_path.connect_policy,
             crate::lighter::order_path::ConnectPolicy::CancelAll
         );
-        // The send budget the RH accounts run with: under the venue's 60, with a reserve for
-        // getting out (design note §4.15).
-        assert_eq!(order_path.tx_budget_per_minute, Some(48));
-        assert_eq!(order_path.tx_reserve, Some(12));
+        // The send budget the RH accounts run with, with a reserve for getting out (design note
+        // §4.15). It has to fit the STRICTER reading of the RH docs' "Transaction Type Limits:
+        // Default 40 requests / minute" — every sendTx type counted together — because which
+        // reading the venue applies is not measured: the gate counts every send, so a budget
+        // over 40 lets the 41st of a minute through into a 429 and a cooldown in which cancels
+        // do not get through either. Quotes plus every reserve token spent on reducing IOCs is
+        // then at most the budget, so CreateOrder alone fits the per-type reading too.
+        let per_minute = order_path
+            .tx_budget_per_minute
+            .expect("the RH example sets a budget");
+        assert!(
+            per_minute <= 40,
+            "tx_budget_per_minute = {per_minute} lets more than 40 sendTx a rolling minute through"
+        );
+        assert_eq!(order_path.tx_budget_per_minute, Some(40));
+        assert_eq!(order_path.tx_reserve, Some(10));
         // The venue's firewall cooldown (§4.16), and how soon a cancel may probe it.
         assert_eq!(order_path.rate_limit_cooldown_ms, Some(60_000));
         assert_eq!(order_path.rate_limit_cancel_probe_ms, Some(5_000));
         assert_eq!(
             order_path.send_gate_summary(),
-            "budget 48/min, reserve 12, cooldown 60000 ms, cancel probe 5000 ms"
+            "budget 40/min, reserve 10, cooldown 60000 ms, cancel probe 5000 ms"
         );
     }
 }
