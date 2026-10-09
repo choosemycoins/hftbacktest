@@ -31,12 +31,15 @@
 //! concern (§6.В.3) and is left to provisioning, not hard-coded here.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     // `Instant` unqualified in this file is `tokio::time::Instant` (the confirmation
     // deadlines); the outbound stopwatch is plain monotonic time, so it is spelled out.
     time::{Duration, Instant as StdInstant},
@@ -148,6 +151,18 @@ const SWEEP_GATE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// How long [`OrderPath::sweep`] waits for each market's verdict before counting it unconfirmed.
 const SWEEP_REPLY_WAIT: Duration = Duration::from_secs(20);
+
+/// The waits before a connect-time sweep that did not take is tried again; the last one repeats
+/// for as long as the connection lives (§4.18). The same rungs as a dead bot's retries
+/// (`supervision::DEAD_BOT_SWEEP_RETRY_WAITS`), for the same reason: a sweep waits at most 15 s
+/// for the send gate, and the second retry lands 45 s after the first failure with another
+/// 15 s to wait, so a minute-long 429/405 cooldown already running is outlasted by then.
+const CONNECT_SWEEP_RETRY_WAITS: [Duration; 4] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
 
 /// How often the same private-stream error code is told to the bots at most (§4.17).
 const VENUE_ERROR_EVERY: Duration = Duration::from_secs(10);
@@ -461,8 +476,10 @@ pub struct OrderPath {
     command_tx: UnboundedSender<Command>,
     tasks: Vec<JoinHandle<()>>,
     /// Whether the private account stream is live: connected AND snapshotted since it last
-    /// (re)connected. Written by the [`PrivateStreamTask`], read by [`Self::submit`], which
-    /// refuses to place an order whose fill nothing would report.
+    /// (re)connected AND, under `connect_policy = "cancel_all"`, that snapshot's clean-slate
+    /// sweep has taken ([`ConnectSweep`]). Written by the [`PrivateStreamTask`], read by
+    /// [`Self::submit`], which refuses to place an order whose fill nothing would report, or
+    /// that would rest beside orders a previous run left and nothing watches.
     account_stream_live: Arc<AtomicBool>,
 }
 
@@ -521,6 +538,7 @@ impl OrderPath {
             account_stream_live: account_stream_live.clone(),
             snapshotted: false,
             venue_errors: HashMap::new(),
+            connect_sweep: ConnectSweep::default(),
         };
         tasks.push(tokio::spawn(stream.run()));
 
@@ -1815,6 +1833,158 @@ impl SweepSend for CancelAllSender<'_> {
     }
 }
 
+/// The clean-slate sweep a connection owes under `connect_policy = "cancel_all"` before any
+/// order may go out on it (§3.4, §4.18).
+///
+/// The connect snapshot lists what a previous run left resting, under COIs this process never
+/// minted: `OrderManager::apply_order_update` ignores them, a bot is never told of them, and
+/// nothing but this sweep cancels them. So the account stream is not live
+/// ([`OrderPath::submit`] refuses) until every market the snapshot listed has been swept — the
+/// venue took its `CancelAllOrders` — and a sweep that did not take is tried again on
+/// [`CONNECT_SWEEP_RETRY_WAITS`] for as long as the connection lives. Fail closed: no new quote
+/// goes out beside orders nobody manages. Its first failure is told to the bots
+/// ([`SweepFailure::TellBots`]); a retry's is only logged. Per connection: a new connection's
+/// snapshot decides afresh, and the verdicts of a dropped one's attempts go nowhere.
+#[derive(Default)]
+struct ConnectSweep {
+    /// The markets whose sweep has not taken yet.
+    pending: BTreeMap<i32, ConnectSweepMarket>,
+    /// The attempts in flight, each with the slot's answer to come ([`Self::next_verdict`]).
+    verdicts: Vec<(i32, oneshot::Receiver<bool>)>,
+}
+
+/// One market's connect-time sweep.
+#[derive(Debug)]
+struct ConnectSweepMarket {
+    /// Attempts sent so far.
+    attempts: u32,
+    /// When the next attempt is due — `None` while one is in flight.
+    retry_at: Option<Instant>,
+}
+
+/// What a verdict did to a connect-time sweep.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectSweepVerdict {
+    /// The venue took it: the market is clean.
+    Took,
+    /// It did not take; the next attempt goes this long from now.
+    TriedAgainIn(Duration),
+    /// No sweep of that market is pending.
+    NotPending,
+}
+
+impl ConnectSweep {
+    /// Whether nothing is left to sweep.
+    fn is_settled(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn is_pending(&self, market_index: i32) -> bool {
+        self.pending.contains_key(&market_index)
+    }
+
+    fn pending_markets(&self) -> Vec<i32> {
+        self.pending.keys().copied().collect()
+    }
+
+    /// When the next attempt is due, if one is waiting for its time.
+    fn next_retry(&self) -> Option<Instant> {
+        self.pending
+            .values()
+            .filter_map(|market| market.retry_at)
+            .min()
+    }
+
+    /// Starts sweeping `market_index`.
+    fn start(&mut self, command_tx: &UnboundedSender<Command>, market_index: i32) {
+        self.pending.insert(
+            market_index,
+            ConnectSweepMarket {
+                attempts: 0,
+                retry_at: None,
+            },
+        );
+        self.ask(command_tx, market_index);
+    }
+
+    /// Sends one attempt at `market_index` to the slot; its verdict comes back alongside the
+    /// connection ([`Self::next_verdict`]). The slot answers every `CancelAll` once its retries
+    /// and its wait for the gate — both bounded — are over; a slot that is gone drops the command
+    /// and the reply with it: an attempt that did not take.
+    fn ask(&mut self, command_tx: &UnboundedSender<Command>, market_index: i32) {
+        let Some(market) = self.pending.get_mut(&market_index) else {
+            return;
+        };
+        market.attempts += 1;
+        let on_failure = if market.attempts == 1 {
+            SweepFailure::TellBots
+        } else {
+            SweepFailure::LogOnly
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = command_tx.send(Command::CancelAll {
+            market_index,
+            reply: Some(reply_tx),
+            deadline: Instant::now() + SWEEP_GATE_DEADLINE,
+            on_failure,
+        });
+        self.verdicts.push((market_index, reply_rx));
+    }
+
+    /// The next verdict the slot sends back, as `(market, took)` — `took` only for an explicit
+    /// `true`; a dropped reply is an attempt that did not take. Pending while none has come.
+    fn next_verdict(&mut self) -> impl Future<Output = (i32, bool)> + '_ {
+        std::future::poll_fn(move |cx| {
+            for at in 0..self.verdicts.len() {
+                let (market_index, reply) = &mut self.verdicts[at];
+                if let Poll::Ready(answer) = Pin::new(reply).poll(cx) {
+                    let market_index = *market_index;
+                    self.verdicts.swap_remove(at);
+                    return Poll::Ready((market_index, matches!(answer, Ok(true))));
+                }
+            }
+            Poll::Pending
+        })
+    }
+
+    /// Applies the verdict on `market_index`'s attempt at `now`.
+    fn settle(&mut self, market_index: i32, took: bool, now: Instant) -> ConnectSweepVerdict {
+        let Some(market) = self.pending.get_mut(&market_index) else {
+            return ConnectSweepVerdict::NotPending;
+        };
+        if took {
+            self.pending.remove(&market_index);
+            return ConnectSweepVerdict::Took;
+        }
+        let rung = (market.attempts as usize)
+            .saturating_sub(1)
+            .min(CONNECT_SWEEP_RETRY_WAITS.len() - 1);
+        let wait = CONNECT_SWEEP_RETRY_WAITS[rung];
+        market.retry_at = Some(now + wait);
+        ConnectSweepVerdict::TriedAgainIn(wait)
+    }
+
+    /// Takes the markets whose next attempt is due at `now`, with how many went out before it.
+    /// Their wait is cleared here, not when the attempt is sent: a retry that has come due can
+    /// never stay due, and fire again on every turn of the connection's loop.
+    fn take_due(&mut self, now: Instant) -> Vec<(i32, u32)> {
+        let mut due = Vec::new();
+        for (market_index, market) in self.pending.iter_mut() {
+            if market.retry_at.is_some_and(|at| at <= now) {
+                market.retry_at = None;
+                due.push((*market_index, market.attempts));
+            }
+        }
+        due
+    }
+
+    fn attempts(&self, market_index: i32) -> u32 {
+        self.pending
+            .get(&market_index)
+            .map_or(0, |market| market.attempts)
+    }
+}
+
 /// Why [`PrivateStreamTask::connect`] returned. A token refresh is a clean, expected cycle,
 /// **not** a disconnection: the run loop reconnects immediately, resets the backoff and
 /// publishes no `ConnectionInterrupted`, so an 8 h-ceiling refresh (§3.4) never looks to a bot
@@ -1854,8 +2024,9 @@ struct PrivateStreamTask {
     order_manager: Arc<Mutex<OrderManager>>,
     command_tx: UnboundedSender<Command>,
     ev_tx: UnboundedSender<PublishEvent>,
-    /// Shared with [`OrderPath`]: set on this connection's `account_all_orders` snapshot,
-    /// cleared the moment the connection ends ([`Self::serve`]).
+    /// Shared with [`OrderPath`]: set once this connection's `account_all_orders` snapshot has
+    /// arrived and its connect-time sweep has taken ([`Self::update_liveness`]), cleared the
+    /// moment the connection ends ([`Self::serve`]).
     account_stream_live: Arc<AtomicBool>,
     /// Whether **this** connection's `account_all_orders` snapshot has arrived — the evidence
     /// that its subscriptions took. Cleared when a connection starts
@@ -1864,6 +2035,8 @@ struct PrivateStreamTask {
     snapshotted: bool,
     /// When each venue error code was last told to the bots ([`Self::on_venue_error`]).
     venue_errors: HashMap<i64, LogThrottle>,
+    /// This connection's clean-slate sweep under `cancel_all`; reset when a connection starts.
+    connect_sweep: ConnectSweep,
 }
 
 impl PrivateStreamTask {
@@ -2025,8 +2198,11 @@ impl PrivateStreamTask {
         // go, because the next connect re-reads the whole catalog anyway.
         let (catalog_tx, mut catalog_rx) = unbounded_channel::<Resolution>();
         self.awaiting_catalog = false;
-        // Nothing has shown this connection's subscriptions took until its snapshot arrives.
+        // Nothing has shown this connection's subscriptions took until its snapshot arrives,
+        // and this connection owes its own clean-slate sweep (the verdicts of a dropped one's
+        // attempts go nowhere with it).
         self.snapshotted = false;
+        self.connect_sweep = ConnectSweep::default();
 
         // The first tick fires immediately (`time::interval`), which is on purpose: it sends the
         // keepalive at once and, if the connect-time resolve left anything unresolved, retries
@@ -2042,6 +2218,7 @@ impl PrivateStreamTask {
         // or the loop spins at full tilt for the life of the connection (public_stream §4.2).
         let mut registrations_closed = false;
         loop {
+            let connect_sweep_retry = self.connect_sweep.next_retry();
             select! {
                 _ = ping.tick() => {
                     // Keepalive first: this connection's liveness does not depend on the
@@ -2058,6 +2235,17 @@ impl PrivateStreamTask {
                 }
                 _ = &mut refresh => {
                     return Ok(StreamEnd::TokenRefresh);
+                }
+                // The verdict on an attempt of the connect-time sweep (§4.18).
+                (market_index, took) = self.connect_sweep.next_verdict(),
+                    if !self.connect_sweep.verdicts.is_empty() =>
+                {
+                    self.on_connect_sweep_verdict(market_index, took);
+                }
+                _ = time::sleep_until(connect_sweep_retry.unwrap_or_else(Instant::now)),
+                    if connect_sweep_retry.is_some() =>
+                {
+                    self.retry_connect_sweep();
                 }
                 // The answer to a round trip started by one of the impulses in
                 // `start_resolution`. A pattern that does not match disables this arm rather
@@ -2274,17 +2462,16 @@ impl PrivateStreamTask {
                     for market_index in
                         markets_to_sweep_on_connect(self.config.connect_policy, &orders)
                     {
+                        if self.connect_sweep.is_pending(market_index) {
+                            continue;
+                        }
                         info!(
                             market_index,
                             "Clean-slate sweep of a Lighter market the connect snapshot lists \
-                             (connect_policy = cancel_all, §3.4)."
+                             (connect_policy = cancel_all, §3.4); new orders wait for it to take \
+                             (§4.18)."
                         );
-                        let _ = self.command_tx.send(Command::CancelAll {
-                            market_index,
-                            reply: None,
-                            deadline: Instant::now() + SWEEP_GATE_DEADLINE,
-                            on_failure: SweepFailure::TellBots,
-                        });
+                        self.connect_sweep.start(&self.command_tx, market_index);
                     }
                     // Reconnect reconciliation: expire our orders the venue no longer lists,
                     // then adopt the ones it does (§3.4, §5.10).
@@ -2340,10 +2527,8 @@ impl PrivateStreamTask {
                         ApplyOutcome::Unrecognised => {}
                     }
                 }
-                if snapshot && !self.account_stream_live.swap(true, Ordering::AcqRel) {
-                    // The order state is current again: from here a fill is seen, so orders
-                    // may go out ([`OrderPath::submit`]).
-                    info!("The Lighter account stream is live; orders may be placed.");
+                if snapshot {
+                    self.update_liveness();
                 }
             }
             PrivateFrame::Positions { positions, .. } => {
@@ -2388,6 +2573,66 @@ impl PrivateStreamTask {
 }
 
 impl PrivateStreamTask {
+    /// Whether orders may go out: this connection has snapshotted — the order state is current,
+    /// so a fill is seen — and its connect-time sweep has taken, so no order a previous run
+    /// left is resting unwatched beside them ([`ConnectSweep`], §4.18).
+    fn update_liveness(&self) {
+        let live = self.snapshotted && self.connect_sweep.is_settled();
+        let was = self.account_stream_live.swap(live, Ordering::AcqRel);
+        if live && !was {
+            info!("The Lighter account stream is live; orders may be placed.");
+        } else if !live && self.snapshotted {
+            info!(
+                pending = ?self.connect_sweep.pending_markets(),
+                "The Lighter account stream has snapshotted; new orders wait for the connect-time \
+                 sweep of what the snapshot listed to take (connect_policy = cancel_all, §4.18)."
+            );
+        }
+    }
+
+    /// The verdict on one attempt of the connect-time sweep.
+    fn on_connect_sweep_verdict(&mut self, market_index: i32, took: bool) {
+        let attempts = self.connect_sweep.attempts(market_index);
+        match self
+            .connect_sweep
+            .settle(market_index, took, Instant::now())
+        {
+            ConnectSweepVerdict::Took => {
+                info!(
+                    market_index,
+                    attempts, "The connect-time sweep of a Lighter market took."
+                );
+                if self.connect_sweep.is_settled() {
+                    self.update_liveness();
+                }
+            }
+            ConnectSweepVerdict::TriedAgainIn(wait) => {
+                error!(
+                    market_index,
+                    attempts,
+                    retry_in = ?wait,
+                    "The connect-time sweep of a Lighter market did not take: orders a previous \
+                     run left may still rest there. New orders stay refused, and it is tried \
+                     again then (§4.18)."
+                );
+            }
+            ConnectSweepVerdict::NotPending => {}
+        }
+    }
+
+    /// Sends the connect-time sweep's attempts that are due.
+    fn retry_connect_sweep(&mut self) {
+        for (market_index, attempts) in self.connect_sweep.take_due(Instant::now()) {
+            info!(
+                market_index,
+                attempt = attempts + 1,
+                "Trying the connect-time sweep of a Lighter market again; a failure is only \
+                 logged now — the bots heard of the first one (§4.18)."
+            );
+            self.connect_sweep.ask(&self.command_tx, market_index);
+        }
+    }
+
     /// An error frame on the private socket, told to the bots (§4.17): an `OrderError` when it
     /// is about a transaction (`21xxx`), a `CriticalConnectionError` when it is about the
     /// account — auth, a subscription — or is a code not known to be about a transaction (fail
@@ -2485,7 +2730,7 @@ mod tests {
     };
 
     use chrono::Utc;
-    use futures_util::{Stream, stream};
+    use futures_util::{Stream, StreamExt, stream};
     use hftbacktest::types::{
         ErrorKind,
         LiveEvent,
@@ -2729,6 +2974,7 @@ mod tests {
             account_stream_live: Arc::new(AtomicBool::new(false)),
             snapshotted: false,
             venue_errors: Default::default(),
+            connect_sweep: Default::default(),
         };
         (task, symbol_tx, command_rx, ev_rx)
     }
@@ -2917,7 +3163,10 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(market_index, 1, "the market the snapshot lists (BTC)");
-                assert!(reply.is_none(), "the connect sweep is fire-and-forget");
+                assert!(
+                    reply.is_some(),
+                    "the connect sweep's verdict is waited for, not fire-and-forget"
+                );
             }
             _ => panic!("cancel_all must sweep the market the connect snapshot holds an order on"),
         }
@@ -2925,6 +3174,35 @@ mod tests {
             command_rx.try_recv().is_err(),
             "exactly one CancelAll for the one market"
         );
+    }
+
+    /// **Under `cancel_all` no order goes out on a connection until its clean-slate sweep has
+    /// taken.** The snapshot lists orders a previous run left; marking the stream live at the
+    /// snapshot let the bots quote at once, so a sweep that then failed (a 429 window that
+    /// outlived the restart, a maintenance window with `sendTx` down) left those orders
+    /// resting beside the new grid, unwatched — `apply_order_update` ignores a foreign COI —
+    /// until the next reconnect, hours away (review of stage 2, must-fix). Fail closed: the
+    /// stream is live once the sweep's verdict says it took.
+    #[test]
+    fn under_cancel_all_no_order_goes_out_before_the_connect_sweep_has_taken() {
+        let (mut task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
+        assert!(
+            matches!(command_rx.try_recv(), Ok(Command::CancelAll { .. })),
+            "the sweep is asked for"
+        );
+        assert!(
+            !task.account_stream_live.load(Ordering::SeqCst),
+            "orders wait for its verdict"
+        );
+
+        // Witnesses: nothing to sweep, or a policy that adopts, is live at the snapshot.
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT_EMPTY);
+        assert!(task.account_stream_live.load(Ordering::SeqCst));
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
+        assert!(task.account_stream_live.load(Ordering::SeqCst));
     }
 
     /// **`reconcile` (the default) never cancels on connect** (§3.4): the same snapshot yields
@@ -3858,6 +4136,188 @@ mod tests {
             panic!("cancel_all sweeps the market the snapshot lists");
         };
         assert_eq!(deadline, asked + SWEEP_GATE_DEADLINE);
+    }
+
+    // ---- the connect-time sweep, followed to its verdict (§4.18) ---------------------------
+
+    /// One `CancelAllOrders` the connect sweep asked a stand-in slot for: the market, how a
+    /// failure would be reported, when it was asked, and whether orders could go out then.
+    type ConnectSweepAsk = (i32, SweepFailure, time::Instant, bool);
+
+    /// A stand-in for the slot that answers each `CancelAllOrders` with the next of `verdicts`
+    /// (then `false`: the venue keeps refusing), and records every ask.
+    fn answering_slot(
+        mut command_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
+        verdicts: Vec<bool>,
+        live: Arc<AtomicBool>,
+    ) -> Arc<Mutex<Vec<ConnectSweepAsk>>> {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let record = asked.clone();
+        tokio::spawn(async move {
+            let mut verdicts = verdicts.into_iter();
+            while let Some(command) = command_rx.recv().await {
+                if let Command::CancelAll {
+                    market_index,
+                    reply,
+                    on_failure,
+                    ..
+                } = command
+                {
+                    record.lock().unwrap().push((
+                        market_index,
+                        on_failure,
+                        time::Instant::now(),
+                        live.load(Ordering::SeqCst),
+                    ));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(verdicts.next().unwrap_or(false));
+                    }
+                }
+            }
+        });
+        asked
+    }
+
+    /// A read half that hands over `frames` at once and then stays silent for ever.
+    fn frames_then_silence(
+        frames: &[&str],
+    ) -> impl Stream<Item = Result<Message, WsError>> + Unpin {
+        let frames: Vec<Result<Message, WsError>> = frames
+            .iter()
+            .map(|frame| Ok(Message::Text(frame.to_string().into())))
+            .collect();
+        stream::iter(frames).chain(stream::pending())
+    }
+
+    /// **A connect sweep that failed is tried again after the ladder's wait, and no order goes
+    /// out until one has taken.** The first failure is the bots' one Critical (it goes through
+    /// `sweep_market` as `TellBots`); a retry's failure would only be logged (`LogOnly`).
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_sweep_that_failed_is_tried_again_and_orders_wait_until_it_takes() {
+        let (mut task, _symbol_tx, command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let live = task.account_stream_live.clone();
+        let asked = answering_slot(command_rx, vec![false, true], live.clone());
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = frames_then_silence(&[PRIVATE_ORDERS_SNAPSHOT]);
+        let _ = time::timeout(
+            Duration::from_secs(120),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked.len(),
+            2,
+            "tried once more, and not again after it took"
+        );
+        let (first, second) = (asked[0], asked[1]);
+        assert_eq!((first.0, second.0), (1, 1), "the market the snapshot lists");
+        assert_eq!(first.1, SweepFailure::TellBots);
+        assert_eq!(second.1, SweepFailure::LogOnly);
+        let waited = second.2 - first.2;
+        assert!(
+            waited >= Duration::from_secs(15) && waited < Duration::from_secs(16),
+            "the ladder's first wait: {waited:?}"
+        );
+        assert!(
+            !first.3 && !second.3,
+            "no order could go out while the sweep had not taken"
+        );
+        assert!(live.load(Ordering::SeqCst), "and they may once it has");
+    }
+
+    /// **A connect sweep that never takes keeps orders refused, and keeps being tried** — 15,
+    /// 30, 60 and 120 s after each failure, then every 120 s, for as long as the connection
+    /// lives. Giving up would leave a choice between quoting beside orders nobody watches and
+    /// refusing orders for ever with nothing trying to end it.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_sweep_that_never_takes_keeps_orders_refused_and_keeps_trying() {
+        let (mut task, _symbol_tx, command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let live = task.account_stream_live.clone();
+        let asked = answering_slot(command_rx, Vec::new(), live.clone());
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = frames_then_silence(&[PRIVATE_ORDERS_SNAPSHOT]);
+        let _ = time::timeout(
+            Duration::from_secs(600),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+
+        let asked = asked.lock().unwrap().clone();
+        let waits: Vec<u64> = asked
+            .windows(2)
+            .map(|pair| (pair[1].2 - pair[0].2).as_secs())
+            .collect();
+        assert_eq!(waits, [15, 30, 60, 120, 120, 120, 120], "{asked:?}");
+        assert!(
+            asked[1..].iter().all(|ask| ask.1 == SweepFailure::LogOnly),
+            "only the first failure is told to the bots"
+        );
+        assert!(asked.iter().all(|ask| !ask.3), "orders refused throughout");
+        assert!(!live.load(Ordering::SeqCst), "and still refused");
+    }
+
+    /// **A snapshot repeated on the same connection does not start a second sweep of a market
+    /// whose sweep is under way** — that would send another `CancelAllOrders`, and tell the bots
+    /// of its failure a second time as though it were a first attempt.
+    #[test]
+    fn a_repeated_snapshot_does_not_restart_a_connect_sweep_under_way() {
+        let (mut task, _symbol_tx, mut command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(Command::CancelAll {
+                market_index: 1,
+                ..
+            })
+        ));
+        assert!(
+            command_rx.try_recv().is_err(),
+            "one sweep of the one market"
+        );
+        assert!(!task.account_stream_live.load(Ordering::SeqCst));
+    }
+
+    /// **A connect sweep the slot cannot even be asked for has not taken**: orders stay
+    /// refused — the order path is down — rather than going out beside orders nobody swept.
+    #[test]
+    fn a_connect_sweep_the_slot_cannot_be_asked_for_keeps_orders_refused() {
+        let (mut task, _symbol_tx, command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        drop(command_rx);
+        task.on_frame(PRIVATE_ORDERS_SNAPSHOT);
+        assert!(!task.account_stream_live.load(Ordering::SeqCst));
+    }
+
+    /// **Each connection owes its own sweep**: one a dropped connection left pending does not
+    /// hold the next connection's orders back, and the next connection's snapshot decides
+    /// afresh — an empty one is live at once.
+    #[tokio::test(start_paused = true)]
+    async fn each_connection_owes_its_own_connect_sweep() {
+        let (mut task, _symbol_tx, command_rx, _ev_rx) = stream_task(ConnectPolicy::CancelAll);
+        let live = task.account_stream_live.clone();
+        let _asked = answering_slot(command_rx, Vec::new(), live.clone());
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read =
+            crate::utils::testing::read_frames(vec![PRIVATE_ORDERS_SNAPSHOT.to_string()]);
+        assert!(
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S)
+                .await
+                .is_err(),
+            "precondition: the connection drops with its sweep pending"
+        );
+
+        let mut read = frames_then_silence(&[PRIVATE_ORDERS_SNAPSHOT_EMPTY]);
+        let _ = time::timeout(
+            Duration::from_secs(5),
+            task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S),
+        )
+        .await;
+        assert!(
+            live.load(Ordering::SeqCst),
+            "the reconnect's snapshot lists nothing to sweep: its orders may go out"
+        );
     }
 
     // ---- the slot, end to end against a scripted venue ---------------------------------

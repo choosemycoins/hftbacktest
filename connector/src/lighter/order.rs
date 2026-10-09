@@ -85,13 +85,17 @@ pub enum OrderError {
     MarketUnresolved { symbol: String },
     #[error("order {order_id} on {symbol} is not confirmed yet; the venue order_index is unknown")]
     NotConfirmed { symbol: String, order_id: u64 },
-    /// The private account stream is down, or has not snapshotted since it last connected:
+    /// The private account stream is down, or has not snapshotted since it last connected —
     /// a fill of this order would reach neither the order state nor the position, so the bot
-    /// would go on quoting blind. Refused before a nonce is spent; transient by nature. The
-    /// symbol is not repeated in the message: `expire_unsent` prefixes it.
+    /// would go on quoting blind — or, under `connect_policy = "cancel_all"`, the snapshot's
+    /// clean-slate sweep has not taken yet, and the order would rest beside orders a previous
+    /// run left that nothing watches (design note §4.18). Refused before a nonce is spent;
+    /// transient by nature. The symbol is not repeated in the message: `expire_unsent`
+    /// prefixes it.
     #[error(
-        "the Lighter account stream is not live (disconnected, or no snapshot since it \
-         reconnected); an order now would fill unseen, so it was not sent"
+        "the Lighter account stream is not live (disconnected, no snapshot since it reconnected, \
+         or the connect-time sweep of what the snapshot listed has not taken yet); an order now \
+         would fill unseen or rest beside orders nobody manages, so it was not sent"
     )]
     AccountStreamDown { symbol: String },
     #[error("the client-order-index allocator is exhausted (reached 2^48-1)")]
