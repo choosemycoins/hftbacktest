@@ -472,6 +472,135 @@ pub fn classify_send_outcome(status: u16, body: &str) -> SendOutcome {
     }
 }
 
+/// What a `sendTxBatch` answer means — for **every** transaction in it (design note §3.7).
+///
+/// Three verdicts, not the single send's four: a batch has no `InvalidNonce`. That reading is
+/// measured for one transaction (§2.7); for a batch nothing documents whether the venue checks
+/// the nonces all-or-nothing, so a refusal of the batch may follow transactions it already let
+/// in. Every unknown here is read the way the slot already reads an ambiguous single send —
+/// fate checked before anyone is told — so not knowing costs latency, never an orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// HTTP 200 with `code` 200 and the signer's hashes echoed back one for one, in order: the
+    /// venue took every transaction and spent their nonces — one ack each, carrying its own
+    /// hash for the `GET /tx` verdict (§4.11). Still not an order verdict.
+    Accepted(Vec<SendTxAck>),
+    /// HTTP 429 or 405 — the rate limiter, for the batch as a whole (§4.16).
+    RateLimited { status: u16, detail: String },
+    /// Anything else, a refusal of the batch and a 200 that is not a clean echo included: the
+    /// fate of every transaction is unknown. `code` is the venue's error code when the body
+    /// carried one — `21105`/`21121`/`21513`/`21514` mean the batch was built wrong, a bug.
+    Ambiguous {
+        status: u16,
+        code: Option<i64>,
+        detail: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct RespSendTxBatch {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: Option<String>,
+    tx_hash: Vec<String>,
+    #[serde(default)]
+    predicted_execution_time_ms: Option<i64>,
+}
+
+/// The two `sendTxBatch` form fields, as the SDK builds them (`signer_client.py`
+/// `send_tx_batch`): `tx_types` a JSON array of the types, `tx_infos` a JSON array of
+/// **strings**, each a transaction's signed `tx_info` verbatim, in signing — nonce — order.
+pub fn batch_form(txs: &[(u8, String)]) -> [(&'static str, String); 2] {
+    let types: Vec<u8> = txs.iter().map(|(tx_type, _)| *tx_type).collect();
+    let infos: Vec<&str> = txs.iter().map(|(_, info)| info.as_str()).collect();
+    [
+        (
+            "tx_types",
+            serde_json::to_string(&types).expect("numbers serialise"),
+        ),
+        (
+            "tx_infos",
+            serde_json::to_string(&infos).expect("strings serialise"),
+        ),
+    ]
+}
+
+/// One hash as the venue might spell it: the hex, any case, with or without `0x`.
+fn same_hash(venue: &str, signed: &str) -> bool {
+    let venue = venue.strip_prefix("0x").unwrap_or(venue);
+    !venue.is_empty() && venue.eq_ignore_ascii_case(signed)
+}
+
+/// Classifies a `sendTxBatch` HTTP status + body against the hashes the signer produced for
+/// the batch's transactions, in order (design note §3.7). Only a clean echo is `Accepted`;
+/// 429/405 are `RateLimited`; everything else — every 4xx and 5xx, and a 200 whose `code` is
+/// not 200, whose hash array is missing, shorter, longer, reordered or holds a stranger — is
+/// `Ambiguous`.
+pub fn classify_batch_outcome(status: u16, body: &str, signed_hashes: &[String]) -> BatchOutcome {
+    if (200..300).contains(&status) {
+        let resp = match serde_json::from_str::<RespSendTxBatch>(body) {
+            Ok(resp) => resp,
+            Err(_) => {
+                return BatchOutcome::Ambiguous {
+                    status,
+                    code: None,
+                    detail: format!("an unreadable sendTxBatch 200: {}", clip(body)),
+                };
+            }
+        };
+        let echoed = resp.code == 200
+            && resp.tx_hash.len() == signed_hashes.len()
+            && resp
+                .tx_hash
+                .iter()
+                .zip(signed_hashes)
+                .all(|(venue, signed)| same_hash(venue, signed));
+        if !echoed {
+            return BatchOutcome::Ambiguous {
+                status,
+                code: Some(resp.code),
+                detail: format!(
+                    "a sendTxBatch 200 that is not a clean echo of the {} signed hashes \
+                     (code {}, {} hashes back): {}",
+                    signed_hashes.len(),
+                    resp.code,
+                    resp.tx_hash.len(),
+                    clip(body)
+                ),
+            };
+        }
+        let ratelimit = resp
+            .message
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<RateLimitReport>(m).ok())
+            .and_then(|report| report.ratelimit);
+        return BatchOutcome::Accepted(
+            resp.tx_hash
+                .into_iter()
+                .map(|tx_hash| SendTxAck {
+                    tx_hash,
+                    ratelimit: ratelimit.clone(),
+                    predicted_execution_time_ms: resp.predicted_execution_time_ms,
+                })
+                .collect(),
+        );
+    }
+    if RATE_LIMITED_STATUSES.contains(&status) {
+        return BatchOutcome::RateLimited {
+            status,
+            detail: clip(body),
+        };
+    }
+    BatchOutcome::Ambiguous {
+        status,
+        code: serde_json::from_str::<ApplicationError>(body)
+            .ok()
+            .map(|error| error.code),
+        detail: clip(body),
+    }
+}
+
 /// `21104 invalid nonce` — the one `sendTx` rejection that does not spend the nonce (§2.7).
 const INVALID_NONCE_CODE: i64 = 21104;
 
@@ -594,6 +723,25 @@ pub async fn send_tx(
     let status = response.status().as_u16();
     let body = response.text().await?;
     Ok(classify_send_outcome(status, &body))
+}
+
+/// POSTs a run of signed transactions to `POST /api/v1/sendTxBatch` (design note §3.7) and
+/// classifies the answer against `signed_hashes`, the signer's hash of each, in order. Like
+/// [`send_tx`], it reads the body whatever the status; an `Err` is a transport failure, whose
+/// fate is as unknown as an ambiguous answer's.
+pub async fn send_tx_batch(
+    rest_url: &str,
+    txs: &[(u8, String)],
+    signed_hashes: &[String],
+) -> Result<BatchOutcome, LighterError> {
+    let response = order_rest_client()?
+        .post(format!("{rest_url}/api/v1/sendTxBatch"))
+        .form(&batch_form(txs))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    Ok(classify_batch_outcome(status, &body, signed_hashes))
 }
 
 /// `GET /api/v1/tx?by=hash&value=<tx_hash>` → the order verdict (§4.11). Called on a lapsed
@@ -728,11 +876,14 @@ mod tests {
         fixtures::{ACCOUNT_LIMITS_INVALID_DEADLINE, ACCOUNT_LIMITS_OK, ORDER_BOOKS_CATALOG},
         rest::{
             AuthCheck,
+            BatchOutcome,
             MarketInfo,
             MarketType,
             SendOutcome,
             TxVerdict,
+            batch_form,
             classify_auth_check,
+            classify_batch_outcome,
             classify_send_outcome,
             match_catalog,
             parse_next_nonce,
@@ -1009,6 +1160,162 @@ mod tests {
             classify_send_outcome(404, ""),
             SendOutcome::Ambiguous { .. }
         ));
+    }
+
+    // ---- sendTxBatch (design note §3.7) ------------------------------------------------
+
+    const HASH_A: &str =
+        "e38dd4f2150419f1b407d1aaa4d494c71ac4cb0d1c1735fa54408b1b1275bf3357c853b0a9b826af";
+    const HASH_B: &str =
+        "5050882aba3f8ac068939a7b667b0e56f0624b7aa63bf0d915344b6b7b858fa100000000aaaaaaaa";
+
+    fn signed_hashes() -> Vec<String> {
+        vec![HASH_A.to_string(), HASH_B.to_string()]
+    }
+
+    /// The `RespSendTxBatch` shape (SDK `models/resp_send_tx_batch.py`): one `code`, one
+    /// `message`, one `predicted_execution_time_ms` for the batch, and an array of hashes.
+    fn batch_body(code: i64, hashes: serde_json::Value) -> String {
+        serde_json::json!({
+            "code": code,
+            "message": "{\"ratelimit\": \"Ratelimit is off\"}",
+            "tx_hash": hashes,
+            "predicted_execution_time_ms": 1_785_431_671_831_i64,
+            "volume_quota_remaining": 100,
+        })
+        .to_string()
+    }
+
+    /// **The body is the SDK's: two form fields, each a JSON string — `tx_types` an array of
+    /// numbers, `tx_infos` an array of strings, each the signer's own `tx_info` verbatim**
+    /// (`signer_client.py` `send_tx_batch`: `json.dumps(tx_types)`, `json.dumps(tx_infos)`).
+    /// A string-in-an-array-in-a-string; an object array in its place would be a different
+    /// request the venue never documented.
+    #[test]
+    fn a_batch_goes_as_two_json_string_fields_in_signing_order() {
+        let first = r#"{"Nonce":7,"Sig":"x"}"#;
+        let second = r#"{"Nonce":8,"Sig":"y"}"#;
+        let form = batch_form(&[(14, first.to_string()), (15, second.to_string())]);
+        assert_eq!(form[0], ("tx_types", "[14,15]".to_string()));
+        assert_eq!(form[1].0, "tx_infos");
+        let infos: Vec<String> = serde_json::from_str(&form[1].1).unwrap();
+        assert_eq!(infos, [first, second], "each tx_info verbatim, in order");
+    }
+
+    /// **A clean 200 is a batch whose every hash the venue echoed back, in order** — and only
+    /// that is `Accepted`, one ack per transaction carrying its own hash. The hashes are the
+    /// signer's (the SDK: the server computes the same one or the signature fails), so they
+    /// can be compared element by element; the case of the hex and a `0x` are not a difference.
+    #[test]
+    fn a_batch_is_accepted_only_when_the_venue_echoes_every_signed_hash_in_order() {
+        let body = batch_body(200, serde_json::json!([HASH_A, HASH_B]));
+        let BatchOutcome::Accepted(acks) = classify_batch_outcome(200, &body, &signed_hashes())
+        else {
+            panic!("a clean 200 must be Accepted");
+        };
+        assert_eq!(acks.len(), 2);
+        assert_eq!(acks[0].tx_hash, HASH_A);
+        assert_eq!(acks[1].tx_hash, HASH_B);
+        for ack in &acks {
+            assert_eq!(ack.ratelimit.as_deref(), Some("Ratelimit is off"));
+            assert_eq!(ack.predicted_execution_time_ms, Some(1_785_431_671_831));
+        }
+        let shouted = batch_body(
+            200,
+            serde_json::json!([format!("0x{}", HASH_A.to_uppercase()), HASH_B]),
+        );
+        assert!(matches!(
+            classify_batch_outcome(200, &shouted, &signed_hashes()),
+            BatchOutcome::Accepted(_)
+        ));
+    }
+
+    /// **Anything short of that clean 200 is `Ambiguous` for the whole batch** (§3.7): nothing
+    /// documents what a partial success looks like, so a short array, a reordered one, an
+    /// empty element, a `code` other than 200, a 200 with no array, and a body that is not
+    /// JSON each leave every transaction's fate unknown. Read as `Accepted`, any of them could
+    /// leave the bot believing in an order that never rested — or, read as refused, orphan one
+    /// that did.
+    #[test]
+    fn a_two_hundred_that_is_not_a_clean_echo_is_ambiguous() {
+        for body in [
+            batch_body(200, serde_json::json!([HASH_A])),
+            batch_body(200, serde_json::json!([HASH_B, HASH_A])),
+            batch_body(200, serde_json::json!([HASH_A, ""])),
+            batch_body(200, serde_json::json!([HASH_A, HASH_B, HASH_B])),
+            batch_body(21104, serde_json::json!([HASH_A, HASH_B])),
+            r#"{"code":200,"message":"ok"}"#.to_string(),
+            r#"{"code":200,"tx_hash":"not-an-array"}"#.to_string(),
+            "<html>bad gateway</html>".to_string(),
+        ] {
+            assert!(
+                matches!(
+                    classify_batch_outcome(200, &body, &signed_hashes()),
+                    BatchOutcome::Ambiguous { status: 200, .. }
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// **A `21104` answering a batch is NOT the single send's "did not take"** (§3.7): that
+    /// reading is measured for one transaction; for a batch, nothing says the venue checked the
+    /// nonces all-or-nothing, so transactions before the one it refused may already be in.
+    /// The same for every other refusal of the batch — `21105` (nonces not consecutive),
+    /// `21121` (two keys), a 5xx — with the venue's code kept for the log.
+    #[test]
+    fn a_refused_batch_is_ambiguous_a_21104_included() {
+        for (status, body, code) in [
+            (
+                400u16,
+                r#"{"code":21104,"message":"invalid nonce"}"#,
+                Some(21104),
+            ),
+            (
+                400,
+                r#"{"code":21105,"message":"batch transaction nonce is not increasing"}"#,
+                Some(21105),
+            ),
+            (
+                400,
+                r#"{"code":21121,"message":"same account and apikey"}"#,
+                Some(21121),
+            ),
+            (500, "upstream unavailable", None),
+            (408, "", None),
+        ] {
+            match classify_batch_outcome(status, body, &signed_hashes()) {
+                BatchOutcome::Ambiguous {
+                    status: got,
+                    code: got_code,
+                    detail,
+                } => {
+                    assert_eq!(got, status);
+                    assert_eq!(got_code, code, "{body}");
+                    assert!(detail.len() <= 400, "bounded: {detail}");
+                }
+                other => panic!("HTTP {status} {body:?} must be Ambiguous, got {other:?}"),
+            }
+        }
+    }
+
+    /// **429 and 405 answering a batch are the rate limiter, as for one transaction** — one
+    /// cooldown for the batch, whatever the body (§4.16).
+    #[test]
+    fn a_429_or_a_405_on_a_batch_is_rate_limited() {
+        for (status, body) in [
+            (429u16, r#"{"code":429,"message":"Too Many Requests"}"#),
+            (405, ""),
+            (429, r#"{"code":21104,"message":"invalid nonce"}"#),
+        ] {
+            assert!(
+                matches!(
+                    classify_batch_outcome(status, body, &signed_hashes()),
+                    BatchOutcome::RateLimited { status: got, .. } if got == status
+                ),
+                "HTTP {status} {body:?}"
+            );
+        }
     }
 
     /// The `GET /tx` body triple-nests the verdict: `event_info` is a JSON string, and inside
