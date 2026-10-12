@@ -47,7 +47,9 @@ pub enum NonceAction {
 pub fn nonce_action(outcome: &SendOutcome) -> NonceAction {
     match outcome {
         SendOutcome::Accepted(_) => NonceAction::Consumed,
-        SendOutcome::InvalidNonce { .. } | SendOutcome::Ambiguous { .. } => NonceAction::Resync,
+        SendOutcome::InvalidNonce { .. }
+        | SendOutcome::Refused { .. }
+        | SendOutcome::Ambiguous { .. } => NonceAction::Resync,
         SendOutcome::RateLimited { .. } => NonceAction::Invalidate,
     }
 }
@@ -87,6 +89,9 @@ pub fn cancel_after_send(outcome: &SendOutcome) -> CancelFollowUp {
              taken — cancel again"
         )),
         SendOutcome::RateLimited { .. } => CancelFollowUp::AfterCooldown,
+        SendOutcome::Refused { code, message } => CancelFollowUp::HandBack(format!(
+            "the venue refused the cancel ({code}: {message}); the cancel did not take"
+        )),
     }
 }
 
@@ -137,6 +142,11 @@ pub fn sweep_follow_up(outcome: Result<&SendOutcome, &str>, attempt: u32) -> Swe
         Ok(SendOutcome::RateLimited { status, detail }) => (
             format!("the sweep's sendTx was rate-limited (HTTP {status}: {detail})"),
             Duration::ZERO,
+        ),
+        // A cancel-all needs no margin; a refusal here is unexpected — retried as an unknown.
+        Ok(SendOutcome::Refused { code, message }) => (
+            format!("the venue refused the sweep ({code}: {message})"),
+            SWEEP_RETRY_BACKOFF * attempt,
         ),
         Err(reason) => (reason.to_string(), SWEEP_RETRY_BACKOFF * attempt),
     };

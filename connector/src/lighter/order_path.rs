@@ -1101,7 +1101,9 @@ impl SlotTask {
                              its fate can be read after the cooldown (§4.16)."
                         );
                     }
-                    SendOutcome::Accepted(_) | SendOutcome::InvalidNonce { .. } => {}
+                    SendOutcome::Accepted(_)
+                    | SendOutcome::InvalidNonce { .. }
+                    | SendOutcome::Refused { .. } => {}
                 }
                 self.settle_submit(awaiting, coi, market_index, outcome);
             }
@@ -1150,6 +1152,19 @@ impl SlotTask {
                 self.expire(
                     coi,
                     "the venue rejected the nonce (21104); the order did not take",
+                );
+            }
+            SendOutcome::Refused { code, message } => {
+                // `21739` on a lone sendTx: the API refused the order for want of margin
+                // before the sequencer — nothing rests, so expiring cannot orphan. The prose
+                // carries the venue's margin status word, `canceled-margin-not-allowed`: the
+                // bot reads that as an account refusal, not as transient backpressure.
+                self.expire(
+                    coi,
+                    &format!(
+                        "the venue refused the order (canceled-margin-not-allowed: sendTx \
+                         {code}, {message})"
+                    ),
                 );
             }
             // Unknown fate — the tx MAY already rest on the venue (§4.11). §3.3: the nonce is
@@ -5205,6 +5220,45 @@ mod tests {
             "a 21104 re-reads the counter"
         );
         assert_eq!(slot.venue.sent()[1], ("create_order".to_string(), 8));
+    }
+
+    /// **A margin refusal comes back at once, in the words the bot's classifier reads as
+    /// one** (live RH, 12.10): `400 {code 21739}` expires the order immediately — no
+    /// confirmation deadline, no fate check — with the venue's margin status word in the
+    /// prose (`canceled-margin-not-allowed`, which myhft counts as an account refusal), and
+    /// re-reads the nonce before the next send.
+    #[tokio::test]
+    async fn a_margin_refusal_expires_the_order_at_once_as_a_margin_refusal() {
+        let mut slot = slot_on_scripted_venue(|_| {}).await;
+        slot.venue.answer_send_tx_with([(
+            400,
+            r#"{"code":21739,"message":"not enough margin to create the order"}"#.to_string(),
+        )]);
+        slot.submit(&eth_order(1, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the refused order comes back first");
+        };
+        assert_eq!((order.order_id, order.status), (1, Status::Expired));
+        let (kind, message) = as_error(slot.next_event().await);
+        assert_eq!(kind, ErrorKind::OrderError);
+        assert!(
+            message.contains("the venue refused the order (canceled-margin-not-allowed"),
+            "{message}"
+        );
+        assert!(message.contains("21739"), "{message}");
+        assert_eq!(
+            slot.venue.count("/api/v1/accountActiveOrders"),
+            0,
+            "no fate check: the refusal is the verdict"
+        );
+        slot.submit(&eth_order(2, Side::Buy));
+        slot.venue_until(|venue| venue.sent().len() == 2).await;
+        assert_eq!(
+            slot.venue.count("/api/v1/nextNonce"),
+            2,
+            "the counter is re-read after the refusal"
+        );
     }
 
     // ---- sendTxBatch: what is queued together goes together (§3.7) ----------------------

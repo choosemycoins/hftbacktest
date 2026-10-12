@@ -384,7 +384,15 @@ pub enum SendOutcome {
     /// ambiguous answer's — what differs is the timing: nothing is sent, and nothing is read,
     /// until the cooldown is over (§4.16).
     RateLimited { status: u16, detail: String },
+    /// HTTP 400 with a code that refuses the transaction before the sequencer — today only
+    /// `21739 not enough margin` (live RH, 12.10). No order resulted; the nonce is re-read
+    /// all the same, as for any non-2xx (whether the API spent it is not the claim here).
+    Refused { code: i64, message: String },
 }
+
+/// `21739 not enough margin to create the order`: the API's refusal of an order the account
+/// cannot carry — the one 4xx besides `21104` read as a verdict (live RH, 12.10).
+pub const NOT_ENOUGH_MARGIN_CODE: i64 = 21739;
 
 /// The statuses the venue answers a rate-limited request with (its docs: "You will receive
 /// HTTP 429, or HTTP 405").
@@ -459,12 +467,18 @@ pub fn classify_send_outcome(status: u16, body: &str) -> SendOutcome {
     }
     // The one rejection that leaves the nonce untouched is `21104` (§2.7); every other
     // non-2xx is ambiguous for the counter and forces a `nextNonce` resync.
-    if let Ok(err) = serde_json::from_str::<ApplicationError>(body)
-        && err.code == INVALID_NONCE_CODE
-    {
-        return SendOutcome::InvalidNonce {
-            message: err.message,
-        };
+    if let Ok(err) = serde_json::from_str::<ApplicationError>(body) {
+        if err.code == INVALID_NONCE_CODE {
+            return SendOutcome::InvalidNonce {
+                message: err.message,
+            };
+        }
+        if status == 400 && err.code == NOT_ENOUGH_MARGIN_CODE {
+            return SendOutcome::Refused {
+                code: err.code,
+                message: err.message,
+            };
+        }
     }
     SendOutcome::Ambiguous {
         status,
@@ -1104,6 +1118,37 @@ mod tests {
             SendOutcome::InvalidNonce { message } => assert!(message.contains("nonce")),
             other => panic!("21104 must be InvalidNonce, got {other:?}"),
         }
+    }
+
+    /// **`21739 not enough margin` is a refusal, not an unknown** (live RH, 12.10): the API
+    /// answers it with HTTP 400 before the sequencer — the order did not take (the fate check
+    /// of that send found nothing resting). Read as `Ambiguous` it held the order "in flight"
+    /// to the confirmation deadline and reached the bot as an ambiguous send, never as the
+    /// margin refusal it is. Only this code: every other 4xx stays `Ambiguous`.
+    #[test]
+    fn not_enough_margin_is_a_refusal() {
+        let body = r#"{"code":21739,"message":"not enough margin to create the order"}"#;
+        match classify_send_outcome(400, body) {
+            SendOutcome::Refused { code, message } => {
+                assert_eq!(code, 21739);
+                assert!(message.contains("margin"), "{message}");
+            }
+            other => panic!("21739 must be Refused, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                classify_send_outcome(400, r#"{"code":21740,"message":"something else"}"#),
+                SendOutcome::Ambiguous { .. }
+            ),
+            "an unknown 4xx stays ambiguous"
+        );
+        assert!(
+            matches!(
+                classify_send_outcome(503, body),
+                SendOutcome::Ambiguous { .. }
+            ),
+            "only a 400 carries the refusal"
+        );
     }
 
     /// **Everything unrecognised is `Ambiguous`, and fails closed** (§3.3): a 5xx, a 408, and
