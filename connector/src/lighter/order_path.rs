@@ -779,6 +779,10 @@ fn batch_answer_turns_batching_off(answer: &BatchOutcome) -> bool {
 }
 
 /// A placement awaiting confirmation, and when its deadline is up (§4.11).
+/// How many lapsed deadlines a placement with a `sendTx` hash is judged by `GET /tx` before its
+/// fate is read off `accountActiveOrders` instead (live RH 13.10: `/tx` read "pending" for 7 h).
+const TX_VERDICT_TRIES: u32 = 3;
+
 struct Awaiting {
     /// The `sendTx` tx hash for the `GET /tx` verdict (§4.11), or **empty** when the send was
     /// ambiguous / a transport error and produced no hash — then the deadline resolves the
@@ -787,6 +791,9 @@ struct Awaiting {
     /// The order's market, so the fate check can scope `accountActiveOrders` to it (§3.3).
     market_index: i32,
     deadline: Instant,
+    /// Lapsed deadlines `GET /tx` has left unresolved; at [`TX_VERDICT_TRIES`] the hash is
+    /// dropped and the fate is read off `accountActiveOrders` instead.
+    unresolved: u32,
 }
 
 impl SlotTask {
@@ -1200,6 +1207,7 @@ impl SlotTask {
                 tx_hash,
                 market_index,
                 deadline: Instant::now() + Duration::from_millis(self.config.confirm_deadline_ms),
+                unresolved: 0,
             },
         );
     }
@@ -2082,9 +2090,25 @@ impl SlotTask {
                         }
                         Placement::Unresolved => {
                             // Give it one more interval; the channel may still be catching up.
+                            // But not forever: a confirmation lost with a dropped private stream
+                            // never arrives, and `/tx` can read "pending" indefinitely (live RH
+                            // 13.10). After TX_VERDICT_TRIES the hash is dropped, so the next
+                            // deadline reads the fate off `accountActiveOrders` (§3.3).
                             if let Some(entry) = awaiting.get_mut(&coi) {
+                                entry.unresolved += 1;
                                 entry.deadline =
                                     now + Duration::from_millis(self.config.confirm_deadline_ms);
+                                if entry.unresolved >= TX_VERDICT_TRIES {
+                                    entry.tx_hash.clear();
+                                    warn!(
+                                        coi,
+                                        tries = entry.unresolved,
+                                        "A Lighter placement is still unconfirmed after its tx \
+                                         verdict tries; reading its fate off accountActiveOrders \
+                                         at the next deadline (§3.3)."
+                                    );
+                                    continue;
+                                }
                             }
                             warn!(
                                 coi,
@@ -5259,6 +5283,31 @@ mod tests {
             2,
             "the counter is re-read after the refusal"
         );
+    }
+
+    /// **A placement whose `GET /tx` never resolves is settled against `accountActiveOrders`,
+    /// not waited on forever** (live RH, 13.10 01:29Z: a send answered 200, the private stream
+    /// went silent and dropped, the reconnect snapshot did not list the order, and `/tx` kept
+    /// reading "pending" — the order sat "in flight" for 7 h and the bot quoted nothing). After
+    /// `TX_VERDICT_TRIES` unresolved deadlines the hash is dropped and the next deadline reads
+    /// the order's fate off the account's open orders: absent here, so it comes back expired.
+    #[tokio::test]
+    async fn a_placement_the_tx_endpoint_never_resolves_is_settled_against_active_orders() {
+        let mut slot = slot_on_scripted_venue(|config| config.confirm_deadline_ms = 200).await;
+        slot.submit(&eth_order(1, Side::Buy));
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the unconfirmed order comes back");
+        };
+        assert_eq!((order.order_id, order.status), (1, Status::Expired));
+        let (_, message) = as_error(slot.next_event().await);
+        assert!(message.contains("accountActiveOrders"), "{message}");
+        assert_eq!(
+            slot.venue.count("/api/v1/tx"),
+            super::TX_VERDICT_TRIES as usize,
+            "asked `/tx` exactly the allowed number of times first"
+        );
+        assert!(slot.venue.count("/api/v1/accountActiveOrders") >= 1);
     }
 
     // ---- sendTxBatch: what is queued together goes together (§3.7) ----------------------
