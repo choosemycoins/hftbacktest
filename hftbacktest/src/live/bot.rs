@@ -844,8 +844,13 @@ where
                         return Ok(ElapseResult::Ok);
                     }
                     // A *capped* receive expiring is not this call expiring. Without the cap
-                    // the channel's timeout was the call's, and this is the end of it.
-                    if chunk >= remaining_duration || elapsed >= duration {
+                    // the channel's timeout was the call's, and this is the end of it — unless a
+                    // batch is open: its messages are separate sends, the next one can simply be
+                    // late, and returning here hands the strategy the half-applied book the
+                    // batch exists to hide (a mirrored touch with its old level retracted and the
+                    // new one not yet written: no bid at all). The event arm already waits on
+                    // `holds`; this is the same rule, and the ceiling still bounds it.
+                    if !holds && (chunk >= remaining_duration || elapsed >= duration) {
                         return Ok(ElapseResult::Ok);
                     }
                     remaining_duration = duration
@@ -3162,5 +3167,97 @@ mod tests {
 
         assert!(bot.snapshot_ready(0));
         assert_eq!(bot.depth(0).best_bid(), 100.0);
+    }
+
+    /// One scripted step of [`GapChannel`]: an event, or a receive that expires after `gap`.
+    enum Step {
+        Event(usize, LiveEvent),
+        Gap(Duration),
+    }
+
+    /// A feed whose messages can be **late**: a `Gap` sleeps, then reports the receive
+    /// expired, exactly as `IceoryxUnifiedChannel::recv_timeout` does when the next message of
+    /// a batch has not been published yet. Out of script, every receive expires at once.
+    struct GapChannel {
+        script: VecDeque<Step>,
+    }
+
+    impl Channel for GapChannel {
+        fn build<MD>(_instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+        where
+            Self: Sized,
+        {
+            unimplemented!()
+        }
+
+        fn recv_timeout(
+            &mut self,
+            _id: u64,
+            _timeout: Duration,
+        ) -> Result<(usize, LiveEvent), BotError> {
+            match self.script.pop_front() {
+                Some(Step::Event(inst_no, ev)) => Ok((inst_no, ev)),
+                Some(Step::Gap(gap)) => {
+                    std::thread::sleep(gap);
+                    Err(BotError::Timeout)
+                }
+                None => Err(BotError::Timeout),
+            }
+        }
+
+        fn send(
+            &mut self,
+            _id: u64,
+            _inst_no: usize,
+            _request: LiveRequest,
+        ) -> Result<(), BotError> {
+            Ok(())
+        }
+    }
+
+    /// **A receive that expires inside an open batch must not hand back the half-applied
+    /// book.** A connector mirroring a touch publishes "retract the old level, write the new
+    /// one" as one batch; its messages are separate IPC sends, so the second can be late. If
+    /// the receive expires in between once the call's own duration has run out, the expiry arm
+    /// returned without asking whether a batch was open — and the strategy read a book with
+    /// the old bid gone and the new one not yet there: no bid at all. Measured live
+    /// (2026-10-13, Binance bookTicker leader): about one such tick a minute, each one blanking
+    /// the leader's mid.
+    #[test]
+    fn an_expiry_inside_an_open_batch_does_not_return_a_half_applied_book() {
+        let duration = Duration::from_millis(5);
+        let mut bot = LiveBot::new(
+            42,
+            GapChannel {
+                script: VecDeque::from([
+                    Step::Event(0, bid("BTCUSDT", 100.0, 1.0)),
+                    Step::Event(0, LiveEvent::BatchStart),
+                    Step::Event(0, bid("BTCUSDT", 100.0, 0.0)),
+                    // The write is late, past the end of this call's own duration.
+                    Step::Gap(duration * 2),
+                    Step::Event(0, bid("BTCUSDT", 99.0, 1.0)),
+                    Step::Event(0, LiveEvent::BatchEnd),
+                ]),
+            },
+            vec![Instrument::new(
+                "mock",
+                "BTCUSDT",
+                0.01,
+                1.0,
+                HashMapMarketDepth::new(0.01, 1.0),
+                0,
+            )],
+            None,
+            None,
+            None,
+        );
+
+        bot.elapse(duration.as_nanos() as i64).unwrap();
+
+        assert_eq!(
+            bot.depth(0).best_bid(),
+            99.0,
+            "the call must return on the whole batch, not between its two halves"
+        );
     }
 }
