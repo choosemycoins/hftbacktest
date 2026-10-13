@@ -327,15 +327,7 @@ impl<MD> LiveBotBuilder<MD> {
                 "Registers the instrument."
             );
             channel
-                .send(
-                    id,
-                    inst_no,
-                    LiveRequest::RegisterInstrument {
-                        symbol: instrument.symbol.clone(),
-                        tick_size: instrument.tick_size,
-                        lot_size: instrument.lot_size,
-                    },
-                )
+                .send(id, inst_no, registration(instrument))
                 .map_err(|error| BuildError::Error(anyhow::Error::from(error)))?;
         }
 
@@ -347,6 +339,16 @@ impl<MD> LiveBotBuilder<MD> {
             self.order_hook,
             self.heartbeat_interval,
         ))
+    }
+}
+
+/// The request that asks an instrument's connector to serve it. One constructor, so that
+/// [`LiveBotBuilder::build`] and [`LiveBot::register_again`] cannot drift apart.
+fn registration<MD>(instrument: &Instrument<MD>) -> LiveRequest {
+    LiveRequest::RegisterInstrument {
+        symbol: instrument.symbol.clone(),
+        tick_size: instrument.tick_size,
+        lot_size: instrument.lot_size,
     }
 }
 
@@ -501,6 +503,42 @@ where
     CH: Channel,
     MD: MarketDepth + L2MarketDepth,
 {
+    /// Sends `asset_no`'s registration to its connector again — the same request
+    /// [`LiveBotBuilder::build`] sent.
+    ///
+    /// **Why it exists.** A connector learns what to serve from `RegisterInstrument`, and
+    /// `build` sends it once. A connector process that restarts under a running bot starts
+    /// with no registrations: it subscribes to nothing for this bot and drops every feed event
+    /// for a symbol nobody registered with it, so this instrument's book stops updating with
+    /// no error anywhere. Registering again is how a bot recovers from that without being
+    /// restarted itself.
+    ///
+    /// **What the connector does with it** is exactly what it does with the first one: it
+    /// subscribes if it is not subscribed yet (a no-op otherwise), and answers this bot with a
+    /// batch of the instrument's current state followed by
+    /// [`LiveEvent::SnapshotComplete`]. Those are processed by `elapse` like any other.
+    ///
+    /// **Venue-side effects are the connector's, and they repeat.** A backend whose `register`
+    /// does more than subscribe repeats that too — Bybit's cancels every resting order on the
+    /// symbol and fetches the position. When and whether to call this is the consumer's
+    /// policy (`AGENTS.md` §1.1); the library only sends. A market-data-only connector is the
+    /// case it is meant for.
+    ///
+    /// Fails with [`BotError::InstrumentNotFound`] for an unknown `asset_no`, sending nothing.
+    pub fn register_again(&mut self, asset_no: usize) -> Result<(), BotError> {
+        let instrument = self
+            .instruments
+            .get(asset_no)
+            .ok_or(BotError::InstrumentNotFound)?;
+        info!(
+            connector_name = instrument.connector_name,
+            symbol = instrument.symbol,
+            "Registers the instrument again."
+        );
+        let request = registration(instrument);
+        self.channel.send(self.id, asset_no, request)
+    }
+
     fn process_event<const WAIT_NEXT_FEED: bool>(
         &mut self,
         inst_no: usize,
@@ -3055,5 +3093,74 @@ mod tests {
             "both unreachable connectors must be named in the log, got {named:?}"
         );
         assert_eq!(bot.channel.attempts, 2, "and both were actually attempted");
+    }
+
+    fn registrations(
+        bot: &LiveBot<MockChannel, HashMapMarketDepth>,
+    ) -> Vec<(u64, usize, String, f64, f64)> {
+        bot.channel
+            .sent
+            .iter()
+            .filter_map(|(id, inst_no, request)| match request {
+                LiveRequest::RegisterInstrument {
+                    symbol,
+                    tick_size,
+                    lot_size,
+                } => Some((*id, *inst_no, symbol.clone(), *tick_size, *lot_size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **A connector that restarts has forgotten the bot.** It learns what to subscribe to from
+    /// `RegisterInstrument`, which `build` sends once; the restarted process drops every feed
+    /// event for a symbol nobody registered with *it*, so the bot's book goes quiet for good.
+    /// Sending the same request again is the cure, and it has to be the same request — this
+    /// bot's id, routed to this instrument's connector, with the instrument's own tick and lot.
+    #[test]
+    fn register_again_resends_exactly_the_registration_build_sent() {
+        let mut bot = make_bot(&["BTCUSDT", "ETHUSDT"], vec![]);
+
+        bot.register_again(1).unwrap();
+
+        assert_eq!(
+            registrations(&bot),
+            vec![(42, 1, "ETHUSDT".to_string(), 0.01, 1.0)]
+        );
+    }
+
+    #[test]
+    fn register_again_refuses_an_unknown_asset_and_sends_nothing() {
+        let mut bot = make_bot(&["BTCUSDT"], vec![]);
+
+        assert!(matches!(
+            bot.register_again(1),
+            Err(BotError::InstrumentNotFound)
+        ));
+        assert!(bot.channel.sent.is_empty());
+    }
+
+    /// The connector answers a repeated registration the way it answered the first: a batch
+    /// with the current state, then the marker. Mid-run, that answer must not wedge the bot —
+    /// the feed that follows it is applied as usual.
+    #[test]
+    fn the_answer_to_a_repeated_registration_is_taken_like_the_first() {
+        let mut bot = make_bot(
+            &["BTCUSDT"],
+            vec![
+                (0, LiveEvent::BatchStart),
+                (0, LiveEvent::BatchEnd),
+                (0, snapshot_complete("BTCUSDT")),
+                (0, bid("BTCUSDT", 100.0, 1.0)),
+            ],
+        );
+
+        bot.register_again(0).unwrap();
+        while !bot.channel.incoming.is_empty() {
+            bot.elapse(1_000).unwrap();
+        }
+
+        assert!(bot.snapshot_ready(0));
+        assert_eq!(bot.depth(0).best_bid(), 100.0);
     }
 }
