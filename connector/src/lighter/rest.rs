@@ -809,6 +809,89 @@ pub async fn fetch_active_orders(
     parse_active_orders(&body)
 }
 
+/// `GET /api/v1/trades?account_index=..&market_id=..&sort_by=timestamp&sort_dir=desc` → the
+/// client order indices of **this account's** side of its latest trades on one market (§3.3).
+///
+/// The second half of an ambiguous send's fate. An order that landed **and filled** is absent
+/// from `accountActiveOrders` exactly like one that never landed, so absence alone is not "it
+/// never produced an order" — live RH 14.10 09:09Z: the private stream went silent without
+/// dropping, ten placements filled unseen, each was expired back as "never produced" and the
+/// bot re-quoted into the next fill, 0.03 → 0.23 long. A COI found here **traded**.
+///
+/// Public: answered without a token (MEASURED live RH 14.10). The latest [`TRADES_LOOKBACK`]
+/// trades cover the ~20 s between a send and its fate check many times over at our rate. Any
+/// failure is an `Err` the caller fails closed on; it is never "no trades".
+pub async fn fetch_traded_cois(
+    rest_url: &str,
+    account_index: i64,
+    market_index: i32,
+) -> Result<Vec<i64>, LighterError> {
+    let response = order_rest_client()?
+        .get(format!("{rest_url}/api/v1/trades"))
+        .query(&[
+            ("account_index", account_index.to_string()),
+            ("market_id", market_index.to_string()),
+            ("sort_by", "timestamp".to_string()),
+            ("sort_dir", "desc".to_string()),
+            ("limit", TRADES_LOOKBACK.to_string()),
+        ])
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(LighterError::Frame(format!(
+            "trades HTTP {}: {}",
+            status.as_u16(),
+            clip(&body)
+        )));
+    }
+    parse_traded_cois(&body, account_index)
+}
+
+/// How many of the account's latest trades the fate check reads (the venue's page maximum).
+pub const TRADES_LOOKBACK: u32 = 100;
+
+#[derive(Deserialize)]
+struct RestTrades {
+    code: i64,
+    #[serde(default)]
+    message: Option<String>,
+    trades: Vec<RestTrade>,
+}
+
+#[derive(Deserialize)]
+struct RestTrade {
+    bid_account_id: i64,
+    ask_account_id: i64,
+    bid_client_id: i64,
+    ask_client_id: i64,
+}
+
+/// The client order indices `account_index` traded with, out of a `trades` body. A body
+/// without `code == 200` or without a `trades` list is an `Err`, never an empty answer: an
+/// empty answer would read as "it never traded" and expire a filled order (§1.1).
+pub fn parse_traded_cois(body: &str, account_index: i64) -> Result<Vec<i64>, LighterError> {
+    let resp: RestTrades = serde_json::from_str(body)?;
+    if resp.code != 200 {
+        return Err(LighterError::Frame(format!(
+            "trades returned code {} ({})",
+            resp.code,
+            resp.message.as_deref().unwrap_or("no message")
+        )));
+    }
+    let mut cois = Vec::new();
+    for trade in resp.trades {
+        if trade.bid_account_id == account_index {
+            cois.push(trade.bid_client_id);
+        }
+        if trade.ask_account_id == account_index {
+            cois.push(trade.ask_client_id);
+        }
+    }
+    Ok(cois)
+}
+
 // ========================================================================================
 // Phase 2 auth-token verification (§3.4). The 8 h token ceiling is enforced ONLY by the
 // server: a longer deadline mints without error on the `.so` and is rejected `20013` only at
@@ -902,6 +985,7 @@ mod tests {
             match_catalog,
             parse_next_nonce,
             parse_send_tx_ack,
+            parse_traded_cois,
             parse_tx_verdict,
         },
     };
@@ -1491,5 +1575,40 @@ mod tests {
         assert_eq!(resolved[1].market_type, MarketType::Spot);
         assert_eq!(resolved[1].market_id, 2065);
         assert_eq!(resolved[2].min_base_amount, Some(0.002));
+    }
+
+    /// **The trade fate reads our side only, by client order index** (shape: live RH
+    /// `GET /api/v1/trades`, 14.10). Ours as the bid in one trade and as the ask in another; a
+    /// trade between two other accounts contributes nothing.
+    #[test]
+    fn the_traded_cois_are_this_accounts_side_of_each_trade() {
+        let body = r#"{"code":200,"next_cursor":"x","trades":[
+            {"trade_id":1,"market_id":38,"size":"0.02750","price":"2068.8",
+             "ask_client_id":5340314011960,"bid_client_id":1791907686864,
+             "ask_account_id":9001,"bid_account_id":516,"is_maker_ask":false},
+            {"trade_id":2,"market_id":38,"size":"0.01000","price":"2069.0",
+             "ask_client_id":1791907686870,"bid_client_id":77,
+             "ask_account_id":516,"bid_account_id":9002,"is_maker_ask":true},
+            {"trade_id":3,"market_id":38,"size":"0.01000","price":"2069.0",
+             "ask_client_id":5,"bid_client_id":6,
+             "ask_account_id":9001,"bid_account_id":9002,"is_maker_ask":true}]}"#;
+        assert_eq!(
+            parse_traded_cois(body, 516).unwrap(),
+            [1791907686864, 1791907686870]
+        );
+        assert_eq!(
+            parse_traded_cois(r#"{"code":200,"trades":[]}"#, 516).unwrap(),
+            Vec::<i64>::new()
+        );
+    }
+
+    /// **An answer that is not a trade list is an error, never "it never traded"** — that
+    /// reading would expire a filled order back to the bot (§1.1).
+    #[test]
+    fn a_trades_answer_without_a_list_is_an_error_not_an_empty_answer() {
+        assert!(parse_traded_cois(r#"{"code":20001,"message":"no"}"#, 516).is_err());
+        assert!(parse_traded_cois(r#"{"code":200}"#, 516).is_err());
+        assert!(parse_traded_cois(r#"{"code":500,"trades":[]}"#, 516).is_err());
+        assert!(parse_traded_cois("not json", 516).is_err());
     }
 }

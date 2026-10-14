@@ -120,6 +120,8 @@ pub(crate) struct Seen {
 /// * `POST /api/v1/sendTxBatch` — the next scripted [`BatchAnswer`], or [`BatchAnswer::Echo`]
 ///   once the script is spent.
 /// * `GET /api/v1/accountActiveOrders` — an empty list (the venue holds nothing).
+/// * `GET /api/v1/trades` — per [`Trades`]: no trades (the default), every order this venue was
+///   sent having traded with this account as the bid, or a 500.
 /// * `GET /api/v1/tx` — no verdict yet; or, for a transaction whose client order index
 ///   [`ScriptedRestVenue::reject_tx_of`] names, the application error `21733` — told apart by
 ///   the hash the stand-in signer wrote into its `tx_info`, so a verdict asked for under the
@@ -133,6 +135,20 @@ pub(crate) struct ScriptedRestVenue {
     batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
     rejected_cois: Arc<Mutex<HashSet<i64>>>,
+    trades: Arc<Mutex<Trades>>,
+}
+
+/// How the scripted venue answers `GET /api/v1/trades`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Trades {
+    /// `{"code":200,"trades":[]}` — the account has traded nothing.
+    #[default]
+    None,
+    /// Every order sent so far traded, this account (`account_index` of the query) the bid:
+    /// orders that landed and filled, which is why they are not on `accountActiveOrders`.
+    EverySent,
+    /// A 500: the check cannot run.
+    Fail,
 }
 
 /// How the scripted venue answers one `sendTxBatch`.
@@ -176,6 +192,7 @@ impl ScriptedRestVenue {
         let batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>> = Arc::default();
         let next_nonce_answers: Arc<Mutex<VecDeque<u16>>> = Arc::default();
         let rejected_cois: Arc<Mutex<HashSet<i64>>> = Arc::default();
+        let trades: Arc<Mutex<Trades>> = Arc::default();
         let hash_cois: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
         let counter = Arc::new(Mutex::new(nonce));
         {
@@ -184,6 +201,7 @@ impl ScriptedRestVenue {
             let batch_answers = batch_answers.clone();
             let next_nonce_answers = next_nonce_answers.clone();
             let rejected_cois = rejected_cois.clone();
+            let trades = trades.clone();
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     let script = Script {
@@ -192,6 +210,7 @@ impl ScriptedRestVenue {
                         batch_answers: batch_answers.clone(),
                         next_nonce_answers: next_nonce_answers.clone(),
                         rejected_cois: rejected_cois.clone(),
+                        trades: trades.clone(),
                         hash_cois: hash_cois.clone(),
                         counter: counter.clone(),
                     };
@@ -208,7 +227,13 @@ impl ScriptedRestVenue {
             batch_answers,
             next_nonce_answers,
             rejected_cois,
+            trades,
         }
+    }
+
+    /// From now on `GET /api/v1/trades` answers as `trades` says.
+    pub(crate) fn answer_trades_with(&self, trades: Trades) {
+        *self.trades.lock().unwrap() = trades;
     }
 
     /// From now on `GET /tx` answers the transaction that carried client order index `coi`
@@ -278,6 +303,7 @@ struct Script {
     batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
     rejected_cois: Arc<Mutex<HashSet<i64>>>,
+    trades: Arc<Mutex<Trades>>,
     /// Each transaction's hash, as the stand-in signer wrote it into `tx_info`, to the client
     /// order index it carried.
     hash_cois: Arc<Mutex<HashMap<String, i64>>>,
@@ -291,6 +317,7 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
         batch_answers,
         next_nonce_answers,
         rejected_cois,
+        trades,
         hash_cois,
         counter,
     } = script;
@@ -408,6 +435,36 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
         }
         ("GET", "/api/v1/accountActiveOrders") => {
             (200, json!({"code": 200, "orders": []}).to_string())
+        }
+        ("GET", "/api/v1/trades") => {
+            let query: HashMap<String, String> =
+                serde_qs::from_str(target.split_once('?').map_or("", |(_, query)| query))
+                    .unwrap_or_default();
+            let account: i64 = query
+                .get("account_index")
+                .and_then(|account| account.parse().ok())
+                .unwrap_or(-1);
+            let mode = *trades.lock().unwrap();
+            match mode {
+                Trades::Fail => (500, json!({"code": 500, "message": "down"}).to_string()),
+                Trades::None => (200, json!({"code": 200, "trades": []}).to_string()),
+                Trades::EverySent => {
+                    let rows: Vec<Value> = hash_cois
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .map(|coi| {
+                            json!({
+                                "bid_account_id": account,
+                                "bid_client_id": coi,
+                                "ask_account_id": 9001,
+                                "ask_client_id": 5,
+                            })
+                        })
+                        .collect();
+                    (200, json!({"code": 200, "trades": rows}).to_string())
+                }
+            }
         }
         ("GET", "/api/v1/tx") => {
             let query: HashMap<String, String> =

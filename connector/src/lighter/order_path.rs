@@ -52,6 +52,7 @@ use serde::Deserialize;
 use tokio::{
     select,
     sync::{
+        Notify,
         broadcast::{self, error::RecvError},
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
@@ -550,6 +551,7 @@ impl OrderPath {
 
         let (command_tx, command_rx) = unbounded_channel();
         let mut tasks = Vec::new();
+        let resync = Arc::new(Notify::new());
 
         let slot = SlotTask {
             config: config.clone(),
@@ -558,6 +560,7 @@ impl OrderPath {
             order_manager: order_manager.clone(),
             ev_tx: ev_tx.clone(),
             batching_off: AtomicBool::new(false),
+            resync: resync.clone(),
         };
         tasks.push(tokio::spawn(slot.run(command_rx)));
 
@@ -577,6 +580,7 @@ impl OrderPath {
             snapshotted: false,
             venue_errors: HashMap::new(),
             connect_sweep: ConnectSweep::default(),
+            resync,
         };
         tasks.push(tokio::spawn(stream.run()));
 
@@ -763,6 +767,10 @@ struct SlotTask {
     /// clean echo or a 429 ([`batch_answer_turns_batching_off`], §3.7). From then on the slot
     /// gathers nothing: every transaction goes alone through `sendTx`, as at `max_batch = 1`.
     batching_off: AtomicBool,
+    /// Asks the [`PrivateStreamTask`] to drop its connection and make a fresh one — a new
+    /// order snapshot and position frame — when the slot holds evidence the account channel is
+    /// not reporting this account ([`SlotTask::request_resync`]).
+    resync: Arc<Notify>,
 }
 
 /// Whether a `sendTxBatch` answer is a doubt about the batch path itself, which turns
@@ -1257,7 +1265,20 @@ impl SlotTask {
             return;
         };
         let active = self.check_order_fate(signer, market_index).await;
-        let fate = fate_of_ambiguous(coi, active.as_ref().map(Vec::as_slice).map_err(|_| ()));
+        let traded =
+            rest::fetch_traded_cois(&self.rest_url, self.config.account_index, market_index).await;
+        if let Err(error) = &traded {
+            warn!(
+                coi,
+                ?error,
+                "Couldn't read the Lighter account's trades for an order's fate."
+            );
+        }
+        let fate = fate_of_ambiguous(
+            coi,
+            active.as_ref().map(Vec::as_slice).map_err(|_| ()),
+            traded.as_ref().map(Vec::as_slice).map_err(|_| ()),
+        );
         match fate {
             AmbiguousFate::Landed => {
                 awaiting.remove(&coi);
@@ -1302,12 +1323,24 @@ impl SlotTask {
                     }
                 }
             }
+            AmbiguousFate::Traded => {
+                // Not expired: the bot would re-quote into the next unseen fill. Not adopted
+                // as resting either. The order stays as the bot last heard of it until the
+                // resynced connection's snapshot settles it and its position frame says what
+                // the fill did.
+                awaiting.remove(&coi);
+                self.request_resync(
+                    coi,
+                    "an order absent from accountActiveOrders is in the account's trades: it \
+                     filled and the account stream never said so",
+                );
+            }
             AmbiguousFate::DidNotLand => {
                 awaiting.remove(&coi);
                 self.expire(
                     coi,
                     "the ambiguous sendTx never produced an order (absent from \
-                     accountActiveOrders, §3.3)",
+                     accountActiveOrders and from the account's trades, §3.3)",
                 );
             }
             AmbiguousFate::Unknown => {
@@ -2089,6 +2122,20 @@ impl SlotTask {
                             );
                         }
                         Placement::Unresolved => {
+                            // A healthy channel lists a placement in ~200 ms; not one deadline
+                            // was missed in the ~22 h before the 14.10 incident, every one of
+                            // its misses was a fill the silent channel never reported. So the
+                            // first miss doubts the channel, not the order: resync it now.
+                            if awaiting
+                                .get(&coi)
+                                .is_some_and(|entry| entry.unresolved == 0)
+                            {
+                                self.request_resync(
+                                    coi,
+                                    "a placement the venue accepted is not on the account \
+                                     stream past its confirmation deadline",
+                                );
+                            }
                             // Give it one more interval; the channel may still be catching up.
                             // But not forever: a confirmation lost with a dropped private stream
                             // never arrives, and `/tx` can read "pending" indefinitely (live RH
@@ -2126,6 +2173,19 @@ impl SlotTask {
                 }
             }
         }
+    }
+
+    /// Drops the account stream for a fresh connection ([`PrivateStreamTask`]'s resync arm):
+    /// the slot has evidence the channel is not reporting this account, and an order path
+    /// that cannot see its fills must not keep placing (live RH 14.10, 0.03 → 0.23 long).
+    fn request_resync(&self, coi: i64, why: &str) {
+        error!(
+            coi,
+            why,
+            "The Lighter account stream is not reporting this account; dropping it for a fresh \
+             snapshot and position (§3.4)."
+        );
+        self.resync.notify_one();
     }
 
     fn expire(&self, coi: i64, reason: &str) {
@@ -2673,6 +2733,8 @@ struct PrivateStreamTask {
     venue_errors: HashMap<i64, LogThrottle>,
     /// This connection's clean-slate sweep under `cancel_all`; reset when a connection starts.
     connect_sweep: ConnectSweep,
+    /// The slot's request to drop this connection for a fresh one ([`SlotTask::request_resync`]).
+    resync: Arc<Notify>,
 }
 
 impl PrivateStreamTask {
@@ -2871,6 +2933,19 @@ impl PrivateStreamTask {
                 }
                 _ = &mut refresh => {
                     return Ok(StreamEnd::TokenRefresh);
+                }
+                // The slot holds evidence this connection is not reporting the account — a
+                // placement the venue took and the channel never listed, or an order found in
+                // the account's trades that the channel never filled (live RH 14.10: silent
+                // for 16 min without dropping, ten fills unseen). Drop it: the next connection
+                // snapshots, reconciles and republishes the position, and until then no new
+                // order goes out (`account_stream_live`).
+                () = self.resync.notified() => {
+                    return Err(LighterError::ConnectionAbort(
+                        "resync: the order path holds evidence this connection is not \
+                         reporting the account (§3.4)"
+                            .to_string(),
+                    ));
                 }
                 // The verdict on an attempt of the connect-time sweep (§4.18).
                 (market_index, took) = self.connect_sweep.next_verdict(),
@@ -3379,7 +3454,7 @@ mod tests {
     };
     use serde::Deserialize;
     use tokio::{
-        sync::{broadcast, mpsc::unbounded_channel},
+        sync::{Notify, broadcast, mpsc::unbounded_channel},
         time,
     };
     use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -3428,6 +3503,7 @@ mod tests {
                 DROP_CONNECTION,
                 ScriptedRestVenue,
                 SidecarIdentity,
+                Trades,
                 fake_signer,
             },
         },
@@ -3618,6 +3694,7 @@ mod tests {
             snapshotted: false,
             venue_errors: Default::default(),
             connect_sweep: Default::default(),
+            resync: Arc::new(Notify::new()),
         };
         (task, symbol_tx, command_rx, ev_rx)
     }
@@ -4821,6 +4898,35 @@ mod tests {
         asked
     }
 
+    /// **A resync request ends the connection, and with it the account stream's liveness** —
+    /// the next connect snapshots, reconciles and republishes the position, and no order goes
+    /// out meanwhile. A silent socket (live RH 14.10: 16 minutes connected, reporting nothing)
+    /// is otherwise ended only by the venue or the ~7.5 h token refresh.
+    #[tokio::test]
+    async fn a_resync_request_ends_the_connection_and_the_streams_liveness() {
+        let (mut task, _symbol_tx, _command_rx, _ev_rx) = stream_task(ConnectPolicy::Reconcile);
+        task.account_stream_live.store(true, Ordering::Release);
+        let live = task.account_stream_live.clone();
+        let resync = task.resync.clone();
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut read = stream::pending();
+        let serve = task.serve(&mut sink, &mut read, AUTH_MAX_LIFETIME_S);
+        tokio::pin!(serve);
+        assert!(
+            time::timeout(Duration::from_millis(100), &mut serve)
+                .await
+                .is_err(),
+            "a silent connection is served on"
+        );
+        resync.notify_one();
+        let ended = time::timeout(Duration::from_secs(1), &mut serve)
+            .await
+            .expect("the resync ends it");
+        let error = ended.expect_err("as a fault, so the bots hear ConnectionInterrupted");
+        assert!(error.to_string().contains("resync"), "{error}");
+        assert!(!live.load(Ordering::Acquire));
+    }
+
     /// A read half that hands over `frames` at once and then stays silent for ever.
     fn frames_then_silence(
         frames: &[&str],
@@ -4981,6 +5087,8 @@ mod tests {
         venue: ScriptedRestVenue,
         /// The client order indices the stand-in signer refuses to sign.
         refuse_signing: Arc<Mutex<HashSet<i64>>>,
+        /// What the slot pulls to ask the account stream for a fresh connection.
+        resync: Arc<Notify>,
     }
 
     /// The `[order_path]` the scripted slot runs with before a test tweaks it: no budget, no
@@ -5046,6 +5154,7 @@ mod tests {
         let (ev_tx, events) = unbounded_channel();
         let (command_tx, command_rx) = unbounded_channel();
         let refuse_signing: Arc<Mutex<HashSet<i64>>> = Arc::default();
+        let resync = Arc::new(Notify::new());
         let signer = fake_signer(
             SidecarIdentity {
                 url: venue.url.clone(),
@@ -5065,6 +5174,7 @@ mod tests {
             order_manager: order_manager.clone(),
             ev_tx: ev_tx.clone(),
             batching_off: AtomicBool::new(false),
+            resync: resync.clone(),
         };
         let order_path = OrderPath {
             order_manager,
@@ -5082,6 +5192,7 @@ mod tests {
                 events,
                 venue,
                 refuse_signing,
+                resync,
             },
         )
     }
@@ -5308,6 +5419,87 @@ mod tests {
             "asked `/tx` exactly the allowed number of times first"
         );
         assert!(slot.venue.count("/api/v1/accountActiveOrders") >= 1);
+    }
+
+    /// **The first missed confirmation deadline drops the account stream for a fresh one**
+    /// (live RH 14.10 09:08Z: the private stream went silent without dropping; a placement the
+    /// venue accepted and filled was never listed, and the slot only waited). A healthy
+    /// channel lists a placement in ~200 ms, so the miss doubts the channel: the slot pulls
+    /// the resync before telling the bot anything about the order.
+    #[tokio::test]
+    async fn a_placement_unconfirmed_past_its_deadline_resyncs_the_account_stream() {
+        let mut slot = slot_on_scripted_venue(|config| config.confirm_deadline_ms = 200).await;
+        let resync = slot.resync.clone();
+        let pulled = resync.notified();
+        slot.submit(&eth_order(1, Side::Buy));
+        time::timeout(Duration::from_secs(2), pulled)
+            .await
+            .expect("the first missed deadline pulls the resync");
+        assert_eq!(
+            slot.venue.count("/api/v1/tx"),
+            1,
+            "on the first miss, not the third"
+        );
+        assert!(
+            slot.events.try_recv().is_err(),
+            "nothing told to the bot yet"
+        );
+    }
+
+    /// **An order absent from `accountActiveOrders` but in the account's trades FILLED: it is
+    /// never expired as "never produced an order"** (live RH 14.10 09:09–09:13Z: ten fills
+    /// expired that way, each re-quoted into the next, 0.03 → 0.23 long). It stays with the
+    /// bot as it last heard of it, and the account stream is resynced so its snapshot and
+    /// position frame settle it.
+    #[tokio::test]
+    async fn an_unconfirmed_order_found_in_the_trades_is_resynced_never_expired() {
+        let mut slot = slot_on_scripted_venue(|config| config.confirm_deadline_ms = 100).await;
+        slot.venue.answer_trades_with(Trades::EverySent);
+        slot.submit(&eth_order(1, Side::Buy));
+        slot.venue_until(|venue| venue.count("/api/v1/trades") >= 1)
+            .await;
+        // One deadline more: an expiry, had there been one, is published right after the check.
+        time::sleep(Duration::from_millis(300)).await;
+        while let Ok(event) = slot.events.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = &event {
+                panic!("a filled order was told to the bot as {:?}", order.status);
+            }
+        }
+        // The resync permit is up (the first miss pulled it; the trade pulls it again).
+        time::timeout(Duration::from_millis(100), slot.resync.notified())
+            .await
+            .expect("the resync was pulled");
+        assert_eq!(
+            slot.venue.count("/api/v1/trades"),
+            1,
+            "settled on the trade: not checked again"
+        );
+    }
+
+    /// **A fate check whose trades read fails expires nothing** (§1.1): absent from the active
+    /// list is not "never landed" until the trades say so too.
+    #[tokio::test]
+    async fn an_unreadable_trades_answer_keeps_the_order_tracked() {
+        let mut slot = slot_on_scripted_venue(|config| config.confirm_deadline_ms = 100).await;
+        slot.venue.answer_trades_with(Trades::Fail);
+        slot.submit(&eth_order(1, Side::Buy));
+        slot.venue_until(|venue| venue.count("/api/v1/trades") >= 2)
+            .await;
+        while let Ok(event) = slot.events.try_recv() {
+            if let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = &event {
+                panic!(
+                    "an order of unknown fate was told to the bot as {:?}",
+                    order.status
+                );
+            }
+        }
+        // Once the trades can be read and hold nothing, it never landed: expired.
+        slot.venue.answer_trades_with(Trades::None);
+        let PublishEvent::LiveEvent(LiveEvent::Order { order, .. }) = slot.next_event().await
+        else {
+            panic!("the order comes back once its fate is known");
+        };
+        assert_eq!((order.order_id, order.status), (1, Status::Expired));
     }
 
     // ---- sendTxBatch: what is queued together goes together (§3.7) ----------------------

@@ -250,8 +250,14 @@ pub enum AmbiguousFate {
     /// through the order manager as the private channel would); do **not** re-send it, so the
     /// §5 gate's "reconcile WITHOUT a duplicate" holds.
     Landed,
-    /// The order is **absent** from a list the venue positively returned — it never landed.
-    /// Expire it back to the bot so the id is freed and the bot re-quotes.
+    /// The order is not on the active-order list but **is** in the account's trades — it
+    /// landed and filled, and the private channel never said so. The channel is not to be
+    /// believed: neither expire it (the bot would re-quote into the next unseen fill — live RH
+    /// 14.10, 0.03 → 0.23 long) nor adopt it as resting. Resync the account stream; the
+    /// reconnect's snapshot and position frame settle the order and the position.
+    Traded,
+    /// The order is **absent** from both lists the venue positively returned — it never
+    /// landed. Expire it back to the bot so the id is freed and the bot re-quotes.
     DidNotLand,
     /// The check itself could not run (the auth mint, the token, or the GET failed). Fail
     /// closed: keep the order tracked as unconfirmed and let the confirmation deadline /
@@ -260,17 +266,25 @@ pub enum AmbiguousFate {
     Unknown,
 }
 
-/// Reads an ambiguous order's fate out of the venue's active-order list (§3.3). `active` is the
-/// `accountActiveOrders` result — `Ok(list)` when the venue answered (even if empty), `Err(())`
-/// when the check could not be performed. Presence of our `coi` is the only signal; an empty or
-/// COI-absent list that the venue positively returned means it never landed.
-pub fn fate_of_ambiguous(coi: i64, active: Result<&[AccountOrder], ()>) -> AmbiguousFate {
-    match active {
-        Ok(orders) if orders.iter().any(|order| order.client_order_index == coi) => {
-            AmbiguousFate::Landed
-        }
-        Ok(_) => AmbiguousFate::DidNotLand,
-        Err(()) => AmbiguousFate::Unknown,
+/// Reads an ambiguous order's fate out of the venue's active-order list and the account's
+/// latest trades (§3.3). Each is `Ok(list)` when the venue answered (even if empty) and
+/// `Err(())` when the check could not be performed. "It never landed" needs **both** answers
+/// and our `coi` in neither: a filled order is as absent from the active list as one that
+/// never landed, so absence there alone proves nothing.
+pub fn fate_of_ambiguous(
+    coi: i64,
+    active: Result<&[AccountOrder], ()>,
+    traded: Result<&[i64], ()>,
+) -> AmbiguousFate {
+    if active.is_ok_and(|orders| orders.iter().any(|order| order.client_order_index == coi)) {
+        return AmbiguousFate::Landed;
+    }
+    if traded.is_ok_and(|cois| cois.contains(&coi)) {
+        return AmbiguousFate::Traded;
+    }
+    match (active, traded) {
+        (Ok(_), Ok(_)) => AmbiguousFate::DidNotLand,
+        _ => AmbiguousFate::Unknown,
     }
 }
 
@@ -761,23 +775,55 @@ mod tests {
     fn an_ambiguous_send_is_resolved_against_the_active_order_list_not_guessed() {
         // Our COI is on the venue's list → it landed. Adopt it; do not re-send.
         let landed = vec![active(900_000_000_002), active(424242424242)];
+        let no_trades: &[i64] = &[];
         assert_eq!(
-            fate_of_ambiguous(424242424242, Ok(&landed)),
+            fate_of_ambiguous(424242424242, Ok(&landed), Ok(no_trades)),
+            AmbiguousFate::Landed
+        );
+        // Resting is resting whether or not the trades could be read (a partial fill rests).
+        assert_eq!(
+            fate_of_ambiguous(424242424242, Ok(&landed), Err(())),
             AmbiguousFate::Landed
         );
 
-        // The list holds other orders but not ours → it never landed. Expire it.
+        // Neither list holds ours → it never landed. Expire it.
         assert_eq!(
-            fate_of_ambiguous(555, Ok(&landed)),
+            fate_of_ambiguous(555, Ok(&landed), Ok(&[7, 8])),
             AmbiguousFate::DidNotLand
         );
 
-        // A flat account (empty list) → absent → it never landed.
-        assert_eq!(fate_of_ambiguous(555, Ok(&[])), AmbiguousFate::DidNotLand);
+        // A flat account with no trades → absent → it never landed.
+        assert_eq!(
+            fate_of_ambiguous(555, Ok(&[]), Ok(no_trades)),
+            AmbiguousFate::DidNotLand
+        );
 
-        // The check itself could not run (mint/token/transport failed) → Unknown. NEVER expire:
+        // Either check could not run (mint/token/transport failed) → Unknown. NEVER expire:
         // keep the order tracked as unconfirmed and let the deadline / reconnect resolve it.
-        assert_eq!(fate_of_ambiguous(555, Err(())), AmbiguousFate::Unknown);
+        assert_eq!(
+            fate_of_ambiguous(555, Err(()), Ok(no_trades)),
+            AmbiguousFate::Unknown
+        );
+        assert_eq!(
+            fate_of_ambiguous(555, Ok(&[]), Err(())),
+            AmbiguousFate::Unknown
+        );
+    }
+
+    /// **Absent from the active list but in the trades: it landed and FILLED** (live RH 14.10
+    /// 09:09Z — the private stream went silent without dropping; ten fills were read as "never
+    /// produced an order" and re-quoted, 0.03 → 0.23 long). Never `DidNotLand`; and a trade
+    /// found answers even when the active list could not be read.
+    #[test]
+    fn an_order_absent_from_the_active_list_but_in_the_trades_traded() {
+        assert_eq!(
+            fate_of_ambiguous(555, Ok(&[]), Ok(&[554, 555])),
+            AmbiguousFate::Traded
+        );
+        assert_eq!(
+            fate_of_ambiguous(555, Err(()), Ok(&[555])),
+            AmbiguousFate::Traded
+        );
     }
 
     /// **The confirmation deadline dispatches on whether a `tx_hash` exists** (§4.11 vs §3.3). A
