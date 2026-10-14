@@ -80,10 +80,19 @@ use crate::{
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A write that has not been accepted by now means the write half is wedged.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// No frame of any kind for this long means the socket is gone, whatever it claims. Wide,
-/// because a false positive costs a reconnect and a false negative costs the feed.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// How often the housekeeping runs: the idle check, the subscription deadlines, the silence
+/// No **market data** for this long means the feed is gone, whatever the socket claims (a
+/// data clock: pongs do not count, see the read arm of [`PublicStream::serve`]). A false
+/// positive costs a reconnect and a snapshot; a false negative costs the feed — and a
+/// consumer that exits on its own staleness bound restarts into a feed that is still dead.
+/// Measured on the RH tape 08–14.10 (`order_book` + `trade` of one market, weekends
+/// included): the longest pause outside a venue outage was 8 s, and every pause past 20 s
+/// was an outage. Was 90 s: on 14.10 15:55Z a bot's 30 s staleness exit restarted it four
+/// times before this connector reconnected.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often the idle detector looks: the detection latency is at most [`IDLE_TIMEOUT`]
+/// plus this. Its own tick, not the 15 s housekeeping one, which would add up to 15 s.
+pub const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the housekeeping runs: the subscription deadlines, the silence
 /// watchdog, deferred repairs and the counter log.
 pub const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(15);
 /// Application-level keepalive. The venue needs a client frame every two minutes and sends
@@ -862,6 +871,8 @@ impl PublicStream {
         ping.reset();
         let mut housekeeping = time::interval(HOUSEKEEPING_INTERVAL);
         housekeeping.reset();
+        let mut idle_check = time::interval(IDLE_CHECK_INTERVAL);
+        idle_check.reset();
         let mut last_frame = Instant::now();
         let mut last_counts = self.state.counts();
         // A closed broadcast answers instantly and for ever, so the arm has to stop being
@@ -885,12 +896,14 @@ impl PublicStream {
                         );
                     }
                 }
-                _ = housekeeping.tick() => {
-                    let now = Instant::now();
+                _ = idle_check.tick() => {
                     let idle = last_frame.elapsed();
                     if idle > IDLE_TIMEOUT {
                         return Err(LighterError::IdleTimeout(idle));
                     }
+                }
+                _ = housekeeping.tick() => {
+                    let now = Instant::now();
                     self.report_concerns(now);
                     self.flush_repairs(write, now).await?;
                     self.subscribe_pending(write, &mut tracker).await?;
@@ -1376,6 +1389,7 @@ mod tests {
                 FeedCounts,
                 HOUSEKEEPING_INTERVAL,
                 Handled,
+                IDLE_CHECK_INTERVAL,
                 IDLE_TIMEOUT,
                 MarketState,
                 MessageBudget,
@@ -1929,6 +1943,58 @@ mod tests {
         assert_eq!(sink.sent.len(), 2, "only the subscribe: {:?}", sink.sent);
     }
 
+    /// **A feed that has gone silent is dropped within the idle bound**, measured from the
+    /// last data frame: [`IDLE_TIMEOUT`] plus at most one [`IDLE_CHECK_INTERVAL`]. The check
+    /// used to ride the 15 s housekeeping tick, so a 20 s timeout fired only at ~30 s — no
+    /// sooner than a bot's own 30 s staleness exit, which is the outage of 14.10 15:55Z
+    /// (the venue silent ~3 min, four bot restarts before this connector reconnected).
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_feed_is_dropped_within_the_idle_bound() {
+        let (mut stream, _ev_rx) = stream(&["CRV"], &[crv()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let start = Instant::now();
+
+        let error = stream
+            .serve(&mut sink, &mut futures_util::stream::pending())
+            .await
+            .unwrap_err();
+
+        let waited = start.elapsed();
+        assert!(matches!(error, LighterError::IdleTimeout(_)), "{error:?}");
+        assert!(
+            waited > IDLE_TIMEOUT && waited <= IDLE_TIMEOUT + IDLE_CHECK_INTERVAL,
+            "dropped after {waited:?}"
+        );
+        // The point of the bound: the reconnect lands before a consumer's 30 s staleness
+        // exit, so a restarted bot finds a fresh feed instead of the dead one.
+        assert!(waited < Duration::from_secs(30), "dropped after {waited:?}");
+    }
+
+    /// **A feed as quiet as the quietest one measured is kept.** The RH tape of 08–14.10
+    /// (`order_book:38` + `trade:38`, seven days, weekends included) never paused longer
+    /// than 8 s outside venue outages; every pause past 20 s was one (26.6 s, 29.1 s, 51 s,
+    /// 56 s, 78 s). A trade every 10 s for ten minutes must not trip the detector.
+    #[tokio::test(start_paused = true)]
+    async fn a_feed_quieter_than_any_measured_day_is_kept() {
+        let (mut stream, _ev_rx) = stream(&["CRV"], &[crv()]);
+        let mut sink = RecordingSink::<LighterError>::default();
+        let mut every_ten = time::interval(Duration::from_secs(10));
+        every_ten.reset();
+        let mut trades = futures_util::stream::poll_fn(move |cx| {
+            every_ten
+                .poll_tick(cx)
+                .map(|_| Some(Ok::<_, WsError>(Message::Text(TRADE_CRV.into()))))
+        });
+
+        let served = time::timeout(
+            Duration::from_secs(600),
+            stream.serve(&mut sink, &mut trades),
+        )
+        .await;
+
+        assert!(served.is_err(), "the connection ended: {served:?}");
+    }
+
     /// **A socket that answers keepalives and serves nothing is dropped.** Going over the
     /// venue's message budget is answered by throttling the connection, and a subscription
     /// it quietly stopped serving looks identical — in both cases the socket stays open
@@ -1937,7 +2003,7 @@ mod tests {
     /// subscribed and publishing nothing until somebody noticed.
     ///
     /// Whether a throttled connection still answers keepalives is not measured, which is
-    /// exactly why this fails closed. The clock is frozen, so the 90 s wait costs nothing.
+    /// exactly why this fails closed. The clock is frozen, so the wait costs nothing.
     ///
     /// Verified by mutation: counting every frame instead of only data makes this test
     /// **hang** rather than fail an assertion — which is the honest reproduction, because
