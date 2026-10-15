@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     connector::{ApplyOutcome, GetOrders},
@@ -432,17 +432,6 @@ impl OrderManager {
             let Some(tracked) = self.orders.get_mut(&coi) else {
                 return ApplyOutcome::Ignored;
             };
-            // §4.12: the only monotone key is `transaction_time`; a frame older than the last
-            // applied is stale and must not rewind the order (e.g. a late "open" after a
-            // "canceled").
-            if update.transaction_time_us < tracked.update_ts_us {
-                debug!(
-                    coi,
-                    stale_by_us = tracked.update_ts_us - update.transaction_time_us,
-                    "Ignoring an out-of-order Lighter order update (§4.12)."
-                );
-                return ApplyOutcome::Ignored;
-            }
             // Finding 3: map the status **before any mutation**. If this connector cannot
             // classify it (`Status::Unsupported`), leave the order exactly as it is — not
             // transitioned, not removed, not even marked confirmed — and return `Unrecognised`.
@@ -450,6 +439,31 @@ impl OrderManager {
             // a double position); treating it as live quotes against one that is gone. §1.1
             // fail closed: keep it, and let the caller escalate so reconciliation settles it.
             let mapped = map_status(&update.status);
+            // §4.12: the only monotone key is `transaction_time`; a live frame older than the
+            // last applied is stale and must not rewind the order. A **terminal** one is applied
+            // whatever its stamp: the status is absorbing, so there is nothing to rewind, and a
+            // taker's fill that sat out the 300 ms speed bump carries a stamp older than our
+            // post-only's "open". Dropped, it left a ghost `active()` for 1.5 h (2026-10-15).
+            let terminal = matches!(mapped, Status::Canceled | Status::Filled);
+            if update.transaction_time_us < tracked.update_ts_us {
+                let stale_by_us = tracked.update_ts_us - update.transaction_time_us;
+                if !terminal {
+                    warn!(
+                        coi,
+                        status = %update.status,
+                        stale_by_us,
+                        "Ignoring an out-of-order Lighter order update (§4.12)."
+                    );
+                    return ApplyOutcome::Ignored;
+                }
+                warn!(
+                    coi,
+                    status = %update.status,
+                    stale_by_us,
+                    "Applying a terminal Lighter order update older than the last one applied; \
+                     a terminal status cannot rewind anything (§4.12)."
+                );
+            }
             if mapped == Status::Unsupported {
                 warn!(
                     coi,
@@ -459,7 +473,7 @@ impl OrderManager {
                 );
                 return ApplyOutcome::Unrecognised;
             }
-            tracked.update_ts_us = update.transaction_time_us;
+            tracked.update_ts_us = tracked.update_ts_us.max(update.transaction_time_us);
             tracked.order_index = Some(update.order_index);
             tracked.confirmed = true;
             tracked.order.req = Status::None;
@@ -975,6 +989,70 @@ mod tests {
             "a stale open frame must not resurrect a canceled order"
         );
         assert_eq!(m.tracked(), 0);
+    }
+
+    /// **A terminal frame older than the watermark still ends the order** (2026-10-15
+    /// incident). `transaction_time` is the venue's stamp of the transaction that *caused* the
+    /// update, and a taker's transaction sits out a 300 ms speed bump our post-only does not:
+    /// sent before our "open" and executed after it, the fill that consumes our quote can carry
+    /// the *older* stamp. Dropped as stale, the order stayed `active()` in this manager for
+    /// 1.5 h with nothing resting on the venue — the bot held every bid against the ghost ask,
+    /// and a warm connector replayed the ghost to the restarted bot. A terminal status is
+    /// absorbing; there is nothing for it to rewind, so it is applied whatever its stamp.
+    #[test]
+    fn a_terminal_update_older_than_the_watermark_still_ends_the_order() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.001)).unwrap();
+        m.apply_order_update(&account_order(coi, 5, "open", 2_000));
+
+        let mut filled = account_order(coi, 5, "filled", 1_000);
+        filled.filled_base_amount = 0.001;
+        let (_, order) = m
+            .apply_order_update(&filled)
+            .published()
+            .expect("an older-stamped fill is still the order's end");
+        assert_eq!(order.status, Status::Filled);
+        assert_eq!(order.exec_qty, 0.001, "the fill reaches the bot");
+        assert_eq!(
+            order.exch_timestamp, 2_000_000,
+            "the stamp never goes backwards, or LiveBot drops the update"
+        );
+        assert_eq!(m.tracked(), 0, "a filled order leaves tracking");
+        assert!(
+            m.orders(None).is_empty(),
+            "and is no longer replayed to a (re)registering bot"
+        );
+
+        // The same for a cancel (a venue cancel sits out the same bump).
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(2, 58300.0, 0.001)).unwrap();
+        m.apply_order_update(&account_order(coi, 6, "open", 5_000));
+        let (_, order) = m
+            .apply_order_update(&account_order(coi, 6, "canceled-post-only", 4_000))
+            .published()
+            .expect("an older-stamped cancel is still the order's end");
+        assert_eq!(order.status, Status::Canceled);
+        assert_eq!(m.tracked(), 0);
+    }
+
+    /// The watermark still guards everything that is **not** terminal: an older live frame
+    /// must not rewind `leaves_qty` past a partial fill already applied.
+    #[test]
+    fn a_stale_non_terminal_update_is_still_dropped() {
+        let mut m = manager();
+        let (coi, _) = m.new_order("BTC", &btc(), &bid(1, 58300.0, 0.002)).unwrap();
+        let mut later = account_order(coi, 5, "partially-filled", 3_000);
+        later.filled_base_amount = 0.001;
+        later.remaining_base_amount = 0.001;
+        m.apply_order_update(&later);
+
+        let mut older = account_order(coi, 5, "open", 2_000);
+        older.remaining_base_amount = 0.002;
+        assert!(
+            m.apply_order_update(&older).published().is_none(),
+            "a stale live frame is dropped"
+        );
+        assert_eq!(m.tracked(), 1);
+        assert_eq!(m.orders(None)[0].leaves_qty, 0.001, "not rewound");
     }
 
     /// A terminal update takes the order out, and repeating it does not bring it back — the
