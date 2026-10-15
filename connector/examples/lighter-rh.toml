@@ -181,3 +181,13 @@ timeout_ms = 10000
 # # CDN's body limit. The first ambiguous batch logs `consumed` (nonces the venue kept of it) —
 # # the first evidence. Absent: 1 — one sendTx per transaction. 1..=15, else refused at startup.
 # max_batch = 2
+#
+# # LIVE CHECK: while the account stream is live and a confirmed order rests, every
+# # live_order_check_ms the slot looks for each order the stream has been quiet about for
+# # live_order_quiet_ms on accountActiveOrders; one the venue no longer lists (a terminal update
+# # never applied — RH 2026-10-15, a ghost ask held every bid for 1.5 h) resyncs the account
+# # stream: snapshot, reconcile, sweep. A failed check changes nothing. Costs one auth mint and
+# # one read per market per check, no sendTx; none when nothing rests or inside a 429/405
+# # cooldown. Defaults 30000 / 5000; check >= 1000, quiet < check, else refused at startup.
+# live_order_check_ms = 30000
+# live_order_quiet_ms = 5000

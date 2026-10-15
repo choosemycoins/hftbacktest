@@ -30,10 +30,14 @@
 //! (§4.12 — `updated_at` is block-granular and reorders a cancel before its open), and the
 //! position comes from `account_all_positions` (§3.4), never from replaying fills.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use hftbacktest::types::{OrdType, Order, Side, Status, TimeInForce};
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::{
@@ -158,6 +162,24 @@ struct Tracked {
     /// account out when they are sent ([`OrderManager::reduces_position`]). A post-only quote
     /// is not one of them, whichever side it rests on.
     exits_on_arrival: bool,
+    /// When the account stream last moved this order — the clock the live check
+    /// ([`OrderManager::quiet_live_orders`]) reads, so an order the channel is still talking
+    /// about is never judged absent mid-update.
+    updated_at: Option<Instant>,
+    /// When a cancel of this order was last asked for: a cancel the venue took removes the order
+    /// before the channel says so, and an order whose cancel is that young is not judged either.
+    cancel_requested_at: Option<Instant>,
+}
+
+impl Tracked {
+    fn is_quiet_live(&self, quiet: Duration) -> bool {
+        let quiet_since = |at: Option<Instant>| at.is_none_or(|at| at.elapsed() >= quiet);
+        self.confirmed
+            && self.order.active()
+            && self.updated_at.is_some()
+            && quiet_since(self.updated_at)
+            && quiet_since(self.cancel_requested_at)
+    }
 }
 
 /// Owns this connector's order state for one account.
@@ -373,6 +395,8 @@ impl OrderManager {
                 confirmed: false,
                 exits_on_arrival: wire.time_in_force == TIF_IMMEDIATE_OR_CANCEL
                     || wire.reduce_only != 0,
+                updated_at: None,
+                cancel_requested_at: None,
             },
         );
         Ok((coi, wire))
@@ -407,7 +431,32 @@ impl OrderManager {
     pub fn mark_requested(&mut self, coi: i64, req: Status) {
         if let Some(tracked) = self.orders.get_mut(&coi) {
             tracked.order.req = req;
+            if req == Status::Canceled {
+                tracked.cancel_requested_at = Some(Instant::now());
+            }
         }
+    }
+
+    /// The confirmed, live orders the account stream has said nothing about for `quiet`, and
+    /// whose last cancel request (if any) is as old — as `(market_index, coi)`. These are the
+    /// ones a live check may judge against `accountActiveOrders`: the venue has had every chance
+    /// to report them, so absence from its list means a terminal update this connector never
+    /// applied (2026-10-15: a ghost ask, 1.5 h). An unconfirmed order is the slot deadline's
+    /// (§4.11), and a young one may simply be mid-update.
+    pub fn quiet_live_orders(&self, quiet: Duration) -> Vec<(i64, i64)> {
+        self.orders
+            .iter()
+            .filter(|(_, tracked)| tracked.is_quiet_live(quiet))
+            .map(|(coi, tracked)| (tracked.market_index, *coi))
+            .collect()
+    }
+
+    /// Whether `coi` is still one of [`Self::quiet_live_orders`] — asked again once the venue
+    /// has answered, so an update that arrived while the list was being fetched spares it.
+    pub fn is_quiet_live(&self, coi: i64, quiet: Duration) -> bool {
+        self.orders
+            .get(&coi)
+            .is_some_and(|tracked| tracked.is_quiet_live(quiet))
     }
 
     /// Applies one `account_all_orders` entry — the **only** acceptance signal (§4.11).
@@ -476,6 +525,7 @@ impl OrderManager {
             tracked.update_ts_us = tracked.update_ts_us.max(update.transaction_time_us);
             tracked.order_index = Some(update.order_index);
             tracked.confirmed = true;
+            tracked.updated_at = Some(Instant::now());
             tracked.order.req = Status::None;
             tracked.order.status = mapped;
             // §4.12: `transaction_time` is MICROseconds and `Order::exch_timestamp` is

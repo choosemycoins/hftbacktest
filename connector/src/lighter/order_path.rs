@@ -282,16 +282,52 @@ pub struct OrderPathConfig {
     /// before it existed. 1..=15, else refused at startup.
     #[serde(default = "default_max_batch")]
     pub max_batch: u32,
+    /// How often, while the account stream is live and a confirmed order rests, the slot checks
+    /// those orders against `accountActiveOrders`, ms. A confirmed order the venue no longer
+    /// lists is a terminal update this connector never applied; the account stream is resynced
+    /// (snapshot, reconcile, sweep), not the order guessed at. Live RH 2026-10-15: a ghost ask
+    /// held every bid for 1.5 h with no reconnect to reconcile it. Costs one auth mint and one
+    /// read per market per check, nothing of the `sendTx` budget; skipped inside a 429/405
+    /// cooldown and when no order qualifies. At least 1000.
+    #[serde(default = "default_live_order_check_ms")]
+    pub live_order_check_ms: u64,
+    /// How long the account stream must have said nothing about an order (and its last cancel
+    /// request be as old) before the live check judges it, ms — so an order mid-fill or
+    /// mid-cancel is never read as missing. Must be shorter than `live_order_check_ms`.
+    #[serde(default = "default_live_order_quiet_ms")]
+    pub live_order_quiet_ms: u64,
 }
 
 fn default_max_batch() -> u32 {
     1
 }
 
+fn default_live_order_check_ms() -> u64 {
+    30_000
+}
+
+fn default_live_order_quiet_ms() -> u64 {
+    5_000
+}
+
 impl OrderPathConfig {
     /// Refuses a combination that cannot do what it says, so it is found at startup rather
     /// than at the first quote it would refuse.
     pub fn validate(&self) -> Result<(), String> {
+        if self.live_order_check_ms < 1_000 {
+            return Err(format!(
+                "[order_path] live_order_check_ms = {} is under 1000: every check mints a token \
+                 and reads accountActiveOrders out of the account's REST budget",
+                self.live_order_check_ms
+            ));
+        }
+        if self.live_order_quiet_ms >= self.live_order_check_ms {
+            return Err(format!(
+                "[order_path] live_order_quiet_ms = {} must be shorter than live_order_check_ms = \
+                 {}",
+                self.live_order_quiet_ms, self.live_order_check_ms
+            ));
+        }
         if !(1..=MAX_BATCH).contains(&self.max_batch) {
             return Err(format!(
                 "[order_path] max_batch = {} is outside 1..={MAX_BATCH}: 0 sends nothing, and a \
@@ -903,6 +939,9 @@ impl SlotTask {
 
         let mut awaiting: HashMap<i64, Awaiting> = HashMap::new();
         let mut deadline_tick = time::interval(Duration::from_millis(250));
+        let live_check_every = Duration::from_millis(self.config.live_order_check_ms);
+        let mut live_check = time::interval_at(Instant::now() + live_check_every, live_check_every);
+        live_check.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         // A command taken off the queue while a batch was gathered that could not join it
         // (§3.7): served next, before anything newer, so the queue's order holds.
         let mut lookahead: Option<Command> = None;
@@ -915,6 +954,10 @@ impl SlotTask {
                     _ = deadline_tick.tick() => {
                         self.release_held_cancels(&mut signer, &mut nonce, &mut gate, &mut held).await;
                         self.check_deadlines(&mut signer, &gate, &mut awaiting).await;
+                        continue;
+                    }
+                    _ = live_check.tick() => {
+                        self.check_live_orders(&mut signer, &gate).await;
                         continue;
                     }
                 },
@@ -2171,6 +2214,55 @@ impl SlotTask {
                     self.resolve_ambiguous_fate(signer, coi, now, awaiting)
                         .await;
                 }
+            }
+        }
+    }
+
+    /// The live check: every confirmed order the account stream has been quiet about for
+    /// `live_order_quiet_ms` is looked for on `accountActiveOrders`; the first one the venue
+    /// positively does not list resyncs the account stream, whose snapshot then expires it
+    /// (`reconcile`) and whose sweep clears the market. A check that cannot run changes nothing
+    /// (§1.1): absence is only read off a list the venue returned.
+    async fn check_live_orders(&self, signer: &mut SignerClient, gate: &SendGate) {
+        if gate.cooling(Instant::now()).is_some() {
+            return;
+        }
+        let quiet = Duration::from_millis(self.config.live_order_quiet_ms);
+        let mut by_market: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (market_index, coi) in self.order_manager.lock().unwrap().quiet_live_orders(quiet) {
+            by_market.entry(market_index).or_default().push(coi);
+        }
+        for (market_index, cois) in by_market {
+            let Ok(market) = i32::try_from(market_index) else {
+                continue;
+            };
+            let listed: HashSet<i64> = match self.check_order_fate(signer, market).await {
+                Ok(orders) => orders.iter().map(|o| o.client_order_index).collect(),
+                Err(error) => {
+                    warn!(
+                        %error,
+                        market_index,
+                        "Couldn't check the confirmed Lighter orders against accountActiveOrders; \
+                         leaving them as they are."
+                    );
+                    continue;
+                }
+            };
+            let missing = cois.into_iter().find(|coi| {
+                !listed.contains(coi)
+                    && self
+                        .order_manager
+                        .lock()
+                        .unwrap()
+                        .is_quiet_live(*coi, quiet)
+            });
+            if let Some(coi) = missing {
+                self.request_resync(
+                    coi,
+                    "a confirmed order the venue no longer lists on accountActiveOrders (live \
+                     check): a terminal update was never applied",
+                );
+                return;
             }
         }
     }
@@ -3499,6 +3591,7 @@ mod tests {
                 testing::{ScriptedVenue, throttled},
             },
             test_venue::{
+                ActiveOrders,
                 BatchAnswer,
                 DROP_CONNECTION,
                 ScriptedRestVenue,
@@ -3677,6 +3770,8 @@ mod tests {
             rate_limit_cooldown_ms: None,
             rate_limit_cancel_probe_ms: None,
             max_batch: 1,
+            live_order_check_ms: 30_000,
+            live_order_quiet_ms: 5_000,
         };
         let (symbol_tx, symbol_rx) = broadcast::channel(16);
         let task = PrivateStreamTask {
@@ -5107,6 +5202,8 @@ mod tests {
             rate_limit_cooldown_ms: None,
             rate_limit_cancel_probe_ms: None,
             max_batch: 1,
+            live_order_check_ms: 30_000,
+            live_order_quiet_ms: 5_000,
         }
     }
 
@@ -5500,6 +5597,96 @@ mod tests {
             panic!("the order comes back once its fate is known");
         };
         assert_eq!((order.order_id, order.status), (1, Status::Expired));
+    }
+
+    // ---- the live check: confirmed orders against accountActiveOrders --------------------
+
+    fn live_check(check_ms: u64, quiet_ms: u64) -> impl FnOnce(&mut OrderPathConfig) {
+        move |config| {
+            config.live_order_check_ms = check_ms;
+            config.live_order_quiet_ms = quiet_ms;
+        }
+    }
+
+    /// **A confirmed order the venue no longer lists resyncs the account stream** (live RH
+    /// 2026-10-15: a ghost ask, its terminal update never applied, held every bid for 1.5 h; no
+    /// reconnect came to reconcile it). The live check finds it on its own tick, and asks the
+    /// stream for a fresh snapshot — whose reconcile expires it — instead of guessing its fate.
+    #[tokio::test]
+    async fn a_confirmed_order_the_venue_no_longer_lists_resyncs_the_account_stream() {
+        let slot = slot_on_scripted_venue(live_check(150, 50)).await;
+        let pulled = slot.resync.notified();
+        slot.resting(1);
+        time::timeout(Duration::from_secs(2), pulled)
+            .await
+            .expect("the live check pulls the resync");
+        assert!(slot.venue.count("/api/v1/accountActiveOrders") >= 1);
+    }
+
+    /// **An order the venue lists is left alone**, check after check.
+    #[tokio::test]
+    async fn a_confirmed_order_the_venue_lists_is_left_alone() {
+        let slot = slot_on_scripted_venue(live_check(100, 20)).await;
+        slot.resting(1);
+        let coi = slot
+            .order_path
+            .order_manager
+            .lock()
+            .unwrap()
+            .coi_for("ETH", 1)
+            .unwrap();
+        slot.venue
+            .answer_active_orders_with(ActiveOrders::Listing(vec![coi]));
+        slot.venue_until(|venue| venue.count("/api/v1/accountActiveOrders") >= 3)
+            .await;
+        assert!(
+            time::timeout(Duration::from_millis(50), slot.resync.notified())
+                .await
+                .is_err(),
+            "a listed order resyncs nothing"
+        );
+    }
+
+    /// **A check that cannot run changes nothing** (§1.1): absence is read only off a list the
+    /// venue returned.
+    #[tokio::test]
+    async fn a_live_check_that_fails_resyncs_nothing() {
+        let slot = slot_on_scripted_venue(live_check(100, 20)).await;
+        slot.venue.answer_active_orders_with(ActiveOrders::Fail);
+        slot.resting(1);
+        slot.venue_until(|venue| venue.count("/api/v1/accountActiveOrders") >= 3)
+            .await;
+        assert!(
+            time::timeout(Duration::from_millis(50), slot.resync.notified())
+                .await
+                .is_err(),
+            "an unreadable list is not an empty one"
+        );
+    }
+
+    /// **An order the stream moved within `live_order_quiet_ms` is not judged**, and with no
+    /// order to judge nothing is asked of the venue at all: a quiet account costs no reads.
+    #[tokio::test]
+    async fn a_young_order_is_not_judged_and_no_order_costs_no_read() {
+        let slot = slot_on_scripted_venue(live_check(100, 60_000)).await;
+        time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            slot.venue.count("/api/v1/accountActiveOrders"),
+            0,
+            "nothing rests: nothing is read"
+        );
+        slot.resting(1);
+        time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            slot.venue.count("/api/v1/accountActiveOrders"),
+            0,
+            "an order the stream just moved is not judged"
+        );
+        assert!(
+            time::timeout(Duration::from_millis(50), slot.resync.notified())
+                .await
+                .is_err()
+        );
     }
 
     // ---- sendTxBatch: what is queued together goes together (§3.7) ----------------------

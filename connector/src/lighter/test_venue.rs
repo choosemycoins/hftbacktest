@@ -119,7 +119,8 @@ pub(crate) struct Seen {
 ///   transport error on the client's side.
 /// * `POST /api/v1/sendTxBatch` — the next scripted [`BatchAnswer`], or [`BatchAnswer::Echo`]
 ///   once the script is spent.
-/// * `GET /api/v1/accountActiveOrders` — an empty list (the venue holds nothing).
+/// * `GET /api/v1/accountActiveOrders` — per [`ActiveOrders`]: an empty list (the default:
+///   the venue holds nothing), the orders named, or a 500.
 /// * `GET /api/v1/trades` — per [`Trades`]: no trades (the default), every order this venue was
 ///   sent having traded with this account as the bid, or a 500.
 /// * `GET /api/v1/tx` — no verdict yet; or, for a transaction whose client order index
@@ -136,6 +137,19 @@ pub(crate) struct ScriptedRestVenue {
     next_nonce_answers: Arc<Mutex<VecDeque<u16>>>,
     rejected_cois: Arc<Mutex<HashSet<i64>>>,
     trades: Arc<Mutex<Trades>>,
+    active_orders: Arc<Mutex<ActiveOrders>>,
+}
+
+/// How the scripted venue answers `GET /api/v1/accountActiveOrders`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ActiveOrders {
+    /// No order rests.
+    #[default]
+    None,
+    /// These client order indices rest (as bids on market 42).
+    Listing(Vec<i64>),
+    /// A 500: the check cannot run.
+    Fail,
 }
 
 /// How the scripted venue answers `GET /api/v1/trades`.
@@ -193,6 +207,7 @@ impl ScriptedRestVenue {
         let next_nonce_answers: Arc<Mutex<VecDeque<u16>>> = Arc::default();
         let rejected_cois: Arc<Mutex<HashSet<i64>>> = Arc::default();
         let trades: Arc<Mutex<Trades>> = Arc::default();
+        let active_orders: Arc<Mutex<ActiveOrders>> = Arc::default();
         let hash_cois: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
         let counter = Arc::new(Mutex::new(nonce));
         {
@@ -202,6 +217,7 @@ impl ScriptedRestVenue {
             let next_nonce_answers = next_nonce_answers.clone();
             let rejected_cois = rejected_cois.clone();
             let trades = trades.clone();
+            let active_orders = active_orders.clone();
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     let script = Script {
@@ -211,6 +227,7 @@ impl ScriptedRestVenue {
                         next_nonce_answers: next_nonce_answers.clone(),
                         rejected_cois: rejected_cois.clone(),
                         trades: trades.clone(),
+                        active_orders: active_orders.clone(),
                         hash_cois: hash_cois.clone(),
                         counter: counter.clone(),
                     };
@@ -228,7 +245,13 @@ impl ScriptedRestVenue {
             next_nonce_answers,
             rejected_cois,
             trades,
+            active_orders,
         }
+    }
+
+    /// From now on `GET /api/v1/accountActiveOrders` answers as `orders` says.
+    pub(crate) fn answer_active_orders_with(&self, orders: ActiveOrders) {
+        *self.active_orders.lock().unwrap() = orders;
     }
 
     /// From now on `GET /api/v1/trades` answers as `trades` says.
@@ -298,6 +321,7 @@ impl ScriptedRestVenue {
 
 /// What one connection to the scripted venue answers from, and records into.
 struct Script {
+    active_orders: Arc<Mutex<ActiveOrders>>,
     seen: Arc<Mutex<Vec<Seen>>>,
     send_tx_answers: Arc<Mutex<VecDeque<(u16, String)>>>,
     batch_answers: Arc<Mutex<VecDeque<BatchAnswer>>>,
@@ -312,6 +336,7 @@ struct Script {
 
 async fn serve_one(mut socket: TcpStream, script: Script) {
     let Script {
+        active_orders,
         seen,
         send_tx_answers,
         batch_answers,
@@ -434,7 +459,31 @@ async fn serve_one(mut socket: TcpStream, script: Script) {
             }
         }
         ("GET", "/api/v1/accountActiveOrders") => {
-            (200, json!({"code": 200, "orders": []}).to_string())
+            let mode = active_orders.lock().unwrap().clone();
+            match mode {
+                ActiveOrders::None => (200, json!({"code": 200, "orders": []}).to_string()),
+                ActiveOrders::Listing(cois) => {
+                    let orders: Vec<_> = cois
+                        .iter()
+                        .map(|coi| {
+                            json!({
+                                "market_index": 42,
+                                "client_order_index": coi,
+                                "order_index": 900_000 + coi,
+                                "is_ask": false,
+                                "status": "open",
+                                "price": "1000.00",
+                                "initial_base_amount": "0.0100",
+                                "remaining_base_amount": "0.0100",
+                                "filled_base_amount": "0.0000",
+                                "transaction_time": 1_000,
+                            })
+                        })
+                        .collect();
+                    (200, json!({"code": 200, "orders": orders}).to_string())
+                }
+                ActiveOrders::Fail => (500, json!({"code": 500, "message": "down"}).to_string()),
+            }
         }
         ("GET", "/api/v1/trades") => {
             let query: HashMap<String, String> =
