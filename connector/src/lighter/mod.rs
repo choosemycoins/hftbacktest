@@ -1187,6 +1187,31 @@ mod tests {
         }
     }
 
+    /// **The live check is on by default, and one that cannot work is refused at startup.**
+    /// Absent, every 30 s against orders quiet for 5 s; a check under a second spends the REST
+    /// budget for nothing, and a quiet window as long as the period never lets an order qualify.
+    #[test]
+    fn the_live_check_is_on_by_default_and_one_that_cannot_work_is_refused() {
+        let absent = armed_rh("").unwrap().config.order_path.unwrap();
+        assert_eq!(
+            (absent.live_order_check_ms, absent.live_order_quiet_ms),
+            (30_000, 5_000)
+        );
+        for broken in [
+            "live_order_check_ms = 999",
+            "live_order_check_ms = 5000\nlive_order_quiet_ms = 5000",
+        ] {
+            let Err(error) = armed_rh(broken) else {
+                panic!("{broken:?} must be refused");
+            };
+            assert!(
+                matches!(error, LighterError::Config(_)),
+                "{broken:?}: {error}"
+            );
+        }
+        assert!(armed_rh("live_order_check_ms = 10000\nlive_order_quiet_ms = 3000").is_ok());
+    }
+
     /// **A budget past every tier the venue sells is refused at startup.** The window keeps one
     /// stamp per send it may hold, sized up front, so `tx_budget_per_minute = 4294967295` asks
     /// for tens of gigabytes before the first quote — and a budget no account can reach guards
