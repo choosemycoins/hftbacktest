@@ -165,3 +165,56 @@ def test_only_a_rate_limit_is_retried():
     with pytest.raises(OSError):
         lp.with_backoff(fetch, pause=waits.append)("/p", {})
     assert waits == []
+
+
+def refreshing_fetch(versions, calls):
+    """Serves the table as of one hourly refresh per entry of ``versions``
+    (a list of (updated_at, rows, n_calls)): each version answers ``n_calls``
+    pages, then the next refresh lands. Mirrors 2026-10-16 20:01Z, when the
+    20:00 refresh landed mid-walk and re-ranked the table under the cursor."""
+    def fetch(path, params):
+        calls.append(params["offset"])
+        served = len(calls)
+        for updated_at, rows, n_calls in versions:
+            if served <= n_calls:
+                break
+            served -= n_calls
+        off, lim = params["offset"], params["limit"]
+        return {"code": 200, "entries": rows[off:off + lim], "total": len(rows),
+                "updated_at": updated_at}
+    return fetch
+
+
+def test_a_walk_that_straddles_a_refresh_is_walked_again(monkeypatch):
+    monkeypatch.setattr(lp, "PAGE_LIMIT", 2)
+    rows = load("pnl_all_volume_offset0_limit5.json")["entries"]
+    old, new = rows[:4], [rows[4]] + rows[:4]  # the refresh ranks a newcomer first
+    calls = []
+    # Old table answers page 0; the refresh lands; the cursor reads pages 2, 4
+    # of the new ranking and misses whichever row slid back past it.
+    fetch = refreshing_fetch([(100, old, 1), (200, new, 10**6)], calls)
+    table = lp.volume_table(fetch, pause=no_pause)
+    assert table["walks"] == 2
+    assert table["updated_at"] == [200], "rows come from one refresh only"
+    assert set(table["accounts"]) == {r["l1_address"] for r in new}
+    assert table["complete"] is True
+    assert calls[:3] == [0, 2, 4] and calls[3:] == [0, 2, 4]
+
+
+def test_a_walk_inside_one_refresh_is_not_repeated(monkeypatch):
+    monkeypatch.setattr(lp, "PAGE_LIMIT", 2)
+    rows = load("pnl_all_volume_offset0_limit5.json")["entries"]
+    calls = []
+    table = lp.volume_table(refreshing_fetch([(100, rows, 10**6)], calls), pause=no_pause)
+    assert table["walks"] == 1
+    assert calls == [0, 2, 4]
+
+
+def test_the_walks_are_bounded_and_a_still_mixed_walk_is_recorded_as_such(monkeypatch):
+    monkeypatch.setattr(lp, "PAGE_LIMIT", 2)
+    rows = load("pnl_all_volume_offset0_limit5.json")["entries"]
+    # A refresh lands inside every walk: a runaway, not a reason to walk forever.
+    versions = [(100 + i, rows, 1) for i in range(50)]
+    table = lp.volume_table(refreshing_fetch(versions, []), pause=no_pause)
+    assert table["walks"] == lp.MAX_WALKS
+    assert len(table["updated_at"]) > 1

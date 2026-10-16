@@ -60,6 +60,7 @@ PAGE_PAUSE_S = 3.0  # ~383 pages (38k accounts on 08.10), ~19 min a run; the RES
 # is shared per IP with the collectors — 0.5 s drew a 429 on the first deploy
 BACKOFF_S = (15, 60, 180)  # waits before each retry of a 429, then give up
 MAX_PAGES = 1000  # 100k accounts — a runaway guard, not an expectation
+MAX_WALKS = 2  # a walk is ~21 min and the table refreshes hourly, so the second walk sits inside one refresh
 TIMEOUT_S = 20
 SCHEMA = "lighter-rh-points-v1"
 
@@ -118,7 +119,29 @@ def leaderboard(fetch: Fetch, kind: str) -> list:
 
 
 def volume_table(fetch: Fetch, pause: Callable[[float], None] = time.sleep) -> dict:
-    """Every account's all-time volume, paged out of ``pnlLeaderboard``.
+    """Every account's all-time volume, walked again if the first walk mixed
+    two hourly refreshes.
+
+    A refresh landing mid-walk re-ranks the table under the cursor: rows that
+    slide back past it are never served. Measured 2026-10-16 20:01Z (the
+    Friday run starts on the hour): 48 of 42115 accounts missed, 47 of them
+    present in the morning snapshot — not newcomers. Keeping the rows of the
+    first walk would mix two hours, so a repeat walk replaces it whole.
+    """
+    for walk in range(1, MAX_WALKS + 1):
+        table = _walk_volume(fetch, pause)
+        table["walks"] = walk
+        if len(table["updated_at"]) <= 1:
+            break
+        if walk < MAX_WALKS:
+            print(f"lighter_rh_points: refresh landed mid-walk {table['updated_at']}, walking again",
+                  file=sys.stderr)
+            pause(PAGE_PAUSE_S)
+    return table
+
+
+def _walk_volume(fetch: Fetch, pause: Callable[[float], None]) -> dict:
+    """One walk of every account's all-time volume, paged out of ``pnlLeaderboard``.
 
     Sorted by volume descending so that if the population grows mid-walk the
     newcomers (small volume) land at the end, where they are least likely to
@@ -154,7 +177,7 @@ def volume_table(fetch: Fetch, pause: Callable[[float], None] = time.sleep) -> d
     return {
         "total": total,
         # More than one value means the hourly refresh landed mid-walk and the
-        # pages mix two hours; recorded, not repaired.
+        # pages mix two hours; ``volume_table`` walks again.
         "updated_at": sorted(updated_at),
         "complete": total is not None and len(rows) >= total,
         "accounts": rows,
@@ -177,6 +200,7 @@ def snapshot(fetch: Fetch, now: Optional[datetime] = None,
         "volume_total_accounts": volume["total"],
         "volume_updated_at": volume["updated_at"],
         "volume_complete": volume["complete"],
+        "volume_walks": volume["walks"],
         "volume_sum": round(sum(r["volume"] for r in volume["accounts"].values()), 6),
         "accounts": volume["accounts"],
     }
@@ -215,7 +239,8 @@ def main(argv=None, fetch: Fetch = http_get) -> int:
         f"lighter_rh_points: top10={record['top_all_points_sum']:.1f} "
         f"weekly_rows={len(record['leaderboard_weekly'])} "
         f"accounts={len(record['accounts'])}/{record['volume_total_accounts']} "
-        f"volume=${record['volume_sum'] / 1e9:.3f}B complete={record['volume_complete']}"
+        f"volume=${record['volume_sum'] / 1e9:.3f}B walks={record['volume_walks']} "
+        f"complete={record['volume_complete']}"
     )
     return 0 if record["volume_complete"] else 3
 
