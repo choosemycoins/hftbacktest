@@ -2339,3 +2339,265 @@ def test_a_screen_run_without_the_hold_inputs_still_runs_and_says_unknown(tmp_pa
     ])
     assert rc == 0
     assert json.loads(out.read_text())["rows"][0]["funding"]["verdict"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# the screen window and the evaluation window (selection-on-outcome)
+# ---------------------------------------------------------------------------
+
+#: 0.20 wide on a 100.10 mid, and 0.01 wide on a 100.005 one. Two spreads that
+#: are three orders of magnitude apart in what they leave after the fee: 19.98
+#: bps clears `fee_RT + adverse` = 4 with 15.98 to spare, 0.99995 misses it by 3.
+WIDE_BPS = 0.20 / 100.10 * 1e4
+NARROW_BPS = 0.01 / 100.005 * 1e4
+
+#: The rest of the pre-committed rule's terms, measured elsewhere and passed in.
+GATE = dict(fee_rt_bps=3.0, adverse_bps=1.0, hold_mean_s=600.0, hold_p95_s=3000.0)
+
+
+def a_split_day(tmp_path, early, late, day=DAY, hours=8, hot_hour=None):
+    """A `hours`-long recording with quotes in one or both halves.
+
+    `early`/`late` are `(frames, step_seconds, width)`. The early cluster starts
+    at the first second of the recording and the late one three quarters of the
+    way in, so both sit unambiguously inside their half whichever frame happens
+    to open the recording.
+
+    The weights are exactly countable because of `SPREAD_WEIGHT_CAP_NS`: a frame
+    is credited with `min(step, 5s)`, and the last frame of the whole series is
+    credited with nothing. A cluster of `n` frames five seconds apart therefore
+    weighs 5n seconds and one of `n` frames thirty seconds apart weighs 5n too —
+    which is what lets a fixture put most of the session's WEIGHT in one half
+    while both halves cover the same span of TIME.
+
+    One `activeAssetCtx` frame a second before each hour mark, so the funding
+    tape the gate reads has one settled rate per hour of the recording.
+    """
+    t0 = ns_on(day, 0)
+    hl = []
+    for i in range(1, hours + 1):
+        t = t0 + i * 3600 * SEC - SEC
+        rate = "0.0005" if hot_hour == i else "0.0000125"
+        hl.append((t, hl_ctx("PUMP", t, rate)))
+    for start_s, (frames, step_s, width) in ((0, early), (hours * 2700, late)):
+        for k in range(frames):
+            t = t0 + (start_s + k * step_s) * SEC
+            hl.append((t, hl_bbo("PUMP", t, "100.00", f"{100.0 + width:.2f}")))
+    hl.sort(key=lambda record: record[0])
+    um = [(t0, um_book_ticker("PUMPUSDT", t0, 1, "100.00", "100.01"))]
+    return a_day(tmp_path, hl, um, day=day)
+
+
+def a_split_row(tmp_path, early, late, hot_hour=None, **gate):
+    """`(row, samples)` for one such recording, with the gate's inputs supplied."""
+    hl_dir, um_dir = a_split_day(tmp_path, early, late, hot_hour=hot_hour)
+    samples = rm.read_day(hl_dir, "PUMP", [um_dir], "PUMPUSDT", DAY)
+    return rm.summarize(samples, dict(GATE, **gate)), samples
+
+
+def test_the_frame_on_the_boundary_belongs_to_the_evaluation_window():
+    """The screen window is STRICTLY prior: `[first, boundary)`, `[boundary, last]`.
+
+    An off-by-one here is the whole bug in miniature — one frame of the window
+    being judged leaking into the window doing the judging.
+    """
+    series = quotes([(ns(0), 100.0, 100.2), (ns(50), 100.0, 100.2), (ns(100), 100.0, 100.2)])
+    split = rm.screen_split(series, ns(0), ns(100))
+    assert split["boundary_local_ts"] == ns(50)
+    assert split["screen_window"]["from_local_ts"] == ns(0)
+    assert split["screen_window"]["to_local_ts"] == ns(50)
+    assert split["screen_window"]["frames"] == 1
+    assert split["evaluation_window"]["from_local_ts"] == ns(50)
+    assert split["evaluation_window"]["frames"] == 2
+
+
+def test_a_spread_wide_only_in_the_first_half_is_judged_on_the_second(tmp_path):
+    """The landing: the gate no longer credits a capture the coin stopped offering.
+
+    Twenty quotes five seconds apart at 19.98 bps in the first half — 100s of
+    weight — and four quotes thirty seconds apart at 0.99995 bps in the second —
+    15s. The whole recording's p25 is therefore WIDE (the narrow frames hold
+    13% of the weight, so the quarter mark falls in the wide regime), which is
+    exactly what the old gate credited: the same funding series with that number
+    in front of it returns `immaterial`, and the coin passed.
+
+    The coin's actual second half is one tick wide. The gate now credits the
+    lesser of what the screen window promised and what the evaluation window
+    delivered, and the coin does not pass.
+    """
+    row, samples = a_split_row(tmp_path, early=(20, 5, 0.20), late=(4, 30, 0.01))
+    screen = row["screen"]
+
+    assert screen["screen_window"]["frames"] == 20
+    assert screen["screen_window"]["spread_p25_bps"] == pytest.approx(WIDE_BPS, abs=1e-9)
+    assert screen["evaluation_window"]["frames"] == 4
+    assert screen["evaluation_window"]["spread_p25_bps"] == pytest.approx(NARROW_BPS, abs=1e-9)
+    assert screen["used_source"] == "evaluation"
+    assert screen["spread_p25_bps_used"] == pytest.approx(NARROW_BPS, abs=1e-9)
+    assert screen["evaluation_minus_screen_bps"] == pytest.approx(NARROW_BPS - WIDE_BPS, abs=1e-9)
+
+    # what the OLD gate did, measured rather than asserted: the whole-recording
+    # p25 is still reported, and it passes on this very funding series.
+    assert row["spread"]["p25_bps"] == pytest.approx(WIDE_BPS, abs=1e-9)
+    assert rm.summarize_funding(
+        samples.funding, spread_p25_bps=row["spread"]["p25_bps"], **GATE
+    )["verdict"] == "immaterial"
+
+    assert row["funding"]["gross_capture_bps"] == pytest.approx(NARROW_BPS - 4.0, abs=1e-9)
+    assert row["funding"]["verdict"] == "erased"
+
+
+def test_a_spread_wide_only_in_the_second_half_does_not_pass_the_screen(tmp_path):
+    """The mirror: a coin that widened AFTER the screen window is not admitted.
+
+    Four narrow quotes thirty seconds apart in the first half (20s of weight)
+    and twenty wide ones five seconds apart in the second (95s), so the whole
+    recording's p25 is again wide and the old gate again passed. The screen
+    window saw one tick, and one tick is what the gate credits — and it prints
+    the evaluation window's 19.98 beside it, so the reader can see that the
+    coin's spread arrived after the window that admits it.
+    """
+    row, samples = a_split_row(tmp_path, early=(4, 30, 0.01), late=(20, 5, 0.20))
+    screen = row["screen"]
+
+    assert screen["screen_window"]["spread_p25_bps"] == pytest.approx(NARROW_BPS, abs=1e-9)
+    assert screen["evaluation_window"]["spread_p25_bps"] == pytest.approx(WIDE_BPS, abs=1e-9)
+    assert screen["used_source"] == "screen"
+    assert screen["spread_p25_bps_used"] == pytest.approx(NARROW_BPS, abs=1e-9)
+    assert screen["evaluation_minus_screen_bps"] == pytest.approx(WIDE_BPS - NARROW_BPS, abs=1e-9)
+
+    assert row["spread"]["p25_bps"] == pytest.approx(WIDE_BPS, abs=1e-9)
+    assert rm.summarize_funding(
+        samples.funding, spread_p25_bps=row["spread"]["p25_bps"], **GATE
+    )["verdict"] == "immaterial"
+
+    assert row["funding"]["gross_capture_bps"] == pytest.approx(NARROW_BPS - 4.0, abs=1e-9)
+    assert row["funding"]["verdict"] == "erased"
+
+
+def test_an_empty_screen_window_is_unknown_however_good_the_second_half_is(tmp_path):
+    """Fail closed: no measurable p25 BEFORE the evaluation window, no verdict.
+
+    Every quote in this recording is in the second half and every one of them is
+    wide. Reading the p25 off them is precisely the selection this split exists
+    to stop, so the verdict is `unknown` — and `unknown` does not pass.
+    """
+    row, _ = a_split_row(tmp_path, early=(0, 5, 0.20), late=(20, 5, 0.20))
+    screen = row["screen"]
+
+    assert screen["screen_window"]["frames"] == 0
+    assert screen["screen_window"]["spread_p25_bps"] is None
+    assert screen["evaluation_window"]["spread_p25_bps"] == pytest.approx(WIDE_BPS, abs=1e-9)
+    assert screen["spread_p25_bps_used"] is None
+    assert screen["used_source"] is None
+    assert row["funding"]["gross_capture_bps"] is None
+    assert row["funding"]["verdict"] == "unknown"
+
+
+def test_the_operators_constant_bypasses_the_screen_window_and_says_so(tmp_path):
+    """`--spread-p25-bps` is the constant declared BEFORE the data; it wins.
+
+    The same recording as the pin above — nothing to screen on — with a number
+    the operator brought from outside it. That is not selection on outcome: it
+    is the one number in the rule that a live bot could have been holding before
+    the recording started. Both measured windows are still printed beside it.
+    """
+    hl_dir, um_dir = a_split_day(tmp_path, early=(0, 5, 0.20), late=(20, 5, 0.20))
+    out = tmp_path / "r.json"
+    rc = rm.main([
+        "--hl-dir", str(hl_dir), "--coin", "PUMP", "--um-dir", str(um_dir),
+        "--um-symbol", "PUMPUSDT", "--day", DAY, "--json", str(out),
+        "--fee-rt-bps", "3.0", "--adverse-bps", "1.0",
+        "--hold-mean-s", "600", "--hold-p95-s", "3000",
+        "--spread-p25-bps", "12.0",
+    ])
+    assert rc == 0
+    report = json.loads(out.read_text())
+    row = report["rows"][0]
+
+    assert row["screen"]["used_source"] == "operator"
+    assert row["screen"]["spread_p25_bps_used"] == pytest.approx(12.0)
+    assert row["screen"]["screen_window"]["spread_p25_bps"] is None
+    assert row["screen"]["evaluation_window"]["spread_p25_bps"] == pytest.approx(
+        WIDE_BPS, abs=1e-9
+    )
+    assert row["funding"]["gross_capture_bps"] == pytest.approx(8.0, abs=1e-9)
+    assert row["funding"]["verdict"] == "immaterial"
+
+    # and both windows reach the operator's table, not only the JSON
+    text = rm.render_text(report)
+    assert "screen" in text and "p25_eval" in text
+
+
+def test_the_split_moves_no_number_the_coin_did_not_move(tmp_path):
+    """The control: a coin that quotes the same in both halves is scored as before.
+
+    Same spread throughout, so screen p25 = evaluation p25 = the whole
+    recording's p25 and the gate credits exactly the number it credited before
+    the split existed. What the split must NOT have done is change a
+    DENOMINATOR: the funding tail is still a share of every hour of the
+    recording, and the hour that carries the rate here is in the first half, so
+    a tail computed over the second half alone would report zero.
+    """
+    row, _ = a_split_row(tmp_path, early=(20, 5, 0.08), late=(20, 5, 0.08), hot_hour=2)
+    p25 = 0.08 / 100.04 * 1e4
+
+    assert row["spread"]["p25_bps"] == pytest.approx(p25, abs=1e-9)
+    assert row["screen"]["screen_window"]["spread_p25_bps"] == pytest.approx(p25, abs=1e-9)
+    assert row["screen"]["evaluation_window"]["spread_p25_bps"] == pytest.approx(p25, abs=1e-9)
+    assert row["screen"]["spread_p25_bps_used"] == pytest.approx(p25, abs=1e-9)
+    assert row["screen"]["evaluation_minus_screen_bps"] == pytest.approx(0.0, abs=1e-12)
+    assert row["funding"]["gross_capture_bps"] == pytest.approx(p25 - 4.0, abs=1e-9)
+
+    # eight hours of tape, one of them hot, and it is in the screen half
+    assert row["funding"]["hours_covered"] == 8
+    assert row["funding"]["tail"]["p_hour_rate_ge_gross"] == pytest.approx(1 / 8, abs=1e-12)
+    assert row["funding"]["rate_bps_per_hour"]["max_abs"] == pytest.approx(5.0, abs=1e-9)
+
+
+def test_the_pooled_row_screens_on_the_earlier_days(tmp_path):
+    """The rule is one rule: the first half of the row's OWN span, by time.
+
+    A pooled row's span is every day it pooled, so its first half is the earlier
+    days — which is the "screen on the previous day" the audit asked for,
+    arriving for free rather than as a second code path. Day one is quoted wide
+    throughout and day two one tick wide; the pooled row credits day two.
+    """
+    hl_dir, um_dir = a_split_day(tmp_path, (20, 5, 0.20), (20, 5, 0.20), day="20260729")
+    a_split_day(tmp_path, (20, 5, 0.01), (20, 5, 0.01), day="20260730")
+    report = rm.build_report(hl_dir, "PUMP", [um_dir], "PUMPUSDT", ["20260729", "20260730"])
+    one, two, pooled = report["rows"]
+
+    assert pooled["day"] == "pooled"
+    assert pooled["screen"]["boundary_local_ts"] > one["window"]["last_local_ts"]
+    assert pooled["screen"]["boundary_local_ts"] < two["window"]["first_local_ts"]
+    assert pooled["screen"]["screen_window"]["frames"] == one["counts"]["bbo"]
+    assert pooled["screen"]["evaluation_window"]["frames"] == two["counts"]["bbo"]
+    assert pooled["screen"]["screen_window"]["spread_p25_bps"] == pytest.approx(
+        WIDE_BPS, abs=1e-9
+    )
+    assert pooled["screen"]["evaluation_window"]["spread_p25_bps"] == pytest.approx(
+        NARROW_BPS, abs=1e-9
+    )
+    assert pooled["screen"]["used_source"] == "evaluation"
+    assert pooled["screen"]["spread_p25_bps_used"] == pytest.approx(NARROW_BPS, abs=1e-9)
+
+
+def test_a_recording_with_no_span_to_split_screens_on_nothing(tmp_path):
+    """A span that cannot be halved leaves no screen window, so no verdict.
+
+    An instant is not a window. The tempting reading of "no boundary" is
+    "everything is in scope", which silently restores the whole-recording p25 —
+    the exact leak — in the one case nobody looks at. Fail closed instead: both
+    windows are empty and the coin is `unknown`.
+    """
+    series = quotes([(ns(0), 100.0, 100.2), (ns(0), 100.0, 100.2)])
+    split = rm.screen_split(series, ns(0), ns(0))
+
+    assert split["boundary_local_ts"] is None
+    assert split["screen_window"]["frames"] == 0
+    assert split["evaluation_window"]["frames"] == 0
+    assert split["spread_p25_bps_used"] is None
+    assert split["used_source"] is None
+    # and a missing `last` (nothing was read at all) is the same answer
+    assert rm.screen_split(series, None, None)["spread_p25_bps_used"] is None

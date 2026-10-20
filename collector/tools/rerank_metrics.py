@@ -61,6 +61,21 @@ What is measured, and the decision each number exists to make:
    refined; `path_bps` and `path_efficiency` in the same block do not and are
    labelled as the within-row diagnostics they are.
 
+**The threshold and the outcome come from different halves of the recording.**
+The screen rule `spread_p25 > fee_RT + adverse + funding x hold` used to take
+its p25 from the whole recording it then scored — the coin selected by the very
+quantile it was judged on, which is optimistic by construction and most
+optimistic on the thin wide-quoting coins the screen exists to catch. The p25
+now comes from the SCREEN window (the first half of the row's own recorded span,
+by time; for a pooled multi-day row, the earlier days), the coin is judged over
+the EVALUATION window that follows, and the gate credits the lesser of the two —
+so the second half can lower the credit and never raise it. Both windows, their
+bounds, their frame counts and both p25s are printed side by side, so the
+shrinkage is visible. A screen window with no measurable p25 is `unknown`
+whatever the evaluation window says, and `--spread-p25-bps` is the operator's
+constant, declared before the data and exempt. `SCREEN_SPLIT_RULE` carries the
+argument; the funding tape is deliberately NOT split (see it).
+
 **Reading and channel classification are `quality_report.py`'s.** `iter_gz_lines`
 handles the multi-member gzip a collector restart appends; `classify` tells the
 two `l2Book` cadences apart by `data.fast` (5 levels at 0.54s versus 20 at 5.4s),
@@ -754,6 +769,139 @@ def summarize_spread(series: BboSeries, tick_scaled: Optional[int]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 2a. the screen window and the evaluation window
+# ---------------------------------------------------------------------------
+
+
+#: Where a row's recorded span is cut in two. The first half SCREENS and the
+#: second half is what the coin is judged over.
+#:
+#: The first half of the row's own span rather than "the previous day", so that
+#: one rule covers every row this tool emits: a single-day row splits at noon, a
+#: pooled multi-day row splits between days, and neither needs a recording the
+#: run was not given. `boundary_local_ts` is printed, so which frames fell where
+#: is never a guess.
+SCREEN_WINDOW_FRACTION = 0.5
+
+SCREEN_SPLIT_RULE = (
+    "the p25 the gate credits is measured on the SCREEN window — the first half "
+    "of this row's own recorded span, by time — and never only on the window the "
+    "coin is then judged over; a pooled multi-day row splits the same way, which "
+    "is the earlier days screening the later ones. The credit is "
+    "min(screen p25, evaluation p25): the screen window is the number a live "
+    "operator could have committed to before the evaluation window happened, and "
+    "the evaluation window is what the coin actually went on to quote, so a coin "
+    "is credited with the lesser of promised and delivered. No quantile of the "
+    "evaluation window can therefore RAISE the credited capture, which is the "
+    "direction selection-on-outcome moves it. A screen window with no measurable "
+    "p25 is verdict `unknown` however good the evaluation window looks — fail "
+    "closed — and `--spread-p25-bps` replaces the measurement with the operator's "
+    "own constant, the one term of the rule that is declared before the data. "
+    "The funding tape is NOT split: its hours are the recording's outcome, not a "
+    "threshold chosen on it, and halving the denominator of `p_hour_rate_ge_gross` "
+    "would only hide hours that already happened."
+)
+
+
+def _window_spread(
+    series: BboSeries, from_ts: Optional[int], to_ts: Optional[int]
+) -> dict:
+    """The time-weighted p25 of the spread over the frames stamped `[from, to)`.
+
+    Frames are assigned to a window by their own timestamp and keep the weight
+    the whole-recording pass gave them, so the quote standing across the
+    boundary is credited to the window it started in — at most
+    `SPREAD_WEIGHT_CAP_NS` of spill, against half a recording.
+
+    `frames`/`frames_weighted`/`weighted_seconds` ship beside the quantile
+    because a p25 over four frames and a p25 over forty thousand are the same
+    number with different things behind them, and the reader is the one who has
+    to tell them apart.
+    """
+    #: A `None` bound is an EMPTY window, never an unbounded one. Both callers
+    #: pass a real upper bound on the happy path (`boundary`, and `last + 1`),
+    #: so `None` only ever means "there was no span to split" — and reading that
+    #: as "everything" would restore the whole-recording p25 this split exists
+    #: to remove, in the one case nobody inspects.
+    if from_ts is None or to_ts is None or to_ts <= from_ts or len(series) == 0:
+        inside = np.zeros(len(series), dtype=bool)
+    else:
+        inside = (series.ts >= from_ts) & (series.ts < to_ts)
+    weight = series.weight[inside]
+    return {
+        "from_local_ts": None if from_ts is None else int(from_ts),
+        "to_local_ts": None if to_ts is None else int(to_ts),
+        "frames": int(inside.sum()),
+        "frames_weighted": int((weight > 0).sum()),
+        "weighted_seconds": float(weight.sum()) / SEC,
+        "spread_p25_bps": time_weighted_quantile(series.spread_bps[inside], weight, 0.25),
+    }
+
+
+def screen_split(
+    series: BboSeries,
+    first_ts: Optional[int],
+    last_ts: Optional[int],
+    *,
+    override: Optional[float] = None,
+) -> dict:
+    """The screen window, the evaluation window, and the p25 the gate credits.
+
+    THE THRESHOLD AND THE OUTCOME COME FROM DIFFERENT WINDOWS, which is the
+    whole point. The pre-committed rule is `spread_p25 > fee_RT + adverse +
+    funding x hold`, and until now every one of its measured terms came off the
+    same recording the verdict then described: the coin was selected by the very
+    quantile it was scored on. That is optimistic by construction, and most
+    optimistic exactly where the tool is aimed — thin coins whose wide quarter
+    hours are what the whole-recording p25 is made of.
+
+    So: `spread_p25_bps` on the first half, the coin judged on the second, and
+    `min` of the two credited. `min` and not the screen number alone because a
+    capture that evaporated is not a capture; `min` and not the evaluation
+    number alone because that is the leak. Neither window can lift the other's
+    credit — `used_source` says which one bound.
+
+    An unmeasurable screen window (`None`) is not backfilled from the
+    evaluation window: it returns no number at all, and `summarize_funding`
+    turns that into `unknown`, which does not pass.
+    """
+    boundary = None
+    if first_ts is not None and last_ts is not None and int(last_ts) > int(first_ts):
+        boundary = int(first_ts) + int(
+            (int(last_ts) - int(first_ts)) * SCREEN_WINDOW_FRACTION
+        )
+    screen = _window_spread(series, first_ts, boundary)
+    # inclusive of the last frame of the recording, hence the `+ 1`
+    evaluation = _window_spread(
+        series, boundary, None if last_ts is None else int(last_ts) + 1
+    )
+    p25_screen = screen["spread_p25_bps"]
+    p25_evaluation = evaluation["spread_p25_bps"]
+
+    if override is not None:
+        used, source = float(override), "operator"
+    elif p25_screen is None:
+        used, source = None, None
+    elif p25_evaluation is None or p25_screen <= p25_evaluation:
+        used, source = p25_screen, "screen"
+    else:
+        used, source = p25_evaluation, "evaluation"
+
+    return {
+        "boundary_local_ts": boundary,
+        "screen_window": screen,
+        "evaluation_window": evaluation,
+        "spread_p25_bps_used": _num(used),
+        "used_source": source,
+        "evaluation_minus_screen_bps": _num(
+            None
+            if p25_screen is None or p25_evaluation is None
+            else p25_evaluation - p25_screen
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 2b. funding (#40) — the third term of the pre-committed screen rule
 # ---------------------------------------------------------------------------
 
@@ -823,6 +971,14 @@ def summarize_funding(
     is no default hold and no fallback to another coin's: `expected_hold` is
     measured from the run being scored or it is not known. `adverse_bps` comes
     from the #32 fill-quality harness and this tool refuses to guess it.
+
+    `spread_p25_bps` is supplied by `screen_split` and is NOT the whole
+    recording's p25: it is the screen window's, lowered by the evaluation
+    window's where the coin narrowed, or the operator's own constant. `None`
+    reaches here when the screen window had nothing to measure, and takes the
+    same `unknown` path as a missing hold. The funding series, by contrast, is
+    the whole recording: `p_hour_rate_ge_gross` is a share of every hour that
+    settled, and that denominator did not move.
     """
     curve = funding.curve_from_samples(
         series.ts, series.rate, series.oracle_px, interval_ns=interval_ns
@@ -2182,13 +2338,18 @@ def summarize(samples: DaySamples, screen: Optional[dict] = None) -> dict:
             f"the tick is not {used:.3g}; every _ticks number in this row, "
             f"frac_time_ge_3_ticks included, is wrong by up to that share"
         )
-    screen = dict(screen or {})
+    gate_inputs = dict(screen or {})
     spread = summarize_spread(samples.bbo, tick_scaled)
-    # The gate reads the p25 of THIS row's own pooled spread unless the operator
-    # named one: the screen rule is about the spread the coin actually quoted,
-    # and a Sunday spot reading of it moved 12.56 -> 6.33 bps in five minutes.
-    screen.setdefault("spread_p25_bps", spread["p25_bps"])
-    funding_block = summarize_funding(samples.funding, **screen)
+    # The gate reads the p25 of the SCREEN window — the first half of this row's
+    # recorded span — and never only the window it then scores the coin over;
+    # `spread` above stays the whole recording's description. An operator's
+    # `--spread-p25-bps` arrives here as an already-set key and replaces the
+    # measurement outright: it is the one term declared before the data.
+    split = screen_split(
+        samples.bbo, first, last, override=gate_inputs.get("spread_p25_bps")
+    )
+    gate_inputs["spread_p25_bps"] = split["spread_p25_bps_used"]
+    funding_block = summarize_funding(samples.funding, **gate_inputs)
     warnings.extend(funding_block["warnings"])
 
     return {
@@ -2202,6 +2363,7 @@ def summarize(samples: DaySamples, screen: Optional[dict] = None) -> dict:
         | {k: samples.counts.get(k, 0) for k in COUNT_KEYS},
         "tick": tick,
         "spread": spread,
+        "screen": split,
         "funding": funding_block,
         "conditional_spread": conditional_spread_curve(samples.windows, samples.bbo),
         "touch": summarize_touch(
@@ -2324,6 +2486,7 @@ def build_report(hl_dir, coin, um_dirs, um_symbol, days, screen=None) -> dict:
                     "oscillation. Neither is a cross-coin number; the round trips "
                     "are"
                 ),
+                "screen": SCREEN_SPLIT_RULE,
                 "pooled_row": (
                     "the same metrics recomputed over every day's observations, not "
                     "an average of the per-day rows"
@@ -2385,6 +2548,32 @@ def render_text(report: dict) -> str:
             for r in rows
         ],
         [11, 9, 9, 11, 10, 6, 9, 11, 9, 10],
+    )
+
+    lines.append("")
+    lines.append(
+        "  coin screen — the p25 the gate credits comes from the screen window "
+        "(the first half of the recording, by time); the evaluation window is "
+        "what the coin quoted afterwards and can only LOWER the credit. src="
+        "operator means --spread-p25-bps replaced both"
+    )
+    lines += _table(
+        ["day", "n_scr", "scr_s", "p25_scr", "n_eval", "eval_s", "p25_eval", "used", "src"],
+        [
+            [
+                r["day"],
+                _cell(r["screen"]["screen_window"]["frames"]),
+                _cell(r["screen"]["screen_window"]["weighted_seconds"], ".0f"),
+                _cell(r["screen"]["screen_window"]["spread_p25_bps"], ".3f"),
+                _cell(r["screen"]["evaluation_window"]["frames"]),
+                _cell(r["screen"]["evaluation_window"]["weighted_seconds"], ".0f"),
+                _cell(r["screen"]["evaluation_window"]["spread_p25_bps"], ".3f"),
+                _cell(r["screen"]["spread_p25_bps_used"], ".3f"),
+                _cell(r["screen"]["used_source"]),
+            ]
+            for r in rows
+        ],
+        [11, 8, 9, 10, 8, 9, 10, 9, 11],
     )
 
     lines.append("")
@@ -2681,8 +2870,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adverse-bps", type=float, default=None,
                        help="Adverse selection in bps, from the #32 fill-quality harness. "
                             "No default: the tool refuses to guess it.")
+    # The one term of the screen rule that can be a CONSTANT DECLARED BEFORE THE
+    # DATA, which is what makes it exempt from the window split: it bypasses the
+    # screen window entirely rather than being min'd with anything measured here.
     parser.add_argument("--spread-p25-bps", type=float, default=None,
-                       help="Override the measured p25 spread the gate uses.")
+                       help="Override the measured p25 spread the gate uses: an "
+                            "operator constant, applied instead of the screen "
+                            "window's measurement (both windows are still "
+                            "reported beside it).")
     parser.add_argument("--json", dest="json_out", metavar="OUT", help="Write the report here.")
     parser.add_argument("--txt", dest="txt_out", metavar="OUT", help="Write the table here too.")
     return parser
