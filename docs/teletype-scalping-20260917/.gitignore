@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+out/*.npz
+out/trades.csv.gz
+study.bundle

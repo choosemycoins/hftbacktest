@@ -1,0 +1,42 @@
+[
+  {
+    "symbol": "BTCUSDT",
+    "month": "2017-08",
+    "raw_rows": 1281572,
+    "sampled_rows": 900,
+    "timestamp_divisor": 1000,
+    "max_relative_error": 5.637076871956026e-08,
+    "raw_path": "/home/storage/hft-scratch/spot1s_oos/BTCUSDT-1s-2017-08.zip",
+    "sha256": "de91dda385bc0464273fd247c4134adac11f733c809c5213f9744b00d33e5051"
+  },
+  {
+    "symbol": "SOLUSDT",
+    "month": "2020-08",
+    "raw_rows": 1792800,
+    "sampled_rows": 900,
+    "timestamp_divisor": 1000,
+    "max_relative_error": 4.905587291936797e-08,
+    "raw_path": "/home/storage/hft-scratch/spot1s_sol/SOLUSDT-1s-2020-08.zip",
+    "sha256": "dd04d4813702becbc247844d12d6a3426a0a9d7d4619129c376241977467bc22"
+  },
+  {
+    "symbol": "BTCUSDT",
+    "month": "2025-01",
+    "raw_rows": 2678400,
+    "sampled_rows": 900,
+    "timestamp_divisor": 1000000,
+    "max_relative_error": 4.008630427598803e-08,
+    "raw_path": "/home/storage/hft-scratch/spot1s_oos/BTCUSDT-1s-2025-01.zip",
+    "sha256": "ff21e9f872d3aab90c2a49dbbcc0d897c418766f999e666159a876a3d15a1482"
+  },
+  {
+    "symbol": "SOLUSDT",
+    "month": "2026-07",
+    "raw_rows": 2678400,
+    "sampled_rows": 900,
+    "timestamp_divisor": 1000000,
+    "max_relative_error": 5.027607608010243e-08,
+    "raw_path": "/home/storage/hft-scratch/spot1s_sol/SOLUSDT-1s-2026-07.zip",
+    "sha256": "5a2b3f5aef7cb4828bc628b27de545b9ffb2c58390209399685155dbbadaf459"
+  }
+]

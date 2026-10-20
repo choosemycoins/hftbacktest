@@ -1,0 +1,3917 @@
+{
+ "1000bonkusdt_20260812": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "1000pepeusdt_20260812": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "1000shibusdt_20260812": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "aceusdt_20260812": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "aptusdt_20260812": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "dymusdt_20260812": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "merlusdt_20260812": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "morphousdt_20260812": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "neirousdt_20260812": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "nilusdt_20260812": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "penguusdt_20260812": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "peopleusdt_20260812": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "pythusdt_20260812": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "sagausdt_20260812": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "xaiusdt_20260812": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786464900.795098
+ },
+ "1000bonkusdt_20260813": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "1000pepeusdt_20260813": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "1000shibusdt_20260813": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "aceusdt_20260813": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "aptusdt_20260813": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "dymusdt_20260813": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "merlusdt_20260813": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "morphousdt_20260813": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "neirousdt_20260813": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "nilusdt_20260813": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "penguusdt_20260813": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "peopleusdt_20260813": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "pythusdt_20260813": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "sagausdt_20260813": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "xaiusdt_20260813": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786548234.147709
+ },
+ "1000bonkusdt_20260814": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "1000pepeusdt_20260814": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "1000shibusdt_20260814": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "aceusdt_20260814": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "aptusdt_20260814": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "dymusdt_20260814": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "merlusdt_20260814": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "morphousdt_20260814": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "neirousdt_20260814": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "nilusdt_20260814": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "penguusdt_20260814": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "peopleusdt_20260814": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "pythusdt_20260814": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "sagausdt_20260814": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "xaiusdt_20260814": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786615351.302686
+ },
+ "1000bonkusdt_20260815": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "1000pepeusdt_20260815": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "1000shibusdt_20260815": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "aceusdt_20260815": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "aptusdt_20260815": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "dymusdt_20260815": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "merlusdt_20260815": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "morphousdt_20260815": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "neirousdt_20260815": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "nilusdt_20260815": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "penguusdt_20260815": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "peopleusdt_20260815": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "pythusdt_20260815": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "sagausdt_20260815": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "xaiusdt_20260815": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786701726.220977
+ },
+ "1000bonkusdt_20260816": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "1000pepeusdt_20260816": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "1000shibusdt_20260816": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "aceusdt_20260816": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "aptusdt_20260816": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "dymusdt_20260816": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "merlusdt_20260816": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "morphousdt_20260816": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "neirousdt_20260816": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "nilusdt_20260816": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "penguusdt_20260816": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "peopleusdt_20260816": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "pythusdt_20260816": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "sagausdt_20260816": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "xaiusdt_20260816": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "1000bonkusdt_20260817": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "1000pepeusdt_20260817": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "1000shibusdt_20260817": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "aceusdt_20260817": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "aptusdt_20260817": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "dymusdt_20260817": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "merlusdt_20260817": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "morphousdt_20260817": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "neirousdt_20260817": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "nilusdt_20260817": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "penguusdt_20260817": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "peopleusdt_20260817": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "pythusdt_20260817": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "sagausdt_20260817": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "xaiusdt_20260817": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786777291.438385
+ },
+ "1000bonkusdt_20260818": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "1000pepeusdt_20260818": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "1000shibusdt_20260818": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "aceusdt_20260818": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "aptusdt_20260818": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "dymusdt_20260818": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "merlusdt_20260818": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "morphousdt_20260818": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "neirousdt_20260818": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "nilusdt_20260818": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "penguusdt_20260818": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "peopleusdt_20260818": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "pythusdt_20260818": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "sagausdt_20260818": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "xaiusdt_20260818": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1786975411.451794
+ },
+ "1000bonkusdt_20260819": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "1000pepeusdt_20260819": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "1000shibusdt_20260819": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "aceusdt_20260819": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "aptusdt_20260819": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "dymusdt_20260819": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "merlusdt_20260819": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "morphousdt_20260819": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "neirousdt_20260819": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "nilusdt_20260819": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "penguusdt_20260819": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "peopleusdt_20260819": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "pythusdt_20260819": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "sagausdt_20260819": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "xaiusdt_20260819": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787043691.484058
+ },
+ "1000bonkusdt_20260820": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "1000pepeusdt_20260820": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "1000shibusdt_20260820": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "aceusdt_20260820": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "aptusdt_20260820": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "dymusdt_20260820": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "merlusdt_20260820": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "morphousdt_20260820": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "neirousdt_20260820": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "nilusdt_20260820": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "penguusdt_20260820": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "peopleusdt_20260820": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "pythusdt_20260820": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "sagausdt_20260820": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "xaiusdt_20260820": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787130211.443115
+ },
+ "1000bonkusdt_20260821": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "1000pepeusdt_20260821": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "1000shibusdt_20260821": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "aceusdt_20260821": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "aptusdt_20260821": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "dymusdt_20260821": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "merlusdt_20260821": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "morphousdt_20260821": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "neirousdt_20260821": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "nilusdt_20260821": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "penguusdt_20260821": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "peopleusdt_20260821": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "pythusdt_20260821": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "sagausdt_20260821": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "xaiusdt_20260821": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787266831.390123
+ },
+ "1000bonkusdt_20260822": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000pepeusdt_20260822": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000shibusdt_20260822": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "aceusdt_20260822": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "aptusdt_20260822": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "dymusdt_20260822": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "merlusdt_20260822": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "morphousdt_20260822": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "neirousdt_20260822": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "nilusdt_20260822": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "penguusdt_20260822": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "peopleusdt_20260822": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "pythusdt_20260822": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "sagausdt_20260822": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "xaiusdt_20260822": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000bonkusdt_20260823": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000pepeusdt_20260823": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000shibusdt_20260823": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "aceusdt_20260823": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "aptusdt_20260823": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "dymusdt_20260823": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "merlusdt_20260823": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "morphousdt_20260823": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "neirousdt_20260823": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "nilusdt_20260823": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "penguusdt_20260823": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "peopleusdt_20260823": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "pythusdt_20260823": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "sagausdt_20260823": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "xaiusdt_20260823": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000bonkusdt_20260824": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000pepeusdt_20260824": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000shibusdt_20260824": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "aceusdt_20260824": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "aptusdt_20260824": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "dymusdt_20260824": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "merlusdt_20260824": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "morphousdt_20260824": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "neirousdt_20260824": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "nilusdt_20260824": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "penguusdt_20260824": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "peopleusdt_20260824": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "pythusdt_20260824": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "sagausdt_20260824": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "xaiusdt_20260824": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787349631.360736
+ },
+ "1000bonkusdt_20260825": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "1000pepeusdt_20260825": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "1000shibusdt_20260825": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "aceusdt_20260825": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "aptusdt_20260825": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "dymusdt_20260825": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "merlusdt_20260825": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "morphousdt_20260825": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "neirousdt_20260825": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "nilusdt_20260825": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "penguusdt_20260825": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "peopleusdt_20260825": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "pythusdt_20260825": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "sagausdt_20260825": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "xaiusdt_20260825": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787605377.435428
+ },
+ "1000bonkusdt_20260826": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "1000pepeusdt_20260826": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "1000shibusdt_20260826": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "aceusdt_20260826": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "aptusdt_20260826": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "dymusdt_20260826": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "merlusdt_20260826": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "morphousdt_20260826": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "neirousdt_20260826": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "nilusdt_20260826": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "penguusdt_20260826": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "peopleusdt_20260826": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "pythusdt_20260826": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "sagausdt_20260826": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "xaiusdt_20260826": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787652031.356966
+ },
+ "1000bonkusdt_20260827": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "1000pepeusdt_20260827": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "1000shibusdt_20260827": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "aceusdt_20260827": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "aptusdt_20260827": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "dymusdt_20260827": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "merlusdt_20260827": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "morphousdt_20260827": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "neirousdt_20260827": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "nilusdt_20260827": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "penguusdt_20260827": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "peopleusdt_20260827": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "pythusdt_20260827": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "sagausdt_20260827": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "xaiusdt_20260827": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787738543.24974
+ },
+ "1000bonkusdt_20260828": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "1000pepeusdt_20260828": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "1000shibusdt_20260828": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "aceusdt_20260828": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "aptusdt_20260828": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "dymusdt_20260828": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "merlusdt_20260828": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "morphousdt_20260828": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "neirousdt_20260828": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "nilusdt_20260828": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "penguusdt_20260828": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "peopleusdt_20260828": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "pythusdt_20260828": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "sagausdt_20260828": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "xaiusdt_20260828": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787871646.661005
+ },
+ "1000bonkusdt_20260829": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "1000pepeusdt_20260829": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "1000shibusdt_20260829": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "aceusdt_20260829": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "aptusdt_20260829": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "dymusdt_20260829": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "merlusdt_20260829": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "morphousdt_20260829": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "neirousdt_20260829": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "nilusdt_20260829": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "penguusdt_20260829": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "peopleusdt_20260829": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "pythusdt_20260829": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "sagausdt_20260829": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "xaiusdt_20260829": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "1000bonkusdt_20260830": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "1000pepeusdt_20260830": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "1000shibusdt_20260830": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "aceusdt_20260830": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "aptusdt_20260830": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "dymusdt_20260830": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "merlusdt_20260830": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "morphousdt_20260830": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "neirousdt_20260830": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "nilusdt_20260830": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "penguusdt_20260830": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "peopleusdt_20260830": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "pythusdt_20260830": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "sagausdt_20260830": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "xaiusdt_20260830": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1787911266.845308
+ },
+ "1000bonkusdt_20260831": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "1000pepeusdt_20260831": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "1000shibusdt_20260831": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "aceusdt_20260831": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "aptusdt_20260831": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "dymusdt_20260831": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "merlusdt_20260831": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "morphousdt_20260831": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "neirousdt_20260831": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "nilusdt_20260831": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "penguusdt_20260831": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "peopleusdt_20260831": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "pythusdt_20260831": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "sagausdt_20260831": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "xaiusdt_20260831": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788091291.32531
+ },
+ "1000bonkusdt_20260901": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "1000pepeusdt_20260901": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "1000shibusdt_20260901": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "aceusdt_20260901": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "aptusdt_20260901": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "dymusdt_20260901": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "merlusdt_20260901": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "morphousdt_20260901": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "neirousdt_20260901": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "nilusdt_20260901": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "penguusdt_20260901": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "peopleusdt_20260901": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "pythusdt_20260901": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "sagausdt_20260901": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "xaiusdt_20260901": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788159656.74107
+ },
+ "1000bonkusdt_20260902": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "1000pepeusdt_20260902": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "1000shibusdt_20260902": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "aceusdt_20260902": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "aptusdt_20260902": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "dymusdt_20260902": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "merlusdt_20260902": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "morphousdt_20260902": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "neirousdt_20260902": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "nilusdt_20260902": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "penguusdt_20260902": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "peopleusdt_20260902": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "pythusdt_20260902": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "sagausdt_20260902": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "xaiusdt_20260902": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788256906.695054
+ },
+ "1000bonkusdt_20260903": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "1000pepeusdt_20260903": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "1000shibusdt_20260903": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "aceusdt_20260903": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "aptusdt_20260903": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "dymusdt_20260903": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "merlusdt_20260903": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "morphousdt_20260903": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "neirousdt_20260903": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "nilusdt_20260903": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "penguusdt_20260903": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "peopleusdt_20260903": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "pythusdt_20260903": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "sagausdt_20260903": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "xaiusdt_20260903": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788346856.228976
+ },
+ "1000bonkusdt_20260904": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "1000pepeusdt_20260904": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "1000shibusdt_20260904": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "aceusdt_20260904": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "aptusdt_20260904": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "dymusdt_20260904": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "merlusdt_20260904": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "morphousdt_20260904": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "neirousdt_20260904": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "nilusdt_20260904": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "penguusdt_20260904": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "peopleusdt_20260904": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "pythusdt_20260904": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "sagausdt_20260904": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "xaiusdt_20260904": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788444091.307031
+ },
+ "1000bonkusdt_20260905": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "1000pepeusdt_20260905": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "1000shibusdt_20260905": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "aceusdt_20260905": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "aptusdt_20260905": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "dymusdt_20260905": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "merlusdt_20260905": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "morphousdt_20260905": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "neirousdt_20260905": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "nilusdt_20260905": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "penguusdt_20260905": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "peopleusdt_20260905": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "pythusdt_20260905": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "sagausdt_20260905": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "xaiusdt_20260905": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "1000bonkusdt_20260906": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "1000pepeusdt_20260906": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "1000shibusdt_20260906": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "aceusdt_20260906": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "aptusdt_20260906": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "dymusdt_20260906": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "merlusdt_20260906": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "morphousdt_20260906": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "neirousdt_20260906": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "nilusdt_20260906": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "penguusdt_20260906": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "peopleusdt_20260906": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "pythusdt_20260906": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "sagausdt_20260906": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "xaiusdt_20260906": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788508821.326813
+ },
+ "1000bonkusdt_20260907": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "1000pepeusdt_20260907": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "1000shibusdt_20260907": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "aceusdt_20260907": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "aptusdt_20260907": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "dymusdt_20260907": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "merlusdt_20260907": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "morphousdt_20260907": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "neirousdt_20260907": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "nilusdt_20260907": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "penguusdt_20260907": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "peopleusdt_20260907": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "pythusdt_20260907": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "sagausdt_20260907": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "xaiusdt_20260907": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788724742.637029
+ },
+ "1000bonkusdt_20260908": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "1000pepeusdt_20260908": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "1000shibusdt_20260908": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "aceusdt_20260908": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "aptusdt_20260908": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "dymusdt_20260908": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "merlusdt_20260908": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "morphousdt_20260908": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "neirousdt_20260908": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "nilusdt_20260908": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "penguusdt_20260908": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "peopleusdt_20260908": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "pythusdt_20260908": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "sagausdt_20260908": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "xaiusdt_20260908": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "1000bonkusdt_20260909": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 40000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "1000pepeusdt_20260909": {
+  "tick": 1e-07,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 100000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "1000shibusdt_20260909": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 50000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "aceusdt_20260909": {
+  "tick": 1e-05,
+  "lot": 0.01,
+  "minqty": 0.01,
+  "minnotional": 5.0,
+  "market_lot": 0.01,
+  "maxqty": 600000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "aptusdt_20260909": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 200000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "dymusdt_20260909": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 4000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "merlusdt_20260909": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "morphousdt_20260909": {
+  "tick": 0.0001,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 100000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "neirousdt_20260909": {
+  "tick": 1e-08,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 900000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "nilusdt_20260909": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 2000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "penguusdt_20260909": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 20000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "peopleusdt_20260909": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 10000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "pythusdt_20260909": {
+  "tick": 1e-05,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "sagausdt_20260909": {
+  "tick": 1e-05,
+  "lot": 0.1,
+  "minqty": 0.1,
+  "minnotional": 5.0,
+  "market_lot": 0.1,
+  "maxqty": 3000000.0,
+  "param_stamp": 1788750151.363955
+ },
+ "xaiusdt_20260909": {
+  "tick": 1e-06,
+  "lot": 1.0,
+  "minqty": 1.0,
+  "minnotional": 5.0,
+  "market_lot": 1.0,
+  "maxqty": 9000000.0,
+  "param_stamp": 1788750151.363955
+ }
+}

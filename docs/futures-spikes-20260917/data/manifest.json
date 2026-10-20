@@ -1,0 +1,5657 @@
+[
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260812.gz",
+  "sha256": "ca1c97ca2d201f3bf8e7ce85317a4815da8a20e2a2ec57a402b5f10949e959f8",
+  "counts": {
+   "book": 700610,
+   "premium": 8640,
+   "trade": 167580
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 876830,
+  "cache_bytes": 13721453
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260813.gz",
+  "sha256": "14548f6145935c8cd0efdb9fe593006de048e72de79ab6d2fe4b239a5b663037",
+  "counts": {
+   "book": 749967,
+   "premium": 8640,
+   "trade": 181752
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 940359,
+  "cache_bytes": 14613451
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260814.gz",
+  "sha256": "39afa566cd3c62a59a02c194a5774f4de3659af55928a2a917dcf79cf85060ed",
+  "counts": {
+   "book": 737989,
+   "premium": 8640,
+   "trade": 170780
+  },
+  "disorder": 30,
+  "duplicates": 0,
+  "events": 917409,
+  "cache_bytes": 14161002
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260815.gz",
+  "sha256": "c38f08e9da1a625fc56fb1f413edd932adf77634e2fcd5bec853379ab964a7e7",
+  "counts": {
+   "book": 512469,
+   "premium": 8640,
+   "trade": 87940
+  },
+  "disorder": 21,
+  "duplicates": 0,
+  "events": 609049,
+  "cache_bytes": 9733934
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260816.gz",
+  "sha256": "f6358145dabe8f601cd6cc089fe5ad6d528f6cde6e2f53151020cd10eb8f5dff",
+  "counts": {
+   "book": 511809,
+   "premium": 8640,
+   "trade": 88401
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 608850,
+  "cache_bytes": 9770216
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260817.gz",
+  "sha256": "1ee6751732c3eb8d08b17897d17164d264fd82ae8264c85e200119ab11087aec",
+  "counts": {
+   "book": 551286,
+   "premium": 8640,
+   "trade": 76730
+  },
+  "disorder": 22,
+  "duplicates": 0,
+  "events": 636656,
+  "cache_bytes": 10318302
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260818.gz",
+  "sha256": "a29087fd7e645297eed6c204b0809aa6ad333435ba29ad979abb7fca94889944",
+  "counts": {
+   "book": 586618,
+   "premium": 8640,
+   "trade": 98424
+  },
+  "disorder": 25,
+  "duplicates": 0,
+  "events": 693682,
+  "cache_bytes": 11135641
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260819.gz",
+  "sha256": "2122fad245d039125bc804daa68ac57bd71824b680b4019c92d09f5745647c6e",
+  "counts": {
+   "book": 900625,
+   "premium": 8640,
+   "trade": 150622
+  },
+  "disorder": 39,
+  "duplicates": 0,
+  "events": 1059887,
+  "cache_bytes": 16785864
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260820.gz",
+  "sha256": "212aa073aceddfaeeabde64ef0777641faf83e98c1414c001b1bcc5b1545a6a8",
+  "counts": {
+   "book": 990446,
+   "premium": 8640,
+   "trade": 231577
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1230663,
+  "cache_bytes": 19121840
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260821.gz",
+  "sha256": "6a45ddd0073dd6b2da8fe7100b37ec88afbf9a303b1f8172a69160b3e7b429ff",
+  "counts": {
+   "book": 2110932,
+   "premium": 8640,
+   "trade": 534992
+  },
+  "disorder": 111,
+  "duplicates": 0,
+  "events": 2654564,
+  "cache_bytes": 39588055
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260822.gz",
+  "sha256": "7904ac5ac0a69536bf5559f6cf2333a16c2312042919ddd1e3c6e522fce7b228",
+  "counts": {
+   "book": 2229255,
+   "premium": 8642,
+   "trade": 649329
+  },
+  "disorder": 110,
+  "duplicates": 0,
+  "events": 2887226,
+  "cache_bytes": 42695447
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260823.gz",
+  "sha256": "952c03fccf54be5e7034bdebf56a9b838e1ed3b9f742fb25a75fc348e483495b",
+  "counts": {
+   "book": 1615497,
+   "premium": 8641,
+   "trade": 415776
+  },
+  "disorder": 48,
+  "duplicates": 0,
+  "events": 2039914,
+  "cache_bytes": 30317639
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260824.gz",
+  "sha256": "954733247f71e0fe13569f4e9f325e74ea75e1e98e4ecb99fae5f8848d63e6ac",
+  "counts": {
+   "book": 1410109,
+   "premium": 8640,
+   "trade": 270944
+  },
+  "disorder": 69,
+  "duplicates": 0,
+  "events": 1689693,
+  "cache_bytes": 26104318
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260825.gz",
+  "sha256": "831c253083396d82cbcf45e1998f6873111f02c9a3539fe6bfb5072a1a7f9fe7",
+  "counts": {
+   "book": 1406264,
+   "premium": 8640,
+   "trade": 295432
+  },
+  "disorder": 71,
+  "duplicates": 0,
+  "events": 1710336,
+  "cache_bytes": 26033818
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260826.gz",
+  "sha256": "9a2a4382dc95dbd6e3850c9b40c522af137d72c7f07f686a24fc40d6636ef28b",
+  "counts": {
+   "book": 960169,
+   "premium": 8640,
+   "trade": 164895
+  },
+  "disorder": 69,
+  "duplicates": 0,
+  "events": 1133704,
+  "cache_bytes": 17601372
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260827.gz",
+  "sha256": "e4dc8925cc0b16ae21a38410f4add72aa9eb610051861b354b1434b1719f9c3f",
+  "counts": {
+   "book": 1010191,
+   "premium": 8641,
+   "trade": 176422
+  },
+  "disorder": 54,
+  "duplicates": 0,
+  "events": 1195254,
+  "cache_bytes": 18500705
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260828.gz",
+  "sha256": "4dcf592287534dd8694474faea342d04e380d58cd0a05b3b2d66974e6bad0301",
+  "counts": {
+   "book": 969204,
+   "premium": 8640,
+   "trade": 166951
+  },
+  "disorder": 58,
+  "duplicates": 0,
+  "events": 1144795,
+  "cache_bytes": 17788323
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260829.gz",
+  "sha256": "733744161762eb160372b7c91c020f17f639f65ea6565643753f377051ea6aa6",
+  "counts": {
+   "book": 498976,
+   "premium": 8640,
+   "trade": 90694
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 598310,
+  "cache_bytes": 9459530
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260830.gz",
+  "sha256": "71953ab13fded0214811f248a1907ea37ad641a62cd821d6e32de13d97e53540",
+  "counts": {
+   "book": 718259,
+   "premium": 8640,
+   "trade": 132429
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 859328,
+  "cache_bytes": 13540381
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260831.gz",
+  "sha256": "0486c12f3c9171f6c5f8d5f479be80229ebbc8a1d367f1e5c20fa6ab8ee7e508",
+  "counts": {
+   "book": 1136080,
+   "premium": 8640,
+   "trade": 249210
+  },
+  "disorder": 59,
+  "duplicates": 0,
+  "events": 1393930,
+  "cache_bytes": 21291392
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260901.gz",
+  "sha256": "8b312d251f34663c65c2694a78a9c5dc32902a8943e4d314dbc380bf481d3860",
+  "counts": {
+   "book": 1551587,
+   "premium": 8640,
+   "trade": 395279
+  },
+  "disorder": 77,
+  "duplicates": 0,
+  "events": 1955506,
+  "cache_bytes": 29274091
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260902.gz",
+  "sha256": "4f0840d01859c91ac63e6af6695d8e7d519afabc765810ad620191010a07948a",
+  "counts": {
+   "book": 875969,
+   "premium": 8640,
+   "trade": 167700
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 1052309,
+  "cache_bytes": 16419843
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260903.gz",
+  "sha256": "be10b514961e1c49e55fdb2d524947d42517dd7ff498afca541c615da2797eba",
+  "counts": {
+   "book": 1151673,
+   "premium": 8640,
+   "trade": 243742
+  },
+  "disorder": 76,
+  "duplicates": 0,
+  "events": 1404055,
+  "cache_bytes": 21559772
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260904.gz",
+  "sha256": "680ad059d5bdc40e8b93b316bc7f8d48d73f690dd25388d6dbf2e337c7571a0c",
+  "counts": {
+   "book": 1135909,
+   "premium": 8641,
+   "trade": 267285
+  },
+  "disorder": 62,
+  "duplicates": 0,
+  "events": 1411835,
+  "cache_bytes": 21739250
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260905.gz",
+  "sha256": "16e873268305800a3bbac13cf7baa243c4d64b4f23fd754fa90cbe89ce854fa6",
+  "counts": {
+   "book": 977668,
+   "premium": 8640,
+   "trade": 260505
+  },
+  "disorder": 49,
+  "duplicates": 0,
+  "events": 1246813,
+  "cache_bytes": 18781819
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260906.gz",
+  "sha256": "4f63bb6f58f1bcc9a3e3ef3b07b23be6f5117e4a213e4869dab55850b90c380a",
+  "counts": {
+   "book": 1362418,
+   "premium": 8640,
+   "trade": 383936
+  },
+  "disorder": 61,
+  "duplicates": 0,
+  "events": 1754994,
+  "cache_bytes": 25985376
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260907.gz",
+  "sha256": "c42d2ac7633126509861ff9442ff22fbd94e383cbb5d88bf21435a605bc38531",
+  "counts": {
+   "book": 1360966,
+   "premium": 8640,
+   "trade": 342035
+  },
+  "disorder": 124,
+  "duplicates": 0,
+  "events": 1711641,
+  "cache_bytes": 25672652
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260908.gz",
+  "sha256": "ac32166070e67111c7e1fdd9c2c075cdc4fdc14d18dcde23b311a5d2fd74fcd2",
+  "counts": {
+   "book": 968254,
+   "premium": 8640,
+   "trade": 210919
+  },
+  "disorder": 167,
+  "duplicates": 0,
+  "events": 1187813,
+  "cache_bytes": 18443429
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000bonkusdt_20260909.gz",
+  "sha256": "e1955589e5353b7a9b84cc517a2ac6ee26cd43613270a0cbc82f69be59c154a0",
+  "counts": {
+   "book": 388533,
+   "premium": 4195,
+   "trade": 79584
+  },
+  "disorder": 59,
+  "duplicates": 0,
+  "events": 472312,
+  "cache_bytes": 7421796
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260812.gz",
+  "sha256": "52cde3be6523e0eb2071e7feb23fd4e4102d08e06324e8c97abf89dddb0cd376",
+  "counts": {
+   "book": 1952422,
+   "premium": 8640,
+   "trade": 725862
+  },
+  "disorder": 83,
+  "duplicates": 0,
+  "events": 2686924,
+  "cache_bytes": 39063717
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260813.gz",
+  "sha256": "3652c3cb36212cb9ffc532226f3af4a1d51d4fed6d09ada170c8d0241c31c133",
+  "counts": {
+   "book": 1985525,
+   "premium": 8640,
+   "trade": 733703
+  },
+  "disorder": 93,
+  "duplicates": 0,
+  "events": 2727868,
+  "cache_bytes": 39742353
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260814.gz",
+  "sha256": "1dca83c031dea54db77252ba975469333872731283e7b1f7186e089795664aca",
+  "counts": {
+   "book": 1753588,
+   "premium": 8640,
+   "trade": 609117
+  },
+  "disorder": 68,
+  "duplicates": 0,
+  "events": 2371345,
+  "cache_bytes": 34545945
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260815.gz",
+  "sha256": "5c18686a1905cf305904fd368335f9c0e898d4f5851a301fc032af392470fab0",
+  "counts": {
+   "book": 1366518,
+   "premium": 8640,
+   "trade": 390602
+  },
+  "disorder": 56,
+  "duplicates": 0,
+  "events": 1765760,
+  "cache_bytes": 26340708
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260816.gz",
+  "sha256": "5e44f52645a7731877b4e54f6d22f32ac9866df2ef765bb27ec629a096d926cc",
+  "counts": {
+   "book": 1670012,
+   "premium": 8640,
+   "trade": 542462
+  },
+  "disorder": 82,
+  "duplicates": 0,
+  "events": 2221114,
+  "cache_bytes": 32460150
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260817.gz",
+  "sha256": "b3783bf8f27c4eca62f590c6169de8ad81ab9e3ee054b7eff9cf31533eefe07c",
+  "counts": {
+   "book": 1766280,
+   "premium": 8640,
+   "trade": 612412
+  },
+  "disorder": 60,
+  "duplicates": 0,
+  "events": 2387332,
+  "cache_bytes": 34964863
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260818.gz",
+  "sha256": "a6887739c0fae6e0ea7b22e21844de52503183f2a2f246f30660bef2b5fa27e0",
+  "counts": {
+   "book": 1871281,
+   "premium": 8640,
+   "trade": 675583
+  },
+  "disorder": 81,
+  "duplicates": 0,
+  "events": 2555504,
+  "cache_bytes": 36950522
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260819.gz",
+  "sha256": "1084a9c2bed9f71e009cf1c1916fc5202bb0e6ec2baaa1afdef6af8e0a3b8ece",
+  "counts": {
+   "book": 3286163,
+   "premium": 8640,
+   "trade": 1405966
+  },
+  "disorder": 122,
+  "duplicates": 0,
+  "events": 4700769,
+  "cache_bytes": 66321236
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260820.gz",
+  "sha256": "fdce059a135dc6b426a54e6b8d45c6a9d23b03e5725b6fe21a93d4791b61ebff",
+  "counts": {
+   "book": 5569167,
+   "premium": 8640,
+   "trade": 2943934
+  },
+  "disorder": 173,
+  "duplicates": 0,
+  "events": 8521741,
+  "cache_bytes": 117082367
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260821.gz",
+  "sha256": "a922779e02980aa479430e586663b029254857de53ee51791642b54991833c4c",
+  "counts": {
+   "book": 8711699,
+   "premium": 8640,
+   "trade": 5339216
+  },
+  "disorder": 331,
+  "duplicates": 0,
+  "events": 14059555,
+  "cache_bytes": 192632654
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260822.gz",
+  "sha256": "ace14b1543e00da79ef0628c6e950c3e5d45acc9e79d89f36e2786b6efb723c9",
+  "counts": {
+   "book": 8231589,
+   "premium": 8642,
+   "trade": 4980538
+  },
+  "disorder": 407,
+  "duplicates": 0,
+  "events": 13220769,
+  "cache_bytes": 184675879
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260823.gz",
+  "sha256": "c86122dd0f0c5c929c059aa79b45c8e9538cf47f902aded0bab803592c4a0edf",
+  "counts": {
+   "book": 4677627,
+   "premium": 8641,
+   "trade": 3174489
+  },
+  "disorder": 188,
+  "duplicates": 0,
+  "events": 7860757,
+  "cache_bytes": 107976478
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260824.gz",
+  "sha256": "5f51682674b235c8068d563f1d26ec66ceefd635b85baca09f095d9152fa77e4",
+  "counts": {
+   "book": 4607588,
+   "premium": 8640,
+   "trade": 2908776
+  },
+  "disorder": 180,
+  "duplicates": 0,
+  "events": 7525004,
+  "cache_bytes": 104628196
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260825.gz",
+  "sha256": "d54e41dc495300199acc14008a3f5f568cb2b56926c57d098c42423509e5ef08",
+  "counts": {
+   "book": 4482043,
+   "premium": 8640,
+   "trade": 2911919
+  },
+  "disorder": 259,
+  "duplicates": 0,
+  "events": 7402602,
+  "cache_bytes": 102424109
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260826.gz",
+  "sha256": "f039623581eee17d52533ed7405d57dec52b2b89e68afa71dcc42f41b9e51373",
+  "counts": {
+   "book": 3821385,
+   "premium": 8640,
+   "trade": 1902905
+  },
+  "disorder": 180,
+  "duplicates": 0,
+  "events": 5732930,
+  "cache_bytes": 80325302
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260827.gz",
+  "sha256": "9d46a63db8ffd5173a66c27ce2ead7fe0253d3373717d2202b346d6864f395fc",
+  "counts": {
+   "book": 3612688,
+   "premium": 8641,
+   "trade": 1965207
+  },
+  "disorder": 167,
+  "duplicates": 0,
+  "events": 5586536,
+  "cache_bytes": 77997193
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260828.gz",
+  "sha256": "2a4dc8c3e84fdae17491a836867a06cb29ac91ef81e1bebf57ac639d0af0b1b5",
+  "counts": {
+   "book": 3442745,
+   "premium": 8640,
+   "trade": 1826348
+  },
+  "disorder": 161,
+  "duplicates": 0,
+  "events": 5277733,
+  "cache_bytes": 73995239
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260829.gz",
+  "sha256": "59d1c2ee6c61938e2a36e910c62ff94a689f079e9b5e20f45f17a6cf2b43f2d7",
+  "counts": {
+   "book": 1658701,
+   "premium": 8640,
+   "trade": 715502
+  },
+  "disorder": 58,
+  "duplicates": 0,
+  "events": 2382843,
+  "cache_bytes": 34768166
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260830.gz",
+  "sha256": "f3b0172d62ed38b08be0d9141a7a097e3a5f652c93166c88dd56112818dfb053",
+  "counts": {
+   "book": 2577713,
+   "premium": 8640,
+   "trade": 1361701
+  },
+  "disorder": 103,
+  "duplicates": 0,
+  "events": 3948054,
+  "cache_bytes": 56118686
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260831.gz",
+  "sha256": "14dcc524b4adfee748144f433682aec5816120451d22d78158f78ce57e95db5d",
+  "counts": {
+   "book": 3246396,
+   "premium": 8640,
+   "trade": 1593394
+  },
+  "disorder": 129,
+  "duplicates": 0,
+  "events": 4848430,
+  "cache_bytes": 68883094
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260901.gz",
+  "sha256": "ceda809681b6eb382591adb03f5c75cf1eb2bd0718dc2e408dc07b097a92d92b",
+  "counts": {
+   "book": 3140968,
+   "premium": 8640,
+   "trade": 1338867
+  },
+  "disorder": 124,
+  "duplicates": 0,
+  "events": 4488475,
+  "cache_bytes": 63747438
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260902.gz",
+  "sha256": "7232508bc91c2e251b2417f2a671561aadca8ab352f9d3821215fee85b4a548b",
+  "counts": {
+   "book": 2896906,
+   "premium": 8640,
+   "trade": 1050932
+  },
+  "disorder": 93,
+  "duplicates": 0,
+  "events": 3956478,
+  "cache_bytes": 56903846
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260903.gz",
+  "sha256": "54f1994c3c4e4e99d91f5b7a30e26c9d624184b94a02d64c5acfd1fe914352c1",
+  "counts": {
+   "book": 4548459,
+   "premium": 8640,
+   "trade": 1955813
+  },
+  "disorder": 161,
+  "duplicates": 0,
+  "events": 6512912,
+  "cache_bytes": 91297713
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260904.gz",
+  "sha256": "6f93d2f1b1292067c3f674955589c5ad2637b9f294fdc26f32e2bc88a8bc95ba",
+  "counts": {
+   "book": 3726662,
+   "premium": 8641,
+   "trade": 1497953
+  },
+  "disorder": 146,
+  "duplicates": 0,
+  "events": 5233256,
+  "cache_bytes": 74930259
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260905.gz",
+  "sha256": "a67eb5a6cbd1f4d76f28cc8a7c9b5720020d0f565032f1b14d12143cbdeaa059",
+  "counts": {
+   "book": 2821619,
+   "premium": 8640,
+   "trade": 1142339
+  },
+  "disorder": 88,
+  "duplicates": 0,
+  "events": 3972598,
+  "cache_bytes": 56786231
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260906.gz",
+  "sha256": "36f69ccc0195747df710fa5f213d9cfea722359893a6d375b7402b1858846b8e",
+  "counts": {
+   "book": 2873500,
+   "premium": 8640,
+   "trade": 1076044
+  },
+  "disorder": 111,
+  "duplicates": 0,
+  "events": 3958184,
+  "cache_bytes": 57158798
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260907.gz",
+  "sha256": "a73848e508919eff0fbcb6d8bd978a20c08f3e553618ffcd487fe0a384fef89a",
+  "counts": {
+   "book": 3190410,
+   "premium": 8640,
+   "trade": 1340349
+  },
+  "disorder": 233,
+  "duplicates": 0,
+  "events": 4539399,
+  "cache_bytes": 64572942
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260908.gz",
+  "sha256": "34ef565aa425e07f44b0accf9c6e14c8498b84b020195567ad5a7e2a9a540abe",
+  "counts": {
+   "book": 3346545,
+   "premium": 8640,
+   "trade": 1481156
+  },
+  "disorder": 311,
+  "duplicates": 0,
+  "events": 4836341,
+  "cache_bytes": 68588675
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000pepeusdt_20260909.gz",
+  "sha256": "ff4ad6c431b7c2c28e6ea187b3c540ef1d6bd35bd5287c50f02318f87653f81c",
+  "counts": {
+   "book": 1646410,
+   "premium": 4195,
+   "trade": 737078
+  },
+  "disorder": 122,
+  "duplicates": 0,
+  "events": 2387683,
+  "cache_bytes": 33730273
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260812.gz",
+  "sha256": "aa03901947e79f3f7550a0fd24543bca6416c2bf295abb05ef0c6cc6a73fe6b4",
+  "counts": {
+   "book": 1220678,
+   "premium": 8640,
+   "trade": 217839
+  },
+  "disorder": 61,
+  "duplicates": 0,
+  "events": 1447157,
+  "cache_bytes": 22196523
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260813.gz",
+  "sha256": "f4ce674e76586a71084b4bac56e883cc96d929f87b71c053380ed6318987a682",
+  "counts": {
+   "book": 1069930,
+   "premium": 8640,
+   "trade": 192714
+  },
+  "disorder": 33,
+  "duplicates": 0,
+  "events": 1271284,
+  "cache_bytes": 19784673
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260814.gz",
+  "sha256": "d50cb16d208b3dadf531b5392d5d585d974fcba333f5c0b41bae2cfaffc82aa7",
+  "counts": {
+   "book": 1220586,
+   "premium": 8640,
+   "trade": 269120
+  },
+  "disorder": 38,
+  "duplicates": 0,
+  "events": 1498346,
+  "cache_bytes": 22346903
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260815.gz",
+  "sha256": "dfc15c208620c097f81103a87f78fd5a011a7d1f68db8460a8d2c1aee574f1b7",
+  "counts": {
+   "book": 775680,
+   "premium": 8640,
+   "trade": 128911
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 913231,
+  "cache_bytes": 14381121
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260816.gz",
+  "sha256": "f2028335113f0df35556f4918ae3f08cd8c22b644fea3610d0bcf0cd1915f96f",
+  "counts": {
+   "book": 812251,
+   "premium": 8640,
+   "trade": 130240
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 951131,
+  "cache_bytes": 15096039
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260817.gz",
+  "sha256": "f7b29f1eb99d952bfe3a6cceaf0d34a92a34adc7af3e98788629b5cf85d22196",
+  "counts": {
+   "book": 882060,
+   "premium": 8640,
+   "trade": 140926
+  },
+  "disorder": 29,
+  "duplicates": 0,
+  "events": 1031626,
+  "cache_bytes": 16202028
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260818.gz",
+  "sha256": "baa10276fffca31a9075501da0478cf6047d537ef0237d950fd040403e2cf436",
+  "counts": {
+   "book": 937162,
+   "premium": 8640,
+   "trade": 143495
+  },
+  "disorder": 33,
+  "duplicates": 0,
+  "events": 1089297,
+  "cache_bytes": 17030487
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260819.gz",
+  "sha256": "c1ffe311682be7b85068e9bdc5743ec9787d4978ef3fc2ecddb0db754aec6f2b",
+  "counts": {
+   "book": 1616994,
+   "premium": 8640,
+   "trade": 240630
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1866264,
+  "cache_bytes": 28536708
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260820.gz",
+  "sha256": "bbc3707aef78dedb2dc91a27ddae19a5890071dec969fab778ed9df4bc86d22a",
+  "counts": {
+   "book": 2269495,
+   "premium": 8640,
+   "trade": 363775
+  },
+  "disorder": 70,
+  "duplicates": 0,
+  "events": 2641910,
+  "cache_bytes": 39024226
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260821.gz",
+  "sha256": "f1a569af86826a5ec0c17f596a02e806d22a63e56e20503a423f058a19e39683",
+  "counts": {
+   "book": 3635943,
+   "premium": 8640,
+   "trade": 806702
+  },
+  "disorder": 157,
+  "duplicates": 0,
+  "events": 4451285,
+  "cache_bytes": 64074509
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260822.gz",
+  "sha256": "76002ab9951481f0aa125588e38d0c8b1b704f93244e06d99f96d4fcd0b1d100",
+  "counts": {
+   "book": 3975936,
+   "premium": 8642,
+   "trade": 957012
+  },
+  "disorder": 143,
+  "duplicates": 0,
+  "events": 4941590,
+  "cache_bytes": 70918351
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260823.gz",
+  "sha256": "89944842ec7fc50be096c26324813398fb31774a9c4b48b2743d84c024100a5c",
+  "counts": {
+   "book": 2179415,
+   "premium": 8641,
+   "trade": 463942
+  },
+  "disorder": 67,
+  "duplicates": 0,
+  "events": 2651998,
+  "cache_bytes": 38835705
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260824.gz",
+  "sha256": "a17f3a216f35d72cc1af25e708681ca8e0621273ab57d81cf32e7600efb434b2",
+  "counts": {
+   "book": 3188755,
+   "premium": 8640,
+   "trade": 459576
+  },
+  "disorder": 110,
+  "duplicates": 0,
+  "events": 3656971,
+  "cache_bytes": 54000238
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260825.gz",
+  "sha256": "859c51082c35055d47f91ffa6b1ad636910c95b771b7f180b4f4680c14cc04cc",
+  "counts": {
+   "book": 2873738,
+   "premium": 8640,
+   "trade": 462723
+  },
+  "disorder": 173,
+  "duplicates": 0,
+  "events": 3345101,
+  "cache_bytes": 48995686
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260826.gz",
+  "sha256": "8980970536a0af346d96279c246f720eb2c609cd922f9e537dd2b38baf2dd7b3",
+  "counts": {
+   "book": 1806708,
+   "premium": 8640,
+   "trade": 277450
+  },
+  "disorder": 109,
+  "duplicates": 0,
+  "events": 2092798,
+  "cache_bytes": 31202364
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260827.gz",
+  "sha256": "ec21d53017dcefb8ee0538a918525dc69fd17ff46b80b7804209400d79df9fee",
+  "counts": {
+   "book": 1748374,
+   "premium": 8641,
+   "trade": 252578
+  },
+  "disorder": 93,
+  "duplicates": 0,
+  "events": 2009593,
+  "cache_bytes": 30393150
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260828.gz",
+  "sha256": "e245cc75794b8b260588c840c83adab686db453af00747676eca0aad10614e68",
+  "counts": {
+   "book": 1790695,
+   "premium": 8640,
+   "trade": 266216
+  },
+  "disorder": 98,
+  "duplicates": 0,
+  "events": 2065551,
+  "cache_bytes": 31069455
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260829.gz",
+  "sha256": "4abd9aff3334afcf1b95746e149a8dceef0d830f53d06a907e9628c1919d7cb7",
+  "counts": {
+   "book": 755339,
+   "premium": 8640,
+   "trade": 141267
+  },
+  "disorder": 48,
+  "duplicates": 0,
+  "events": 905246,
+  "cache_bytes": 14071885
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260830.gz",
+  "sha256": "8ec2a5888634e81bcec730a5874c18d56ef87942dfe0d709da91f98491530dda",
+  "counts": {
+   "book": 1280357,
+   "premium": 8640,
+   "trade": 209006
+  },
+  "disorder": 63,
+  "duplicates": 0,
+  "events": 1498003,
+  "cache_bytes": 22623069
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260831.gz",
+  "sha256": "e6f5d25490aa0c275ceffd11d4f568b8bbdec292708de3fa995a09a6c9c07fa5",
+  "counts": {
+   "book": 1392051,
+   "premium": 8640,
+   "trade": 201018
+  },
+  "disorder": 73,
+  "duplicates": 0,
+  "events": 1601709,
+  "cache_bytes": 24304522
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260901.gz",
+  "sha256": "2f8a1104680dd7a8bfc0a3f45879b7e67ebd47d141221c0dc3a45044e4354905",
+  "counts": {
+   "book": 1477203,
+   "premium": 8640,
+   "trade": 251225
+  },
+  "disorder": 70,
+  "duplicates": 0,
+  "events": 1737068,
+  "cache_bytes": 26149730
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260902.gz",
+  "sha256": "671f3ea9ee4da883c11b80427f610fb72f08303d705bcd864e9557f1842962c9",
+  "counts": {
+   "book": 1322859,
+   "premium": 8640,
+   "trade": 228858
+  },
+  "disorder": 61,
+  "duplicates": 0,
+  "events": 1560357,
+  "cache_bytes": 23662654
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260903.gz",
+  "sha256": "1c5ec4caafa1d77983b403acb7ac2d0732f9ab8adf1ec4424330dff23484eda9",
+  "counts": {
+   "book": 1680273,
+   "premium": 8640,
+   "trade": 255219
+  },
+  "disorder": 92,
+  "duplicates": 0,
+  "events": 1944132,
+  "cache_bytes": 29376876
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260904.gz",
+  "sha256": "8b74389f3e3049347e09f2f8902d5c44ec2ed48a352cc4255ffbc36b985d66c4",
+  "counts": {
+   "book": 1353214,
+   "premium": 8641,
+   "trade": 274101
+  },
+  "disorder": 85,
+  "duplicates": 0,
+  "events": 1635956,
+  "cache_bytes": 25052995
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260905.gz",
+  "sha256": "89947bff6dcb93b2541f993946de8e8b491e524267c8fbedc33061058fd6eb54",
+  "counts": {
+   "book": 1166881,
+   "premium": 8640,
+   "trade": 255273
+  },
+  "disorder": 41,
+  "duplicates": 0,
+  "events": 1430794,
+  "cache_bytes": 22115724
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260906.gz",
+  "sha256": "60bea5135cdecd1e1bf9339f18ac0c51e8ccd1abdf89d66e6e44eda72ea4b04c",
+  "counts": {
+   "book": 1123515,
+   "premium": 8640,
+   "trade": 203346
+  },
+  "disorder": 49,
+  "duplicates": 0,
+  "events": 1335501,
+  "cache_bytes": 21118851
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260907.gz",
+  "sha256": "84c82ce4a66a57f2ab09ff7b24dd077ec2b1aa8224955d4483612a01572a4829",
+  "counts": {
+   "book": 1369622,
+   "premium": 8640,
+   "trade": 230842
+  },
+  "disorder": 155,
+  "duplicates": 0,
+  "events": 1609104,
+  "cache_bytes": 24722782
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260908.gz",
+  "sha256": "c51a6fb8b375ec3e91101cbe7fdd460753d11a8929ef3e2c387b752ef0274848",
+  "counts": {
+   "book": 1394607,
+   "premium": 8640,
+   "trade": 217358
+  },
+  "disorder": 188,
+  "duplicates": 0,
+  "events": 1620605,
+  "cache_bytes": 25010457
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/1000shibusdt_20260909.gz",
+  "sha256": "c6ef146923fe5662a3c32ac7f15c56191211cbbb6d852cabdca697148317530e",
+  "counts": {
+   "book": 597025,
+   "premium": 4195,
+   "trade": 94673
+  },
+  "disorder": 85,
+  "duplicates": 0,
+  "events": 695893,
+  "cache_bytes": 10761574
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260812.gz",
+  "sha256": "9f3cc9a5b8c3dd9a67a3170d75243ca2259a79f34d4a632be254b39874b439fd",
+  "counts": {
+   "book": 1560589,
+   "premium": 8640,
+   "trade": 955727
+  },
+  "disorder": 66,
+  "duplicates": 0,
+  "events": 2524956,
+  "cache_bytes": 37915765
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260813.gz",
+  "sha256": "f107f50faa9bb10c0a98d1753b7f56e5f10d3568b75fe12573f6592e3101f7f2",
+  "counts": {
+   "book": 1043104,
+   "premium": 8640,
+   "trade": 563207
+  },
+  "disorder": 51,
+  "duplicates": 0,
+  "events": 1614951,
+  "cache_bytes": 24937585
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260814.gz",
+  "sha256": "24fe529233714f126edadf2641c4a1530cd4c63be9e67cd97048300eab5b8aed",
+  "counts": {
+   "book": 20648620,
+   "premium": 8640,
+   "trade": 17179800
+  },
+  "disorder": 944,
+  "duplicates": 0,
+  "events": 37837060,
+  "cache_bytes": 540136322
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260815.gz",
+  "sha256": "753a86845f1b63c5431c425a6c00c13ca712852eb0da6787d9e6a772840ade3e",
+  "counts": {
+   "book": 20277756,
+   "premium": 8640,
+   "trade": 19729311
+  },
+  "disorder": 859,
+  "duplicates": 0,
+  "events": 40015707,
+  "cache_bytes": 564663083
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260816.gz",
+  "sha256": "97c0381959171ebd95adaa2e857bfb58801218708963ffb2157390228faf1b6b",
+  "counts": {
+   "book": 6152211,
+   "premium": 8640,
+   "trade": 4747848
+  },
+  "disorder": 278,
+  "duplicates": 0,
+  "events": 10908699,
+  "cache_bytes": 156851222
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260817.gz",
+  "sha256": "497448ea767fff23cc260411136901e2831ea0bf2322f7b585ca6217d4b9c333",
+  "counts": {
+   "book": 9981049,
+   "premium": 8640,
+   "trade": 8823087
+  },
+  "disorder": 434,
+  "duplicates": 0,
+  "events": 18812776,
+  "cache_bytes": 266893259
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260818.gz",
+  "sha256": "f6d58adb601dbd4e1f04357155d63df3efbd585e902ab61f460f835dcf047bf8",
+  "counts": {
+   "book": 11419182,
+   "premium": 8640,
+   "trade": 10262489
+  },
+  "disorder": 489,
+  "duplicates": 0,
+  "events": 21690311,
+  "cache_bytes": 307068667
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260819.gz",
+  "sha256": "1dd241df12fc69f402c0d615a12421b254a9b85c8f89ee8a2b97863dee621a06",
+  "counts": {
+   "book": 8726161,
+   "premium": 8640,
+   "trade": 7949121
+  },
+  "disorder": 435,
+  "duplicates": 0,
+  "events": 16683922,
+  "cache_bytes": 237442091
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260820.gz",
+  "sha256": "712ad0c9d83086cf9f515fb339189b19cf4b3615804764454587b93d8160e5f4",
+  "counts": {
+   "book": 8980555,
+   "premium": 8640,
+   "trade": 8471471
+  },
+  "disorder": 366,
+  "duplicates": 0,
+  "events": 17460666,
+  "cache_bytes": 247056643
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260821.gz",
+  "sha256": "ba3808cb037b472eb66d3cf2075e72a6e09fafe83b60e848135660bf5679d808",
+  "counts": {
+   "book": 4973358,
+   "premium": 8640,
+   "trade": 4392936
+  },
+  "disorder": 227,
+  "duplicates": 0,
+  "events": 9374934,
+  "cache_bytes": 134701682
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260822.gz",
+  "sha256": "ac2e481498395876e777d551843d12a98e67926ff671afb746fa154539fcd87e",
+  "counts": {
+   "book": 5256574,
+   "premium": 8642,
+   "trade": 4560128
+  },
+  "disorder": 331,
+  "duplicates": 0,
+  "events": 9825344,
+  "cache_bytes": 141769479
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260823.gz",
+  "sha256": "18b86f6e43da7ebf57031aeab6953b1b998aab52810111a9ac96e02fec6255eb",
+  "counts": {
+   "book": 2614012,
+   "premium": 8641,
+   "trade": 2176212
+  },
+  "disorder": 139,
+  "duplicates": 0,
+  "events": 4798865,
+  "cache_bytes": 69814431
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260824.gz",
+  "sha256": "80b6fa759b6ea832316827bdd9366ae22a1398a3589af45f7bff9abf36982c9a",
+  "counts": {
+   "book": 2213642,
+   "premium": 8640,
+   "trade": 1837219
+  },
+  "disorder": 92,
+  "duplicates": 0,
+  "events": 4059501,
+  "cache_bytes": 59101349
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260825.gz",
+  "sha256": "c4f6cf20bf348aa6864ff174925fea9de60cf63758f823808e245f82dbda58bd",
+  "counts": {
+   "book": 1876800,
+   "premium": 8640,
+   "trade": 1945334
+  },
+  "disorder": 100,
+  "duplicates": 0,
+  "events": 3830774,
+  "cache_bytes": 54965417
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260826.gz",
+  "sha256": "7240281baece6c06c582d239f1f0a210f244fefb796a0bb963066020645b82db",
+  "counts": {
+   "book": 1120569,
+   "premium": 8640,
+   "trade": 709436
+  },
+  "disorder": 78,
+  "duplicates": 0,
+  "events": 1838645,
+  "cache_bytes": 28764643
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260827.gz",
+  "sha256": "3f3eb3f5d68ce07e91e891e5f38b943fdc3d2b2392cf3a4668532b25cfbe83ab",
+  "counts": {
+   "book": 797769,
+   "premium": 8641,
+   "trade": 474039
+  },
+  "disorder": 56,
+  "duplicates": 0,
+  "events": 1280449,
+  "cache_bytes": 20685214
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260828.gz",
+  "sha256": "d8638485059d2c3aa79a584f9002b12503e514f1c2e52a67abd58d93c244be4f",
+  "counts": {
+   "book": 950409,
+   "premium": 8640,
+   "trade": 501723
+  },
+  "disorder": 65,
+  "duplicates": 0,
+  "events": 1460772,
+  "cache_bytes": 23470679
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260829.gz",
+  "sha256": "a6fe6e013332b1185091923a5d21261b8f4460cb73ef6a6bb25b5e88bc5dd9e7",
+  "counts": {
+   "book": 588470,
+   "premium": 8640,
+   "trade": 288265
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 885375,
+  "cache_bytes": 14482723
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260830.gz",
+  "sha256": "bafba8d9a8ae00cfe34ab250750b3b94db10224b57134ba567778b09250f76c0",
+  "counts": {
+   "book": 808201,
+   "premium": 8640,
+   "trade": 339675
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1156516,
+  "cache_bytes": 18905520
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260831.gz",
+  "sha256": "4edc686bacf408e89c817f0074b60580311ad4fe5260d93d8a57f7f10c8deb69",
+  "counts": {
+   "book": 885354,
+   "premium": 8640,
+   "trade": 389035
+  },
+  "disorder": 49,
+  "duplicates": 0,
+  "events": 1283029,
+  "cache_bytes": 20866922
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260901.gz",
+  "sha256": "45bc3574a8b36240752849ca34304598e8b571ccb461b60d410109e4da3b0f5f",
+  "counts": {
+   "book": 4541763,
+   "premium": 8640,
+   "trade": 2203671
+  },
+  "disorder": 215,
+  "duplicates": 0,
+  "events": 6754074,
+  "cache_bytes": 102917784
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260902.gz",
+  "sha256": "351cf9d8f416a5553d5c992813f5a51943bb536f1f8285b4d7fa662046f72fb3",
+  "counts": {
+   "book": 3567644,
+   "premium": 8640,
+   "trade": 2136626
+  },
+  "disorder": 160,
+  "duplicates": 0,
+  "events": 5712910,
+  "cache_bytes": 86436331
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260903.gz",
+  "sha256": "e1c038f81411015f29d347dee18c3c8350c58ded96518a02b54fbfb5bf147c7a",
+  "counts": {
+   "book": 1500782,
+   "premium": 8640,
+   "trade": 669318
+  },
+  "disorder": 70,
+  "duplicates": 0,
+  "events": 2178740,
+  "cache_bytes": 34252031
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260904.gz",
+  "sha256": "99067ce13799dd008d81ba93e2ef43b2bbb54e1c480eb4a2da14ecdda8474fa8",
+  "counts": {
+   "book": 735470,
+   "premium": 8641,
+   "trade": 514454
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1258565,
+  "cache_bytes": 19381280
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260905.gz",
+  "sha256": "bdef052283f1c4e3c8d88f44422bf9e244ea97b5a406e480d32d60f0c9520b24",
+  "counts": {
+   "book": 709991,
+   "premium": 8640,
+   "trade": 305468
+  },
+  "disorder": 27,
+  "duplicates": 0,
+  "events": 1024099,
+  "cache_bytes": 17210628
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260906.gz",
+  "sha256": "3bcd80595fbd48324d7b9858d37afe40f35051e053f4d472d9a2bd452c27f227",
+  "counts": {
+   "book": 682037,
+   "premium": 8640,
+   "trade": 293693
+  },
+  "disorder": 36,
+  "duplicates": 0,
+  "events": 984370,
+  "cache_bytes": 16637296
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260907.gz",
+  "sha256": "d6868af4a7b610d18353c927febc3fcec05e798bf5a0b78296b269e21e4bdf69",
+  "counts": {
+   "book": 2102521,
+   "premium": 8640,
+   "trade": 1086073
+  },
+  "disorder": 162,
+  "duplicates": 0,
+  "events": 3197234,
+  "cache_bytes": 49250939
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260908.gz",
+  "sha256": "e42c6f205d0c1735506f9d2920e09eded19fad2f25ef8196823e78f211b50348",
+  "counts": {
+   "book": 1146044,
+   "premium": 8640,
+   "trade": 550539
+  },
+  "disorder": 175,
+  "duplicates": 0,
+  "events": 1705223,
+  "cache_bytes": 27113903
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aceusdt_20260909.gz",
+  "sha256": "0b77d2e0c9a9b78c1c3df493dd698c7e11b718f600f1703c01d7484f72ce5004",
+  "counts": {
+   "book": 682473,
+   "premium": 4195,
+   "trade": 184620
+  },
+  "disorder": 85,
+  "duplicates": 0,
+  "events": 871288,
+  "cache_bytes": 13381276
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260812.gz",
+  "sha256": "24eedab45f7b5d506f3bf182c072f66830f6d085010274280ddb8c7c988d3fab",
+  "counts": {
+   "book": 571913,
+   "premium": 8640,
+   "trade": 158638
+  },
+  "disorder": 30,
+  "duplicates": 0,
+  "events": 739191,
+  "cache_bytes": 11409121
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260813.gz",
+  "sha256": "5a6485765999e7e5108248ac92f3e991e9b2f856a5d5b0273b335548c3318380",
+  "counts": {
+   "book": 482952,
+   "premium": 8640,
+   "trade": 125253
+  },
+  "disorder": 18,
+  "duplicates": 0,
+  "events": 616845,
+  "cache_bytes": 9747394
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260814.gz",
+  "sha256": "246f7b050ace1444b6a4bc0522f1955593433cedceee4ec79821fed7a9972ecc",
+  "counts": {
+   "book": 792620,
+   "premium": 8640,
+   "trade": 185192
+  },
+  "disorder": 24,
+  "duplicates": 0,
+  "events": 986452,
+  "cache_bytes": 15360668
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260815.gz",
+  "sha256": "8ac4ef477b7e42aa95a94989ad21005615943dd19b1cfb776c1d0a2d0aa15237",
+  "counts": {
+   "book": 592520,
+   "premium": 8640,
+   "trade": 116299
+  },
+  "disorder": 41,
+  "duplicates": 0,
+  "events": 717459,
+  "cache_bytes": 11228144
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260816.gz",
+  "sha256": "ecc28f391fe48cc2a9c800e9cdc7a72e5e3e7fc6839676684cfe1a974c68c456",
+  "counts": {
+   "book": 662535,
+   "premium": 8640,
+   "trade": 148532
+  },
+  "disorder": 33,
+  "duplicates": 0,
+  "events": 819707,
+  "cache_bytes": 12578136
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260817.gz",
+  "sha256": "d1e020c96367ee26fc55948a4ca07bab56429db005a63c12aae9bcf862bb9583",
+  "counts": {
+   "book": 698076,
+   "premium": 8640,
+   "trade": 174632
+  },
+  "disorder": 20,
+  "duplicates": 0,
+  "events": 881348,
+  "cache_bytes": 13522447
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260818.gz",
+  "sha256": "127e35d8ae6b4948927a0a07ddccea055ed6874ff92b1a39e3f2218c4363fda4",
+  "counts": {
+   "book": 566342,
+   "premium": 8640,
+   "trade": 142458
+  },
+  "disorder": 15,
+  "duplicates": 0,
+  "events": 717440,
+  "cache_bytes": 11324399
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260819.gz",
+  "sha256": "198cc18150ded9c8040b125d822ff199971f6eb15100e15c5e549e6fa5782aed",
+  "counts": {
+   "book": 922046,
+   "premium": 8640,
+   "trade": 230105
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 1160791,
+  "cache_bytes": 17767650
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260820.gz",
+  "sha256": "fc14d200d8454438f5bbfecf00e3161f22959d3d07c3d6ebac3d722b671da3af",
+  "counts": {
+   "book": 1037124,
+   "premium": 8640,
+   "trade": 270757
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 1316521,
+  "cache_bytes": 20087501
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260821.gz",
+  "sha256": "f57ffe1abc27f19e4b8126a8acc9bfee5a0880a75d5506ed2ebdb01080354a2f",
+  "counts": {
+   "book": 2148351,
+   "premium": 8640,
+   "trade": 566022
+  },
+  "disorder": 89,
+  "duplicates": 0,
+  "events": 2723013,
+  "cache_bytes": 39678773
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260822.gz",
+  "sha256": "514fb5421fe595e5dcdb275e63eaf3863167cbc31bf894e84df78e97782b6278",
+  "counts": {
+   "book": 2154301,
+   "premium": 8642,
+   "trade": 648244
+  },
+  "disorder": 89,
+  "duplicates": 0,
+  "events": 2811187,
+  "cache_bytes": 41241224
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260823.gz",
+  "sha256": "4e6ca12fd0de7bd71fa21a5427ecf0ceb4ca7b0ec6f5aa208efb22f2ed98ffb1",
+  "counts": {
+   "book": 1554652,
+   "premium": 8641,
+   "trade": 458157
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 2021450,
+  "cache_bytes": 29534180
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260824.gz",
+  "sha256": "3508fb30f5c98adfa6af6929182d838aeb8b7ba91692159821cc76705a5d8c3f",
+  "counts": {
+   "book": 1994504,
+   "premium": 8640,
+   "trade": 448948
+  },
+  "disorder": 59,
+  "duplicates": 0,
+  "events": 2452092,
+  "cache_bytes": 35708274
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260825.gz",
+  "sha256": "4d13db408b5574a4e1c6f9e9bb71aa3b98d5c9b273a1c71089c2990bc48487b4",
+  "counts": {
+   "book": 1869506,
+   "premium": 8640,
+   "trade": 433965
+  },
+  "disorder": 80,
+  "duplicates": 0,
+  "events": 2312111,
+  "cache_bytes": 33926189
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260826.gz",
+  "sha256": "f8ca6dc6f8dc8f3ebfb4c8f4f4d928dabf01ce8d479d44430dd4d4e8c1f7de70",
+  "counts": {
+   "book": 1287878,
+   "premium": 8640,
+   "trade": 290703
+  },
+  "disorder": 66,
+  "duplicates": 0,
+  "events": 1587221,
+  "cache_bytes": 23858792
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260827.gz",
+  "sha256": "9cbd6971499b5cc291bc9a75740e4eedca0eaee56dcd8d5e86b652cdebd547d5",
+  "counts": {
+   "book": 1218789,
+   "premium": 8641,
+   "trade": 271068
+  },
+  "disorder": 47,
+  "duplicates": 0,
+  "events": 1498498,
+  "cache_bytes": 22456780
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260828.gz",
+  "sha256": "4208afe9002aece0b5708387dffa484d111b619e843a514062f8eac79c7a20a3",
+  "counts": {
+   "book": 1399687,
+   "premium": 8640,
+   "trade": 314921
+  },
+  "disorder": 63,
+  "duplicates": 0,
+  "events": 1723248,
+  "cache_bytes": 25650361
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260829.gz",
+  "sha256": "74f0e5973cf017316c689099851ef843454ec9f32aa11019fa7be1602f4486f0",
+  "counts": {
+   "book": 572577,
+   "premium": 8640,
+   "trade": 159394
+  },
+  "disorder": 25,
+  "duplicates": 0,
+  "events": 740611,
+  "cache_bytes": 11350588
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260830.gz",
+  "sha256": "0ee431ca2933ae800960ed902e82009ff10e92bfcbee4a87ed8269bf9622b773",
+  "counts": {
+   "book": 856738,
+   "premium": 8640,
+   "trade": 218449
+  },
+  "disorder": 37,
+  "duplicates": 0,
+  "events": 1083827,
+  "cache_bytes": 16452071
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260831.gz",
+  "sha256": "9e892a3c2d5059ca0e20d4e29e55da03dda4ed678ef6741f9f7680b6b53d019a",
+  "counts": {
+   "book": 1149954,
+   "premium": 8640,
+   "trade": 260940
+  },
+  "disorder": 61,
+  "duplicates": 0,
+  "events": 1419534,
+  "cache_bytes": 21619260
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260901.gz",
+  "sha256": "d594f193ccf8b507683036905a67cda1300aabb74d79f46a3d87bf6e8e2a3ceb",
+  "counts": {
+   "book": 1516695,
+   "premium": 8640,
+   "trade": 402132
+  },
+  "disorder": 71,
+  "duplicates": 0,
+  "events": 1927467,
+  "cache_bytes": 28369945
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260902.gz",
+  "sha256": "ed71322700ede5eb746a56c4d569683cd78d67df177a9c961ff440924394d947",
+  "counts": {
+   "book": 1401676,
+   "premium": 8640,
+   "trade": 388312
+  },
+  "disorder": 80,
+  "duplicates": 0,
+  "events": 1798628,
+  "cache_bytes": 26652186
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260903.gz",
+  "sha256": "36162be2f1040bc27fb1232c7c1284e73c20a8ec8d2d3aa786ed972a955be3c6",
+  "counts": {
+   "book": 1939728,
+   "premium": 8640,
+   "trade": 725250
+  },
+  "disorder": 90,
+  "duplicates": 0,
+  "events": 2673618,
+  "cache_bytes": 37578469
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260904.gz",
+  "sha256": "f6765e205a735f02567bf22e530d5d69080d96225447135785b4a5e6f049ab00",
+  "counts": {
+   "book": 1154539,
+   "premium": 8641,
+   "trade": 320537
+  },
+  "disorder": 68,
+  "duplicates": 0,
+  "events": 1483717,
+  "cache_bytes": 22240164
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260905.gz",
+  "sha256": "4301bdaac9d530a9be836aeb3f2353ed04c9b5b7698a589f8810eb37c86a9635",
+  "counts": {
+   "book": 914666,
+   "premium": 8640,
+   "trade": 284207
+  },
+  "disorder": 41,
+  "duplicates": 0,
+  "events": 1207513,
+  "cache_bytes": 17775296
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260906.gz",
+  "sha256": "868fba2874fc2a19e3e69232506a50ee7082ce8b4c1bcb127a8c88f99227e136",
+  "counts": {
+   "book": 1145186,
+   "premium": 8640,
+   "trade": 314384
+  },
+  "disorder": 46,
+  "duplicates": 0,
+  "events": 1468210,
+  "cache_bytes": 21740084
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260907.gz",
+  "sha256": "94b15cfc9c00cc2925268f7df8b1c7f57975625d8ee812b18133d6a560a6b101",
+  "counts": {
+   "book": 1298722,
+   "premium": 8640,
+   "trade": 386223
+  },
+  "disorder": 125,
+  "duplicates": 0,
+  "events": 1693585,
+  "cache_bytes": 25008547
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260908.gz",
+  "sha256": "9535b1ea9c4273e7bed5858436e3ee7b319da62036b6f1bd279ee12674051871",
+  "counts": {
+   "book": 1300658,
+   "premium": 8640,
+   "trade": 440863
+  },
+  "disorder": 186,
+  "duplicates": 0,
+  "events": 1750161,
+  "cache_bytes": 25833216
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/aptusdt_20260909.gz",
+  "sha256": "f1ec2cb1aa3889c2479524cc791ca9daff77a922b958ea7106f3d997dae25574",
+  "counts": {
+   "book": 510054,
+   "premium": 4195,
+   "trade": 168250
+  },
+  "disorder": 70,
+  "duplicates": 0,
+  "events": 682499,
+  "cache_bytes": 10105957
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260812.gz",
+  "sha256": "69693e42c90db048ed51ee22742f68acbbdfb1c11f3399592a4f19fde371c1fd",
+  "counts": {
+   "book": 118532,
+   "premium": 8640,
+   "trade": 25018
+  },
+  "disorder": 3,
+  "duplicates": 0,
+  "events": 152190,
+  "cache_bytes": 2683653
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260813.gz",
+  "sha256": "4d4a4d88373a0472880e9b46201a23ca8d1456719d4d235e5c53349bcd3d1642",
+  "counts": {
+   "book": 100246,
+   "premium": 8640,
+   "trade": 26633
+  },
+  "disorder": 3,
+  "duplicates": 0,
+  "events": 135519,
+  "cache_bytes": 2381312
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260814.gz",
+  "sha256": "70fb19be7e91041bf3cedf8c838ab49be8bd03f67f883fb757100aa79cde33bb",
+  "counts": {
+   "book": 133240,
+   "premium": 8640,
+   "trade": 28402
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 170282,
+  "cache_bytes": 2891811
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260815.gz",
+  "sha256": "5f0d745452c2ee182f1f97495c54ff5d526cf719f4f303af29d3123da8c2be31",
+  "counts": {
+   "book": 113970,
+   "premium": 8640,
+   "trade": 28808
+  },
+  "disorder": 3,
+  "duplicates": 0,
+  "events": 151418,
+  "cache_bytes": 2556149
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260816.gz",
+  "sha256": "bd3452eeceb2d6a3ff77188ed9b30ebd6c5f5b4637cbb218937305808b3ebd75",
+  "counts": {
+   "book": 100452,
+   "premium": 8640,
+   "trade": 25759
+  },
+  "disorder": 3,
+  "duplicates": 0,
+  "events": 134851,
+  "cache_bytes": 2319911
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260817.gz",
+  "sha256": "0148da9d718f5629b2a6be43b5ee2d0ae1c35b28e378b51e8f61e4d840440cfa",
+  "counts": {
+   "book": 94371,
+   "premium": 8640,
+   "trade": 20134
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 123145,
+  "cache_bytes": 2135706
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260818.gz",
+  "sha256": "0666b7df52821f6b623be1454d2560babbaf80ba7b4301506a3149c0c76d59ed",
+  "counts": {
+   "book": 99310,
+   "premium": 8640,
+   "trade": 18772
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 126722,
+  "cache_bytes": 2181763
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260819.gz",
+  "sha256": "7f2eea88e23fcaac5483ccc6fddcae79b99860463e79a9059f388c68999cbea7",
+  "counts": {
+   "book": 113011,
+   "premium": 8640,
+   "trade": 21659
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 143310,
+  "cache_bytes": 2533559
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260820.gz",
+  "sha256": "e054b51645dd7d6d055a12207cd0ea48171d4ed44405662e610d3bf9b709edd8",
+  "counts": {
+   "book": 126747,
+   "premium": 8640,
+   "trade": 31352
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 166739,
+  "cache_bytes": 2914849
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260821.gz",
+  "sha256": "679d4da1b48fdfe007efc5948594fbd49ac830b7277f52a3dfa011db60199b1f",
+  "counts": {
+   "book": 154471,
+   "premium": 8640,
+   "trade": 40270
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 203381,
+  "cache_bytes": 3457732
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260822.gz",
+  "sha256": "58fee86b491d2d016ff6021abbe3dbd010f68033b47456919c7ec650ce8c7a4c",
+  "counts": {
+   "book": 226915,
+   "premium": 8642,
+   "trade": 83721
+  },
+  "disorder": 19,
+  "duplicates": 0,
+  "events": 319278,
+  "cache_bytes": 5471655
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260823.gz",
+  "sha256": "e3da4e280e92c8bf6b6735cd2384f7fdbe2372a779056641bad20f5caeef3254",
+  "counts": {
+   "book": 159110,
+   "premium": 8641,
+   "trade": 61062
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 228813,
+  "cache_bytes": 3917157
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260824.gz",
+  "sha256": "0f0ae81c6c7ca74e91376f65db8c3ab7aae2dbe91426ecbd0e391c89febb4a9a",
+  "counts": {
+   "book": 137878,
+   "premium": 8640,
+   "trade": 36263
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 182781,
+  "cache_bytes": 3224433
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260825.gz",
+  "sha256": "dbae29f2680350d99bafe5553fdb38d1b7c1b11b9896d04d309916937fd4aab4",
+  "counts": {
+   "book": 128114,
+   "premium": 8640,
+   "trade": 28725
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 165479,
+  "cache_bytes": 2857688
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260826.gz",
+  "sha256": "596dfe544bb8529f27c761b3d73031b134aa9abf95aecc7815143d79ab80d96c",
+  "counts": {
+   "book": 144392,
+   "premium": 8640,
+   "trade": 35145
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 188177,
+  "cache_bytes": 3124331
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260827.gz",
+  "sha256": "5c9c6df4042de08477676bc8e72b5ac11ee5d57a8794e27a4ed03f2cdcf036a7",
+  "counts": {
+   "book": 105291,
+   "premium": 8641,
+   "trade": 22994
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 136926,
+  "cache_bytes": 2222016
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260828.gz",
+  "sha256": "1c9d4626b30cb52c32d364f6dc1604520576a1ce48259cba8bff3041505d1aa4",
+  "counts": {
+   "book": 114622,
+   "premium": 8640,
+   "trade": 28425
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 151687,
+  "cache_bytes": 2512758
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260829.gz",
+  "sha256": "cae6f2ddd4202a5cbbf7028b426a7be341946eba694da249f0e190bc44ec0045",
+  "counts": {
+   "book": 68426,
+   "premium": 8640,
+   "trade": 27707
+  },
+  "disorder": 2,
+  "duplicates": 0,
+  "events": 104773,
+  "cache_bytes": 1816176
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260830.gz",
+  "sha256": "b5347b790e1d2a71c1880df173544b2854ecd6e4010846fc27518608b8167bb6",
+  "counts": {
+   "book": 204512,
+   "premium": 8640,
+   "trade": 84495
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 297647,
+  "cache_bytes": 4812405
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260831.gz",
+  "sha256": "80855482154b548f2b7e44b09938d886f31546c7755a1132f82c5ebbd2c2a065",
+  "counts": {
+   "book": 105092,
+   "premium": 8640,
+   "trade": 37457
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 151189,
+  "cache_bytes": 2587520
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260901.gz",
+  "sha256": "4de4534a0fbbbc543cfff2dc7d9a98c20c9e9f4d72d94a2143adf4e05308fb33",
+  "counts": {
+   "book": 72984,
+   "premium": 8640,
+   "trade": 22711
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 104335,
+  "cache_bytes": 1831614
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260902.gz",
+  "sha256": "638442f62b09385320ddd71a3cb93e36809cecedb9d98fa973dd991b68e548f0",
+  "counts": {
+   "book": 75017,
+   "premium": 8640,
+   "trade": 19427
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 103084,
+  "cache_bytes": 1777619
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260903.gz",
+  "sha256": "cbcade772d5e326e8015fcdffe65c8994ad31d336bf50702fa2ba0216d3ae5f3",
+  "counts": {
+   "book": 79816,
+   "premium": 8640,
+   "trade": 20893
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 109349,
+  "cache_bytes": 1923819
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260904.gz",
+  "sha256": "300ccbfcffd91183b44d13d825c988c37e5ebe1f664860490fa1e2686286cc44",
+  "counts": {
+   "book": 83346,
+   "premium": 8641,
+   "trade": 20642
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 112629,
+  "cache_bytes": 1942681
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260905.gz",
+  "sha256": "4ea5f0a085ff9ca4688358e61a68dc5bbd05d602075e68e02756a898a807b277",
+  "counts": {
+   "book": 76404,
+   "premium": 8640,
+   "trade": 26644
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 111688,
+  "cache_bytes": 1935504
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260906.gz",
+  "sha256": "60493dc3402345513ecc52f720e825c2a23f004fc24eac51bc4e80959204e8d8",
+  "counts": {
+   "book": 89185,
+   "premium": 8640,
+   "trade": 25536
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 123361,
+  "cache_bytes": 2122252
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260907.gz",
+  "sha256": "a5c4f06aebcae534a37a97a7e29cbb5d6cf6e19ab5c968c989d361657ae68b21",
+  "counts": {
+   "book": 97853,
+   "premium": 8640,
+   "trade": 32478
+  },
+  "disorder": 15,
+  "duplicates": 0,
+  "events": 138971,
+  "cache_bytes": 2345955
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260908.gz",
+  "sha256": "5bece757c25bcc9d431a95d766e2b15f65141290988dd0bc757f8279215af089",
+  "counts": {
+   "book": 80660,
+   "premium": 8640,
+   "trade": 23595
+  },
+  "disorder": 32,
+  "duplicates": 0,
+  "events": 112895,
+  "cache_bytes": 1968096
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/dymusdt_20260909.gz",
+  "sha256": "25abdd33075e42539ceeedaad19c7ae13ac562b009b50e60eacb850f1f986f41",
+  "counts": {
+   "book": 37326,
+   "premium": 4195,
+   "trade": 9982
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 51503,
+  "cache_bytes": 901887
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260812.gz",
+  "sha256": "d06566fadd277f6d6b948dc4e239bad68279ab4e723bb0db1ac742497b2b8cda",
+  "counts": {
+   "book": 184022,
+   "premium": 8640,
+   "trade": 34226
+  },
+  "disorder": 3,
+  "duplicates": 0,
+  "events": 226888,
+  "cache_bytes": 3591019
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260813.gz",
+  "sha256": "3e813df42f4f1d8848eabb9ef26aae1f4f8e2e3aa17f73717b83012672f23de2",
+  "counts": {
+   "book": 111452,
+   "premium": 8640,
+   "trade": 17973
+  },
+  "disorder": 5,
+  "duplicates": 0,
+  "events": 138065,
+  "cache_bytes": 2282518
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260814.gz",
+  "sha256": "0d2230c2df85cf40f024510628bd75c6086cc9b5ca35908758826e27441372e4",
+  "counts": {
+   "book": 112926,
+   "premium": 8640,
+   "trade": 16501
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 138067,
+  "cache_bytes": 2270100
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260815.gz",
+  "sha256": "521254b7352a33054aa84ad57b2c6c3167e536af2e4ad1c808023b99cd13b209",
+  "counts": {
+   "book": 198686,
+   "premium": 8640,
+   "trade": 41465
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 248791,
+  "cache_bytes": 3834824
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260816.gz",
+  "sha256": "620ea6b13f4f1a23e62445fa24d5ec3d8e590690b7bfeb9e60a205a77973dec9",
+  "counts": {
+   "book": 118516,
+   "premium": 8640,
+   "trade": 15366
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 142522,
+  "cache_bytes": 2308945
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260817.gz",
+  "sha256": "801f834b8a286a6b5aea821d0b2cb9b98a08d282937dcb4cbbdf98517d6c62d4",
+  "counts": {
+   "book": 140777,
+   "premium": 8640,
+   "trade": 23732
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 173149,
+  "cache_bytes": 2761450
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260818.gz",
+  "sha256": "fda78c433f272ac59aca3f64c38138ed6324361029e41daf8cba298f6a1749a0",
+  "counts": {
+   "book": 99278,
+   "premium": 8640,
+   "trade": 17333
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 125251,
+  "cache_bytes": 2061330
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260819.gz",
+  "sha256": "d6b7ace06cc7ef9944c2bab3a1953d802216bdda0f1ba56c49c3897e1662df61",
+  "counts": {
+   "book": 123407,
+   "premium": 8640,
+   "trade": 22411
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 154458,
+  "cache_bytes": 2531471
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260820.gz",
+  "sha256": "d2c8a2e22c925e1fd68d256411e6f389082980d60a762e578fb192de90a6b421",
+  "counts": {
+   "book": 233178,
+   "premium": 8640,
+   "trade": 62345
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 304163,
+  "cache_bytes": 4752026
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260821.gz",
+  "sha256": "876f78a6467ac0e49541c7172716a042199cbd87b803ae2b25c50bc51b388918",
+  "counts": {
+   "book": 244529,
+   "premium": 8640,
+   "trade": 58906
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 312075,
+  "cache_bytes": 4902743
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260822.gz",
+  "sha256": "bce0db58082075f2057d01cc72a7852febf78b43edeb6d4df114595dbedbe84a",
+  "counts": {
+   "book": 296048,
+   "premium": 8642,
+   "trade": 96756
+  },
+  "disorder": 20,
+  "duplicates": 0,
+  "events": 401446,
+  "cache_bytes": 6368180
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260823.gz",
+  "sha256": "3f4ce199748c727d709c6c58055fc506a07c6ecfbae4bf02ff02aa31092430a2",
+  "counts": {
+   "book": 153870,
+   "premium": 8641,
+   "trade": 30382
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 192893,
+  "cache_bytes": 3124589
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260824.gz",
+  "sha256": "452260b46e5e9534642a1c6758c410b4d35a079eadf1d5f7ef9088f3a1ccdbfb",
+  "counts": {
+   "book": 222157,
+   "premium": 8640,
+   "trade": 44360
+  },
+  "disorder": 16,
+  "duplicates": 0,
+  "events": 275157,
+  "cache_bytes": 4423342
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260825.gz",
+  "sha256": "29f5fd8967564f12fa85469918f9d7e95c232b85497f6bea5b17c5edd3859964",
+  "counts": {
+   "book": 172384,
+   "premium": 8640,
+   "trade": 29043
+  },
+  "disorder": 15,
+  "duplicates": 0,
+  "events": 210067,
+  "cache_bytes": 3393236
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260826.gz",
+  "sha256": "4f2d1c7306600115da9821f56bf2d837f7c28f1a46f4b8270afa3d196a51caa1",
+  "counts": {
+   "book": 326802,
+   "premium": 8640,
+   "trade": 86927
+  },
+  "disorder": 22,
+  "duplicates": 0,
+  "events": 422369,
+  "cache_bytes": 6332840
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260827.gz",
+  "sha256": "a0a22d55a4a7edbe570d2ba229f2fff10029cf0e157fc243689f14673fdf560a",
+  "counts": {
+   "book": 409943,
+   "premium": 8641,
+   "trade": 107493
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 526077,
+  "cache_bytes": 7734418
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260828.gz",
+  "sha256": "0d45c9c2e434623b21db87a524e8bfe64f3e07d7b4a9904ad35b352b7c7c9dfb",
+  "counts": {
+   "book": 407997,
+   "premium": 8640,
+   "trade": 102352
+  },
+  "disorder": 22,
+  "duplicates": 0,
+  "events": 518989,
+  "cache_bytes": 7745655
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260829.gz",
+  "sha256": "81fbd269236103f4d0dbd1fa0883c83587299539ad4abee3b66bf240f7eee324",
+  "counts": {
+   "book": 166260,
+   "premium": 8640,
+   "trade": 33473
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 208373,
+  "cache_bytes": 3069303
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260830.gz",
+  "sha256": "4bce1d520e34aebe9c7067813ce57923511e5d0caebddfd3cbaf885dbc4296ce",
+  "counts": {
+   "book": 136046,
+   "premium": 8640,
+   "trade": 29571
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 174257,
+  "cache_bytes": 2705165
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260831.gz",
+  "sha256": "aee2c335ff5dcd8a20b63a734a4c295dc79e78f6af87dc42ba1e5a2ebcb855d8",
+  "counts": {
+   "book": 163344,
+   "premium": 8640,
+   "trade": 30707
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 202691,
+  "cache_bytes": 3103171
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260901.gz",
+  "sha256": "1a961f3828c96e8d4e53ed4d2ff86efe6f7ad45cd774b6f8cb990e3d712efed0",
+  "counts": {
+   "book": 119320,
+   "premium": 8640,
+   "trade": 27910
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 155870,
+  "cache_bytes": 2497392
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260902.gz",
+  "sha256": "7f95dfe0538c35fb7e82918760d061895635167d4aebe1d1dcf1b84cdd434c66",
+  "counts": {
+   "book": 110858,
+   "premium": 8640,
+   "trade": 25749
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 145247,
+  "cache_bytes": 2339475
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260903.gz",
+  "sha256": "7b46a777d0f99e983707a973881f009ae0dea339c19e246fb7d8da9e645ddb7f",
+  "counts": {
+   "book": 256993,
+   "premium": 8640,
+   "trade": 78416
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 344049,
+  "cache_bytes": 5172021
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260904.gz",
+  "sha256": "19fd70fec2adfbc3ccdbb92bae3a42bcc1b1c1f598e9a72aff12f36ce2d09f6f",
+  "counts": {
+   "book": 371542,
+   "premium": 8641,
+   "trade": 104322
+  },
+  "disorder": 25,
+  "duplicates": 0,
+  "events": 484505,
+  "cache_bytes": 7225659
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260905.gz",
+  "sha256": "61c88e22d2ba4d425cd59d6f1cef2ee2563c0197ef7b8b6beffdee3f38f492bf",
+  "counts": {
+   "book": 128753,
+   "premium": 8640,
+   "trade": 33946
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 171339,
+  "cache_bytes": 2628495
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260906.gz",
+  "sha256": "1363a42df34ff51b0fe26355ddd558f3e0c09b6c8f35a83bc780aadec821f22f",
+  "counts": {
+   "book": 119099,
+   "premium": 8640,
+   "trade": 35193
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 162932,
+  "cache_bytes": 2538321
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260907.gz",
+  "sha256": "0f18b4d69ffaf4b07bde6d2e1bcfbae6880f49be0fecdc30e2e49838fec5d177",
+  "counts": {
+   "book": 137871,
+   "premium": 8640,
+   "trade": 33372
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 179883,
+  "cache_bytes": 2778158
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260908.gz",
+  "sha256": "d0432192f7b74d25cf64dc19accf4bf06cef8b0b6d0d828de1e088af0ad6d48d",
+  "counts": {
+   "book": 110910,
+   "premium": 8640,
+   "trade": 29246
+  },
+  "disorder": 27,
+  "duplicates": 0,
+  "events": 148796,
+  "cache_bytes": 2347870
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/merlusdt_20260909.gz",
+  "sha256": "0f5884c751777f568072c36051f1610d99e048a8853c72ddb2a18c69e75bfe46",
+  "counts": {
+   "book": 41494,
+   "premium": 4195,
+   "trade": 10105
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 55794,
+  "cache_bytes": 906626
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260812.gz",
+  "sha256": "8554d74cd8c7864f52c5e5705bf02682a642c020cd5c79f7757a9b5f998525c2",
+  "counts": {
+   "book": 314390,
+   "premium": 8640,
+   "trade": 109846
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 432876,
+  "cache_bytes": 6842008
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260813.gz",
+  "sha256": "95f9ba12682046c0324a400c19017be00347bf9e8299d433abe1e56f5bb3cbed",
+  "counts": {
+   "book": 192758,
+   "premium": 8640,
+   "trade": 79592
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 280990,
+  "cache_bytes": 4509350
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260814.gz",
+  "sha256": "7403f3c6e0fd6186ded4d17ae2c9870fbcfbe998448477371a1413ff61a75c05",
+  "counts": {
+   "book": 198301,
+   "premium": 8640,
+   "trade": 76834
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 283775,
+  "cache_bytes": 4571621
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260815.gz",
+  "sha256": "0193d3ee7103b23b173c4d3e2bf41de7940eae8b18153a57f21327f51b8947ea",
+  "counts": {
+   "book": 180146,
+   "premium": 8640,
+   "trade": 68609
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 257395,
+  "cache_bytes": 4096689
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260816.gz",
+  "sha256": "6f0b7e8498dad82c88fd08b65f3599904fdf74de79e9abf2c0916c648051ce9e",
+  "counts": {
+   "book": 220663,
+   "premium": 8640,
+   "trade": 97908
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 327211,
+  "cache_bytes": 5099803
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260817.gz",
+  "sha256": "8a8a5da653927dee433cabcf32f456a6ff9ec01faaf19a5cd237d9a746ed2207",
+  "counts": {
+   "book": 512072,
+   "premium": 8640,
+   "trade": 246955
+  },
+  "disorder": 27,
+  "duplicates": 0,
+  "events": 767667,
+  "cache_bytes": 11513239
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260818.gz",
+  "sha256": "2bb11def08a0ff3b44872bc6598f21c214b17fed137359c2679be37fd2dcf845",
+  "counts": {
+   "book": 659663,
+   "premium": 8640,
+   "trade": 284612
+  },
+  "disorder": 47,
+  "duplicates": 0,
+  "events": 952915,
+  "cache_bytes": 14222639
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260819.gz",
+  "sha256": "51b339455e678dbe9cdb0787b346d291cd466b834ab0479bca45a2e1e6d7bb24",
+  "counts": {
+   "book": 890546,
+   "premium": 8640,
+   "trade": 324318
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 1223504,
+  "cache_bytes": 18562060
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260820.gz",
+  "sha256": "b7fbcaa9447e981f5c0bd969662bb7a459c79e4b93afad4862889ea5fcef52ab",
+  "counts": {
+   "book": 811153,
+   "premium": 8640,
+   "trade": 429424
+  },
+  "disorder": 44,
+  "duplicates": 0,
+  "events": 1249217,
+  "cache_bytes": 18813567
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260821.gz",
+  "sha256": "5a991acf21a54873a5fcda9dab9b8dd48cd8d87d82f94ab07d11a0b0dd852765",
+  "counts": {
+   "book": 1134233,
+   "premium": 8640,
+   "trade": 615992
+  },
+  "disorder": 74,
+  "duplicates": 0,
+  "events": 1758865,
+  "cache_bytes": 26465795
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260822.gz",
+  "sha256": "6135d0f2c7b72c3b283b2f902c3c7bcf089f3d84ca4b11e76377301fc77334f9",
+  "counts": {
+   "book": 711368,
+   "premium": 8642,
+   "trade": 468726
+  },
+  "disorder": 35,
+  "duplicates": 0,
+  "events": 1188736,
+  "cache_bytes": 18176029
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260823.gz",
+  "sha256": "a3755eb5328c02a7510cc42e1a0a12643da600791729b71c4606ab4288bf6bc4",
+  "counts": {
+   "book": 1666930,
+   "premium": 8641,
+   "trade": 1427986
+  },
+  "disorder": 94,
+  "duplicates": 0,
+  "events": 3103557,
+  "cache_bytes": 43040729
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260824.gz",
+  "sha256": "b21cad65cec70e1ef5a8d1c55a73bbe19b93b0d0eddd79acaf71668848b72351",
+  "counts": {
+   "book": 2826073,
+   "premium": 8640,
+   "trade": 1714438
+  },
+  "disorder": 145,
+  "duplicates": 0,
+  "events": 4549151,
+  "cache_bytes": 64195070
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260825.gz",
+  "sha256": "112a169b9b0dd7ab1c4c2fdef3e3514ed5f7d03fcee3ed0b249bcb6a14dee036",
+  "counts": {
+   "book": 1191180,
+   "premium": 8640,
+   "trade": 769056
+  },
+  "disorder": 64,
+  "duplicates": 0,
+  "events": 1968876,
+  "cache_bytes": 28152814
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260826.gz",
+  "sha256": "fb7437dc9fc512850153630ecd3153072cffc333b14668179aacaa6ff34efb79",
+  "counts": {
+   "book": 732713,
+   "premium": 8640,
+   "trade": 472311
+  },
+  "disorder": 32,
+  "duplicates": 0,
+  "events": 1213664,
+  "cache_bytes": 17620344
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260827.gz",
+  "sha256": "e76e3412372838741e1fbe74984d4ad40610986d554579c23693694484911da4",
+  "counts": {
+   "book": 1456081,
+   "premium": 8641,
+   "trade": 322547
+  },
+  "disorder": 57,
+  "duplicates": 0,
+  "events": 1787269,
+  "cache_bytes": 27454298
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260828.gz",
+  "sha256": "b62d7742fdeb7374d6ad5ab0c2b66a51f5f8fc49d068873486bddfec9d53e9ec",
+  "counts": {
+   "book": 1392873,
+   "premium": 8640,
+   "trade": 334293
+  },
+  "disorder": 73,
+  "duplicates": 0,
+  "events": 1735806,
+  "cache_bytes": 26683493
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260829.gz",
+  "sha256": "2256491d13239962ace3610418be44d58bbfa9a616b9c8bc8d785fadd6b7b878",
+  "counts": {
+   "book": 338876,
+   "premium": 8640,
+   "trade": 143219
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 490735,
+  "cache_bytes": 7717969
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260830.gz",
+  "sha256": "e36e8c067d0671eda53253f1e21279303cea127cb0c4ae75c5e44eb7a902fb14",
+  "counts": {
+   "book": 377762,
+   "premium": 8640,
+   "trade": 155347
+  },
+  "disorder": 15,
+  "duplicates": 0,
+  "events": 541749,
+  "cache_bytes": 8442530
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260831.gz",
+  "sha256": "d454fa0c956d6839b0f7b2a6cecc0f900d417a4fe3fa1ca7e8cc76309eba85c5",
+  "counts": {
+   "book": 1100589,
+   "premium": 8640,
+   "trade": 363988
+  },
+  "disorder": 62,
+  "duplicates": 0,
+  "events": 1473217,
+  "cache_bytes": 22097463
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260901.gz",
+  "sha256": "79e2a583833a3082e62b05cc7be462f8beb2072b9ea4b991230139c270e9663e",
+  "counts": {
+   "book": 534372,
+   "premium": 8640,
+   "trade": 196460
+  },
+  "disorder": 27,
+  "duplicates": 0,
+  "events": 739472,
+  "cache_bytes": 11767818
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260902.gz",
+  "sha256": "10b337e576f5a257354d2b8aa2aece91a3b38c703b32ec703c19ffa8550eecb3",
+  "counts": {
+   "book": 619354,
+   "premium": 8640,
+   "trade": 211149
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 839143,
+  "cache_bytes": 12949832
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260903.gz",
+  "sha256": "98b7357ba5536627c6ec23bbd4f1fb9a8578257d1326a4d407d0364d86d89ae4",
+  "counts": {
+   "book": 780320,
+   "premium": 8640,
+   "trade": 303617
+  },
+  "disorder": 46,
+  "duplicates": 0,
+  "events": 1092577,
+  "cache_bytes": 16821007
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260904.gz",
+  "sha256": "617dff3ed191febcdcda52440fd51fbfcb776dedc61fcd33acf027a075779009",
+  "counts": {
+   "book": 567011,
+   "premium": 8641,
+   "trade": 270437
+  },
+  "disorder": 37,
+  "duplicates": 0,
+  "events": 846089,
+  "cache_bytes": 13318869
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260905.gz",
+  "sha256": "41cbc0ee6310e4c4076759112b5d0dc61d167a91077c95f7cfb3ae223b5dc7f8",
+  "counts": {
+   "book": 351299,
+   "premium": 8640,
+   "trade": 148400
+  },
+  "disorder": 27,
+  "duplicates": 0,
+  "events": 508339,
+  "cache_bytes": 8069641
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260906.gz",
+  "sha256": "9f9a0e9ccb904c42551697f2f5c04f66bf699bdc5d117c6ea7ee2cab984149ac",
+  "counts": {
+   "book": 579302,
+   "premium": 8640,
+   "trade": 251405
+  },
+  "disorder": 29,
+  "duplicates": 0,
+  "events": 839347,
+  "cache_bytes": 13008952
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260907.gz",
+  "sha256": "968c837c2d8c4a097b42d0e6d3a6c5c70684ad7d3099c2089a564a52d369e91f",
+  "counts": {
+   "book": 539660,
+   "premium": 8640,
+   "trade": 193491
+  },
+  "disorder": 56,
+  "duplicates": 0,
+  "events": 741791,
+  "cache_bytes": 11614607
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260908.gz",
+  "sha256": "65d7e3f84e6809acd1d6bedb9e8fabbcd92fd5d9f39978b95fab1863c2c2bb28",
+  "counts": {
+   "book": 537298,
+   "premium": 8640,
+   "trade": 179751
+  },
+  "disorder": 71,
+  "duplicates": 0,
+  "events": 725689,
+  "cache_bytes": 11528863
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/morphousdt_20260909.gz",
+  "sha256": "0fbd80edb91f001acd8bb90663da20d7fdce55603277d709d15e13e18e905231",
+  "counts": {
+   "book": 321448,
+   "premium": 4195,
+   "trade": 103040
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 428683,
+  "cache_bytes": 6676410
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260812.gz",
+  "sha256": "a7428f7bd3ed3948a766577043e9e1ffa7fccd2bdd9e661bf7646ec42f498979",
+  "counts": {
+   "book": 489636,
+   "premium": 8640,
+   "trade": 78431
+  },
+  "disorder": 21,
+  "duplicates": 0,
+  "events": 576707,
+  "cache_bytes": 8737550
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260813.gz",
+  "sha256": "2be2a0e18be57f026a4c5abdd02c09ea0fcb25231ebfdaf5c71b038057042ed4",
+  "counts": {
+   "book": 496898,
+   "premium": 8640,
+   "trade": 66835
+  },
+  "disorder": 29,
+  "duplicates": 0,
+  "events": 572373,
+  "cache_bytes": 8615999
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260814.gz",
+  "sha256": "f2b6b56340f2b0bec2ad52b26979b0174897534acb3399d41d68353c31cb1d01",
+  "counts": {
+   "book": 511623,
+   "premium": 8640,
+   "trade": 54004
+  },
+  "disorder": 21,
+  "duplicates": 0,
+  "events": 574267,
+  "cache_bytes": 8607245
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260815.gz",
+  "sha256": "dfed6d3e086e8085109fd0f42e03496977de84b39450c999611e65f1ec4a3bd0",
+  "counts": {
+   "book": 325576,
+   "premium": 8640,
+   "trade": 72549
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 406765,
+  "cache_bytes": 6468747
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260816.gz",
+  "sha256": "7b6d552448dc22e02b210df05bfdb5199452364a486c0aa3bbb0a4bccd670741",
+  "counts": {
+   "book": 483134,
+   "premium": 8640,
+   "trade": 48251
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 540025,
+  "cache_bytes": 7944103
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260817.gz",
+  "sha256": "5c4bf9d4ee97af8e61836ffeb3ff2c2247259ab673b7a6b8a12e572f25d2232b",
+  "counts": {
+   "book": 345171,
+   "premium": 8640,
+   "trade": 47489
+  },
+  "disorder": 16,
+  "duplicates": 0,
+  "events": 401300,
+  "cache_bytes": 6179032
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260818.gz",
+  "sha256": "f2c437df8f2f1f05fb1862db21facbdf571570acab75f7baeeec9304cc9b43be",
+  "counts": {
+   "book": 198134,
+   "premium": 8640,
+   "trade": 51627
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 258401,
+  "cache_bytes": 4283713
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260819.gz",
+  "sha256": "aa29d8fed32cb949ffb53a4f3cb728374639afb9a47c2d6df30353c3ee1dc544",
+  "counts": {
+   "book": 344760,
+   "premium": 8640,
+   "trade": 94445
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 447845,
+  "cache_bytes": 7419909
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260820.gz",
+  "sha256": "6d3fedbf153a99593062b9f29fd3597c10b3b4a22ab0fba6206cdd9f6ecfbbea",
+  "counts": {
+   "book": 3103464,
+   "premium": 8640,
+   "trade": 1009920
+  },
+  "disorder": 123,
+  "duplicates": 0,
+  "events": 4122024,
+  "cache_bytes": 62206379
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260821.gz",
+  "sha256": "16f2fe4031d8130714c9ade85039e8d91e7d7dceb7871905446a47145abdb685",
+  "counts": {
+   "book": 5127322,
+   "premium": 8640,
+   "trade": 2403080
+  },
+  "disorder": 209,
+  "duplicates": 0,
+  "events": 7539042,
+  "cache_bytes": 111970921
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260822.gz",
+  "sha256": "28d89d238be4676a70e34943d154be93991fc62d28ae083d7bf94e6daa1a5f12",
+  "counts": {
+   "book": 2501615,
+   "premium": 8642,
+   "trade": 1023357
+  },
+  "disorder": 122,
+  "duplicates": 0,
+  "events": 3533614,
+  "cache_bytes": 53528456
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260823.gz",
+  "sha256": "2ac3dc345929df13927759708150cabc5ba274a68d04a2b6bd4fb6d54f8b14ce",
+  "counts": {
+   "book": 1314361,
+   "premium": 8641,
+   "trade": 340644
+  },
+  "disorder": 66,
+  "duplicates": 0,
+  "events": 1663646,
+  "cache_bytes": 25463515
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260824.gz",
+  "sha256": "d147873041fb85250a348a4d63798304ec015cb130b351673e64ef28617dda18",
+  "counts": {
+   "book": 1181832,
+   "premium": 8640,
+   "trade": 242055
+  },
+  "disorder": 67,
+  "duplicates": 0,
+  "events": 1432527,
+  "cache_bytes": 22156843
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260825.gz",
+  "sha256": "7e8cd2f26cde06aa68e0b3fec8cb513f296c4b0346e6a5cd0096557d844022c2",
+  "counts": {
+   "book": 1316759,
+   "premium": 8640,
+   "trade": 190267
+  },
+  "disorder": 98,
+  "duplicates": 0,
+  "events": 1515666,
+  "cache_bytes": 22853228
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260826.gz",
+  "sha256": "9ade06a37a6650383ee2c6225e947abf85592d8b7d9d4e0b36efed55478ff57a",
+  "counts": {
+   "book": 1574955,
+   "premium": 8640,
+   "trade": 161951
+  },
+  "disorder": 130,
+  "duplicates": 0,
+  "events": 1745546,
+  "cache_bytes": 25009140
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260827.gz",
+  "sha256": "b0140a122c8701e65e2de78578d44caed30803aa1ce7cfab81746fb71ea93ad6",
+  "counts": {
+   "book": 1417301,
+   "premium": 8641,
+   "trade": 154487
+  },
+  "disorder": 96,
+  "duplicates": 0,
+  "events": 1580429,
+  "cache_bytes": 22487744
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260828.gz",
+  "sha256": "a16b77c0d1ea271a4e1aa5c3cef7779513eaf54845bc7a389a8fa172481a1be0",
+  "counts": {
+   "book": 827840,
+   "premium": 8640,
+   "trade": 171501
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 1007981,
+  "cache_bytes": 15319855
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260829.gz",
+  "sha256": "60abc2b97eb303373296e3a1c0178a17a1aca957821e8cbce0840d55e0f4d13a",
+  "counts": {
+   "book": 408136,
+   "premium": 8640,
+   "trade": 93134
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 509910,
+  "cache_bytes": 7786392
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260830.gz",
+  "sha256": "5f3f65a3b179b177addc8be874fc6c8e5e5cfc4b1728802716bd343a7b4b5930",
+  "counts": {
+   "book": 768621,
+   "premium": 8640,
+   "trade": 111677
+  },
+  "disorder": 52,
+  "duplicates": 0,
+  "events": 888938,
+  "cache_bytes": 13015444
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260831.gz",
+  "sha256": "f2189eda5117cc4e98fe771609f7d6711ecd0a9262f226c204f7248c3d7a2e9b",
+  "counts": {
+   "book": 553770,
+   "premium": 8640,
+   "trade": 128317
+  },
+  "disorder": 39,
+  "duplicates": 0,
+  "events": 690727,
+  "cache_bytes": 10783018
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260901.gz",
+  "sha256": "93e000a2be449e78dd3a34c71249bee2b66e8e961ee1a01698421b54b7986547",
+  "counts": {
+   "book": 415365,
+   "premium": 8640,
+   "trade": 124585
+  },
+  "disorder": 32,
+  "duplicates": 0,
+  "events": 548590,
+  "cache_bytes": 8857605
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260902.gz",
+  "sha256": "a700da310a77d3ac6217d8a10f7588dbe43e088bc2a864df842d9f311d251e3b",
+  "counts": {
+   "book": 480871,
+   "premium": 8640,
+   "trade": 106795
+  },
+  "disorder": 41,
+  "duplicates": 0,
+  "events": 596306,
+  "cache_bytes": 9262043
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260903.gz",
+  "sha256": "0cdda87078c77d01bad5bac4036e919faca3cd287262ef46cc1629d56030c780",
+  "counts": {
+   "book": 496347,
+   "premium": 8640,
+   "trade": 142198
+  },
+  "disorder": 38,
+  "duplicates": 0,
+  "events": 647185,
+  "cache_bytes": 10193469
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260904.gz",
+  "sha256": "f64f8cbdc50946b383447182657fb448ad9633aef196a9c22bdea5b6234c0c71",
+  "counts": {
+   "book": 929356,
+   "premium": 8641,
+   "trade": 129431
+  },
+  "disorder": 78,
+  "duplicates": 0,
+  "events": 1067428,
+  "cache_bytes": 15497570
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260905.gz",
+  "sha256": "60ddb90889d459e0f2d70dd73410381143d577d45e65224534a88bf373324cfe",
+  "counts": {
+   "book": 706218,
+   "premium": 8640,
+   "trade": 123073
+  },
+  "disorder": 33,
+  "duplicates": 0,
+  "events": 837931,
+  "cache_bytes": 12324794
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260906.gz",
+  "sha256": "978213b486c9564849c071ef4941a671b5cfb4b395eacfcdc1a470f501fa56a2",
+  "counts": {
+   "book": 432031,
+   "premium": 8640,
+   "trade": 128965
+  },
+  "disorder": 25,
+  "duplicates": 0,
+  "events": 569636,
+  "cache_bytes": 9208431
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260907.gz",
+  "sha256": "bd021759f5d75d0bb3c658a8f0bd87169d81e7497716eaddbcca93dd02aacfc3",
+  "counts": {
+   "book": 441991,
+   "premium": 8640,
+   "trade": 125893
+  },
+  "disorder": 45,
+  "duplicates": 0,
+  "events": 576524,
+  "cache_bytes": 9333408
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260908.gz",
+  "sha256": "dbbfa6bb26d1d1faa12dc7c459eb5b9f915585832b932024d4fff711a71a1323",
+  "counts": {
+   "book": 478007,
+   "premium": 8640,
+   "trade": 136420
+  },
+  "disorder": 94,
+  "duplicates": 0,
+  "events": 623067,
+  "cache_bytes": 10154085
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/neirousdt_20260909.gz",
+  "sha256": "a16c98ff64303e9e11c142b32917674e4b53f63778917a8438332fd4b8712f3a",
+  "counts": {
+   "book": 198149,
+   "premium": 4195,
+   "trade": 53920
+  },
+  "disorder": 32,
+  "duplicates": 0,
+  "events": 256264,
+  "cache_bytes": 4212131
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260812.gz",
+  "sha256": "6fafe626b4519b5bfb52923b7548407064dab6ff3f3b58c6283c09b2a20ba0ce",
+  "counts": {
+   "book": 2381884,
+   "premium": 8640,
+   "trade": 538380
+  },
+  "disorder": 115,
+  "duplicates": 0,
+  "events": 2928904,
+  "cache_bytes": 41281100
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260813.gz",
+  "sha256": "3492b58e3b4a883bc9db7760e0615f54ce281bc298f7ee61ceb041493ab67117",
+  "counts": {
+   "book": 824397,
+   "premium": 8640,
+   "trade": 268083
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 1101120,
+  "cache_bytes": 16352260
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260814.gz",
+  "sha256": "0d7a4d81c985799241ed3460454eaff26f043c86e2db9c9acc2752de2121938a",
+  "counts": {
+   "book": 711034,
+   "premium": 8640,
+   "trade": 190054
+  },
+  "disorder": 34,
+  "duplicates": 0,
+  "events": 909728,
+  "cache_bytes": 13477261
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260815.gz",
+  "sha256": "af5da837649ce3ecf4dbb6208f5cdae9e13b7d311ac1cbd8d1f612d2bd392777",
+  "counts": {
+   "book": 3509426,
+   "premium": 8640,
+   "trade": 800907
+  },
+  "disorder": 145,
+  "duplicates": 0,
+  "events": 4318973,
+  "cache_bytes": 61106054
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260816.gz",
+  "sha256": "4234c4b9ad1cfac16c3bc3dff289166ea472782bf85d8fd868ca5a18874d1ec3",
+  "counts": {
+   "book": 970021,
+   "premium": 8640,
+   "trade": 301029
+  },
+  "disorder": 48,
+  "duplicates": 0,
+  "events": 1279690,
+  "cache_bytes": 19124807
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260817.gz",
+  "sha256": "36a135669c4dd1f78e44d2289d27a9c3306ca9e5821bcd002bd7ce0487d9c321",
+  "counts": {
+   "book": 1153919,
+   "premium": 8640,
+   "trade": 455009
+  },
+  "disorder": 56,
+  "duplicates": 0,
+  "events": 1617568,
+  "cache_bytes": 23527472
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260818.gz",
+  "sha256": "c1540b615b7dc341869b4f18f5d2a641039f0b95bd6151da60f52c7f7e386ab5",
+  "counts": {
+   "book": 683957,
+   "premium": 8640,
+   "trade": 270267
+  },
+  "disorder": 30,
+  "duplicates": 0,
+  "events": 962864,
+  "cache_bytes": 14303571
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260819.gz",
+  "sha256": "f1573d1f1df3db5328a9fb88279e4a55777ba04c05c001f0f711eb4de1b5de0b",
+  "counts": {
+   "book": 608401,
+   "premium": 8640,
+   "trade": 197369
+  },
+  "disorder": 27,
+  "duplicates": 0,
+  "events": 814410,
+  "cache_bytes": 12544139
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260820.gz",
+  "sha256": "8a8d319395ce35498ddcbfb0af25776da63e1a5cd1755ffb3345238f4bebc8a0",
+  "counts": {
+   "book": 747800,
+   "premium": 8640,
+   "trade": 208114
+  },
+  "disorder": 35,
+  "duplicates": 0,
+  "events": 964554,
+  "cache_bytes": 14509373
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260821.gz",
+  "sha256": "e9e6da81437c7bd9d349dbbd3622ff5d3f3f0b1d485f595952da7ac8867da50b",
+  "counts": {
+   "book": 795836,
+   "premium": 8640,
+   "trade": 292182
+  },
+  "disorder": 36,
+  "duplicates": 0,
+  "events": 1096658,
+  "cache_bytes": 16569371
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260822.gz",
+  "sha256": "3ecc7b1f3b7f2278d28ef81b1c64c52e00c472134ef30ef74a63bc303d2e1068",
+  "counts": {
+   "book": 881623,
+   "premium": 8642,
+   "trade": 290657
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1180922,
+  "cache_bytes": 18031624
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260823.gz",
+  "sha256": "687d475e0d91f3e7dc001eb2722d24bbd953c532a9ee553a604df57728247b81",
+  "counts": {
+   "book": 417452,
+   "premium": 8641,
+   "trade": 132605
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 558698,
+  "cache_bytes": 8735230
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260824.gz",
+  "sha256": "2cc2d891dd8c724d020a6d680c8a1b3fb8d32e324a0deb021396a7c5aeeec096",
+  "counts": {
+   "book": 387864,
+   "premium": 8640,
+   "trade": 122062
+  },
+  "disorder": 20,
+  "duplicates": 0,
+  "events": 518566,
+  "cache_bytes": 8168137
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260825.gz",
+  "sha256": "d0ca42b7b8451ff7aeefdcbe131cedc791942ca4a76254daba8edff4baadeaa4",
+  "counts": {
+   "book": 334630,
+   "premium": 8640,
+   "trade": 112130
+  },
+  "disorder": 18,
+  "duplicates": 0,
+  "events": 455400,
+  "cache_bytes": 7261113
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260826.gz",
+  "sha256": "7dccf1b5f3f7ec67014d02ca1a40d97f4ad4347ed94a8d795f451ffaff03bafc",
+  "counts": {
+   "book": 386396,
+   "premium": 8640,
+   "trade": 134958
+  },
+  "disorder": 17,
+  "duplicates": 0,
+  "events": 529994,
+  "cache_bytes": 8413352
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260827.gz",
+  "sha256": "75edbf3caaed86d67d2980ede891b32d418f8d2fa76ee18dcd20b21ad2b8dea6",
+  "counts": {
+   "book": 232606,
+   "premium": 8641,
+   "trade": 66188
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 307435,
+  "cache_bytes": 5068606
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260828.gz",
+  "sha256": "661651980d3ce8c1c11b1bb6b1dd706dc73b80416e71ba7a54699a1b2b47f48b",
+  "counts": {
+   "book": 754069,
+   "premium": 8640,
+   "trade": 217952
+  },
+  "disorder": 51,
+  "duplicates": 0,
+  "events": 980661,
+  "cache_bytes": 14700923
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260829.gz",
+  "sha256": "0f8eb43965e6705c5fd7b1cdd1c3abcf4387cebdb7f52e384276f9d41a92e828",
+  "counts": {
+   "book": 4388747,
+   "premium": 8640,
+   "trade": 1623453
+  },
+  "disorder": 178,
+  "duplicates": 0,
+  "events": 6020840,
+  "cache_bytes": 87691405
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260830.gz",
+  "sha256": "eb8cede5d788f6004e29a15b8ec4b3555609a69bceb9dccf49f2014009b3cb6f",
+  "counts": {
+   "book": 1735912,
+   "premium": 8640,
+   "trade": 658436
+  },
+  "disorder": 77,
+  "duplicates": 0,
+  "events": 2402988,
+  "cache_bytes": 35750364
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260831.gz",
+  "sha256": "6d8b4dfb70455768feaeee36d3e7bbbf4c78d3349d9ea93c693ea503373ce3d0",
+  "counts": {
+   "book": 695698,
+   "premium": 8640,
+   "trade": 289142
+  },
+  "disorder": 34,
+  "duplicates": 0,
+  "events": 993480,
+  "cache_bytes": 14731717
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260901.gz",
+  "sha256": "927a74dd971ab18a2b0b8a9f19b2e575c8c70186f186666dd7ec113f00bf4e90",
+  "counts": {
+   "book": 397643,
+   "premium": 8640,
+   "trade": 111547
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 517830,
+  "cache_bytes": 8177820
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260902.gz",
+  "sha256": "f9feb750f2536b9c826d1b1296047cf720fd4ec4a45da89483fa941511892793",
+  "counts": {
+   "book": 437484,
+   "premium": 8640,
+   "trade": 95653
+  },
+  "disorder": 16,
+  "duplicates": 0,
+  "events": 541777,
+  "cache_bytes": 8389585
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260903.gz",
+  "sha256": "8fa75f4e6164018fba8c5b1c6df50fc66b7c51d570fba7d72578e8f8048bf512",
+  "counts": {
+   "book": 713366,
+   "premium": 8640,
+   "trade": 85778
+  },
+  "disorder": 47,
+  "duplicates": 0,
+  "events": 807784,
+  "cache_bytes": 11812777
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260904.gz",
+  "sha256": "6c1deb5dffb893721878377c86cdd1b622fd17b3d21ff4a26b2c7c0e7e26f79d",
+  "counts": {
+   "book": 779924,
+   "premium": 8641,
+   "trade": 97570
+  },
+  "disorder": 55,
+  "duplicates": 0,
+  "events": 886135,
+  "cache_bytes": 12861413
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260905.gz",
+  "sha256": "9a257c02b21161125f226b20f60faee6ec660d544966f591078564b285e67bf1",
+  "counts": {
+   "book": 1159173,
+   "premium": 8640,
+   "trade": 121823
+  },
+  "disorder": 75,
+  "duplicates": 0,
+  "events": 1289636,
+  "cache_bytes": 18036712
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260906.gz",
+  "sha256": "d908a452d50480eda8d2fb65090e2391de9bf26a5fae3daf4489cbbce2f732ed",
+  "counts": {
+   "book": 396742,
+   "premium": 8640,
+   "trade": 101464
+  },
+  "disorder": 20,
+  "duplicates": 0,
+  "events": 506846,
+  "cache_bytes": 8055535
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260907.gz",
+  "sha256": "ee27f02ffa8b0407ea65fe71208333730b68efae77ed32abeb458b9ccfd99019",
+  "counts": {
+   "book": 360687,
+   "premium": 8640,
+   "trade": 78758
+  },
+  "disorder": 47,
+  "duplicates": 0,
+  "events": 448085,
+  "cache_bytes": 7105821
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260908.gz",
+  "sha256": "0976e6bf2769d82fbf6e01c998713191bcde910c4df67a5cda9cd1bb9cb26c6d",
+  "counts": {
+   "book": 334092,
+   "premium": 8640,
+   "trade": 67059
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 409791,
+  "cache_bytes": 6315515
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/nilusdt_20260909.gz",
+  "sha256": "3fb3f0231233f43a0f46ee9d91a0335fb4ed1a035fc7ce5d55f076ce10a9c0c0",
+  "counts": {
+   "book": 110363,
+   "premium": 4195,
+   "trade": 22944
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 137502,
+  "cache_bytes": 2287774
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260812.gz",
+  "sha256": "c154e77fd04322112fa621125f456bec1efb0e88078a4d35de1d7e06f6f5359b",
+  "counts": {
+   "book": 866065,
+   "premium": 8640,
+   "trade": 228864
+  },
+  "disorder": 44,
+  "duplicates": 0,
+  "events": 1103569,
+  "cache_bytes": 16538375
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260813.gz",
+  "sha256": "b8ea96c25189100ff6e0cd27511ae7dcde7215ea3f5bf011ff41a8edfe8865c3",
+  "counts": {
+   "book": 770139,
+   "premium": 8640,
+   "trade": 183299
+  },
+  "disorder": 33,
+  "duplicates": 0,
+  "events": 962078,
+  "cache_bytes": 14622237
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260814.gz",
+  "sha256": "4c3fa7325db1a631aff25ecada436d61a77c098f2e2371b7300b6430f9e7bc71",
+  "counts": {
+   "book": 676400,
+   "premium": 8640,
+   "trade": 162787
+  },
+  "disorder": 20,
+  "duplicates": 0,
+  "events": 847827,
+  "cache_bytes": 13023935
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260815.gz",
+  "sha256": "8ac095fe70b9fc258c0d30d6a21cf8d2dbe04ce554070d56f52a915fd9d8a5f4",
+  "counts": {
+   "book": 530768,
+   "premium": 8640,
+   "trade": 129639
+  },
+  "disorder": 16,
+  "duplicates": 0,
+  "events": 669047,
+  "cache_bytes": 10420324
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260816.gz",
+  "sha256": "e9dfa291c0ec6252c4e5afaa8eece8fb8a302ff0bd143b75d23e1d4a2927a4b7",
+  "counts": {
+   "book": 553721,
+   "premium": 8640,
+   "trade": 142134
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 704495,
+  "cache_bytes": 10891716
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260817.gz",
+  "sha256": "eb399acba3050eadcdd8c81b60e779fd10970ae100ed065ff7f3edc3dd1f41bb",
+  "counts": {
+   "book": 818018,
+   "premium": 8640,
+   "trade": 195689
+  },
+  "disorder": 39,
+  "duplicates": 0,
+  "events": 1022347,
+  "cache_bytes": 15777591
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260818.gz",
+  "sha256": "ed95c575bb0dfa8a61362f0782f530a2c72200c6b4d31079de11488c2f498d91",
+  "counts": {
+   "book": 887977,
+   "premium": 8640,
+   "trade": 219486
+  },
+  "disorder": 37,
+  "duplicates": 0,
+  "events": 1116103,
+  "cache_bytes": 16859110
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260819.gz",
+  "sha256": "8c90e44f83ac000f00470014ae6d4aaf175cc828404aee74c92b43c3ae111457",
+  "counts": {
+   "book": 1398466,
+   "premium": 8640,
+   "trade": 315702
+  },
+  "disorder": 64,
+  "duplicates": 0,
+  "events": 1722808,
+  "cache_bytes": 26238502
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260820.gz",
+  "sha256": "d3ae767f392e09b2938da0bc5cafeb7671bdce40dc4125c12854f7ea4615a6b3",
+  "counts": {
+   "book": 2070402,
+   "premium": 8640,
+   "trade": 646284
+  },
+  "disorder": 84,
+  "duplicates": 0,
+  "events": 2725326,
+  "cache_bytes": 39798038
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260821.gz",
+  "sha256": "a95c2c0f980221655757806e47dd9b34be4e7e854b3e5f5d52e9d9f9b2b90dae",
+  "counts": {
+   "book": 3763848,
+   "premium": 8640,
+   "trade": 1412707
+  },
+  "disorder": 151,
+  "duplicates": 0,
+  "events": 5185195,
+  "cache_bytes": 73552405
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260822.gz",
+  "sha256": "ef4c7a83e5a5b8b59c9189176a823ae205b81dfd1d92516b5808af22d522c47e",
+  "counts": {
+   "book": 3541947,
+   "premium": 8642,
+   "trade": 1437490
+  },
+  "disorder": 137,
+  "duplicates": 0,
+  "events": 4988079,
+  "cache_bytes": 70572815
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260823.gz",
+  "sha256": "a334c76a133c8a947a838958b1af29e9dad585e6096f7e9011f34fdbbdb20777",
+  "counts": {
+   "book": 3649520,
+   "premium": 8641,
+   "trade": 1951864
+  },
+  "disorder": 233,
+  "duplicates": 0,
+  "events": 5610025,
+  "cache_bytes": 77635593
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260824.gz",
+  "sha256": "970e1c8d305e5f0cd8b132b93531867e0d967ad939d17d9059854424cdbd2bc2",
+  "counts": {
+   "book": 3441688,
+   "premium": 8640,
+   "trade": 1641280
+  },
+  "disorder": 151,
+  "duplicates": 0,
+  "events": 5091608,
+  "cache_bytes": 72091882
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260825.gz",
+  "sha256": "501b0b61ad9c64434278171568d72ee2da76ea88cdf8d21b79dd3065f41a2465",
+  "counts": {
+   "book": 3305280,
+   "premium": 8640,
+   "trade": 1507745
+  },
+  "disorder": 181,
+  "duplicates": 0,
+  "events": 4821665,
+  "cache_bytes": 68235114
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260826.gz",
+  "sha256": "d1ddd986401bb9cf2688cad4a2e5bae5d724c8e58d9b347d8c6914899d725f01",
+  "counts": {
+   "book": 1968939,
+   "premium": 8640,
+   "trade": 757317
+  },
+  "disorder": 93,
+  "duplicates": 0,
+  "events": 2734896,
+  "cache_bytes": 39219621
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260827.gz",
+  "sha256": "16be9f6109e6a885a6b351d2438043c8e40a77e831ab2c28eefc677bc0ebb47a",
+  "counts": {
+   "book": 1719379,
+   "premium": 8641,
+   "trade": 735354
+  },
+  "disorder": 83,
+  "duplicates": 0,
+  "events": 2463374,
+  "cache_bytes": 35195098
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260828.gz",
+  "sha256": "4c24088690d359b9a6ac29041d20138165e8e9f4126746f1c442f2a69dffeaea",
+  "counts": {
+   "book": 1521640,
+   "premium": 8640,
+   "trade": 662502
+  },
+  "disorder": 90,
+  "duplicates": 0,
+  "events": 2192782,
+  "cache_bytes": 31489147
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260829.gz",
+  "sha256": "559258894436ecf54adbc9e518a57934d5de4203d05d03ca13b38c9d22b42958",
+  "counts": {
+   "book": 799897,
+   "premium": 8640,
+   "trade": 352038
+  },
+  "disorder": 28,
+  "duplicates": 0,
+  "events": 1160575,
+  "cache_bytes": 16698254
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260830.gz",
+  "sha256": "61e7d49b3664b9c9ad3762c90e8ae3c580364326487fb0cb32d843a8b9a24628",
+  "counts": {
+   "book": 1008904,
+   "premium": 8640,
+   "trade": 452171
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1469715,
+  "cache_bytes": 21233085
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260831.gz",
+  "sha256": "4712c7881a4ca9deee2be0649973ac6243194f0981b77eef5490e582fb5d43fc",
+  "counts": {
+   "book": 1116850,
+   "premium": 8640,
+   "trade": 378810
+  },
+  "disorder": 52,
+  "duplicates": 0,
+  "events": 1504300,
+  "cache_bytes": 22386104
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260901.gz",
+  "sha256": "ea8f838448f7251e700b643de059c841d057732515218b0b7a45b759a738c259",
+  "counts": {
+   "book": 1336269,
+   "premium": 8640,
+   "trade": 420866
+  },
+  "disorder": 60,
+  "duplicates": 0,
+  "events": 1765775,
+  "cache_bytes": 25903262
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260902.gz",
+  "sha256": "9e8ff49f3314fce77856f66423592af01e7ce63f16c8d83c01691f787ccc10b5",
+  "counts": {
+   "book": 1308329,
+   "premium": 8640,
+   "trade": 407583
+  },
+  "disorder": 61,
+  "duplicates": 0,
+  "events": 1724552,
+  "cache_bytes": 25330235
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260903.gz",
+  "sha256": "202834cc5e16e6c06a3cc833761932c7abc364cd826d69930151680f2a1f7d1c",
+  "counts": {
+   "book": 1781018,
+   "premium": 8640,
+   "trade": 551024
+  },
+  "disorder": 75,
+  "duplicates": 0,
+  "events": 2340682,
+  "cache_bytes": 33999066
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260904.gz",
+  "sha256": "6db5ef755b3b03fb9b8b9b6aab29ebc19449d6a4edb018bb55228ef3c1f4546f",
+  "counts": {
+   "book": 2045092,
+   "premium": 8641,
+   "trade": 739644
+  },
+  "disorder": 98,
+  "duplicates": 0,
+  "events": 2793377,
+  "cache_bytes": 39989474
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260905.gz",
+  "sha256": "12e0bc20db88cd04733a49457f23237306d9073046b545fe854a44950ac7ad9d",
+  "counts": {
+   "book": 1173952,
+   "premium": 8640,
+   "trade": 457475
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 1640067,
+  "cache_bytes": 23885046
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260906.gz",
+  "sha256": "13b10f015e31d7eed24378945f703328294f31743d61c1c3243f42add7e125cb",
+  "counts": {
+   "book": 1447420,
+   "premium": 8640,
+   "trade": 547464
+  },
+  "disorder": 65,
+  "duplicates": 0,
+  "events": 2003524,
+  "cache_bytes": 29052317
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260907.gz",
+  "sha256": "b2b750192c56175943dfd62ed897e43767d16cdeec35e275d1f3803c0c0f66e8",
+  "counts": {
+   "book": 1629539,
+   "premium": 8640,
+   "trade": 555187
+  },
+  "disorder": 141,
+  "duplicates": 0,
+  "events": 2193366,
+  "cache_bytes": 31702239
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260908.gz",
+  "sha256": "b3879cf05c286930b5d48651916e1752b22a56c685ed7f387fdbe9a184d17b86",
+  "counts": {
+   "book": 1608638,
+   "premium": 8640,
+   "trade": 581751
+  },
+  "disorder": 198,
+  "duplicates": 0,
+  "events": 2199029,
+  "cache_bytes": 32092573
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/penguusdt_20260909.gz",
+  "sha256": "bd7594bcb64602d3e4d05eaef256f46a3d795f6979d19ffdb4e787642c5a8fac",
+  "counts": {
+   "book": 710762,
+   "premium": 4195,
+   "trade": 236764
+  },
+  "disorder": 80,
+  "duplicates": 0,
+  "events": 951721,
+  "cache_bytes": 13991378
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260812.gz",
+  "sha256": "9111eb7abbb9bfe3b8a5ce8acdbbe5d3aaf167e08868c312fa435c9d937d12ac",
+  "counts": {
+   "book": 530293,
+   "premium": 8640,
+   "trade": 173113
+  },
+  "disorder": 26,
+  "duplicates": 0,
+  "events": 712046,
+  "cache_bytes": 10682431
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260813.gz",
+  "sha256": "bc2fb1397ebbdcb061626f45e2740cc94d7aaa6e4c3e424dcf559f5f0110fcf6",
+  "counts": {
+   "book": 864270,
+   "premium": 8640,
+   "trade": 149142
+  },
+  "disorder": 57,
+  "duplicates": 0,
+  "events": 1022052,
+  "cache_bytes": 14751424
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260814.gz",
+  "sha256": "e36ca73dce6bc07730caebc339ce39b12b4465f688286b1dca3a70877980f1e0",
+  "counts": {
+   "book": 380869,
+   "premium": 8640,
+   "trade": 126926
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 516435,
+  "cache_bytes": 7680889
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260815.gz",
+  "sha256": "720973f60e0c04486c15e4c7ea643ad9b4ca2cf2c94f6108408a7c5212392e69",
+  "counts": {
+   "book": 409980,
+   "premium": 8640,
+   "trade": 115793
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 534413,
+  "cache_bytes": 7911145
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260816.gz",
+  "sha256": "633097f5257d5b3e2621282cfcb51f82f8629b2dcdfa9d1d364688adae75e34a",
+  "counts": {
+   "book": 321932,
+   "premium": 8640,
+   "trade": 90723
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 421295,
+  "cache_bytes": 6379147
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260817.gz",
+  "sha256": "439020ada3bbd9297cc2c8da7a0208b2e78c5ea6735a3c231a95e6ebea82f23a",
+  "counts": {
+   "book": 308754,
+   "premium": 8640,
+   "trade": 88974
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 406368,
+  "cache_bytes": 6267959
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260818.gz",
+  "sha256": "cb88bffcf829f9e13f9f1a92a1dc25e61e5738264a64bd8eb5b5b8d7a61ab2e2",
+  "counts": {
+   "book": 571624,
+   "premium": 8640,
+   "trade": 268697
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 848961,
+  "cache_bytes": 12314558
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260819.gz",
+  "sha256": "5c9362b9a722b3d751b3a1e0ab509e7ed1a667d24740f1bd7c630919d6ae0419",
+  "counts": {
+   "book": 455185,
+   "premium": 8640,
+   "trade": 191589
+  },
+  "disorder": 19,
+  "duplicates": 0,
+  "events": 655414,
+  "cache_bytes": 9843186
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260820.gz",
+  "sha256": "89191ed2b5803c38528813adcd22fed72ce97abcc41ff0fc543b56fcb7d04bf1",
+  "counts": {
+   "book": 2319704,
+   "premium": 8640,
+   "trade": 1240659
+  },
+  "disorder": 117,
+  "duplicates": 0,
+  "events": 3569003,
+  "cache_bytes": 49478076
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260821.gz",
+  "sha256": "f3c24bb7ecaa6ebaf99e73322451144fd2ff11b71225d9fbe2ae36deb4c94ebd",
+  "counts": {
+   "book": 3528894,
+   "premium": 8640,
+   "trade": 2518603
+  },
+  "disorder": 163,
+  "duplicates": 0,
+  "events": 6056137,
+  "cache_bytes": 81673185
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260822.gz",
+  "sha256": "cc4b8ce6be58f02add92f90bba74facf9ac3b323ca26f04f36132ef978e21c47",
+  "counts": {
+   "book": 1712018,
+   "premium": 8642,
+   "trade": 977449
+  },
+  "disorder": 88,
+  "duplicates": 0,
+  "events": 2698109,
+  "cache_bytes": 38187355
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260823.gz",
+  "sha256": "7b369dbd3a8579bad1c1953a105885826179da9b2988d564e9882e6b2613dd45",
+  "counts": {
+   "book": 943188,
+   "premium": 8641,
+   "trade": 385438
+  },
+  "disorder": 63,
+  "duplicates": 0,
+  "events": 1337267,
+  "cache_bytes": 19397987
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260824.gz",
+  "sha256": "802f40251afd6238a2d1c28f44b3b90957d3754a3981be3a3bac2a4c88c1c0e5",
+  "counts": {
+   "book": 1050364,
+   "premium": 8640,
+   "trade": 340885
+  },
+  "disorder": 55,
+  "duplicates": 0,
+  "events": 1399889,
+  "cache_bytes": 20417385
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260825.gz",
+  "sha256": "a8e4be27d1ec76a971167084d64f978ad29ab0ea972275dacde2fef2d9d4933b",
+  "counts": {
+   "book": 2282683,
+   "premium": 8640,
+   "trade": 726041
+  },
+  "disorder": 146,
+  "duplicates": 0,
+  "events": 3017364,
+  "cache_bytes": 42290262
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260826.gz",
+  "sha256": "b971397972d63d5711abef4fa532b7a12a194d6d90f7770ad50d404464f3e44a",
+  "counts": {
+   "book": 1227886,
+   "premium": 8640,
+   "trade": 423111
+  },
+  "disorder": 80,
+  "duplicates": 0,
+  "events": 1659637,
+  "cache_bytes": 24235972
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260827.gz",
+  "sha256": "ceb450032d33d9d585d03524463ad6cdd065c5be24589cc328e57b534c93bba5",
+  "counts": {
+   "book": 985917,
+   "premium": 8641,
+   "trade": 408059
+  },
+  "disorder": 48,
+  "duplicates": 0,
+  "events": 1402617,
+  "cache_bytes": 20259327
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260828.gz",
+  "sha256": "218f4945143eafc01142fd19c8fcaa0c3cbc093b08b8bd42585d4b4938d25e20",
+  "counts": {
+   "book": 894442,
+   "premium": 8640,
+   "trade": 312644
+  },
+  "disorder": 54,
+  "duplicates": 0,
+  "events": 1215726,
+  "cache_bytes": 17730199
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260829.gz",
+  "sha256": "e620709c2beae5f4656d9615437a1bc94ed826783f165bcb10e61e8a071e4d54",
+  "counts": {
+   "book": 802639,
+   "premium": 8640,
+   "trade": 162809
+  },
+  "disorder": 64,
+  "duplicates": 0,
+  "events": 974088,
+  "cache_bytes": 13726726
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260830.gz",
+  "sha256": "16aee4c13d77cb4f62110630dba99e3089bb7f6fde64bfeb1f3a39a20b235a2d",
+  "counts": {
+   "book": 1161064,
+   "premium": 8640,
+   "trade": 131918
+  },
+  "disorder": 85,
+  "duplicates": 0,
+  "events": 1301622,
+  "cache_bytes": 18382772
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260831.gz",
+  "sha256": "5622bb895152ebdeb9a63526fda70f85fcfd9d84e17b41332ea5a253a56dd4db",
+  "counts": {
+   "book": 1364223,
+   "premium": 8640,
+   "trade": 113873
+  },
+  "disorder": 88,
+  "duplicates": 0,
+  "events": 1486736,
+  "cache_bytes": 20944529
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260901.gz",
+  "sha256": "fe032abd642cdf951338f74e358ee1ef5cde328b681d44adbfeac4c953f0881a",
+  "counts": {
+   "book": 1112424,
+   "premium": 8640,
+   "trade": 134863
+  },
+  "disorder": 69,
+  "duplicates": 0,
+  "events": 1255927,
+  "cache_bytes": 18008469
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260902.gz",
+  "sha256": "937b604fe1acfa5ede650575cd11e1f23fd9802ab40f9a2684d22c4da4aed83b",
+  "counts": {
+   "book": 1092077,
+   "premium": 8640,
+   "trade": 122103
+  },
+  "disorder": 72,
+  "duplicates": 0,
+  "events": 1222820,
+  "cache_bytes": 17537422
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260903.gz",
+  "sha256": "37e070e062217664fa2d5e56ade138ffb7a27b4963eeff56986a43f39dd6f1f7",
+  "counts": {
+   "book": 981478,
+   "premium": 8640,
+   "trade": 156053
+  },
+  "disorder": 70,
+  "duplicates": 0,
+  "events": 1146171,
+  "cache_bytes": 16486982
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260904.gz",
+  "sha256": "9e27ef4603fdfa73fe9aa7fa69f4105afc1bb57676cbe88ec74867a16bf78f30",
+  "counts": {
+   "book": 2056498,
+   "premium": 8641,
+   "trade": 174920
+  },
+  "disorder": 134,
+  "duplicates": 0,
+  "events": 2240059,
+  "cache_bytes": 30941883
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260905.gz",
+  "sha256": "6e9b8f04731a266552611de0bb4819a97a763ec15a636f77386742e4e7ca8c80",
+  "counts": {
+   "book": 536402,
+   "premium": 8640,
+   "trade": 127732
+  },
+  "disorder": 28,
+  "duplicates": 0,
+  "events": 672774,
+  "cache_bytes": 10074776
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260906.gz",
+  "sha256": "0c822bbfe31d31533fd967ea9b74012bec7470c429a876369ef3fb4753da882a",
+  "counts": {
+   "book": 675330,
+   "premium": 8640,
+   "trade": 163569
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 847539,
+  "cache_bytes": 12475769
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260907.gz",
+  "sha256": "74977802b1c5df21d97194c9ae631de24c9e15b3ac464a15dc598c29e1e8725e",
+  "counts": {
+   "book": 495622,
+   "premium": 8640,
+   "trade": 145168
+  },
+  "disorder": 62,
+  "duplicates": 0,
+  "events": 649430,
+  "cache_bytes": 9815229
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260908.gz",
+  "sha256": "194d83166d2a935a3d624d37566157f269d5df5a9d7289393d960c88916b7f60",
+  "counts": {
+   "book": 633167,
+   "premium": 8640,
+   "trade": 171098
+  },
+  "disorder": 109,
+  "duplicates": 0,
+  "events": 812905,
+  "cache_bytes": 11919651
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/peopleusdt_20260909.gz",
+  "sha256": "77ced3143a9f588fa0d7b137c98e5d138fbd4d263acc8b40236ad3eba6b7dbb1",
+  "counts": {
+   "book": 404476,
+   "premium": 4195,
+   "trade": 64634
+  },
+  "disorder": 38,
+  "duplicates": 0,
+  "events": 473305,
+  "cache_bytes": 6676251
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260812.gz",
+  "sha256": "bd9640a78e951afab5a8c9aa4e2d6475ae1a30e5a78b53595ac7549ee8e7b8b3",
+  "counts": {
+   "book": 280420,
+   "premium": 8640,
+   "trade": 92943
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 382003,
+  "cache_bytes": 5695395
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260813.gz",
+  "sha256": "477af7117f95aff7b1638ae832b91011bafc7033f0d058c21b9e3411ee861642",
+  "counts": {
+   "book": 223629,
+   "premium": 8640,
+   "trade": 73696
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 305965,
+  "cache_bytes": 4731950
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260814.gz",
+  "sha256": "46a54b5fd4a0d1676043c3e54d83e9115c631e0edafb4566f8b5e97180a09432",
+  "counts": {
+   "book": 223788,
+   "premium": 8640,
+   "trade": 70386
+  },
+  "disorder": 17,
+  "duplicates": 0,
+  "events": 302814,
+  "cache_bytes": 4630907
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260815.gz",
+  "sha256": "7cfec9d3cfb18e4ae9bf42b975855c3712473131705f941fc07e28f2c9cdf572",
+  "counts": {
+   "book": 165535,
+   "premium": 8640,
+   "trade": 42971
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 217146,
+  "cache_bytes": 3431762
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260816.gz",
+  "sha256": "98a29c165448d2dbd572a724ceaeaafa4cbbaac34e4fea32f81a229c98e86768",
+  "counts": {
+   "book": 141948,
+   "premium": 8640,
+   "trade": 36377
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 186965,
+  "cache_bytes": 2961066
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260817.gz",
+  "sha256": "ac99b701c44775515c4395a01910a7156f33087dcb93a9cbc9e14f195478ae5e",
+  "counts": {
+   "book": 155999,
+   "premium": 8640,
+   "trade": 46333
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 210972,
+  "cache_bytes": 3308946
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260818.gz",
+  "sha256": "6baecae0b591b378215a3278150b846f5ea97d676a80856a943681f6edd5a6a3",
+  "counts": {
+   "book": 197270,
+   "premium": 8640,
+   "trade": 54926
+  },
+  "disorder": 5,
+  "duplicates": 0,
+  "events": 260836,
+  "cache_bytes": 4115588
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260819.gz",
+  "sha256": "533c95556c12f67a3e18f0e5271658f512acd035d76dbbf51d5d29e8869f35bf",
+  "counts": {
+   "book": 303721,
+   "premium": 8640,
+   "trade": 100922
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 413283,
+  "cache_bytes": 6313548
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260820.gz",
+  "sha256": "0eac83c32add2acda8a3ecb9ef41066656830efd07a29fa7a5fc3b2101a7777a",
+  "counts": {
+   "book": 344762,
+   "premium": 8640,
+   "trade": 124030
+  },
+  "disorder": 17,
+  "duplicates": 0,
+  "events": 477432,
+  "cache_bytes": 7383444
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260821.gz",
+  "sha256": "921de36ea3542982be15bf0d4b95c1b30c581009768e7ee1677c1eeff07efbbe",
+  "counts": {
+   "book": 634667,
+   "premium": 8640,
+   "trade": 247942
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 891249,
+  "cache_bytes": 13395593
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260822.gz",
+  "sha256": "63c6d1e76c39a214fb8fe3c1e39cc90c6967b77b76ddfdfcd435da20db0e7118",
+  "counts": {
+   "book": 1316790,
+   "premium": 8642,
+   "trade": 457956
+  },
+  "disorder": 72,
+  "duplicates": 0,
+  "events": 1783388,
+  "cache_bytes": 25841556
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260823.gz",
+  "sha256": "e4d8cfbac7912a8fca07f28103d7826a533d5ad33a927dc75f71184b6c7f1806",
+  "counts": {
+   "book": 741885,
+   "premium": 8641,
+   "trade": 310155
+  },
+  "disorder": 46,
+  "duplicates": 0,
+  "events": 1060681,
+  "cache_bytes": 15334204
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260824.gz",
+  "sha256": "0ba9ac7110d5353e7a3a32c509101a917ee14878f6f42f81bbea4650811e9a7a",
+  "counts": {
+   "book": 826555,
+   "premium": 8640,
+   "trade": 294807
+  },
+  "disorder": 41,
+  "duplicates": 0,
+  "events": 1130002,
+  "cache_bytes": 16389563
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260825.gz",
+  "sha256": "dd98173997ceafb3547d1a714bb4ec56d3709a12e965240fa85953194cf4770d",
+  "counts": {
+   "book": 732787,
+   "premium": 8640,
+   "trade": 239596
+  },
+  "disorder": 40,
+  "duplicates": 0,
+  "events": 981023,
+  "cache_bytes": 14156145
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260826.gz",
+  "sha256": "b65b7cbbd96d1419a634c5504d55f214222477070ce8dc1d3f5cd50e02c589e1",
+  "counts": {
+   "book": 1357420,
+   "premium": 8640,
+   "trade": 423657
+  },
+  "disorder": 55,
+  "duplicates": 0,
+  "events": 1789717,
+  "cache_bytes": 24429244
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260827.gz",
+  "sha256": "1da60c23f237b442db7692831f2108b7865d89249f43e2598b7802272366db5e",
+  "counts": {
+   "book": 1224890,
+   "premium": 8641,
+   "trade": 354042
+  },
+  "disorder": 53,
+  "duplicates": 0,
+  "events": 1587573,
+  "cache_bytes": 22073663
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260828.gz",
+  "sha256": "540e9f044ff8a1c5125959647708849377a0e7967678611635e5fc43d4620e3b",
+  "counts": {
+   "book": 596435,
+   "premium": 8640,
+   "trade": 203764
+  },
+  "disorder": 31,
+  "duplicates": 0,
+  "events": 808839,
+  "cache_bytes": 11853191
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260829.gz",
+  "sha256": "62658f09abb1f42e6393e637a118d6fe4020a66e855c050eb8e7e646cf7d6f91",
+  "counts": {
+   "book": 293706,
+   "premium": 8640,
+   "trade": 103910
+  },
+  "disorder": 19,
+  "duplicates": 0,
+  "events": 406256,
+  "cache_bytes": 6000146
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260830.gz",
+  "sha256": "cd61dfcba475d721b044751e67181351d9bf0c1a6f8d8f7584df757592b9743d",
+  "counts": {
+   "book": 466198,
+   "premium": 8640,
+   "trade": 154548
+  },
+  "disorder": 18,
+  "duplicates": 0,
+  "events": 629386,
+  "cache_bytes": 9054463
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260831.gz",
+  "sha256": "d06415c6573b86e28586aa653d4170f7d05d1bb901b7c2cc76e7319ac7e077c1",
+  "counts": {
+   "book": 489916,
+   "premium": 8640,
+   "trade": 153090
+  },
+  "disorder": 33,
+  "duplicates": 0,
+  "events": 651646,
+  "cache_bytes": 9646917
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260901.gz",
+  "sha256": "e43cbf9cab0517bd062d54e345506cad12dc4a2ba72d99391c759cdd096559ae",
+  "counts": {
+   "book": 706608,
+   "premium": 8640,
+   "trade": 188955
+  },
+  "disorder": 35,
+  "duplicates": 0,
+  "events": 904203,
+  "cache_bytes": 12962669
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260902.gz",
+  "sha256": "c8f7dd3823dd42f601041f7e48243f4dc99b101cfeeb32bed7a6164244815a0b",
+  "counts": {
+   "book": 1127473,
+   "premium": 8640,
+   "trade": 390431
+  },
+  "disorder": 46,
+  "duplicates": 0,
+  "events": 1526544,
+  "cache_bytes": 21509199
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260903.gz",
+  "sha256": "6bca6cf0dfd706a8a85a3aacbe0ae95f05a313c92ac772e11637b5c84d5b4bb2",
+  "counts": {
+   "book": 794833,
+   "premium": 8640,
+   "trade": 245731
+  },
+  "disorder": 46,
+  "duplicates": 0,
+  "events": 1049204,
+  "cache_bytes": 15127059
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260904.gz",
+  "sha256": "029b70037019490f03776dc038f96eba9a847dec88af5397b7483db2969ce2a3",
+  "counts": {
+   "book": 686942,
+   "premium": 8641,
+   "trade": 228972
+  },
+  "disorder": 36,
+  "duplicates": 0,
+  "events": 924555,
+  "cache_bytes": 12959127
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260905.gz",
+  "sha256": "722118497104d13206b2849cea493ac65f0430cfe8160c56fd931b942c032b46",
+  "counts": {
+   "book": 291763,
+   "premium": 8640,
+   "trade": 106936
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 407339,
+  "cache_bytes": 6147446
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260906.gz",
+  "sha256": "730a8583ffc6050760a4b41e8b94f295bf1b843d1e5d0fb7024edc7c0f704637",
+  "counts": {
+   "book": 486344,
+   "premium": 8640,
+   "trade": 173885
+  },
+  "disorder": 26,
+  "duplicates": 0,
+  "events": 668869,
+  "cache_bytes": 9582929
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260907.gz",
+  "sha256": "0e87486b6e44672c40087d1a23f796ab5a3260405f1e1dc58509cb2f226fcc21",
+  "counts": {
+   "book": 413801,
+   "premium": 8640,
+   "trade": 145367
+  },
+  "disorder": 54,
+  "duplicates": 0,
+  "events": 567808,
+  "cache_bytes": 8383492
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260908.gz",
+  "sha256": "b4f1c0f4791211eee75d0fbcae573118f1c62c666704a738636efc4ad10e08e3",
+  "counts": {
+   "book": 438682,
+   "premium": 8640,
+   "trade": 117126
+  },
+  "disorder": 66,
+  "duplicates": 0,
+  "events": 564448,
+  "cache_bytes": 8264894
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/pythusdt_20260909.gz",
+  "sha256": "84621d5501367bc2cd0f63312a3021c45ec0f8076cf5725c4d3111b1bf5cc9ed",
+  "counts": {
+   "book": 217976,
+   "premium": 4195,
+   "trade": 62043
+  },
+  "disorder": 42,
+  "duplicates": 0,
+  "events": 284214,
+  "cache_bytes": 4145459
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260812.gz",
+  "sha256": "cbc56e82dec2603d6f53735b9c2d34cb91b2cb1acedf4c6865524d82807deb10",
+  "counts": {
+   "book": 325807,
+   "premium": 8640,
+   "trade": 82434
+  },
+  "disorder": 17,
+  "duplicates": 0,
+  "events": 416881,
+  "cache_bytes": 6647572
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260813.gz",
+  "sha256": "2740f7a219d03d275cd8cf43bbf92a37da4ca1f349263d2652339dafdb7993e0",
+  "counts": {
+   "book": 268502,
+   "premium": 8640,
+   "trade": 69906
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 347048,
+  "cache_bytes": 5673007
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260814.gz",
+  "sha256": "131d2a7ad289371b8c2803b4f8f6bd7443951f60b5f735bbde01a4d26a8e8b41",
+  "counts": {
+   "book": 231087,
+   "premium": 8640,
+   "trade": 64651
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 304378,
+  "cache_bytes": 5143888
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260815.gz",
+  "sha256": "adb55a3e53af4d0f39b6e6562608b540b37854cfcd3dbf48de7ad24106d63412",
+  "counts": {
+   "book": 176768,
+   "premium": 8640,
+   "trade": 41579
+  },
+  "disorder": 4,
+  "duplicates": 0,
+  "events": 226987,
+  "cache_bytes": 3778718
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260816.gz",
+  "sha256": "26868cd1663e2faccda8e6cd644a4c3f37fe83b7ae5d9b31507e44ce4d38df7c",
+  "counts": {
+   "book": 169363,
+   "premium": 8640,
+   "trade": 36050
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 214053,
+  "cache_bytes": 3570332
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260817.gz",
+  "sha256": "eaa5e63825aeeb5fb2a6afa2070efcfb1f4c6445513b91a65bba93f8b64923cd",
+  "counts": {
+   "book": 200283,
+   "premium": 8640,
+   "trade": 51594
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 260517,
+  "cache_bytes": 4261266
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260818.gz",
+  "sha256": "1fcd0c88f1785672791407b10435fa2ca76f9923251c4d4b80165b248621f9ad",
+  "counts": {
+   "book": 171053,
+   "premium": 8640,
+   "trade": 47394
+  },
+  "disorder": 2,
+  "duplicates": 0,
+  "events": 227087,
+  "cache_bytes": 3773378
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260819.gz",
+  "sha256": "cc53d33f780e4ee20df30448ed129f23eee9e61fe521200bf61581016d9f96f2",
+  "counts": {
+   "book": 180167,
+   "premium": 8640,
+   "trade": 46866
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 235673,
+  "cache_bytes": 3995225
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260820.gz",
+  "sha256": "6679c1383fa52c698a955009995d13391cef1b07aeedb0afba743dc1dc75c1cf",
+  "counts": {
+   "book": 192896,
+   "premium": 8640,
+   "trade": 46747
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 248283,
+  "cache_bytes": 4218270
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260821.gz",
+  "sha256": "f89cf0cf9e2f708e439ad951be42686f371d6e861ae4aafd7d81ad3260c57fd9",
+  "counts": {
+   "book": 318719,
+   "premium": 8640,
+   "trade": 97098
+  },
+  "disorder": 22,
+  "duplicates": 0,
+  "events": 424457,
+  "cache_bytes": 6997456
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260822.gz",
+  "sha256": "748e947900229c860624bafdd651a01c64b69e2dbf191d35ff88c2ddafafe2fb",
+  "counts": {
+   "book": 386144,
+   "premium": 8642,
+   "trade": 147498
+  },
+  "disorder": 17,
+  "duplicates": 0,
+  "events": 542284,
+  "cache_bytes": 8910089
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260823.gz",
+  "sha256": "f8def4b114bc5709b425926f4d825e2b45df33e66925539a3ef0e68a991667e0",
+  "counts": {
+   "book": 443407,
+   "premium": 8641,
+   "trade": 137596
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 589644,
+  "cache_bytes": 9294098
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260824.gz",
+  "sha256": "cd0f6c696ae5e3050d14d88de1649f4627145125f4e02c707b90260bdb19cc8d",
+  "counts": {
+   "book": 302115,
+   "premium": 8640,
+   "trade": 78516
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 389271,
+  "cache_bytes": 6389672
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260825.gz",
+  "sha256": "c627059ab569e76b886fde795b6b36ca94cd89fc2aa7504fdc64572cd8a46e66",
+  "counts": {
+   "book": 260311,
+   "premium": 8640,
+   "trade": 52579
+  },
+  "disorder": 19,
+  "duplicates": 0,
+  "events": 321530,
+  "cache_bytes": 5332849
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260826.gz",
+  "sha256": "01aad3ba4b2541ba6e30d54e46fa3b8ad62fef6e330502edba8c5811d725fbc8",
+  "counts": {
+   "book": 250479,
+   "premium": 8640,
+   "trade": 63838
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 322957,
+  "cache_bytes": 5294203
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260827.gz",
+  "sha256": "46586e5324e8845510dc17d2f07abc21ca66d1f6c0c15148428f8ba3631f2085",
+  "counts": {
+   "book": 155704,
+   "premium": 8641,
+   "trade": 29423
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 193768,
+  "cache_bytes": 3251958
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260828.gz",
+  "sha256": "180e37168e01518a0062e565388f9719e35877c5ff6bb92ac57d8ccd1c2f712e",
+  "counts": {
+   "book": 206070,
+   "premium": 8640,
+   "trade": 39856
+  },
+  "disorder": 17,
+  "duplicates": 0,
+  "events": 254566,
+  "cache_bytes": 4287987
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260829.gz",
+  "sha256": "6e3e0b0d271d5398f33eee1f0ae823e37a2475f5ea2085471ab85d210219c64e",
+  "counts": {
+   "book": 153621,
+   "premium": 8640,
+   "trade": 45467
+  },
+  "disorder": 6,
+  "duplicates": 0,
+  "events": 207728,
+  "cache_bytes": 3326044
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260830.gz",
+  "sha256": "6903658cf2d83677e6ea8cb0f2b914733673f12c867497a6356f5f5c5170cc58",
+  "counts": {
+   "book": 234483,
+   "premium": 8640,
+   "trade": 65095
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 308218,
+  "cache_bytes": 4942622
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260831.gz",
+  "sha256": "da4e6dbf1168efe806e221fd1384da07a6b3d5c912cb0951d07eede00b8e6e1e",
+  "counts": {
+   "book": 211388,
+   "premium": 8640,
+   "trade": 48261
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 268289,
+  "cache_bytes": 4400138
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260901.gz",
+  "sha256": "63b388ec73ae678ee3ed4adc287d53d6a5359c8bbd6ac90e4cec45506efff93b",
+  "counts": {
+   "book": 169753,
+   "premium": 8640,
+   "trade": 30421
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 208814,
+  "cache_bytes": 3462835
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260902.gz",
+  "sha256": "4fa4ae246cd499cdd5d3be69c5b3ba62571aba6cb7ce4294da7b35c01d7ff3bc",
+  "counts": {
+   "book": 156898,
+   "premium": 8640,
+   "trade": 29165
+  },
+  "disorder": 16,
+  "duplicates": 0,
+  "events": 194703,
+  "cache_bytes": 3243678
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260903.gz",
+  "sha256": "f1b56ba638a6db3bb0429b33babee63f6515e3bc8f396d7a426af6d68a3f8291",
+  "counts": {
+   "book": 196865,
+   "premium": 8640,
+   "trade": 39480
+  },
+  "disorder": 13,
+  "duplicates": 0,
+  "events": 244985,
+  "cache_bytes": 4034986
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260904.gz",
+  "sha256": "1e5181298fe7d00a7a1f4c92ca9985fbe04a1398bd38420b7fccf77197e53927",
+  "counts": {
+   "book": 163354,
+   "premium": 8641,
+   "trade": 32296
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 204291,
+  "cache_bytes": 3440694
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260905.gz",
+  "sha256": "4651fb20ef9199c753b5eec9d3ae787b557e922df85a1508c00003438f2cee73",
+  "counts": {
+   "book": 127628,
+   "premium": 8640,
+   "trade": 42516
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 178784,
+  "cache_bytes": 2935034
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260906.gz",
+  "sha256": "ccc7a8de2ef2994ef98244eb4dc5b636bd4e91ca4dd24ba9baba769cfcabf006",
+  "counts": {
+   "book": 119729,
+   "premium": 8640,
+   "trade": 31233
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 159602,
+  "cache_bytes": 2674687
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260907.gz",
+  "sha256": "b3c0d65b2da31cea00f34e7c54d36ea7476ac53b7290e59ec0cc94004d63730f",
+  "counts": {
+   "book": 147883,
+   "premium": 8640,
+   "trade": 37031
+  },
+  "disorder": 28,
+  "duplicates": 0,
+  "events": 193554,
+  "cache_bytes": 3205717
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260908.gz",
+  "sha256": "13815fd7228253f69aab77ba2a26f7dd0a8698581b4e49526eba5dcab3211a70",
+  "counts": {
+   "book": 149216,
+   "premium": 8640,
+   "trade": 38137
+  },
+  "disorder": 32,
+  "duplicates": 0,
+  "events": 195993,
+  "cache_bytes": 3288077
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/sagausdt_20260909.gz",
+  "sha256": "5a5108a7bbf2d4a358790dc65cbcb7c77677268b512926a7aca7e43e88d5d4df",
+  "counts": {
+   "book": 63897,
+   "premium": 4195,
+   "trade": 22110
+  },
+  "disorder": 16,
+  "duplicates": 0,
+  "events": 90202,
+  "cache_bytes": 1436384
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260812.gz",
+  "sha256": "b35b47e0c1b899d3a2afe482e14921c5db75b46006bc1ca3f2f09e935e09aeb6",
+  "counts": {
+   "book": 197926,
+   "premium": 8640,
+   "trade": 71543
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 278109,
+  "cache_bytes": 4475478
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260813.gz",
+  "sha256": "b46a19aff66dac325760eb1960ce6faa82d428f8af2a73da75b33b6d227c22c9",
+  "counts": {
+   "book": 153655,
+   "premium": 8640,
+   "trade": 54609
+  },
+  "disorder": 2,
+  "duplicates": 0,
+  "events": 216904,
+  "cache_bytes": 3522203
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260814.gz",
+  "sha256": "47e71a1db2584b42cfc5b5f24fbb801a4ab32498e5252e3b7706bdab3af98453",
+  "counts": {
+   "book": 863486,
+   "premium": 8640,
+   "trade": 370231
+  },
+  "disorder": 35,
+  "duplicates": 0,
+  "events": 1242357,
+  "cache_bytes": 18211363
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260815.gz",
+  "sha256": "add000a79f1f5c7a4432fb98c3ea5b7c570083514c18a9c77066fc9dc0db23bf",
+  "counts": {
+   "book": 675591,
+   "premium": 8640,
+   "trade": 165391
+  },
+  "disorder": 19,
+  "duplicates": 0,
+  "events": 849622,
+  "cache_bytes": 12635404
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260816.gz",
+  "sha256": "20edbe8915c87b5df59d292e81a4936bbfe64b2ffa55a0eb48a88bc62af6d4b7",
+  "counts": {
+   "book": 1296691,
+   "premium": 8640,
+   "trade": 467591
+  },
+  "disorder": 47,
+  "duplicates": 0,
+  "events": 1772922,
+  "cache_bytes": 25501174
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260817.gz",
+  "sha256": "6f16b963a72f51e045407a039a85a21925015d095f00731ed80957e885815280",
+  "counts": {
+   "book": 610978,
+   "premium": 8640,
+   "trade": 163823
+  },
+  "disorder": 22,
+  "duplicates": 0,
+  "events": 783441,
+  "cache_bytes": 11521179
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260818.gz",
+  "sha256": "77c688f07ad2f4cdbf90055b0ec635d27fa9dca13600781473e1d05dd56bb83b",
+  "counts": {
+   "book": 545098,
+   "premium": 8640,
+   "trade": 145472
+  },
+  "disorder": 28,
+  "duplicates": 0,
+  "events": 699210,
+  "cache_bytes": 10203426
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260819.gz",
+  "sha256": "613c5831fe1c43f186937d68c4b44206371eb582360b72e6cf7b67ee5368e25b",
+  "counts": {
+   "book": 427388,
+   "premium": 8640,
+   "trade": 119381
+  },
+  "disorder": 18,
+  "duplicates": 0,
+  "events": 555409,
+  "cache_bytes": 8296943
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260820.gz",
+  "sha256": "69c31044a9948809898d0c06093b5def1da84d86e247bee2a12cfab4dc30e124",
+  "counts": {
+   "book": 262973,
+   "premium": 8640,
+   "trade": 90149
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 361762,
+  "cache_bytes": 5528222
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260821.gz",
+  "sha256": "a61864356e8de6ffccc1f918bb96180489544d4e676337737ba2ce57e6cfe31f",
+  "counts": {
+   "book": 232283,
+   "premium": 8640,
+   "trade": 103516
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 344439,
+  "cache_bytes": 5342388
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260822.gz",
+  "sha256": "28578258a2ce76a30379d75967b8d8bb0cd06a46707d70ebeab9a4df85c87b12",
+  "counts": {
+   "book": 314664,
+   "premium": 8642,
+   "trade": 168788
+  },
+  "disorder": 25,
+  "duplicates": 0,
+  "events": 492094,
+  "cache_bytes": 7742714
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260823.gz",
+  "sha256": "7c3f2a9ecebb532bdf5186d041933e01c1ec09883a72574244ce29ce7c5ef4e5",
+  "counts": {
+   "book": 206555,
+   "premium": 8641,
+   "trade": 100202
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 315398,
+  "cache_bytes": 4948842
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260824.gz",
+  "sha256": "c7460b48999060121a79d543aaff5b8e0d6b0051b7647f60c15d2040ad401afd",
+  "counts": {
+   "book": 201770,
+   "premium": 8640,
+   "trade": 79523
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 289933,
+  "cache_bytes": 4555364
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260825.gz",
+  "sha256": "12bef4f77dd5d771758e55275b201a5c767fa8ea7232a0cc9bdba62e11683c54",
+  "counts": {
+   "book": 183941,
+   "premium": 8640,
+   "trade": 63402
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 255983,
+  "cache_bytes": 4085852
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260826.gz",
+  "sha256": "c990d8adfd1655b289291b95be0f6635cd9eb3afdd1de116a839c7fd25490b23",
+  "counts": {
+   "book": 160994,
+   "premium": 8640,
+   "trade": 39652
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 209286,
+  "cache_bytes": 3444337
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260827.gz",
+  "sha256": "b45b659b37b0aae6e15fda75bdee8dfeab2031136a3a900eb49e7971b2170c43",
+  "counts": {
+   "book": 140662,
+   "premium": 8641,
+   "trade": 36897
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 186200,
+  "cache_bytes": 3088796
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260828.gz",
+  "sha256": "654bea6aa8e918ad86e9740eb3a1c84f21cf5c67ac0ea318ebad41649e7a0833",
+  "counts": {
+   "book": 143275,
+   "premium": 8640,
+   "trade": 39645
+  },
+  "disorder": 7,
+  "duplicates": 0,
+  "events": 191560,
+  "cache_bytes": 3212854
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260829.gz",
+  "sha256": "0bf1172104ba09b17e556a47f737dd14426971c30cdbd300a560a0066f6b1daa",
+  "counts": {
+   "book": 105347,
+   "premium": 8640,
+   "trade": 33529
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 147516,
+  "cache_bytes": 2417881
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260830.gz",
+  "sha256": "0a42a5cdfbd5f193249c7f4f37d421105ae5fedc359248c64e3d634e522bb834",
+  "counts": {
+   "book": 143849,
+   "premium": 8640,
+   "trade": 45659
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 198148,
+  "cache_bytes": 3156066
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260831.gz",
+  "sha256": "6ccb84a7b7cc5637287fe342bb99bd027245c74c0e4e8ddb70803e4ebbd014a0",
+  "counts": {
+   "book": 131477,
+   "premium": 8640,
+   "trade": 32342
+  },
+  "disorder": 14,
+  "duplicates": 0,
+  "events": 172459,
+  "cache_bytes": 2894272
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260901.gz",
+  "sha256": "5c598d3a1dcdc51c2415e7a3a9180e509e4cf87438e7bb5ac9ebf53be24d01e7",
+  "counts": {
+   "book": 178693,
+   "premium": 8640,
+   "trade": 62535
+  },
+  "disorder": 12,
+  "duplicates": 0,
+  "events": 249868,
+  "cache_bytes": 4008794
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260902.gz",
+  "sha256": "48890121d28050d0753af5a1c22a6f20e42951b931f8851a7901aadde678df8c",
+  "counts": {
+   "book": 118907,
+   "premium": 8640,
+   "trade": 31629
+  },
+  "disorder": 8,
+  "duplicates": 0,
+  "events": 159176,
+  "cache_bytes": 2674551
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260903.gz",
+  "sha256": "87b84fa2a9bebbb6f81160a1b3e07361a8887df90c2a21045914885877020193",
+  "counts": {
+   "book": 115168,
+   "premium": 8640,
+   "trade": 36441
+  },
+  "disorder": 23,
+  "duplicates": 0,
+  "events": 160249,
+  "cache_bytes": 2683781
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260904.gz",
+  "sha256": "23524bb655a11838995cb69d0118775cd21b848bc3d4572dcf85ec38e3cb1e3e",
+  "counts": {
+   "book": 103413,
+   "premium": 8641,
+   "trade": 28918
+  },
+  "disorder": 10,
+  "duplicates": 0,
+  "events": 140972,
+  "cache_bytes": 2351187
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260905.gz",
+  "sha256": "132dcc1ade5b5568ab3bff9e3dfa2f333cafa65469d47c2773f41fec88de2b22",
+  "counts": {
+   "book": 70840,
+   "premium": 8640,
+   "trade": 23503
+  },
+  "disorder": 9,
+  "duplicates": 0,
+  "events": 102983,
+  "cache_bytes": 1709444
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260906.gz",
+  "sha256": "bf88cd87b888c6edb51463736908d0f73547444f80b8b965eb3662efe3d08bed",
+  "counts": {
+   "book": 111976,
+   "premium": 8640,
+   "trade": 38194
+  },
+  "disorder": 11,
+  "duplicates": 0,
+  "events": 158810,
+  "cache_bytes": 2555706
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260907.gz",
+  "sha256": "0b408adfabed9ffaf084e7938452191463c3246882312cd638fa155e34f13166",
+  "counts": {
+   "book": 114621,
+   "premium": 8640,
+   "trade": 35533
+  },
+  "disorder": 21,
+  "duplicates": 0,
+  "events": 158794,
+  "cache_bytes": 2625085
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260908.gz",
+  "sha256": "a647aec03d78e4ca7606f9326eef6137f3acaa49c134e9a184db40f67c84a1ac",
+  "counts": {
+   "book": 125845,
+   "premium": 8640,
+   "trade": 34200
+  },
+  "disorder": 43,
+  "duplicates": 0,
+  "events": 168685,
+  "cache_bytes": 2784642
+ },
+ {
+  "path": "/home/storage/hft-data/binancefuturesum-c/xaiusdt_20260909.gz",
+  "sha256": "3c097ffd5fc92f8e80b60e358dc05188e68c62ae19c618054216d33a80a49c52",
+  "counts": {
+   "book": 54279,
+   "premium": 4195,
+   "trade": 16339
+  },
+  "disorder": 18,
+  "duplicates": 0,
+  "events": 74813,
+  "cache_bytes": 1240223
+ }
+]
