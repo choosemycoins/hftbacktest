@@ -862,6 +862,77 @@ see `hftbacktest.data.utils.snapshot.create_last_snapshot` and the
 
 ---
 
+## Coin screen (`rerank_metrics.py`)
+
+Microstructure metrics over the raw recordings, one coin at a time, plus the
+pre-committed screen rule `spread_p25 > fee_RT + adverse + funding × hold`:
+
+```bash
+.venv/bin/python collector/tools/rerank_metrics.py \
+    --hl-dir /data/hyperliquid --coin DYM \
+    --um-dir /data/binancefuturesum --um-symbol DYMUSDT \
+    --day 20260908 --adverse-bps 1.0 --hold-mean-s 600 --hold-p95-s 3000 \
+    --json out.json
+```
+
+**The threshold and the outcome come from different halves of the recording.**
+Until 2026-09-10 the `p25` of the spread was measured over the whole recording
+and then used to decide whether that same recording's capture survived the fee,
+the adverse fill and funding — the coin selected by the very quantile it was
+judged on. That is optimistic by construction, and most optimistic on the thin
+wide-quoting coins the screen exists to find.
+
+Now:
+
+* the **screen window** is the first half of the row's own recorded span, by
+  time — for a pooled multi-day row, that is the earlier days screening the
+  later ones — and the `p25` the gate credits is measured there;
+* the **evaluation window** is the second half, which is what the coin went on
+  to quote;
+* the gate credits `min(screen p25, evaluation p25)`: the screen window is the
+  number an operator could have committed to before the evaluation window
+  happened, the evaluation window is what was delivered, and the coin gets the
+  lesser. No quantile of the evaluation window can therefore *raise* the
+  credited capture, which is the direction the leak moved it;
+* a screen window with no measurable `p25` is verdict `unknown`, however good
+  the second half looks — fail closed, the same rule a missing hold already had;
+* `--spread-p25-bps` bypasses the screen window entirely. It is the one term of
+  the rule that can be a constant declared *before* the data, so it is exempt —
+  and it is reported as `used_source: operator`, never silently.
+
+Both windows reach the JSON and the operator's table side by side — the
+boundary, each window's bounds, its frame count, its weighted seconds and its
+`p25`, plus `evaluation_minus_screen_bps` (positive means the coin quoted WIDER
+after the screen window) — so a coin whose spread evaporated is visible as a
+number rather than as a verdict nobody can re-derive. The whole recording's
+`p25` is still printed under `spread`: it is the description of the recording,
+it is simply no longer what the gate credits.
+
+How much this moves, measured on the 18 Hyperliquid coin-days of 2026-09-08 in
+`/home/storage/hft-data`: the credited `p25` fell on all 17 that carried quotes
+(the 18th, 2Z, carried none and is `unknown`), by up to 33%
+(GRAM 2.143 → 1.438 bps, its second half quoting 2.852; XYZ:INTC 0.949 → 0.701;
+MERL 2.123 → 1.730; CASHCAT 5.667 → 5.484, that one bound by the evaluation
+window), and no verdict flipped — those coins were already far from their
+thresholds. A quiet full day shrinks by almost nothing (DYM 6.577 → 6.564, XAI
+12.878 → 12.878): the split bites where the spread regime changes across the
+recording, which is exactly the case the whole-recording quantile hid.
+
+The funding tape is deliberately **not** split. Its hours are the recording's
+outcome rather than a threshold chosen on it, and halving the denominator of
+`p_hour_rate_ge_gross` would only hide hours that already happened.
+
+Tests: `.venv/bin/pytest collector/tools/test_rerank_metrics.py` (116 pins).
+The window split is pinned by eight of them and verified by ten mutations —
+screen window widened to the whole recording, evaluation window widened to it,
+the two swapped, the boundary frame counted on the wrong side, a missing bound
+read as an unbounded window, the operator override ignored, an unmeasurable
+screen falling back to the evaluation window, the credit taken from the screen
+alone, the credit taken as the greater of the two, and the funding tape sliced
+along with the spread — each killing its own pin.
+
+---
+
 ## Deployment
 
 Scripts live in [`deploy/`](deploy/) and follow the same versioned-release,
@@ -1692,6 +1763,444 @@ every case. If it is one thin symbol in a quiet market, raise
 warning.
 
 ---
+
+## Announcement poller (venue decisions)
+
+`tools/announce_poller.py` watches the one thing this repository records but does
+not capture: the moment a venue *decides* something. Delistings, listings,
+universe edits, and the rules of reward programmes. It is a fork-local operator
+tool, not part of the collector binary — nothing here touches the recorder.
+
+Why minutes and not a weekly digest: on the 24-month Binance/Bybit announcement
+panel three quarters of a delisting's move happens in the **hour the article is
+published** (−12.3 % in hour 0 against −3.9 / −1.4 / −1.8 % over the following
+days), and reward windows (Lighter LPP) live 4–8 weeks and decay from day one. A weekly scan sees a rule change three to four days late.
+
+### Sources
+
+One adapter per source; a failure of one never blocks the others, and an
+unparsable answer is a **failure of that source**, never an empty world.
+
+| source | venue | kind | endpoint |
+|---|---|---|---|
+| `binance_delisting` / `binance_listing` | Binance | article feed | CMS catalogs 161 / 48 |
+| `bybit_delistings` / `bybit_new_crypto` | Bybit | article feed | `v5/announcements/index` |
+| `okx_delistings` / `okx_new_listings` | OKX | article feed | `v5/support/announcements?annType=…` |
+| `okx_latest` | OKX | article feed, keyword-filtered | `v5/support/announcements` (all types) |
+| `hl_universe` | Hyperliquid | snapshot diff | `info {"type":"meta"}` |
+| `hl_perpdexs` | Hyperliquid | snapshot diff | `info {"type":"perpDexs"}` — the *registry* of builder dexes |
+| `hl_dex_<dex>` × 10 | Hyperliquid builder dexes | snapshot diff | `info {"type":"meta","dex":…}` (`xyz` `io` `mkts` `para` + six dormant) |
+| `hl_dex_<dex>_activity` × 6 | dormant builder dexes | snapshot diff | `info {"type":"metaAndAssetCtxs","dex":…}` — first-trade tripwire |
+| `hl_outcomes` | Hyperliquid | snapshot diff | `info {"type":"outcomeMeta"}` (by *family*, see below) |
+| `lighter_markets` | Lighter | snapshot diff | `api/v1/orderBooks` |
+| `lighter_rh_markets` | Lighter (Robinhood) | snapshot diff | `api.rh.lighter.xyz/api/v1/orderBooks` |
+| `lighter_lpp_doc` | Lighter | page digest | `docs.lighter.xyz/liquidity-partner-program.md` |
+| `polymarket_perps_instruments` | Polymarket Perps | snapshot diff | `api.perpetuals.polymarket.com/v1/info/instruments` |
+| `deribit_usdc_instruments` | Deribit | snapshot diff | `api/v2/public/get_instruments?currency=USDC&kind=future` |
+| `kraken_blog` | Kraken | article feed (RSS, 15 min) | `blog.kraken.com/feed` |
+| `kraken_lp_page` | Kraken | page digest | `blog.kraken.com/product/promotions/kraken-liquidity-provider-program` |
+| `kraken_pairs` | Kraken | snapshot diff | `api.kraken.com/0/public/AssetPairs` |
+| `kraken_futures_instruments` | Kraken Futures | snapshot diff | `futures.kraken.com/derivatives/api/v3/instruments` |
+
+Every catalogued feed also pins **what the answer claims to be**, not just its
+address: the Binance adapter checks `catalogName` (`Delisting` for 161, `New
+Cryptocurrency Listing` for 48), the Bybit adapter checks `type.key` on every
+row, the OKX adapter checks `annType` on every row. A `200` with a valid shape
+but another catalog's articles — Binance repointing an id — would otherwise be
+read as the world, i.e. as *"no delistings any more"*, and the source would go
+quiet for good. A cosmetic rename of the
+catalog will now kill the source loudly within half an hour instead; that is the
+chosen side of the trade.
+
+Diff sources report additions, removals, `isDelisted` flips, `maxLeverage`
+changes and market/pair-status changes. Every registered source except the
+Kraken blog answers `200` to an honest `User-Agent` from a home connection; no
+browser impersonation is needed, and on the blog it would not help either — see
+below. A full tick of the thirteen sources of 2026-09-09 took 6.7 s.
+OKX (three more sources, added 2026-09-13) answers the same way — no auth, no
+JS challenge, no `User-Agent` games.
+
+**The Kraken challenge is intermittent, and 1.3 watches Kraken through three
+sources.** Both `blog.kraken.com` addresses — the RSS feed and the LP-programme
+page — answer `403` with a Cloudflare JavaScript challenge (`Checking your
+browser`, `Javascript required`) to *every* `User-Agent`, from the operator's
+Cyprus machine and from the Tokyo collector host alike, so it is neither our
+address nor our header. What 1.2 got wrong was reading that as a *permanent*
+block and deleting the two sources. Measured 2026-09-14: production 1.1 **read
+the feed** at 19:10:10Z (`источников=14 прочитано=14 провалов=0`, `kraken_blog`
+`fails=0`), while a 20-request probe at one per minute over 19:36:45–19:55:49Z
+got 20 challenges out of 20 — the identical 6,460-byte body every time — and the
+Tokyo host answered the same at 19:36:40Z and at 20:04:06Z. The open windows are
+therefore rarer than one in twenty minutes and cannot be characterised from that
+probe, but they exist, and the blog goes through them. 1.3 restores
+`kraken_blog` and `kraken_lp_page` alongside `kraken_pairs`, the public
+`AssetPairs` universe (1,449 pairs on 2026-09-14), because the two answer
+different questions: **the blog announces listings days before they go live**,
+which nothing else on this venue does, while a universe diff only sees a decision
+once it has taken effect. `support.kraken.com` remains useless (`404` from both
+its Zendesk API and its atom feed) and `status.kraken.com` only knows
+withdrawal-delay incidents, so there is no third way to the lead time. The cost
+of keeping a source that is refused more often than not is paid by the alert
+threshold, not by the operator's attention: see the challenge threshold below.
+
+A Kraken delisting is still visible before the pair disappears, because it
+starts as a status change — `online` →
+`cancel_only` / `post_only` / `reduce_only`, and 79 of the 1,449 live pairs
+already sit in `cancel_only`, 17 in `post_only`. That is picked up by the same
+field-by-field snapshot comparison that reports `isDelisted` on Hyperliquid, so
+the status lives in the snapshot *value* and one transition is one message
+naming both sides; folding it into the snapshot *key* would have split it into
+a "gone"/"new" pair that names neither. The Kraken envelope is checked before
+anything else: a `200` there means nothing (an unknown pair comes back `200`
+with a non-empty `error` and no `result` at all), so only an empty `error` with
+a `result` object is read as the world.
+
+**A JS challenge is named as one, and the body has to be unpacked first.**
+`HTTPError: HTTP Error 403: Forbidden` reads exactly like "the venue is down",
+and the two call for different decisions: an outage is waited out in minutes,
+this challenge in hours, which is why the alert thresholds differ. When the body
+of an HTTP error carries a challenge marker the failure alert says `бот-защита
+(JS challenge)` and the HTTP code instead; everything else keeps its bare error
+text. The body of an error lives only inside the exception — the `last_fail`
+sidecar is written for answers that were read to bytes, and a 403 never gets
+that far.
+
+That label did not work at all until 1.3, and the state file is where it showed.
+Measured 2026-09-14 20:22Z: the challenge arrives with `Content-Encoding: gzip`
+(3,598 bytes on the wire, 6,877 unpacked — a different reading from the probe's
+6,460, taken by a different client; the label keys on markers, never on length),
+and urllib decompresses only
+*successful* answers — `RealHost.fetch` does it by hand for those — so 1.2 was
+searching for its markers inside gzip bytes and never found them. Production
+proved it: `kraken_lp_page` sat in `seen.json` with `last_error` = `HTTPError:
+HTTP Error 403: Forbidden`, the exact string the label exists to replace. 1.3
+unpacks a declared-gzip error body, verified against the live venue at 20:24:17Z
+(`бот-защита (JS challenge), HTTP 403`). Without it the whole challenge
+threshold below would have been inert and silent about it.
+
+Three things about OKX are worth knowing before trusting it:
+
+- **It is the EEA entity that answers us.** From a Cyprus address every link
+  comes back as `/en-eu/help/…`, and neither `Accept-Language`, nor an
+  `X-Locale` header, nor a `locale` parameter moved it. So these are the
+  announcements of OKX's *European* legal entity, not the global feed — the
+  delisting list is genuinely sparse (newest on 2026-07-14) rather than stale.
+- **`announcements-latest-announcements` does not exist.** The venue answers
+  `51000 Parameter annType error`; the live type list is at
+  `/api/v5/support/announcement-types`, and "latest across all types" is the
+  same request with no `annType` at all. That is what `okx_latest` asks for.
+- **`okx_latest` is keyword-filtered on the title** (`perp`, `pre-ipo`,
+  `tokenized`, `delist`, `listing`), because the unfiltered feed is mostly
+  giveaways, P2P campaigns and wallet maintenance. Measured over 160 rows on
+  2026-09-13: 21 match, and they are exactly venue decisions — perp tick size,
+  position tiers, the funding-rate formula. The plausibility floor is applied to
+  the **raw** page, before the filter, so a page where nothing matches (the
+  common case) is a quiet page and not a source failure. Rows whose `annType`
+  already has its own source are subtracted, so one delisting never arrives
+  twice.
+
+An OKX article is keyed by the **slug** of its link, not by its title and not by
+the whole URL: measured on 60 rows, three pairs of rows repeat a title verbatim
+while no slug repeats — a repeat announcement gets a `-1` or a date suffix
+(`…-perpetual-futures-20260413`). The locale segment lives in the URL, so keying
+by the URL would make a locale change look like a fresh delisting.
+
+**Outcome markets are diffed by family, not by id, and that is a measurement.**
+Between 22:05 and 22:26Z on 2026-09-09, 13 of 160 outcomes appeared and 17
+disappeared while the set of *families* — template × underlying perp × deployer,
+29 of them — did not move by one. A per-id diff would be ~2000 messages a day of
+mechanical hourly rolls, burying the one thing the source exists for: a new
+template, a new underlying, or a new deployer. Caveat, stated because it is not
+measured: family stability was observed over half an hour, not a week; sports
+families may well rotate.
+
+**Eighteen sources were added on 2026-09-15, out of one measurement pass**
+(`~/hft-research/new-venues-recon-20260914/out/SUMMARY.md`; every count below was
+pulled 2026-09-14, the Lighter/Robinhood one 2026-09-15).
+
+- **The Hyperliquid *registry* is watched now, not only its dexes.** `info
+  {"type":"perpDexs"}` answers with eleven rows, the first of them `null` — that is
+  the main dex, which has no name — and ten named builder dexes. A per-dex universe
+  is blind to a *new* dex by construction: there is no source for one until somebody
+  adds it by hand, and a new builder dex is a new venue with its own listings (`io`
+  trades pre-IPO names, `xyz` equities and commodities). The snapshot value is
+  `fullName` + `deployer`, because the deployer is who may halt an asset and repoint
+  its oracle: the same name under a new address is a decision, not cosmetics.
+- **All ten dexes have a universe source** (there were three). Four of them trade —
+  `xyz` 120 assets, `para` 35, `mkts` 23, `io` 10 — and six trade nothing at all:
+  `flx`, `vntl`, `hyna`, `km`, `cash`, `abcd`, where *every* asset shows
+  `dayNtlVlm` and `openInterest` of exactly zero. The floor for a dormant dex is 1
+  rather than 3: `abcd`'s universe is a single asset, and any higher floor would kill
+  that source silently and for good.
+- **A dormant dex also gets a tripwire, because its universe diff cannot see it wake
+  up.** The first trade adds nothing and removes nothing, so `{"type":"meta"}` stays
+  quiet exactly when the venue starts existing. `metaAndAssetCtxs` answers with a
+  *pair* — the universe and a context array parallel to it **by index**, with no asset
+  name in the second half — so both halves are read and their lengths compared: halves
+  that drift would credit one asset's activity to another. The snapshot value is one
+  bit per asset (`dayNtlVlm > 0 or openInterest > 0`) and its field is named in words,
+  because `diff_snapshots` composes the operator's sentence out of it: `flx:GOLD на
+  dex flx — первая активность: нет → есть`. One bit and not two: the label is diffed
+  alongside every other field, so a label that depended on the same bit would send two
+  messages for one event. Two things the tripwire does not do. It is **not monotonic**
+  — `dayNtlVlm` is a rolling day, so a dex that wakes and falls quiet again reports the
+  reverse transition; that is one message of noise, not a silence. And if more than
+  `CHURN_FLOOR` assets wake inside one tick, the wholesale-churn guard reads it as a
+  schema move and the source fails loudly (red alert within half an hour, body in
+  `last_fail`) instead of naming them — a whole universe waking in one tick is
+  indistinguishable from the venue handing us another dex's answer.
+- **Four venues this repository had no eyes on at all.** *Lighter under Robinhood* is a
+  separate universe on the same code — 84 books (57 perps, 27 spot) against 245 on the
+  main venue, and SPY / QQQ / XAU / SPCX / OPENAI live only there. It gets its own
+  adapter rather than a shared one because its snapshot also carries `created_at`, and
+  adding a field to a *live* source's snapshot means re-seeding it and throwing away
+  its window. *Polymarket Perps* answers with a **bare list** of 83 instruments and has
+  no status field at all — its own OpenAPI declares nineteen required fields and none
+  of them is one — so what is tracked is `ui_live_time`, the appointed hour of going
+  live, which arrived in four waves (39 / 13 / 15 / 16). *Deribit*'s USDC book is 121
+  futures of which **21 are still inactive**: this venue creates the contract ahead of
+  time and switches it on separately, so the listing queue is visible before the first
+  trade and the activation arrives as `is_active: false → true`. *Kraken Futures* (295
+  instruments) is the only entrance to that venue that sees equity perps at all —
+  `PF_NBISUSD` opened 2026-09-03, and the spot `AssetPairs` universe does not know it
+  exists.
+
+Each of the four checks the venue's own envelope before anything else, because a
+valid-looking `200` carrying the wrong content is the dangerous shape: Kraken Futures
+says `result: "error"` with HTTP 200, Deribit carries `error` beside `result` in a
+JSON-RPC envelope, Lighter/Robinhood repeats its own code inside the body, and
+Polymarket's error is an object where the world is a list. Read as the world, each of
+those means "the venue delisted everything".
+
+**What it costs.** A tick is 35 requests instead of 17, nineteen of them to
+`api.hyperliquid.xyz` (main universe, registry, ten dex universes, six tripwires,
+outcomes). Measured 2026-09-14 23:24:35Z, live dry run of all 35: **14.9 s**,
+`прочитано=35 провалов=0`. Hyperliquid's own budget is 1200 weight per minute per
+address and an `info` request weighs 20, so that burst is 380 against a 6000-weight
+allowance for the five minutes it has to itself. The state file grows with the new
+snapshots — 343 KB → 459 KB, measured on the first 1.4 tick in production
+(2026-09-14 23:30:10Z, `источников=32 прочитано=32 провалов=0 засев=18`) — and is
+still `fsync`ed whole every five minutes.
+
+Each diff source declares a `shape` for its snapshot keys. Change how an adapter
+keys its snapshot and you must bump it — otherwise the upgrade compares new keys
+against old ones, the wholesale-churn guard reads that as a schema move, and the
+source dies loudly-but-uselessly until an operator clears the state by hand.
+Bumping `shape` re-seeds that one source silently instead.
+
+### Behaviour
+
+- **First run seeds silently.** 430 delistings and 2252 listings in a chat is an
+  incident, not a start-up. State is `seen.json`, keyed by the venue's own stable
+  id (`articleId`, RSS `guid`, the Bybit article id, coin name, `market_id`).
+  Bybit writes that id two ways — `--art<hex>` on 38 of 50 live rows and
+  `-blt<hex>` (Contentstack, everything before July 2026) on the other 12 — and
+  both reduce to the same key; when no id can be extracted the fallback key is
+  the URL **without its locale segment**, so `en-US` → `ru-RU` on one article is
+  never a second alert.
+- **One message per new decision**, carrying type, venue, title, the venue's own
+  timestamp *named by its field* (`releaseDate` / `publishTime` / `pubDate`) and
+  a separate local-UTC line. A diff source has no venue timestamp and says so
+  rather than borrowing our clock.
+- **A universe diff reports what appeared and what changed, not what vanished**
+  (since 1.5, 2026-10-06). The operator turned it off after the bigbox outage of
+  2026-09-29 → 10-06 released 178 changes at once. The start of a delisting is a
+  *value* change — `isDelisted` on Hyperliquid and its builder dexes, `status` on
+  Lighter and Kraken spot, `tradeable` on Kraken Futures — and that still goes out;
+  the key disappearing is the same event ending. The price: an instrument removed
+  *without* a preceding value change, and any HL outcome family that goes away, now
+  leave silently. Disappearances still **count** toward the wholesale-churn guard:
+  without them a response truncated above the floor would advance the snapshot
+  quietly, and the full universe coming back would read as a wave of false "new".
+- **Delivery is journalled.** A key is marked seen only after Telegram accepted
+  the message, and a universe snapshot only advances once every change it
+  carries was delivered. A crash between send and state write costs a duplicate,
+  never a miss — the venue pages only go back 50 articles.
+- **Bursts drain in bounded batches** (12 per tick, oldest first); the tail stays
+  unmarked and leaves on the next tick.
+- **Failure alerts** after 6 consecutive failures of one source (~30 min for the
+  5-minute sources, ~1.5 h for the 15-minute Kraken blog, ~6 h for the hourly
+  ones), a reminder every 36 after that, and one green line on recovery. An alert Telegram refused is **re-armed in the
+  state** and repeats every tick until it lands — otherwise a sixth failure that
+  coincided with a delivery failure bought three hours of silence on the
+  five-minute sources and thirty-six on the hourly ones.
+- **A bot-protection failure is held to a different threshold**: 8 consecutive
+  challenge failures instead of 6, with the same reminder rhythm. The arithmetic:
+  8 × 15 min = 2 h on the Kraken blog (8 h on the hourly LP page), chosen as the
+  smallest count that buys two hours on the fastest source that actually answers
+  with a challenge. Six would be 90 min there, i.e. an alert about this source's
+  *normal* behaviour — and a channel that shouts about normal stops being read.
+  The class comes from the **body** of the answer, never from its code: a plain
+  `403` keeps the 6-failure threshold, and an ordinary failure inside a challenge
+  streak puts the streak back on the ordinary scale, so a challenge that happened
+  just before a real breakage cannot gift that breakage two hours of silence. A
+  challenge that lifts gets the usual green line, and the green line **names the
+  challenge**: an intermittent block lifts and returns by itself, and nothing else
+  in the channel distinguishes that from "somebody fixed the source".
+- **A failure keeps the body that caused it**: the first 64 KB of the answer the
+  venue actually sent go to `state/last_fail/<source>.bin`. `last_error` names
+  the missing field; only the body says what arrived, and the next identical
+  answer is a whole cadence away.
+- **Missing Telegram credentials are fatal before the tick** (exit 3), because
+  `EnvironmentFile=-` swallows a vanished env file and `send → False` swallows
+  everything after it: every message refused, no key marked, exit 0, fresh pulse.
+  The non-zero exit is what raises `OnFailure=`, which has credentials of its own.
+- **An unreadable state file is announced once** before the world is re-seeded,
+  naming the lost file's last-write time. Re-seeding stays silent about the
+  articles themselves (a storm is worse than a gap), but the gap itself is not
+  something the operator should have to infer from an empty chat. A first run
+  with no state at all is not a loss and says nothing.
+- **Cadence lives in the state**, not in the timer: API sources every 5 min,
+  page digests hourly. One request per source per tick, 20 s timeout.
+- **Page digests are computed over visible text, not raw bytes** — measured
+  2026-09-09 22:00–22:05Z, two answers of the Kraken page differed only in its
+  "related posts" carousel — and a change is only announced after a **second**
+  confirming read. A page whose digest never settles says so once
+  (`UNSTABLE_AFTER`) instead of alerting every hour. A confirmed digest is still
+  checked against `seen`: a page a CDN swings between two stable variants (A/B
+  cache) confirms on every transition, and that is not news — each variant is
+  announced once and never again.
+- **The pulse file is written only when at least one source was read**; its
+  silence is the second alarm channel, independent of Telegram. It carries
+  `undelivered`, the number of messages Telegram refused this tick, so a fresh
+  pulse can no longer mean "alive and mute". A second user timer
+  (`announce-poller-pulse.timer`, every 15 min) fails — and therefore alerts
+  through the same `signal-alert@` hook — when the pulse is older than 30 min or
+  its `undelivered` is non-zero.
+
+```bash
+# preflight: read everything for real, change nothing, wake nobody
+tools/announce_poller.py --once --dry-run --state /tmp/seen.json
+
+# one source at a time while debugging an adapter
+tools/announce_poller.py --once --dry-run --sources kraken_pairs
+```
+
+Secrets come from the environment only (`TG_BOT_TOKEN`, `TG_CHAT_ID`), supplied
+by the systemd unit's `EnvironmentFile`; the poller never reads that file itself
+and never prints a token, not even inside an exception message. Outside
+`--dry-run` their absence — or a whitespace character inside them, the CRLF
+lesson from `topic-scan` — stops the process before the first fetch.
+
+### What it misses, and for how long
+
+The poller only sees what is on the page when it looks, so downtime costs
+announcements. Measured 2026-09-09, how far back one page of each feed reaches:
+
+| source | rows per page | window |
+|---|---|---|
+| `binance_delisting` | 50 | 134.6 days |
+| `bybit_delistings` | 50 | 85.6 days |
+| `binance_listing` | 50 | 58.6 days |
+| `bybit_new_crypto` | 50 | 21.6 days |
+| `okx_delistings` | 20 | 951 days (measured 2026-09-13) |
+| `okx_new_listings` | 20 | 201 days (measured 2026-09-13) |
+| `okx_latest` | 20 | 65 days (measured 2026-09-13) |
+
+`kraken_blog` is missing from that table on purpose: its page holds ten posts
+and how far back they reach was never measured, so there is no number to put
+there. Treat it as the shortest window of the feeds, and remember that its
+window only advances while the venue's challenge happens to be open.
+
+Diff sources have no window at all: they compare snapshots, so a market listed
+*and* delisted while the poller was off is invisible — the two edits cancel and
+nothing is reported. Since this runs on an operator desktop that is measurably
+off for days at a time, treat every diff source (Kraken pairs included) as
+best-effort, and the two Binance/Bybit delisting feeds as robust.
+
+### Deployment (operator machine, user units)
+
+`ExecStart` points at a **copy** under `/home/storage/announce-poller/bin/` whose
+name carries the version and the sha256 prefix of the file
+(`announce_poller-1.3-<sha8>.py`), not at the repository tree: the tree gets
+edited, production must not move on its own. The tests are copied next to it
+under the same version, and both get an unversioned symlink so `pytest` can
+import them in place — a versioned filename is not a valid Python module name,
+so without the symlinks the deployed copy could not be verified on the box.
+
+```
+~/.config/systemd/user/announce-poller.service        # oneshot, EnvironmentFile=-%h/.config/topic-scan/telegram.env
+~/.config/systemd/user/announce-poller.timer          # OnCalendar=*:0/5, Persistent=true
+~/.config/systemd/user/announce-poller-pulse.service  # pulse watchdog, OnFailure=signal-alert@%n.service
+~/.config/systemd/user/announce-poller-pulse.timer    # OnCalendar=*:0/15
+/home/storage/announce-poller/bin/announce_pulse_watch.sh  # the watchdog's check (age + undelivered)
+/home/storage/announce-poller/state/seen.json         # state, fsynced, ~340 KB (1,449 Kraken pairs)
+/home/storage/announce-poller/state/pulse.json        # pulse: mtime + undelivered
+/home/storage/announce-poller/state/last_fail/*.bin   # body of the last failed answer per source
+```
+
+Changing how a key is derived is an operator action, not just a code change: the
+`-blt<hex>` fix moves 12 live Bybit articles from one key form to another, and a
+plain upgrade would re-announce all twelve. They were migrated **additively** in
+`seen.json` (both forms present, old ones aging out naturally) before the swap,
+so neither the old nor the new binary sees them as new. Re-seeding the feed
+instead — bumping `shape` — would have been silent too, but it throws away the
+window, so anything published during that tick would be lost.
+
+`TimeoutStartSec=600` on the poller unit, not 300: a unit killed by its own timeout
+writes no state and never reaches its own failure alert, and the worst case used to
+fit — 17 sources × 20 s of read plus 12 × 20 s of Telegram, i.e. ~580 s. The two
+Kraken blog sources restored in 1.3 are counted there: a challenged address answers
+`403` immediately, but a hung one would spend the whole timeout.
+
+**That arithmetic no longer fits, and 1.4 did not change it.** With 35 sources the
+same worst case is 35 × 20 + 12 × 20 ≈ 940 s, above the unit's own 600. A release
+touches `ExecStart` and the source-count comment and nothing else, so the debt is
+recorded here rather than papered over: in a *total* outage — every source timing out
+at once — the unit is killed before it writes state or sends a single per-source
+alert. What still covers that case is the second timer: the pulse stops being
+refreshed and `announce-poller-pulse.service` alerts through the same
+`signal-alert@` hook. A healthy tick of all 35 measures 14.9 s, so this is a tail,
+not the normal path; raising the timeout to 1200 s is the obvious next operator
+action.
+
+Adding `kraken_pairs` quadrupled the state file — 81 KB → 343 KB, because its
+snapshot is 1,449 pairs × five fields — and that whole file is `fsync`ed every
+five minutes. Measured, not feared: a tick still finishes in ~7 s. The snapshot
+keeps only the five fields the adapter reads; the venue's full answer is 673 KB.
+
+Order of a first start, and it matters: dry run live → seed for real (silent) →
+one clean tick → only then enable the timer. Enabling before the seed is how you
+mail yourself 2700 announcements. `OnFailure=signal-alert@%n.service` covers the
+case where the process itself dies; per-source failures are reported by the
+poller itself and still exit 0.
+
+Tests: `.venv/bin/pytest collector/tools/test_announce_poller.py` (149 pins;
+each guard is verified by a mutation that kills its own pin — no survivors). One
+of those mutations caught a **vacuous** pin: `retick()` reuses the previous
+payload, so a "recovery" tick that does not re-supply a healthy answer is just
+another failure, and the test passed while proving nothing. The `kraken_pairs`
+guards were added the same way in 1.2: dropping the envelope check, lowering the
+floor to zero, disabling the field-by-field comparison and swapping the
+challenge text back to the bare error each kill a named pin. The 1.4 guards were
+checked by four more: dropping the `result: "success"` envelope check of Kraken
+Futures kills
+`test_a_kraken_futures_error_envelope_is_a_failure_not_an_empty_world`; inverting
+the tripwire predicate kills
+`test_the_first_trade_on_a_dormant_dex_fires_exactly_one_item` and
+`test_open_interest_alone_wakes_the_tripwire`; deleting the Deribit source from the
+registry kills `test_the_four_new_venues_are_registered_each_with_one_request_of_its_own`
+(plus every Deribit pin by name); and lowering the Deribit floor to zero kills
+`test_a_truncated_deribit_answer_is_refused_before_it_can_become_a_snapshot`. In 1.3 five more:
+collapsing the challenge threshold to the ordinary one, dropping the challenge
+counter from the persisted state, deleting the two restored sources again,
+taking the challenge out of the green recovery line, and skipping the gunzip of
+a gzipped error body — each killed by a named pin, plus a sixth (every failure
+read as a challenge) that proves the ordinary threshold is still reachable. The
+gunzip pin is the one that came from the venue rather than from imagination: the
+dry run of 1.3 reported its two Kraken failures as bare `403`s, which is how the
+gzip hole was found at all.
+
+Two decisions of the 1.2 removal paid for themselves within a day, and both are
+worth keeping as habits. The RSS adapter was left in place because
+`blog.kraken.com` refuses us at the venue's edge, not because the format moved —
+so restoring the source in 1.3 cost one line and no new parsing code. And the
+state entry of a removed source was left in `seen.json` rather than pruned,
+carrying that source's `seen` window: the returning source picked the window up
+and re-announced nothing. The pins were the weak half — the adapter's own tests
+kept passing against a hand-built `Source` double while the registry entry was
+gone, so they now take the real registry entry and fail by name if it ever
+disappears again.
 
 ## Known limitations
 
