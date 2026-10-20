@@ -294,6 +294,22 @@ def test_docstrings_are_read_without_executing(tmp_path: Path):
     assert stats["unparsable"] == 1
 
 
+def test_markdown_docs_are_indexed_whole_and_symlinks_are_skipped(tmp_path: Path):
+    d = tmp_path / "docs"
+    d.mkdir()
+    (d / "design-foo.md").write_text("# Design foo\n\nthe l2Book truncation trap\n")
+    (d / "empty.md").write_text("   \n")
+    (d / "AGENTS.md").write_text("agents rules\n")
+    (d / "CLAUDE.md").symlink_to(d / "AGENTS.md")
+    rows, stats = kbindex.collect_docstring_rows([d])
+    names = {Path(r.path).name for r in rows}
+    assert names == {"design-foo.md", "AGENTS.md"}, \
+        "md docs must be indexed; empty files and symlinks (CLAUDE.md -> AGENTS.md dup) skipped"
+    md = {Path(r.path).name: r for r in rows}["design-foo.md"]
+    assert md.kind == "doc"
+    assert "truncation trap" in md.text and md.text.startswith("design-foo.md")
+
+
 # --------------------------------------------------------------------------
 # git source
 # --------------------------------------------------------------------------

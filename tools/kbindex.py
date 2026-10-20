@@ -131,8 +131,14 @@ DEFAULT_CONFIG = Config(
     claude_roots=[HOME / ".claude" / "projects"],
     doc_dirs=[
         HOME / "PycharmProjects" / "jansen" / "studies",
+        HOME / "PycharmProjects" / "jansen",
         HOME / "RustroverProjects" / "myhft" / "scripts",
+        HOME / "RustroverProjects" / "myhft" / "docs",
+        HOME / "RustroverProjects" / "myhft",
         HOME / "RustroverProjects" / "hftbacktest" / "collector" / "tools",
+        HOME / "RustroverProjects" / "hftbacktest" / "collector",
+        HOME / "RustroverProjects" / "hftbacktest" / "docs",
+        HOME / "RustroverProjects" / "hftbacktest",
     ],
     git_repos=[
         HOME / "PycharmProjects" / "jansen",
@@ -365,6 +371,24 @@ def collect_docstring_rows(doc_dirs):
                 ref="",
                 date=iso_date(path.stat().st_mtime),
                 text=f"{path.name}\n{doc.strip()}",
+            ))
+        for path in sorted(d.glob("*.md")):
+            # design notes and AGENTS.md are exactly the documents that answer
+            # venue-property questions; CLAUDE.md is a symlink to AGENTS.md and
+            # would only duplicate it.
+            if not path.is_file() or path.is_symlink():
+                continue
+            files += 1
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if not text.strip():
+                continue
+            rows.append(Row(
+                kind="doc",
+                project=project,
+                path=str(path),
+                ref="",
+                date=iso_date(path.stat().st_mtime),
+                text=f"{path.name}\n{text.strip()}",
             ))
     return rows, {"files": files, "unparsable": unparsable, "missing": missing}
 
